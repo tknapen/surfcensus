@@ -10,10 +10,11 @@ Conventions (docs/rendering.md):
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 import numpy as np
-from jaxtyping import Float
+from jaxtyping import Bool, Float
 
 from surfcensus.render.model import (
     PANEL_ORDER,
@@ -159,12 +160,61 @@ def slice_indices(
     return indices, planes
 
 
+def field_of_view(
+    box: BoxInfo, config: RenderConfig
+) -> tuple[Float[np.ndarray, " 3"], Float[np.ndarray, " 3"]]:
+    """Low and high corner, in tkr RAS, of the cube that the panels show.
+
+    Every panel is a square that spans the cube along its two in-plane axes. The side is the
+    largest box extent plus the margin on both sides, centred on the midpoint of the box.
+    """
+    low, high = np.array(box.low), np.array(box.high)
+    side = float((high - low).max() + 2 * config.margin_mm)
+    if not side > 0:
+        raise ValueError(f"the view box and its margin leave the panels no extent ({side:g} mm)")
+    mid = (low + high) / 2
+    return mid - side / 2, mid + side / 2
+
+
+def clickable_region(
+    box: BoxInfo, panels: Mapping[PanelName, PanelInfo], config: RenderConfig
+) -> Float[np.ndarray, "3 2 3"]:
+    """What the tiles show, as one box per panel in tkr RAS (docs/rendering.md).
+
+    ``region[p]`` holds the low and the high corner of the box of panel ``p`` of
+    ``PANEL_ORDER``: along the slice axis from half a slice step before the panel's first slice
+    plane to half a step past its last, along the two in-plane axes the field of view. The
+    region is the union of the three boxes. Every point that a click on a tile can name lies in
+    it, on a slice plane. The half step makes each slice stand for one step of the sweep.
+    """
+    fov_low, fov_high = field_of_view(box, config)
+    half_step = config.slice_step_mm / 2
+    region = np.empty((len(PANEL_ORDER), 2, 3))
+    for p, name in enumerate(PANEL_ORDER):
+        panel = panels[name]
+        region[p] = fov_low, fov_high
+        region[p, 0, panel.world_axis] = panel.slice_mm[0] - half_step
+        region[p, 1, panel.world_axis] = panel.slice_mm[-1] + half_step
+    return region
+
+
+def in_region(
+    xyz: Float[np.ndarray, "n 3"], region: Float[np.ndarray, "boxes 2 3"], margin_mm: float = 0.0
+) -> Bool[np.ndarray, " n"]:
+    """Which points lie in a union of boxes, each grown by ``margin_mm`` on every side.
+
+    The boundary counts as inside.
+    """
+    inside = np.zeros(len(xyz), dtype=bool)
+    for low, high in region:
+        inside |= ((xyz >= low - margin_mm) & (xyz <= high + margin_mm)).all(axis=1)
+    return inside
+
+
 def build_panels(box: BoxInfo, amap: AxisMap, config: RenderConfig) -> dict[PanelName, PanelInfo]:
     """The three panels: slice lists, tile size, edge letters and pixel <-> voxel affines."""
     low, high, centre = np.array(box.low), np.array(box.high), np.array(box.centre)
-    side = float((high - low).max() + 2 * config.margin_mm)
-    mid = (low + high) / 2
-    fov_low, fov_high = mid - side / 2, mid + side / 2
+    fov_low, fov_high = field_of_view(box, config)
     size = config.panel_px
 
     panels: dict[PanelName, PanelInfo] = {}
@@ -180,14 +230,14 @@ def build_panels(box: BoxInfo, amap: AxisMap, config: RenderConfig) -> dict[Pane
             high_at_left = config.radiological
         h0, h1 = (fov_high[h], fov_low[h]) if high_at_left else (fov_low[h], fov_high[h])
         v0, v1 = fov_high[v], fov_low[v]  # superior (or anterior, in the axial panel) at the top
-        pix2vox = np.array(
-            [
-                [(h1 - h0) / (size * amap.step[h]), 0.0, (h0 - amap.offset[h]) / amap.step[h]],
-                [0.0, (v1 - v0) / (size * amap.step[v]), (v0 - amap.offset[v]) / amap.step[v]],
-                [0.0, 0.0, 1.0],
-            ]
-        )
-        vox2pix = np.linalg.inv(pix2vox)
+        # voxel = scale * pixel + shift along the horizontal (a, c) and the vertical (b, d)
+        a, c = (h1 - h0) / (size * amap.step[h]), (h0 - amap.offset[h]) / amap.step[h]
+        b, d = (v1 - v0) / (size * amap.step[v]), (v0 - amap.offset[v]) / amap.step[v]
+        pix2vox = np.array([[a, 0.0, c], [0.0, b, d], [0.0, 0.0, 1.0]])
+        # The inverse written out, each entry one correctly rounded division. np.linalg.inv
+        # would give the last bit of the shifts, and the sign of the zeros, of the LAPACK
+        # that numpy is linked with, and both go into render.json.
+        vox2pix = np.array([[1.0 / a, 0.0, -c / a], [0.0, 1.0 / b, -d / b], [0.0, 0.0, 1.0]])
         letters_h, letters_v = _AXIS_LETTERS[h], _AXIS_LETTERS[v]
         edges = PanelEdges(
             left=letters_h[1] if high_at_left else letters_h[0],
@@ -317,5 +367,6 @@ def _vec3(a: np.ndarray) -> tuple[float, float, float]:
 def _matrix3(
     m: np.ndarray,
 ) -> tuple[tuple[float, float, float], tuple[float, float, float], tuple[float, float, float]]:
-    rows = [(float(r[0]), float(r[1]), float(r[2])) for r in m]
+    # + 0.0 turns a negative zero into zero, so that none is written to render.json
+    rows = [(float(r[0]) + 0.0, float(r[1]) + 0.0, float(r[2]) + 0.0) for r in m]
     return (rows[0], rows[1], rows[2])

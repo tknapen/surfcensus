@@ -3,14 +3,48 @@
 from __future__ import annotations
 
 import re
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 
 import pytest
 from synth import SyntheticSubject  # pyrefly: ignore[missing-import]
+from typer import rich_utils
 from typer.testing import CliRunner
 
 from surfcensus.cli import app
 from surfcensus.render import RenderConfig, RenderInfo, api
+
+
+@pytest.fixture(params=["plain", "colour", "colour, 30 columns"])
+def terminal(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The ways typer writes a usage error or a help page, each of them in any environment.
+
+    Typer hands these to Rich. It forces Rich's terminal output when ``GITHUB_ACTIONS``,
+    ``FORCE_COLOR`` or ``PY_COLORS`` is set, as on every CI runner, and Rich then puts escape
+    codes around and inside words (``--no-video`` becomes three coloured pieces). Rich also
+    wraps to the width of the terminal that pytest runs in, which ``COLUMNS`` overrides.
+    Typer reads its variables when it is imported, so its switch is set directly; the
+    variables that Rich reads for itself are set or removed, so that each case is the same
+    wherever the tests run.
+    """
+    monkeypatch.setattr(rich_utils, "FORCE_TERMINAL", True if "colour" in request.param else None)
+    monkeypatch.setattr(rich_utils, "MAX_WIDTH", None)
+    for name in ("FORCE_COLOR", "NO_COLOR", "TTY_COMPATIBLE", "TTY_INTERACTIVE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("COLUMNS", "30" if "30" in request.param else "80")
+    return request.param
+
+
+def said(output: str) -> str:
+    """The words of a usage error or a help page, whatever the terminal: without escape
+    codes, without the frame Rich draws around them, and with every run of white space
+    (Rich wraps lines) as one space."""
+    text = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", output)
+    return " ".join(re.sub(r"[\u2500-\u257f]", " ", text).split())
 
 
 def test_render_subject_end_to_end(synth_subject_pial_t1: SyntheticSubject, tmp_path: Path) -> None:
@@ -68,7 +102,7 @@ def test_flags_reach_three_plane(
     assert result.exit_code == 1
 
 
-def test_a_render_error_exits_with_1_and_one_line(tmp_path: Path) -> None:
+def test_a_render_error_exits_with_1_and_one_line(tmp_path: Path, terminal: str) -> None:
     (tmp_path / "empty").mkdir()
     out = tmp_path / "media"
     result = CliRunner().invoke(app, ["render-subject", str(tmp_path / "empty"), "--out", str(out)])
@@ -80,15 +114,115 @@ def test_a_render_error_exits_with_1_and_one_line(tmp_path: Path) -> None:
     assert not out.exists()
 
 
-def test_no_video_contradicts_a_video_path(tmp_path: Path) -> None:
+def test_a_missing_encoder_exits_with_1_and_one_line_before_anything_is_written(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "media"
+    subject = str(synth_subject_pial_t1.path)
+    done = CliRunner().invoke(app, ["render-subject", subject, "--out", str(out), "--no-video"])
+    assert done.exit_code == 0, done.output
+    before = {p: p.read_bytes() for p in out.rglob("*") if p.is_file()}
+    monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", str(tmp_path / "no-ffmpeg"))
+    result = CliRunner().invoke(app, ["render-subject", subject, "--out", str(out)])
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert re.fullmatch(
+        r"render failed: render failure: the video cannot be encoded \(the ffmpeg binary "
+        r"'.*no-ffmpeg' is missing or not executable\)\n",
+        result.stderr,
+    ), result.stderr
+    # the render without video is still complete
+    assert {p: p.read_bytes() for p in out.rglob("*") if p.is_file()} == before
+    assert (out / "render.json").is_file()
+
+
+def test_no_video_contradicts_a_video_path(tmp_path: Path, terminal: str) -> None:
     result = CliRunner().invoke(
         app, ["render-subject", str(tmp_path), "--out", str(tmp_path / "clip.mp4"), "--no-video"]
     )
     assert result.exit_code == 2
-    assert "--no-video" in result.output
+    assert "--no-video contradicts an --out that names a video" in said(result.output)
+    assert ("\x1b[" in result.output) == ("colour" in terminal)  # the fixture does what it says
     assert list(tmp_path.iterdir()) == []
 
 
-def test_out_is_required_and_the_command_is_listed() -> None:
-    assert CliRunner().invoke(app, ["render-subject", "some/subject"]).exit_code == 2
-    assert "render-subject" in CliRunner().invoke(app, ["--help"]).output
+@pytest.mark.parametrize("out", ["", "  "])
+def test_an_empty_out_is_refused(
+    synth_subject_pial_t1: SyntheticSubject,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    out: str,
+    terminal: str,
+) -> None:
+    """``--out "$UNSET"`` would otherwise render into the current directory."""
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        app, ["render-subject", str(synth_subject_pial_t1.path), "--out", out, "--no-video"]
+    )
+    assert result.exit_code == 2
+    assert "--out" in said(result.output) and "the output path is empty" in said(result.output)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_an_output_that_cannot_be_written_exits_with_1_and_one_line(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path, terminal: str
+) -> None:
+    out = tmp_path / "a-file"
+    out.write_text("not a directory")
+    result = CliRunner().invoke(
+        app, ["render-subject", str(synth_subject_pial_t1.path), "--out", str(out), "--no-video"]
+    )
+    assert result.exit_code == 1
+    assert result.stdout == ""
+    assert re.fullmatch(r"render failed: .*a-file.*\n", result.stderr), result.stderr
+    assert out.read_text() == "not a directory"
+    assert [p.name for p in tmp_path.iterdir()] == ["a-file"]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGTERM cannot be caught on Windows")
+def test_sigterm_removes_the_temporary_files(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path
+) -> None:
+    """A scheduler stops a job with SIGTERM; like Ctrl-C it must not leave the hidden
+    directory of a video render behind."""
+    (tmp_path / "videos").mkdir()
+    command = [sys.executable, "-c", "from surfcensus.cli import app; app()", "render-subject"]
+    process = subprocess.Popen(
+        [*command, str(synth_subject_pial_t1.path), "--out", str(tmp_path / "videos" / "clip.mp4")],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        deadline = time.monotonic() + 60
+        while not any((tmp_path / "videos").glob(".surfcensus-*/tiles/*.webp")):
+            assert process.poll() is None, process.communicate()
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+        process.send_signal(signal.SIGTERM)
+        output = process.communicate(timeout=60)
+    finally:
+        process.kill()
+    assert process.returncode == 128 + signal.SIGTERM, output
+    assert list((tmp_path / "videos").iterdir()) == []
+
+
+def test_out_is_required_and_the_command_is_listed(terminal: str) -> None:
+    missing = CliRunner().invoke(app, ["render-subject", "some/subject"])
+    assert missing.exit_code == 2
+    assert "--out" in said(missing.output)
+    listed = CliRunner().invoke(app, ["--help"])
+    assert listed.exit_code == 0
+    assert "render-subject" in said(listed.output)
+
+
+def test_said_reads_through_colour_and_frames() -> None:
+    styled = (
+        "\x1b[31m\u256d\u2500 Error \u2500\u256e\x1b[0m\n"
+        "\x1b[31m\u2502\x1b[0m Invalid value: \x1b[1;36m-\x1b[0m\x1b[1;36m-no\x1b[0m"
+        "\x1b[1;36m-video\x1b[0m     \x1b[31m\u2502\x1b[0m\n"
+        "\x1b[31m\u2502\x1b[0m contradicts \x1b[31m\u2502\x1b[0m\n"
+    )
+    assert "--no-video" not in styled  # what the assertion on the raw output ran into on CI
+    assert said(styled) == "Error Invalid value: --no-video contradicts"
+    assert said("plain  text\n") == "plain text"

@@ -75,8 +75,11 @@ class ContourRenderer:
     """Draws line segments onto a transparent RGBA tile with one persistent Agg figure.
 
     The figure is ``width`` x ``height`` pixels and its coordinates are panel pixels, y down.
-    It is built on the Agg canvas directly, without pyplot, so it touches no global state and
-    is safe in worker processes. Use it as a context manager, or call :meth:`close`.
+    It is built on the Agg canvas directly, without pyplot, so it changes no global state and
+    is safe in worker processes. The tile does not depend on matplotlib's settings either
+    (``matplotlibrc``, styles, ``plt.xkcd()``): the one setting that reaches these lines,
+    ``path.sketch``, is reset on every collection. Use it as a context manager, or call
+    :meth:`close`.
     """
 
     def __init__(self, width: int, height: int, line_width_px: float) -> None:
@@ -117,6 +120,9 @@ class ContourRenderer:
                 zorder=2,
             )
             collection.set_snap(False)  # snapping would move axis-parallel lines to pixel centres
+            # an artist copies rcParams["path.sketch"] when it is made; plt.xkcd() sets it for
+            # the rest of the process and would draw the contours as wobbling lines
+            collection.set_sketch_params(None)
             self._axes.add_collection(collection, autolim=False)
             self._collections.append(collection)
         for i, collection in enumerate(self._collections):

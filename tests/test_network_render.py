@@ -54,10 +54,14 @@ def test_real_subject_renders(real_subject: Path, tmp_path: Path) -> None:
         f"\nanim.mp4 {sizes['anim.mp4'] / 1e6:.2f} MB, "
         f"poster.webp {sizes['poster.webp'] / 1e3:.1f} kB, "
         f"vertex_map.npz {sizes['vertex_map.npz'] / 1e3:.1f} kB "
-        f"({info.vertex_map.n_lh} + {info.vertex_map.n_rh} vertices), "
+        f"({info.vertex_map.n_lh} + {info.vertex_map.n_rh} vertices, "
+        f"{info.vertex_map.n_lh_visible} + {info.vertex_map.n_rh_visible} visible), "
         f"render.json {sizes['render.json'] / 1e3:.1f} kB"
         f"\ntotal {total / 1e6:.2f} MB in {len(gray) + len(contours) + len(sizes)} files"
     )
+    # the numbers of docs/rendering.md: the map follows the tiles (the box plus 10 mm held 56,031)
+    assert (info.vertex_map.n_lh, info.vertex_map.n_rh) == (37356, 37298)
+    assert (info.vertex_map.n_lh_visible, info.vertex_map.n_rh_visible) == (27543, 27991)
     # slices behind the poles and below the occipital lobe cross no surface
     assert drawn > 0.8 * len(gray)
     assert 1e6 < total < 15e6

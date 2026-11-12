@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -213,8 +216,9 @@ def test_mp4_read_back(tmp_path: Path) -> None:
     assert meta["size"] == (128, 96)
     assert meta["fps"] == 12
     assert meta["codec"].startswith("h264")
-    assert meta["pix_fmt"].startswith("yuv420p")
-    assert "bt709" in meta["pix_fmt"]  # colour matrix is tagged, not left to the player
+    # limited range, and matrix, primaries and transfer all BT.709 (ffmpeg prints the three
+    # as a/b/c when they differ): tagged, not left to the player
+    assert meta["pix_fmt"].startswith("yuv420p(tv, bt709") and "/" not in meta["pix_fmt"]
     assert meta["duration"] == pytest.approx(30 / 12, abs=0.01)
     assert len(decoded) == 30
     assert imageio_ffmpeg.count_frames_and_secs(str(path))[0] == 30
@@ -224,6 +228,56 @@ def test_mp4_read_back(tmp_path: Path) -> None:
     for i in (0, 7, 29):
         nearest = np.argmin([np.abs(decoded[i].astype(int) - f).mean() for f in frames])
         assert nearest == i
+
+
+def test_mp4_encoder_settings_are_the_documented_ones(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """docs/rendering.md, "Video": H.264 with preset veryfast and the given CRF and frame rate,
+    yuv420p in limited-range BT.709, a single thread and the bit-exact flags. Most of these
+    do not show in a file made and read back on one machine, so the command is looked at."""
+    commands: list[list[str]] = []
+    popen = subprocess.Popen
+
+    def spy(command: list[str], **kwargs: int) -> subprocess.Popen[bytes]:
+        commands.append(list(command))
+        return popen(command, **kwargs)
+
+    monkeypatch.setattr(encode.subprocess, "Popen", spy)
+    write_mp4(tmp_path / "anim.mp4", [rgb_frame(i) for i in range(3)], fps=12, crf=27)
+    (command,) = commands
+    split = command.index("-i") + 2  # options before the input describe it, the rest the output
+    of_input, of_output = command[:split], command[split:]
+
+    def option(flag: str, options: list[str] = of_output) -> str:
+        assert options.count(flag) == 1, flag
+        return options[options.index(flag) + 1]
+
+    assert option("-framerate", of_input) == "12"
+    assert (option("-c:v"), option("-preset"), option("-crf")) == ("libx264", "veryfast", "27")
+    assert option("-pix_fmt") == "yuv420p"
+    assert (option("-threads"), option("-filter_threads")) == ("1", "1")
+    assert (option("-fflags"), option("-flags:v")) == ("+bitexact", "+bitexact")
+    for part in ("accurate_rnd+bitexact", "out_color_matrix=bt709", "out_range=tv", "yuv420p"):
+        assert part in option("-vf"), part
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "sched_setaffinity") or len(os.sched_getaffinity(0)) < 2,
+    reason="needs a way to hide processors from ffmpeg, and more than one of them",
+)
+def test_mp4_bytes_do_not_depend_on_the_number_of_processors(tmp_path: Path) -> None:
+    """x264 takes its number of threads from the processors it sees, and its output depends
+    on that number; with one thread the file is the same on any machine."""
+    frames = [rgb_frame(i, 320, 960) for i in range(24)]
+    write_mp4(tmp_path / "all.mp4", frames, fps=12, crf=23)
+    allowed = os.sched_getaffinity(0)
+    try:
+        os.sched_setaffinity(0, {min(allowed)})
+        write_mp4(tmp_path / "one.mp4", frames, fps=12, crf=23)
+    finally:
+        os.sched_setaffinity(0, allowed)
+    assert digest(tmp_path / "all.mp4") == digest(tmp_path / "one.mp4")
 
 
 def test_mp4_crf_changes_size(tmp_path: Path) -> None:
@@ -376,6 +430,63 @@ def test_mp4_ffmpeg_failure_raises_and_leaves_nothing(
     with pytest.raises(RuntimeError, match="no_such_filter"):
         write_mp4(tmp_path / "many.mp4", (rgb_frame(i, 320, 960) for i in range(60)), 12, 23)
     assert list(tmp_path.iterdir()) == []
+
+
+def test_ffmpeg_exe_is_the_binary_of_imageio_ffmpeg(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE", raising=False)
+    assert encode.ffmpeg_exe() == imageio_ffmpeg.get_ffmpeg_exe()
+    assert Path(encode.ffmpeg_exe()).is_file()
+
+
+def test_no_ffmpeg_binary_is_a_runtime_error_and_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """imageio-ffmpeg hands back ``IMAGEIO_FFMPEG_EXE`` unchecked, and raises RuntimeError
+    itself when it finds no binary at all."""
+    out = tmp_path / "out"
+    (tmp_path / "ffmpeg-data").write_bytes(b"not a program")  # a file without execute permission
+    for exe in (tmp_path / "no-such-ffmpeg", tmp_path / "ffmpeg-data", tmp_path):
+        monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", str(exe))
+        with pytest.raises(RuntimeError, match="missing or not executable"):
+            encode.ffmpeg_exe()
+        with pytest.raises(RuntimeError, match="missing or not executable"):
+            write_mp4(out / "a.mp4", [rgb_frame(0)], fps=12, crf=23)
+    monkeypatch.delenv("IMAGEIO_FFMPEG_EXE")
+
+    def none_found() -> str:
+        raise RuntimeError("No ffmpeg exe could be found.")
+
+    monkeypatch.setattr(imageio_ffmpeg, "get_ffmpeg_exe", none_found)
+    with pytest.raises(RuntimeError, match="No ffmpeg exe"):
+        write_mp4(out / "a.mp4", [rgb_frame(0)], fps=12, crf=23)
+    assert not out.exists()  # not even the directory the video would go to
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="the stand-ins for ffmpeg are shell scripts")
+def test_an_ffmpeg_that_does_not_start_or_writes_nothing_is_a_runtime_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    path = out / "anim.mp4"
+    write_mp4(path, [rgb_frame(0)] * 3, fps=12, crf=23)
+    before = path.read_bytes()
+    stand_ins = {
+        "not a program\n": "failed to start",  # executable, but the system cannot run it
+        "#!/bin/sh\ncat > /dev/null\n": "wrote no video",  # takes every frame, exits with 0
+        # the same, and leaves an empty file where the video should be (the last argument)
+        '#!/bin/sh\ncat > /dev/null\nfor last; do :; done\n: > "${last#file:}"\n': "wrote no video",
+        "#!/bin/sh\ncat > /dev/null\necho no codec >&2\nexit 3\n": "status 3: no codec",
+    }
+    for number, (script, message) in enumerate(stand_ins.items()):
+        exe = tmp_path / f"ffmpeg-{number}"
+        exe.write_text(script)
+        exe.chmod(0o755)
+        monkeypatch.setenv("IMAGEIO_FFMPEG_EXE", str(exe))
+        assert encode.ffmpeg_exe() == str(exe)
+        with pytest.raises(RuntimeError, match=message):
+            write_mp4(path, (rgb_frame(i) for i in range(5)), fps=12, crf=23)
+        assert path.read_bytes() == before
+        assert list(out.iterdir()) == [path]  # no temporary file
 
 
 def test_webp_failure_while_writing_leaves_nothing_and_keeps_the_previous_file(

@@ -94,6 +94,20 @@ def snapshot_tree(root: Path) -> dict[str, tuple[int, int]]:
     }
 
 
+def file_modes_apply(scratch: Path) -> bool:
+    """Whether a file of mode 000 in ``scratch`` is unreadable; it is not for root."""
+    probe = scratch / "mode-probe"
+    probe.write_text("x")
+    probe.chmod(0)
+    try:
+        probe.read_text()
+    except PermissionError:
+        return True
+    finally:
+        probe.unlink()
+    return False
+
+
 def write_synthetic_subject(
     root: Path,
     *,

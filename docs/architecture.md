@@ -197,7 +197,7 @@ run/
     tiles/               # per-panel WebP slice tiles in two layers, see rendering.md
     poster.webp
     render.json          # geometry, per-panel pixel-to-voxel affines, frame tables, config hash
-    vertex_map.npz       # native vertices in the box and their fsaverage6 counterparts
+    vertex_map.npz       # native vertices the tiles show, plus a margin, and their fsaverage6 counterparts
   app.sqlite             # rater app state, separate from the catalog
 ```
 

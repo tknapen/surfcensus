@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 from synth import (  # pyrefly: ignore[missing-import]
     SyntheticSubject,
+    file_modes_apply,
     snapshot_tree,
     write_synthetic_subject,
 )
@@ -16,6 +17,7 @@ from surfcensus.fsio.surfaces import read_surface
 from surfcensus.sources.base import RENDER_ROLES, FileRole
 from surfcensus.sources.patterns import (
     ROLE_CANDIDATES,
+    is_file,
     is_freesurfer_subject_dir,
     missing_roles,
     resolve_subject_files,
@@ -244,6 +246,68 @@ def test_is_freesurfer_subject_dir_through_directory_symlinks(tmp_path: Path) ->
     assert is_freesurfer_subject_dir(subjects / "sub-01")
     (subjects / "sub-gone").symlink_to(tmp_path / "nowhere")
     assert not is_freesurfer_subject_dir(subjects / "sub-gone")
+
+
+def test_is_file_tells_absent_from_present(tmp_path: Path) -> None:
+    (tmp_path / "file").write_text("x")
+    (tmp_path / "link").symlink_to("file")
+    (tmp_path / "dangling").symlink_to("nothing")
+    (tmp_path / "loop").symlink_to("loop")
+    (tmp_path / "folder").mkdir()
+    assert is_file(tmp_path / "file") and is_file(str(tmp_path / "link"))
+    for absent in ("nothing", "dangling", "loop", "folder", "file/below", "a" * 300, "nul\0"):
+        assert not is_file(tmp_path / absent), absent
+
+
+def test_names_too_long_to_exist_are_absent(tmp_path: Path) -> None:
+    """Such a name raises OSError (ENAMETOOLONG) from ``Path.is_dir()`` up to Python 3.13."""
+    subject = _fake_subject(tmp_path, "sub-01", ("mri/T1.mgz", "surf/lh.pial"))
+    assert not is_freesurfer_subject_dir(tmp_path / ("a" * 300))
+    assert not is_freesurfer_subject_dir(subject / ("a" * 300) / "sub-02")
+    assert resolve_subject_files(tmp_path / ("a" * 300)) == {}
+
+
+@pytest.mark.parametrize("unreadable", ["mri/T1.mgz", "surf/lh.pial"])
+def test_a_path_that_cannot_be_examined_raises(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, unreadable: str
+) -> None:
+    """Whether the file exists is unknown, so the answer is neither "absent" nor "not a
+    subject". ``Path.is_file()`` cannot be relied on for this: it raises up to Python 3.13 and
+    answers False from 3.14. The error is that of ``stat()`` in a directory without search
+    permission, raised here by a replaced ``Path.stat`` so that the test also runs as root."""
+    subject = _fake_subject(
+        tmp_path, "sub-01", ("mri/T1.mgz", "surf/lh.pial", "surf/lh.pial.T1", "surf/rh.pial")
+    )
+    stat = Path.stat
+
+    def refuse(self: Path, *args: object, **kwargs: object) -> object:
+        if self == subject / unreadable:
+            raise PermissionError(13, "Permission denied", str(self))
+        return stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", refuse)
+    with pytest.raises(PermissionError):
+        is_file(subject / unreadable)
+    with pytest.raises(PermissionError):
+        is_freesurfer_subject_dir(subject)
+    with pytest.raises(PermissionError):
+        resolve_subject_files(subject)
+    assert is_file(subject / "surf" / "rh.pial")
+
+
+@pytest.mark.parametrize(("target", "mode"), [("surf", 0), ("mri", 0o444), (".", 0)])
+def test_a_directory_without_permission_raises(tmp_path: Path, target: str, mode: int) -> None:
+    if not file_modes_apply(tmp_path):
+        pytest.skip("file modes do not restrict this user")
+    subject = _fake_subject(tmp_path, "sub-01", ("mri/T1.mgz", "surf/lh.pial", "surf/rh.pial"))
+    (subject / target).chmod(mode)
+    try:
+        with pytest.raises(PermissionError):
+            is_freesurfer_subject_dir(subject)
+        with pytest.raises(PermissionError):
+            resolve_subject_files(subject)
+    finally:
+        (subject / target).chmod(0o755)
 
 
 def test_patterns_leave_the_tree_untouched(

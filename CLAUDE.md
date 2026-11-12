@@ -65,7 +65,7 @@ Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 a
 - `MRISmeasureCorticalThickness` clamps each of its two distance measurements at the maximum and stores their mean, in v6.0.0, v7.0.0 and v7.4.1; recon-all in FreeSurfer 7 calls it through `mris_place_surface --thickness` with a maximum of 5.
 - Lossy WebP is always 4:2:0; Pillow's lossless WebP zeroes RGB under alpha 0 unless `exact=True`.
 
-Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.2 MB of media (tiles 4.1 MB, `anim.mp4` 4.3 MB, `vertex_map.npz` 1.8 MB); 155 of 176 tiles contain contours.
+Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.9 MB of media (tiles 4.1 MB, `anim.mp4` 4.3 MB, `vertex_map.npz` 2.5 MB since it follows the tiles and not the box, 1.8 MB before); 155 of 176 tiles contain contours.
 
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 

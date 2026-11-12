@@ -13,9 +13,11 @@ from __future__ import annotations
 
 import os
 import time
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 
+import matplotlib
 import numpy as np
 import pytest
 from PIL import Image, ImageFont
@@ -28,6 +30,7 @@ from synth import (  # pyrefly: ignore[missing-import]
     T1_WHITE,
     WHITE_SEMI_AXES,
     SyntheticSubject,
+    icosphere,
 )
 
 from surfcensus.fsio.surfaces import read_surface
@@ -296,9 +299,13 @@ def test_gray_tile_window_and_dtypes(scene: Scene) -> None:
         assert np.array_equal(again, window_value(raw, (20.0, 97.0)))
     with_nan = scene.data.astype(np.float32)
     with_nan[with_nan == T1_HEAD] = np.nan
-    assert np.array_equal(
-        frames.gray_tile(with_nan, panel, pos, (0.0, 255.0)), np.where(raw == T1_HEAD, 0, raw)
-    )
+    with warnings.catch_warnings():
+        # NaN is set to 0 before the cast to uint8. A NaN that reached the cast would warn, and
+        # what it becomes there depends on the processor: often 0 as well, so the comparison
+        # alone could not tell.
+        warnings.simplefilter("error")
+        from_nan = frames.gray_tile(with_nan, panel, pos, (0.0, 255.0))
+    assert np.array_equal(from_nan, np.where(raw == T1_HEAD, 0, raw))
     for bad in ((5.0, 5.0), (9.0, 2.0)):
         with pytest.raises(ValueError):
             frames.gray_tile(scene.data, panel, pos, bad)
@@ -424,6 +431,33 @@ def test_renderer_joins_segments_into_even_lines() -> None:
     assert np.abs(tiles[0] - tiles[1]).max() <= 16
 
 
+def ring_segments(cx: float, cy: float, radius: float, n: int = 180) -> np.ndarray:
+    t = np.linspace(0, 2 * np.pi, n + 1)
+    points = np.column_stack([cx + radius * np.cos(t), cy + radius * np.sin(t)])
+    return np.stack([points[:-1], points[1:]], axis=1)
+
+
+def test_renderer_draws_every_loop_and_open_line_of_a_layer() -> None:
+    """A folded surface crosses a slice in several closed loops, and the tile edge cuts others
+    open. All of them are drawn, in whatever order the segments come."""
+    rings = [ring_segments(22, 22, 12), ring_segments(64, 24, 9), ring_segments(40, 68, 15)]
+    arcs = [ring_segments(78, 74, 10)[:60], ring_segments(10, 84, 6)[90:150]]  # thirds of circles
+    parts = [*rings, *arcs]
+    segments = np.concatenate(parts)
+    shuffled = segments[np.random.default_rng(1).permutation(len(segments))]
+    with frames.ContourRenderer(96, 96, 1.25) as r:
+        together = r.render([(shuffled, "#FFFFFF")])[..., 3]
+        in_order = r.render([(segments, "#FFFFFF")])[..., 3]
+        apart = [r.render([(part, "#FFFFFF")])[..., 3] for part in parts]
+    # the five lines do not touch: the tile is the five separate drawings together
+    assert all(part.any() for part in apart)
+    assert ndimage.label(together > 0, structure=np.ones((3, 3)))[1] == 5
+    assert np.abs(together.astype(int) - np.max(apart, axis=0)).max() <= 2
+    assert np.abs(together.astype(int) - in_order).max() <= 2
+    length = 2 * np.pi * (12 + 9 + 15) + 2 * np.pi * (10 + 6) / 3
+    assert together.sum() / 255 == pytest.approx(length * 1.25, rel=0.02)
+
+
 def test_renderer_is_stateless_between_calls(
     scene: Scene, renderer: frames.ContourRenderer
 ) -> None:
@@ -439,6 +473,51 @@ def test_renderer_is_stateless_between_calls(
     size = scene.config.panel_px
     with frames.ContourRenderer(size, size, scene.config.line_width_px) as fresh:
         assert np.array_equal(fresh.render(one), first)
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {"path.sketch": (1.0, 100.0, 2.0)},  # what plt.xkcd() leaves behind
+        {"path.sketch": (3.0, 30.0, 5.0)},
+        {
+            "path.simplify_threshold": 1.0,
+            "agg.path.chunksize": 100,
+            "lines.antialiased": False,
+            "patch.antialiased": False,
+            "lines.linewidth": 9.0,
+            "patch.linewidth": 7.0,
+            "lines.solid_capstyle": "butt",
+            "lines.solid_joinstyle": "bevel",
+            "figure.dpi": 300.0,
+            "savefig.dpi": 300.0,
+            "figure.facecolor": "red",
+            "axes.facecolor": "blue",
+        },
+    ],
+)
+def test_renderer_ignores_matplotlib_settings(settings: dict[str, object]) -> None:
+    """A ``matplotlibrc`` or a style set earlier in the process must not change a tile. An
+    artist copies ``path.sketch`` when it is made, and the renderer makes its collections in
+    the first call of ``render``, so both moments are inside the changed settings once."""
+    t = np.linspace(0.0, 2.0 * np.pi, 49)
+    points = np.column_stack([32 + 20 * np.cos(t), 32 + 14 * np.sin(t)])
+    layers = [
+        (np.stack([points[:-1], points[1:]], axis=1), "#FFD400"),
+        (np.array([[[-5.0, 3.0], [70.0, 60.0]]]), "#FF3B30"),  # leaves the tile on both sides
+    ]
+    with frames.ContourRenderer(64, 64, 1.25) as pen:
+        plain = pen.render(layers)
+    assert (plain[..., 3] == 255).any()
+    with matplotlib.rc_context(settings):
+        with frames.ContourRenderer(64, 64, 1.25) as made_and_drawn_inside:
+            np.testing.assert_array_equal(made_and_drawn_inside.render(layers), plain)
+        made_inside = frames.ContourRenderer(64, 64, 1.25)
+        made_outside = frames.ContourRenderer(64, 64, 1.25)
+        np.testing.assert_array_equal(made_outside.render(layers), plain)
+    with made_inside, made_outside:
+        np.testing.assert_array_equal(made_inside.render(layers), plain)
+        np.testing.assert_array_equal(made_outside.render(layers), plain)
 
 
 def test_renderer_empty_input_and_close() -> None:
@@ -497,6 +576,50 @@ def test_contour_layers_order_colours_and_cropping(scene: Scene) -> None:
     custom = config.model_copy(update={"white_colour": "#010203", "pial_colour": "#040506"})
     recoloured = frames.contour_layers(panel, pos, scene.affine, scene.slicers, custom)
     assert [colour for _, colour in recoloured] == ["#010203"] * 2 + ["#040506"] * 2
+
+
+def folded_surface(centre: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """A closed surface with six gyri around its z axis: a sphere of 25 mm whose radius is
+    1.45 times that on the crowns (at 0, 60, ... degrees from x in the xy plane) and 0.55 times
+    in the sulci between them, with the folds fading out towards the two poles."""
+    unit, faces = icosphere(5)
+    azimuth = np.arctan2(unit[:, 1], unit[:, 0])
+    radius = 25.0 * (1 + 0.45 * np.cos(6 * azimuth) * (1 - unit[:, 2] ** 2))
+    return centre + unit * radius[:, None], faces
+
+
+def test_a_folded_surface_is_drawn_in_all_its_loops(scene: Scene) -> None:
+    """The ellipsoids of the synthetic subject give one loop per surface and tile; the folds of
+    a real surface give several on most tiles. A sagittal plane 15 mm from the centre of the
+    folded surface passes through three gyri (the crown at 0 degrees reaches x = 36 mm, those
+    at 60 and -60 degrees 18 mm) and outside the sulci between them (12 mm): three loops in one
+    layer, one above the other along y."""
+    panel = scene.panels["sagittal"]
+    pos = len(panel.slices) // 2
+    centre = (np.array(scene.box.low) + np.array(scene.box.high)) / 2  # of the field of view
+    centre[0] = panel.slice_mm[pos] - 15.0
+    slicer = MeshSlicer(*folded_surface(centre))
+    layers = frames.contour_layers(panel, pos, scene.affine, {"lh_pial": slicer}, scene.config)
+    assert len(layers) == 1
+    segments = layers[0][0]
+    size = scene.config.panel_px
+    assert segments.min() > 10 and segments.max() < size - 10  # the whole section is in view
+
+    with frames.ContourRenderer(size, size, scene.config.line_width_px) as r:
+        alpha = r.render(layers)[..., 3]
+    labels, count = ndimage.label(alpha > 0, structure=np.ones((3, 3)))
+    assert count == 3
+    # one loop around the crown at 0 degrees, in the middle of the tile, and one on either side
+    # at the same distance: the plane meets the ridges at 60 and -60 degrees 26 mm from it
+    middle = float(scene.pixel_of("sagittal", centre)[0])
+    columns = sorted(col for _, col in ndimage.center_of_mass(alpha, labels, [1, 2, 3]))
+    # in mm along y; the centre of pixel column c is at c + 0.5
+    before, at, after = ((col + 0.5 - middle) / scene.voxel_px for col in columns)
+    assert abs(at) < 0.1 and abs(before + after) < 0.1 and 18 < after < 26
+    # all of each loop: the line covers its length times its width
+    length = np.linalg.norm(segments[:, 1] - segments[:, 0], axis=1).sum()
+    assert length > 1000
+    assert alpha.sum() / 255 == pytest.approx(length * scene.config.line_width_px, rel=0.02)
 
 
 @pytest.mark.parametrize("surface", ["pial", "white"])

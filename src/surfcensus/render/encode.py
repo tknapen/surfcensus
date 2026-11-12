@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 import secrets
+import shutil
 import subprocess
 import threading
 from collections.abc import Iterable, Iterator
@@ -93,6 +94,19 @@ def read_image(path: Path | str) -> UInt8[np.ndarray, "h w *channels"]:
         return np.array(image)
 
 
+def ffmpeg_exe() -> str:
+    """The ffmpeg binary that :func:`write_mp4` runs, as imageio-ffmpeg finds it: the one named
+    by ``IMAGEIO_FFMPEG_EXE``, else the one in its wheel, else one that is installed.
+
+    Raises RuntimeError if there is none, or if the one named is not a file that can be
+    executed (imageio-ffmpeg returns ``IMAGEIO_FFMPEG_EXE`` unchecked). Nothing is started.
+    """
+    exe = imageio_ffmpeg.get_ffmpeg_exe()
+    if shutil.which(exe) is None:
+        raise RuntimeError(f"the ffmpeg binary {exe!r} is missing or not executable")
+    return exe
+
+
 def write_mp4(
     path: Path | str, frames: Iterable[UInt8[np.ndarray, "h w 3"]], fps: int, crf: int
 ) -> int:
@@ -100,7 +114,8 @@ def write_mp4(
 
     Frames are consumed one at a time and piped to the ffmpeg binary of imageio-ffmpeg. Raises
     ValueError for no frames, an odd width or height, frames that differ in shape, or fps and
-    crf out of range, and RuntimeError when ffmpeg fails.
+    crf out of range, and RuntimeError when ffmpeg fails: no binary, one that cannot be
+    started, a non-zero exit status, or no output file.
     """
     if fps < 1 or not 0 <= crf <= 51:
         raise ValueError(f"fps must be at least 1 and crf in 0..51, got fps={fps}, crf={crf}")
@@ -115,10 +130,11 @@ def write_mp4(
         raise ValueError(f"yuv420p needs an even, non-zero width and height, got {width}x{height}")
 
     n, broken = 0, False
+    exe = ffmpeg_exe()
     with atomic_path(path) as tmp:
         # fmt: off
         command = [
-            imageio_ffmpeg.get_ffmpeg_exe(), "-y", "-nostats", "-loglevel", "error",
+            exe, "-y", "-nostats", "-loglevel", "error",
             "-f", "rawvideo", "-pix_fmt", "rgb24", "-video_size", f"{width}x{height}",
             "-framerate", str(fps), "-i", "pipe:0",
             "-an", "-vf", _VIDEO_FILTER, "-filter_threads", "1",
@@ -127,9 +143,12 @@ def write_mp4(
             "-map_metadata", "-1", "-movflags", "+faststart", "-f", "mp4", f"file:{tmp}",
         ]
         # fmt: on
-        process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
-        )
+        try:
+            process = subprocess.Popen(
+                command, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+        except OSError as exc:  # not a program for this machine, or gone since it was found
+            raise RuntimeError(f"ffmpeg failed to start: {exc}") from exc
         stdin, stderr = process.stdin, process.stderr
         assert stdin is not None and stderr is not None
         log: list[bytes] = []
@@ -162,4 +181,6 @@ def write_mp4(
         if broken or process.returncode != 0:
             message = b"".join(log).decode(errors="replace").strip()
             raise RuntimeError(f"ffmpeg failed with status {process.returncode}: {message}")
+        if not tmp.is_file() or tmp.stat().st_size == 0:
+            raise RuntimeError("ffmpeg failed: it exited with status 0 and wrote no video")
     return n

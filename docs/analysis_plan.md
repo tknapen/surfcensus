@@ -30,7 +30,7 @@ From the detectability sample, with sampling weights:
 From click marks resolved to fsaverage6 vertices:
 
 - Census error maps: per-vertex frequency of final marks by class (A, B, C), smoothed with a small geodesic kernel, shown on the inflated and flattened fsaverage occipital surface. This shows where FreeSurfer fails, which no per-subject rating can.
-- Vertex-level ROC: within rated subjects, the evaluable vertices are the search-region vertices inside that subject's rendered box (decision D15), since raters cannot mark outside it. Each evaluable vertex is positive if it lies within a tolerance (default 5 mm geodesic on fsaverage, with sensitivity analysis at 3 and 10 mm) of a final mark. Score: the subject's z-map value at that vertex. Pooled across subjects, with a subject-level bootstrap for intervals.
+- Vertex-level ROC: within rated subjects, the evaluable vertices are the search-region vertices that the subject's tiles show (`visible` in `vertex_map.npz`, decision D15), since raters cannot mark what no tile shows. Each evaluable vertex is positive if it lies within a tolerance (default 5 mm geodesic on fsaverage, with sensitivity analysis at 3 and 10 mm) of a final mark. Score: the subject's z-map value at that vertex. Pooled across subjects, with a subject-level bootstrap for intervals.
 - Cluster localization: for subjects rated major, the fraction whose largest outlier cluster contains or lies within tolerance of a final mark. This separates "the metric flagged the subject" from "the metric flagged the right place".
 - Reference contamination: all of the above with the first-pass reference (all subjects) and the second-pass reference (rater-passed subjects only).
 

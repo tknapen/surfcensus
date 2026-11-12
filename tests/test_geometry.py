@@ -120,18 +120,27 @@ CASES = {
     "ras": Case(RAS_ANISO, (100, 120, 140), (1.1, -60.2, 5.3)),
     "pir": Case(PIR_ANISO, (120, 80, 150), PIR_CENTRE),
     "neurological": Case(LIA_1MM, (256, 256, 256), config=RenderConfig(radiological=False)),
-    "posterior_left": Case(
-        LIA_1MM, (256, 256, 256), config=RenderConfig(sagittal_anterior_left=False)
+    "anterior_left": Case(
+        LIA_1MM, (256, 256, 256), config=RenderConfig(sagittal_anterior_left=True)
     ),
     "both_flipped": Case(
         PIR_ANISO,
         (120, 80, 150),
         PIR_CENTRE,
-        RenderConfig(radiological=False, sagittal_anterior_left=False),
+        RenderConfig(radiological=False, sagittal_anterior_left=True),
     ),
     "non_default": Case(LIA_1MM, (256, 256, 256), config=NON_DEFAULT),
 }
 all_cases = pytest.mark.parametrize("case", CASES.values(), ids=CASES.keys())
+
+
+def test_the_cases_cover_both_values_of_both_orientation_switches() -> None:
+    """The defaults (decision D13) are radiological and posterior at the left of the sagittal
+    panel; the tests over all cases see each switch both ways, alone and together."""
+    default = RenderConfig()
+    assert (default.radiological, default.sagittal_anterior_left) == (True, False)
+    seen = {(c.config.radiological, c.config.sagittal_anterior_left) for c in CASES.values()}
+    assert seen == {(True, False), (False, False), (True, True), (False, True)}
 
 
 def brute_slices(
@@ -600,6 +609,111 @@ def test_pix2vox_and_vox2pix_are_inverse_homogeneous_affines(case: Case) -> None
         assert {panel.slice_voxel_axis, panel.h_voxel_axis, panel.v_voxel_axis} == {0, 1, 2}
 
 
+@all_cases
+def test_vox2pix_is_the_inverse_in_closed_form_without_negative_zeros(case: Case) -> None:
+    """Each entry is one IEEE division of entries of ``pix2vox``, so ``render.json`` does not
+    depend on the LAPACK numpy is linked with. ``np.linalg.inv`` gave ``-0.0`` in the axial
+    panel with OpenBLAS and other last bits of the shifts with reference LAPACK."""
+    for panel in case.panels.values():
+        (a, zero_h, c), (zero_v, b, d), _ = panel.pix2vox
+        assert panel.vox2pix == ((1 / a, 0.0, -c / a), (0.0, 1 / b, -d / b), (0.0, 0.0, 1.0))
+        assert (zero_h, zero_v) == (0.0, 0.0)
+        for matrix in (panel.pix2vox, panel.vox2pix):
+            assert not np.signbit(np.array(matrix)[np.array(matrix) == 0]).any()
+        dumped = json.dumps(panel.model_dump(mode="json")["vox2pix"])
+        assert "-0.0," not in dumped and "-0.0]" not in dumped
+
+
+def test_a_box_without_extent_is_refused() -> None:
+    flat = RenderConfig(box_x_mm=(0, 0), box_y_mm=(0, 0), box_z_mm=(0, 0), margin_mm=0)
+    case = Case(LIA_1MM, (256, 256, 256), config=flat)
+    with pytest.raises(ValueError, match="no extent"):
+        g.build_panels(case.box, case.amap, flat)
+
+
+# ---------------------------------------------------------------- clickable region
+
+
+def test_field_of_view_is_the_cube_around_the_box_midpoint() -> None:
+    low, high = g.field_of_view(CASES["conformed"].box, CASES["conformed"].config)
+    np.testing.assert_allclose(low, [-39.7, -116.7, -55.6], atol=1e-9)
+    np.testing.assert_allclose(high, [40.3, -36.7, 24.4], atol=1e-9)
+    low, high = g.field_of_view(CASES["non_default"].box, NON_DEFAULT)
+    np.testing.assert_allclose(low, [-26.2, -111.7, -24.6], atol=1e-9)
+    np.testing.assert_allclose(high, [31.8, -53.7, 33.4], atol=1e-9)
+
+
+def test_clickable_region_by_hand() -> None:
+    """Default config on the conformed volume, box centre (0.3, -95.2, -10.6). The slice planes
+    are the voxel centres nearest the box ends: x -30 to 30, y -103 to -50, z -46 to 14. Each
+    panel's box reaches half a slice step (0.5 mm) past them along its slice axis and spans the
+    field of view (80 mm around the box midpoint) along the other two."""
+    c = CASES["conformed"]
+    region = g.clickable_region(c.box, c.panels, c.config)
+    expected = [
+        [[-30.5, -116.7, -55.6], [30.5, -36.7, 24.4]],  # sagittal
+        [[-39.7, -103.5, -55.6], [40.3, -49.5, 24.4]],  # coronal
+        [[-39.7, -116.7, -46.5], [40.3, -36.7, 14.5]],  # axial
+    ]
+    np.testing.assert_allclose(region, expected, atol=1e-9)
+
+
+@all_cases
+def test_clickable_region_holds_every_point_of_every_tile(case: Case) -> None:
+    """Corners and centre of the first and last tile of each panel lie in that panel's box,
+    whose faces are the tile edges and, across the slices, half a slice step beyond the planes."""
+    region = g.clickable_region(case.box, case.panels, case.config)
+    assert region.shape == (3, 2, 3)
+    size = float(case.config.panel_px)
+    half_step = case.config.slice_step_mm / 2
+    for p, name in enumerate(PANEL_ORDER):
+        panel = case.panels[name]
+        w, h, v = AXES[name]
+        left, right, top, bottom = case.fov_edges(name)
+        low, high = region[p]
+        np.testing.assert_allclose([low[h], high[h]], sorted([left, right]), atol=1e-9)
+        np.testing.assert_allclose([low[v], high[v]], [bottom, top], atol=1e-9)
+        assert low[w] == pytest.approx(min(panel.slice_mm) - half_step)
+        assert high[w] == pytest.approx(max(panel.slice_mm) + half_step)
+        px, py = np.array([0.0, size, 0.0, size, size / 2]), np.array([0.0, 0.0, size, size, 7.5])
+        for pos in (0, len(panel.slices) - 1):
+            xyz = case.to_tkr(g.pixel_to_voxel(panel, pos, px, py))
+            assert g.in_region(xyz, region[p : p + 1], 1e-9).all()
+            assert g.in_region(xyz, region, 1e-9).all()
+            # a point just outside the tile, or a slice step beyond the last plane, is not
+            beyond = case.to_tkr(g.pixel_to_voxel(panel, pos, np.array([-0.5]), np.array([7.5])))
+            assert not g.in_region(beyond, region[p : p + 1]).any()
+        past = case.to_tkr(g.pixel_to_voxel(panel, 0, np.array([7.5]), np.array([7.5])))
+        past[0, w] = max(panel.slice_mm) + case.config.slice_step_mm
+        assert not g.in_region(past, region[p : p + 1]).any()
+
+
+def test_in_region_is_a_union_of_boxes_with_the_boundary_and_a_margin() -> None:
+    region = np.array([[[0.0, 0.0, 0.0], [10.0, 2.0, 2.0]], [[0.0, 0.0, 0.0], [2.0, 10.0, 2.0]]])
+    points = np.array(
+        [
+            [5.0, 1.0, 1.0],  # in the first box only
+            [1.0, 5.0, 1.0],  # in the second only
+            [1.0, 1.0, 1.0],  # in both
+            [5.0, 5.0, 1.0],  # in the bounding box of the union, in neither box
+            [10.0, 2.0, 0.0],  # on a corner of the first
+            [10.5, 1.0, 1.0],  # 0.5 mm beyond the first
+            [10.5, 2.5, 2.5],  # 0.5 mm beyond it along every axis
+            [1.0, 1.0, 3.5],  # 1.5 mm beyond both
+        ]
+    )
+    assert g.in_region(points, region).tolist() == [True, True, True, False, True] + [False] * 3
+    assert g.in_region(points, region, 0.5).tolist() == [True, True, True, False] + [True] * 3 + [
+        False
+    ]
+    assert g.in_region(points, region, 3.0).all()
+    assert (
+        g.in_region(points, region[:1]).tolist() == [True, False, True, False, True] + [False] * 3
+    )
+    assert g.in_region(np.empty((0, 3)), region).shape == (0,)
+    assert g.in_region(points, np.empty((0, 2, 3))).tolist() == [False] * 8
+
+
 def test_voxel_centre_convention_by_hand() -> None:
     """Box centre (0.125, -95.375, 0.125) on the conformed volume puts pixel centres of every
     fourth column and row exactly on voxel centres (4 px per mm):
@@ -784,6 +898,8 @@ def test_default_frame_tables() -> None:
     assert (len(sync), len(seq)) == (120, 346)
     assert sync[0] == (0, 0, 0)
     assert sync[60] == (60, 53, 60)
+    # 30 * 53 / 60 = 26.5: an exact half goes to the even slice. This is the poster frame.
+    assert sync[30] == sync[90] == (30, 26, 30)
     assert sync[15] == (15, 13, 15)  # round(15 * 53 / 60) = round(13.25)
     assert sync[45] == (45, 40, 45)  # round(45 * 53 / 60) = round(39.75)
     assert sync[61] == sync[59]
@@ -795,6 +911,21 @@ def test_default_frame_tables() -> None:
     assert seq[173] == (30, 53, 35)
     assert seq[226] == (30, 8, 0)
     assert seq[345] == (30, 8, 1)
+
+
+def test_sync_frame_table_rounds_an_exact_half_to_the_even_slice() -> None:
+    """docs/rendering.md, "Frame tables". With 5, 3 and 5 slices the coronal panel is at
+    f / 2: half-way at f = 1, where the even slice is the lower one, and at f = 3, where it
+    is the higher one."""
+    case = Case(
+        LIA_1MM,
+        (256, 256, 256),
+        config=RenderConfig(box_x_mm=(0, 4), box_y_mm=(0, 2), box_z_mm=(0, 4)),
+    )
+    assert [len(case.panels[name].slices) for name in PANEL_ORDER] == [5, 3, 5]
+    sync = g.frame_tables(case.panels)["sync"].frames
+    assert [frame[1] for frame in sync] == [0, 0, 1, 2, 2, 2, 1, 0]
+    assert [frame[0] for frame in sync] == [frame[2] for frame in sync] == [0, 1, 2, 3, 4, 3, 2, 1]
 
 
 def test_frame_tables_with_a_box_one_slice_thick() -> None:
@@ -915,6 +1046,13 @@ def test_config_is_frozen_and_rejects_unknown_and_invalid_fields() -> None:
             RenderConfig.model_validate(bad)
 
 
+def test_config_hash_of_the_defaults_is_unchanged() -> None:
+    """The hash decides whether a render is up to date, so it may change only when the
+    serialized value of a default changes (or the schema version). Validation rules such as
+    the colour format are not part of it."""
+    assert RenderConfig().config_hash() == "17f83a0c9b6c"
+
+
 def test_config_defaults_are_the_documented_ones() -> None:
     c = RenderConfig()
     assert (c.box_x_mm, c.box_y_mm, c.box_z_mm) == ((-30, 30), (-8, 45), (-35, 25))
@@ -923,7 +1061,7 @@ def test_config_defaults_are_the_documented_ones() -> None:
     assert (c.pial_colour, c.white_colour, c.line_width_px) == ("#FFD400", "#FF3B30", 1.25)
     assert (c.window_percentiles, c.brainmask_dilation) == ((1, 99.5), 3)
     assert (c.webp_quality, c.fps, c.crf) == (80, 12, 23)
-    assert c.vertex_map_margin_mm == 10
+    assert c.vertex_map_margin_mm == 5  # the mark snap radius of docs/rater_app.md
 
 
 def make_info(case: Case, reverse: bool = False) -> RenderInfo:
@@ -960,7 +1098,7 @@ def make_info(case: Case, reverse: bool = False) -> RenderInfo:
             "panels": panels,
             "modes": g.frame_tables(panels),
             "video": {"fps": 12, "n_frames": 120, "width": 960, "height": 320},
-            "vertex_map": {"n_lh": 1234, "n_rh": 1250},
+            "vertex_map": {"n_lh": 1234, "n_rh": 1250, "n_lh_visible": 900, "n_rh_visible": 911},
             "versions": versions,
         }
     )
@@ -988,7 +1126,15 @@ def test_render_info_serializes_deterministically_and_round_trips(name: str) -> 
 def test_render_info_contents() -> None:
     info = make_info(CASES["conformed"])
     data = json.loads(info.to_json())
-    assert data["schema_version"] == 1
+    assert data["schema_version"] == 2
+    assert data["vertex_map"] == {
+        "file": "vertex_map.npz",
+        "fsaverage": None,
+        "n_lh": 1234,
+        "n_rh": 1250,
+        "n_lh_visible": 900,
+        "n_rh_visible": 911,
+    }
     assert data["config_hash"] == RenderConfig().config_hash()
     assert RenderConfig.model_validate(data["config"]) == RenderConfig()
     assert list(data["panels"]) == sorted(PANEL_ORDER)

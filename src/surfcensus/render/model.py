@@ -8,12 +8,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-RENDER_SCHEMA_VERSION = 1
+RENDER_SCHEMA_VERSION = 2
+"""Version of ``render.json`` and of the files it lists. 2: the vertex map is selected by the
+clickable region of the tiles and carries ``{hemi}_visible``; 1 selected it by the view box."""
 
 PanelName = Literal["sagittal", "coronal", "axial"]
 PANEL_ORDER: tuple[PanelName, ...] = ("sagittal", "coronal", "axial")
@@ -54,8 +57,10 @@ class RenderConfig(_Frozen):
     """Anterior at the left of the sagittal panel. Freeview shows anterior at the right."""
 
     pial_colour: str = "#FFD400"
+    """``#RRGGBB``, stored in upper case; likewise ``white_colour`` and ``crosshair_colour``."""
     white_colour: str = "#FF3B30"
     line_width_px: float = Field(default=1.25, gt=0)
+    """At most ``panel_px / 8``."""
     crosshair_colour: str = "#33C7FF"
     crosshair_alpha: float = Field(default=0.45, ge=0, le=1)
 
@@ -66,7 +71,30 @@ class RenderConfig(_Frozen):
     fps: int = Field(default=12, ge=1)
     crf: int = Field(default=23, ge=0, le=51)
 
-    vertex_map_margin_mm: float = Field(default=10.0, ge=0)
+    vertex_map_margin_mm: float = Field(default=5.0, ge=0)
+    """How far beyond the region that the tiles show ``vertex_map.npz`` reaches. A mark
+    resolves through the vertex map to the same nearest vertex as on the full surfaces for
+    any snap radius up to this margin; the default is the snap radius of docs/rater_app.md."""
+
+    @field_validator("pial_colour", "white_colour", "crosshair_colour")
+    @classmethod
+    def _hex_colour(cls, colour: str) -> str:
+        # the one form the renderer draws (frames._rgb), in one spelling, so that two configs
+        # that render the same bytes have the same hash
+        if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
+            raise ValueError(f"colour must be '#RRGGBB', got {colour!r}")
+        return colour.upper()
+
+    @model_validator(mode="after")
+    def _line_narrower_than_panel(self) -> RenderConfig:
+        # a contour tile that its lines cover entirely cannot be stored with an alpha channel
+        # (encode.write_rgba_webp); the bound keeps lines far from that, it is not a proof
+        if self.line_width_px > self.panel_px / 8:
+            raise ValueError(
+                f"line_width_px must be at most panel_px / 8 = {self.panel_px / 8:g}, "
+                f"got {self.line_width_px:g}"
+            )
+        return self
 
     def box_offsets(self) -> np.ndarray:
         """Box corners relative to the centre, shape (2, 3): row 0 low, row 1 high."""
@@ -90,7 +118,8 @@ class VolumeInfo(_Frozen):
 
 class InputFile(_Frozen):
     name: str
-    """File name only (for example ``lh.pial.T1``), never a path."""
+    """The name FreeSurfer gives the file (for example ``lh.pial.T1``): never a path, and
+    never a name the file has in some other store."""
     size: int
     sha256: str
 
@@ -180,7 +209,12 @@ class VideoInfo(_Frozen):
 class VertexMapInfo(_Frozen):
     file: str = "vertex_map.npz"
     n_lh: int
+    """Number of left-hemisphere vertices in the file; likewise ``n_rh``."""
     n_rh: int
+    n_lh_visible: int
+    """How many of them have their pial position in the region that the tiles show
+    (``lh_visible`` in the file); likewise ``n_rh_visible``."""
+    n_rh_visible: int
     fsaverage: str | None = None
     """Name of the fsaverage mesh the counterparts refer to; None while they are unset (-1)."""
 
