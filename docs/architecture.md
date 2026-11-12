@@ -32,9 +32,9 @@ Each source yields `SubjectRecord`s with a resolver that turns a file role (`t1`
 
 ## Scoring with a normative reference
 
-Outlier detection runs in fsaverage space: each subject's thickness is resampled to fsaverage6 through its `sphere.reg` and z-scored per vertex against a reference distribution (see `metrics.md`). For the census, the reference is the census itself, stratified. A local user with 12 subjects cannot build a stable per-vertex reference from their own data. The package therefore ships a normative reference derived from the census as package data (`surfcensus/data/reference/`). It holds per-vertex median and MAD maps of globally normalized thickness on fsaverage6 (about 0.7 MB per stratum), stratified by field strength and FreeSurfer major version, plus the regional parcel reference, all computed only from subjects that raters passed. Local scoring reports z-maps against the shipped reference and, when the local set has at least 30 subjects, against the local set. The reference is versioned; scores record which reference version they used. fsaverage template files are fetched and cached on first use, not bundled.
+Outlier detection runs in fsaverage space: each subject's thickness is resampled to fsaverage6 through its `sphere.reg` and z-scored per vertex against a reference distribution (see `metrics.md`). For the census, the reference is the census itself, stratified. A local user with 12 subjects cannot build a stable per-vertex reference from their own data. The package therefore ships a normative reference derived from the census as package data (`surfcensus/data/reference/`). It holds per-vertex median and MAD maps of globally normalized thickness on fsaverage6 (about 0.7 MB per stratum), stratified by field strength and FreeSurfer major version, plus the regional parcel reference, all computed only from subjects that raters passed. Local scoring reports z-maps against the shipped reference and, when the local set has at least 30 subjects, against the local set. The reference is versioned; scores record which reference version they used. The fsaverage6 template is taken from a local FreeSurfer install, from an `fsaverage/` directory next to the subjects, or from a copy bundled in the wheel, in that order (decision D14).
 
-Until the census has produced ratings, the shipped reference is empty and local scoring falls back to within-set scores with a warning when n is small.
+Until the census has produced ratings, the shipped reference is empty. Local sets of at least 30 subjects are scored within the set; smaller sets are ranked on raw ceiling fraction and occipital-to-control thickness ratio only (decision D16).
 
 ## Package layout
 
@@ -88,10 +88,13 @@ surfcensus/
     select/
       sampling.py
     render/
-      geometry.py
-      slicing.py
-      frames.py
-      encode.py
+      model.py             # RenderConfig and the contents of render.json
+      geometry.py          # pole, box, panels, pixel <-> voxel <-> tkr RAS
+      slicing.py           # mesh-plane intersection
+      frames.py            # grayscale tiles, contour overlays, composite strips
+      encode.py            # WebP and MP4 writers
+      vertexmap.py         # vertex_map.npz
+      api.py               # three_plane()
       freeview.py          # optional backend, wraps the original gist approach
     app/
       server.py            # FastAPI
@@ -135,6 +138,8 @@ Local users:
 surfcensus review PATH [--run-dir DIR] [--subjects GLOB] [--rater NAME] [--no-browser]
     # inventory + metrics + scoring + render + serve, in one go
 surfcensus export --run-dir DIR [--format csv|parquet]
+surfcensus render-subject SUBJECT_DIR --out DIR
+    # one subject, no run directory; the CLI form of sc.render.three_plane
 ```
 
 `review` defaults the run directory to `PATH/../surfcensus-run` if writable, else `./surfcensus-run`. It renders every subject (local sets are small enough), orders the rating queue by composite score descending unless `--blind` is given, and starts the app on `127.0.0.1` with a single local rater.
@@ -189,9 +194,9 @@ run/
   cache/                 # remote downloads only, content-addressed, prunable
   media/<subject_uid>/
     anim.mp4
-    frames/              # WebP frames for scrubbing, see rendering.md
+    tiles/               # per-panel WebP slice tiles in two layers, see rendering.md
     poster.webp
-    render.json          # geometry, per-frame pixel-to-voxel affines, config hash
+    render.json          # geometry, per-panel pixel-to-voxel affines, frame tables, config hash
     vertex_map.npz       # native vertices in the box and their fsaverage6 counterparts
   app.sqlite             # rater app state, separate from the catalog
 ```
@@ -218,4 +223,4 @@ Core tables in `catalog.sqlite`:
 - One network fixture: a single real subject from a small OpenNeuroDerivatives dataset, fetched once into a pytest cache, marked `network`. The same subject, copied locally, doubles as the end-to-end test of `surfcensus review --no-browser`.
 - Property tests (hypothesis) for mesh-plane intersection: every segment endpoint lies on the plane and on a mesh edge.
 - Resampling tests: resampling fsaverage onto itself is the identity; a smooth field on a synthetic sphere survives resampling within tolerance; agreement with `mri_surf2surf` on the network fixture within a stated tolerance (run once by a developer with FreeSurfer, stored as a reference array).
-- Click round-trip tests: random voxels to panel pixels and back for every panel and frame in `render.json`; marks resolve to the expected vertex on a synthetic mesh.
+- Click round-trip tests: random voxels to panel pixels and back for every panel and slice in `render.json`; marks resolve to the expected vertex on a synthetic mesh.

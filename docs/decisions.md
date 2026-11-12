@@ -31,13 +31,29 @@ D6. Raters are blind to dataset, scores and other ratings during rating. Local m
 
 D7. The frontend has no build step. Reason: pip-installable without Node; easy to maintain.
 
+D11 (2026-11-12). Render output is per-panel slice tiles in two layers, composed in the browser: a lossy grayscale WebP of the T1 slice and a lossless RGBA WebP of the contours. The browser stacks the layers, places the three panels, draws crosshairs and orientation letters, and plays both playback modes from frame tables in `render.json`. `anim.mp4` and `poster.webp` remain composite three-panel strips. Reason: lossy WebP at quality 80 desaturates thin coloured lines (mean absolute error 47, 16, 70 of 255 on contour pixels, measured on `ds000102` sub-01); composite strips cost about 10 MB per subject against about 4 MB for layered tiles (estimate from 15 sagittal tiles, one hemisphere); a separate contour layer lets raters hide the contours to see the tissue under the line; and one pixel-to-voxel affine per panel replaces one per frame. Supersedes the composite-strip frames first described in `rendering.md`. Consequence for the protocol: raters can toggle contours, which the pilot should take into account when timing ratings.
+
+D12 (2026-11-12). The occipital box is anchored on the geometric pole (most posterior pial vertex per hemisphere). From milestone 3 the renderer also maps a fixed fsaverage pole vertex to native space through `sphere.reg` and records its distance to the geometric pole in `render.json`. The pilot decides from those distances whether the anchor should change. Reason: the geometric pole needs no template, so single-subject rendering stays self-contained, but it depends on head pitch and on the pial surface being correct at the pole.
+
+D13 (2026-11-12). Panels follow Freeview's default 2D display orientation, with orientation letters on the panel edges, so the phase 0 comparison with Freeview is like for like. Implemented as two config switches (`radiological`, default true: subject's left on the right of the coronal and axial panels; `sagittal_anterior_left`, default true). Both defaults are from memory of Freeview and must be confirmed in the by-eye comparison of milestone 1; `render.json` records the orientation used.
+
+D14 (2026-11-12). The fsaverage6 template (spheres, cortex label, search-region labels) is looked up in this order: a local FreeSurfer install, an `fsaverage/` directory next to the subjects, then a copy bundled in the wheel (about 1 to 2 MB). Reason: D1 requires `surfcensus review` to work offline, which fetch-on-first-use does not. Condition: bundling goes ahead only after Tomas confirms that the FreeSurfer licence permits redistributing these fsaverage-derived files (nilearn and TemplateFlow do so; the terms have not been read for this project).
+
+D15 (2026-11-12). Vertex-level spatial detectability is evaluated, per subject, only on search-region vertices inside that subject's rendered box (the vertices in `vertex_map.npz`). Reason: raters can only mark inside the box, so search-region vertices outside it would count as negatives that nobody inspected. The parcel-based search region is kept for scoring.
+
+D16 (2026-11-12). When no shipped reference applies and the local set has fewer than 30 subjects, no z-maps are computed; subjects are ranked on the raw ceiling fraction and the raw occipital-to-control regional thickness ratio, and the output says so. Reason: a per-vertex median and MAD from a handful of subjects is not meaningful. Whether to ship a provisional reference built from unrated census subjects stays open under O7.
+
+D17 (2026-11-12). The code is licensed BSD-3-Clause. The licence for released ratings stays open under O12.
+
+D18 (2026-11-12). Working conventions. Geometry is in mm throughout, so volumes that are not 1 mm conformed are handled. The T1 is upsampled by nearest neighbour, as in Freeview. "Deterministic" (hard rule in `CLAUDE.md`) means for a given input, config and locked environment (`uv.lock`); golden tests use a tolerance. The catalog uses stdlib `sqlite3` with `PRAGMA user_version` migrations, and `sqlmodel` stays in the `app` extra. The version stays static until the first tagged release. Regional metrics, ceiling fraction and scoring are built in milestone 3 because `review` orders its queue by the composite score; the intensity metric follows milestone 4. CI runs lint and tests on Linux and macOS for Python 3.11 and 3.13.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.
 
 O2. When and how to reveal dataset identities. D10 settles the default (pseudonyms). Open: whether to reveal at all, and if so whether after notifying dataset authors, after publication, or on request only. Decide before phase 8.
 
-O12. Licence for the package (code) and for released ratings (CC0 proposed in `phases.md`).
+O12. Licence for released ratings (CC0 proposed in `phases.md`). The code licence is settled in D17.
 
 O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject; FreeSurfer 7 not checked.
 
@@ -51,7 +67,7 @@ O11. Cluster threshold (z > 3 default) and the area measure for clusters (subjec
 
 O6. Number of raters per subject (2 or 3) and rater pool. Decided from pilot agreement and time per subject.
 
-O7. Whether the normative reference ships in the first release or waits for census ratings. Default: ships empty, populated in the release after the census.
+O7. Whether the normative reference ships in the first release or waits for census ratings. Default: ships empty, populated in the release after the census. Option raised 2026-11-12: ship a provisional first-pass reference built from a few hundred unrated OpenNeuroDerivatives subjects, labelled as such (see D16).
 
 O8. Hosting for the team app and media (lab server at the Spinoza Centre or VU, or a cloud VM and bucket).
 

@@ -16,14 +16,14 @@ The frontend is plain HTML, CSS and JavaScript with no build step, shipped insid
 
 Layout, top to bottom:
 
-1. The viewer: the three panels (sagittal, coronal, axial) as one image strip at the largest size the window allows, with a frame slider underneath.
+1. The viewer: the three panels (sagittal, coronal, axial) side by side at the largest size the window allows, with a frame slider underneath. Each panel is composed in the browser from a grayscale tile and a contour tile (decision D11), with crosshairs and orientation letters drawn client-side.
 2. The rating bar: one row per criterion with its scale buttons, each labelled with its keyboard key.
 3. A free-text note field, collapsed by default (key `n`).
 4. A progress line: done today, done in total, remaining in the assignment.
 
 Nothing about the subject is shown: no dataset, subject label, metric, or prior rating. Media URLs use `subject_uid` only.
 
-Playback uses the WebP frame stack, preloaded for the current subject and prefetched for the next two, so moving between subjects is instant. Video is used only in the gallery.
+Playback uses the WebP tile stack and the frame tables in `render.json`, preloaded for the current subject and prefetched for the next two, so moving between subjects is instant. Video is used only in the gallery.
 
 ## Marking errors by clicking
 
@@ -38,7 +38,7 @@ Interaction:
 - Extent is marked with several points, not a brush. The protocol asks for the centre and both ends of an affected stretch.
 - Marks are drawn client-side as an SVG layer over the frame image, so they cost nothing to render and stay sharp under zoom.
 
-Click to coordinates: `render.json` stores, for every frame and panel, the slice axis, voxel slice index, and the 2D affine from panel pixels to voxel indices (crop, scale, flips). The client converts a click to voxel coordinates. The server converts voxels to tkr RAS (via the stored vox2ras-tkr) and scanner RAS (via vox2ras), and stores all of them.
+Click to coordinates: `render.json` stores, for every panel, the slice axis, the voxel slice index of each tile, and the 2D affine from panel pixels to voxel indices (crop, scale, flips). The client converts a click to voxel coordinates. The server converts voxels to tkr RAS (via the stored vox2ras-tkr) and scanner RAS (via vox2ras), and stores all of them.
 
 Click to vertices: at render time the renderer writes `vertex_map.npz` for the occipital box: the native pial and white vertex coordinates inside the box (tkr RAS, float32) with, for each, the corresponding fsaverage6 vertex from the sphere mapping. The server maps each mark to the nearest pial vertex within 5 mm (configurable) using a KD-tree, records the distance and the hemisphere, and looks up the fsaverage6 vertex. A mark with no vertex within range is kept as a volumetric point with a null vertex. The misplaced surface is by definition near the structure it absorbed, so nearest-pial-vertex is the natural target for classes A and B; for class C the nearest white vertex is also recorded.
 
@@ -64,6 +64,7 @@ Every action has a key, so a rater never has to use the mouse.
 | Delete | remove the selected mark |
 | Ctrl/Cmd + Z | undo last mark |
 | h | hide marks while held |
+| s | hide surface contours while held |
 | u | unratable (image quality or render failure), with a reason picker |
 | o | other problem, opens note |
 | n | note |

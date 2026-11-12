@@ -28,9 +28,9 @@ Specification complete; scaffold only (`pyproject.toml`, `justfile`, package `__
 
 Build the local path first: it is the smallest thing that is useful on its own, and everything in the census reuses it. Each milestone ends with tests passing and a short note in `docs/decisions.md` for any choice made along the way.
 
-1. `fsio` and `render`: read a FreeSurfer subject with nibabel, find the occipital pole, slice meshes, compose three-panel frames, write WebP frames, MP4, `render.json` and `vertex_map.npz`. Test on synthetic data, then on one real subject (fetch `ds000102` sub-01 Tier B and C files from the OpenNeuroDerivatives bucket into a pytest cache). Compare a few frames by eye with Freeview output from the gist.
+1. `fsio` and `render`: read a FreeSurfer subject with nibabel, find the occipital pole, slice meshes, write per-panel WebP tiles in two layers (decision D11), a composite MP4 and poster, `render.json` and `vertex_map.npz`. Test on synthetic data, then on one real subject (fetch `ds000102` sub-01 Tier B and C files from the OpenNeuroDerivatives bucket into a pytest cache). Compare a few frames by eye with Freeview output from the gist.
 2. `sources/local` and `inventory`: layout detection, file roles, run directory, catalog.
-3. `templates`, `fsio/registration`, `metrics/fsaverage`, `metrics/clusters`: resampling to fsaverage6 and within-set z-maps (shipped reference is empty at first).
+3. `templates`, `fsio/registration`, `metrics/fsaverage`, `metrics/clusters`, `metrics/regional`, `metrics/ceiling`, `metrics/scoring`: resampling to fsaverage6, within-set z-maps (shipped reference is empty at first), and the composite score that `review` sorts by (decisions D16, D18).
 4. `app`: rating screen, keyboard map, click marks with coordinate round-trip, local mode, export. Then `surfcensus review` end to end.
 5. Census: `privacy`, `remote`, `sources/openneuro_derivatives`, discovery, inventory, enrichment, selection, team mode of the app, Snakemake workflow.
 6. Embedded-derivatives source (only if decision O9 says so), reference building, analysis notebooks.

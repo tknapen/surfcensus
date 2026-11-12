@@ -3,6 +3,8 @@ name = "surfcensus"
 version = "0.0.1"
 description = "Score, render and rate FreeSurfer surfaces around the occipital pole, for your own data or a census of public derivatives."
 readme = "README.md"
+license = "BSD-3-Clause"
+license-files = ["LICENSE"]
 requires-python = ">=3.11"
 authors = [{ name = "Tomas Knapen" }]
 dependencies = [
@@ -53,3 +55,8 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "NPY", "RUF"]
+# F722: jaxtyping shape strings such as Float[np.ndarray, "n 3"] are not forward references.
+ignore = ["F722"]
+
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["typer.Option", "typer.Argument"]

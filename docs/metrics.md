@@ -25,9 +25,9 @@ Target mesh: fsaverage6 by default (40,962 vertices per hemisphere), with fsaver
 
 1. `$FREESURFER_HOME/subjects/fsaverage/surf/?h.sphere.reg` if FreeSurfer is installed;
 2. the `fsaverage/` directory shipped next to the subjects in the same fMRIPrep derivative (present in `ds000102-fmriprep/sourcedata/freesurfer/`, with `surf/lh.sphere.reg` at 5.9 MB), which also matches the FreeSurfer version that produced the subject's registration;
-3. nilearn's `fetch_surf_fsaverage`, which returns sphere meshes for fsaverage3 to fsaverage7 as GIFTI. Whether its coordinates match FreeSurfer's `sphere.reg` convention (radius 100, same orientation) is to verify.
+3. the fsaverage6 copy bundled in the wheel (decision D14, conditional on the FreeSurfer licence), derived from the fsaverage `sphere.reg` by truncation.
 
-fsaverage templates are fetched and cached on first use, not bundled in the wheel. Lower-resolution icosahedral meshes are believed to be the first N vertices of fsaverage (nesting), so fsaverage6 can be derived from the fsaverage sphere by truncation (verified for fsaverage5 on 2026-11-12, inferred for fsaverage6; see `CLAUDE.md`).
+nilearn's `fetch_surf_fsaverage` also returns sphere meshes for fsaverage3 to fsaverage7 as GIFTI, but whether its coordinates match FreeSurfer's `sphere.reg` convention (radius 100, same orientation) is to verify, and it is not used. Lower-resolution icosahedral meshes are believed to be the first N vertices of fsaverage (nesting), so fsaverage6 can be derived from the fsaverage sphere by truncation (verified for fsaverage5 on 2026-11-12, inferred for fsaverage6; see `CLAUDE.md`).
 
 Algorithm: normalize both spheres to unit radius. For each target vertex, query a KD-tree of subject sphere vertices for the k nearest, test the faces in their one-rings for containment, and interpolate thickness barycentrically. Fall back to nearest neighbour if no containing face is found. This is pure numpy and scipy. FreeSurfer's `mri_surf2surf` uses a different default mapping (to verify which), so values will differ slightly; the pilot compares the two on a few subjects and reports the difference.
 
@@ -78,7 +78,7 @@ The maximum over a small set of z-scored subject-level metrics: largest-cluster 
 
 ## Local users
 
-The shipped normative reference (see `architecture.md`) is a set of per-vertex median and MAD maps on fsaverage6 per stratum, about 0.7 MB per stratum. Local subjects are resampled and z-scored against it. When a local set has at least 30 subjects, a within-set z-map is also computed.
+The shipped normative reference (see `architecture.md`) is a set of per-vertex median and MAD maps on fsaverage6 per stratum, about 0.7 MB per stratum. Local subjects are resampled and z-scored against it. When a local set has at least 30 subjects, a within-set z-map is also computed. With no applicable shipped reference and fewer than 30 subjects, no z-map is computed and subjects are ranked on raw ceiling fraction and occipital-to-control ratio (decision D16).
 
 ## What not to do
 
