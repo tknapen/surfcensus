@@ -576,7 +576,8 @@ def test_a_subjects_directory_that_went_away_is_not_found(tmp_path: Path) -> Non
 
 
 def test_globs_are_a_union_on_the_directory_name(tmp_path: Path) -> None:
-    names = ["sub-01", "sub-02", "sub-10", "sub-11", "pilot-01", "SUB-01"]
+    # no two names differ by case only: such directories cannot coexist on macOS
+    names = ["sub-01", "sub-02", "sub-10", "sub-11", "pilot-01", "SUB-03"]
     tree = write_tree(tmp_path / "study", "subjects_dir", names)
     assert _labels(LocalSource(tree, subjects=["sub-0*"])) == ["sub-01", "sub-02"]
     assert _labels(LocalSource(tree, subjects=["sub-1?", "pilot-*"])) == [
@@ -588,7 +589,8 @@ def test_globs_are_a_union_on_the_directory_name(tmp_path: Path) -> None:
         "sub-01",
         "sub-02",
     ]
-    assert _labels(LocalSource(tree, subjects=["*-01"])) == ["SUB-01", "pilot-01", "sub-01"]
+    assert _labels(LocalSource(tree, subjects=["*-01"])) == ["pilot-01", "sub-01"]
+    assert _labels(LocalSource(tree, subjects=["*-03"])) == ["SUB-03"]
     assert _labels(local(tree, subjects=["sub-0*"])) == ["sub-01", "sub-02"]
     # one glob given as a string is one glob, not its characters
     assert _labels(LocalSource(tree, subjects="sub-1*")) == ["sub-10", "sub-11"]
