@@ -17,3 +17,4 @@ media/
 
 # the dataset key must never be committed (decision D10)
 *.key
+.hypothesis/

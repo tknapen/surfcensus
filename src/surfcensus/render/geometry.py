@@ -68,6 +68,8 @@ def axis_map(
 ) -> AxisMap:
     """Read the axis correspondence off a voxel-to-tkr affine, or refuse an oblique one."""
     linear = np.asarray(vox2ras_tkr, dtype=float)[:3, :3]
+    if not np.isfinite(vox2ras_tkr).all():
+        raise NotAxisAlignedError("the affine has non-finite entries")
     voxel_axis: list[int] = []
     step: list[float] = []
     for w in range(3):
@@ -153,7 +155,7 @@ def slice_indices(
     for v in voxel.tolist():
         if 0 <= v < amap.n[w] and (not indices or v != indices[-1]):
             indices.append(v)
-    planes = [float(amap.voxel_to_world(w, v)) for v in indices]
+    planes = [float(amap.voxel_to_world(w, float(v))) for v in indices]
     return indices, planes
 
 
@@ -265,7 +267,8 @@ def voxel_to_pixel(
     m = panel.vox2pix_array()
     px = m[0, 0] * ijk[..., panel.h_voxel_axis] + m[0, 2]
     py = m[1, 1] * ijk[..., panel.v_voxel_axis] + m[1, 2]
-    return px, py, ijk[..., panel.slice_voxel_axis]
+    # np.asarray: a single point (shape (3,)) gives 0-d arrays, not numpy scalars
+    return np.asarray(px), np.asarray(py), np.asarray(ijk[..., panel.slice_voxel_axis])
 
 
 def nearest_slice(panel: PanelInfo, slice_coordinate: float) -> int:

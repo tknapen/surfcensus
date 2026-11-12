@@ -19,9 +19,9 @@ The gist (`tknapen/85d9a23a09c95d15f4b23ba1965fa54d`) uses `freeview -cmd` with 
 
 Coordinates: FreeSurfer surfaces are in tkr RAS (surface RAS): x to the subject's right, y anterior, z superior, in mm. `T1.mgz` is normally a conformed 256³ 1 mm volume; nibabel gives its voxel-to-tkr-RAS affine via `MGHHeader.get_vox2ras_tkr()`. Nothing in the renderer assumes 1 mm or 256³: all geometry is in mm and is converted through the affine, so `-hires` volumes work (decision D18).
 
-Voxel convention: an integer voxel index is the centre of that voxel, so voxel `i` covers `[i - 0.5, i + 0.5)` along its axis. This is the convention of the affine. Whether Freeview draws the image with the same half-voxel placement relative to the contours is part of the by-eye comparison.
+Voxel convention: an integer voxel index is the centre of that voxel, so voxel `i` covers `[i - 0.5, i + 0.5)` along its axis. This is the convention of the affine. Freeview's source (dev branch, read 2026-11-12) uses the same convention and has no half-voxel offset between image and surface contour: image samples sit at voxel centres, `-slice` places the plane through the centre of the named voxel, and the surface is cut by that same plane. The reading has not been checked against a Freeview frame; that is the by-eye comparison. One difference is known: Freeview places surfaces through the volume geometry stored in the surface file's footer, while this renderer uses the `T1.mgz` vox2ras-tkr directly. The two agree when the footer geometry matches the displayed volume, which is the normal case for recon-all output.
 
-Axis alignment: slices are taken along voxel axes, so no resampling is needed. This requires each voxel axis to be parallel to one tkr axis, which holds for every FreeSurfer `mri/` volume. A volume whose voxel-to-tkr matrix is not a scaled signed permutation (tolerance 1e-4 relative) is refused, and the render is recorded as failed with reason `wrong orientation`.
+Axis alignment: slices are taken along voxel axes, so no resampling is needed. This requires each voxel axis to be parallel to one tkr axis, which holds for every FreeSurfer `mri/` volume. nibabel builds vox2ras-tkr from the voxel sizes and dimensions alone, with FreeSurfer's fixed LIA axes, whatever the direction cosines of the file. So tkr RAS is anatomical RAS only for a volume in conformed (LIA) orientation, and the test that can fail on a real file is the comparison of the two affines: a volume whose scanner affine (vox2ras) and vox2ras-tkr differ in their linear part (tolerance 1e-4 relative) is refused, and the render fails with reason `wrong orientation`. A vox2ras-tkr that is not a finite scaled signed permutation is refused with the same reason.
 
 Occipital pole: per hemisphere, the pial vertex with the most posterior y (decision D12). In y and z, the box centre is the mean of the two hemispheric poles. In x, the centre is the midline, estimated as the midpoint between the medial-most pial vertices of the two hemispheres (largest x on the left, smallest x on the right) among vertices whose y and z fall inside the box ranges below. If either hemisphere has no vertex in that range, the centre x is the mean x of the two poles.
 
@@ -31,13 +31,13 @@ Default box, all in mm relative to the centre, configurable:
 - y: −8 (just behind the pole, to show the sinus confluence and skull boundary) to +45 anterior;
 - z: −35 to +25 (covers the tentorium and transverse sinus below, the parieto-occipital region above).
 
-Slices: along each tkr axis, positions from the low to the high end of the box in steps of 1 mm (configurable), each snapped to the nearest voxel centre; duplicates and positions outside the volume are dropped. With the default box and 1 mm voxels that gives 61 sagittal, 54 coronal and 61 axial slices, ordered from low to high tkr coordinate (left to right, posterior to anterior, inferior to superior). The contour plane of a slice is the plane through its voxel centres.
+Slices: along each tkr axis, positions from the low to the high end of the box in steps of 1 mm (configurable), each snapped to the nearest voxel centre (a position exactly half-way goes to the higher voxel index); duplicates and positions outside the volume are dropped. With voxels smaller than the step some voxel planes get no tile: a 0.8 mm volume at the default 1 mm step skips every fifth plane. With the default box and 1 mm voxels that gives 61 sagittal, 54 coronal and 61 axial slices, ordered from low to high tkr coordinate (left to right, posterior to anterior, inferior to superior). The contour plane of a slice is the plane through its voxel centres.
 
 Panel field of view: every panel is square. Its side is the largest box extent plus a 10 mm margin on both sides (80 mm by default), centred on the midpoint of the box along each in-plane axis, so the rater sees just outside the brain. At the default 320 px per panel this is 4 px per mm.
 
 Display orientation (decision D13), recorded per panel in `render.json` as the anatomical letter at each edge:
 
-- sagittal: horizontal is y, vertical is z, superior up; anterior at the left by default (`sagittal_anterior_left`);
+- sagittal: horizontal is y, vertical is z, superior up; posterior at the left by default, as in Freeview, which views the head from the subject's right (`sagittal_anterior_left` flips it);
 - coronal: horizontal is x, vertical is z, superior up; radiological by default (`radiological`), so the subject's right is at the left of the panel;
 - axial: horizontal is x, vertical is y, anterior up; radiological by default.
 
@@ -47,15 +47,15 @@ The box is a reasonable default for adult brains. Pilot renders on infant, elder
 
 ## Contours
 
-Each surface is intersected with the slice plane: for each triangle, signed distances of its three vertices to the plane; triangles with sign changes contribute one segment between the two edge crossings. A vertex exactly on the plane counts as on the positive side, so no triangle yields a degenerate case. Vectorized in numpy per slice, this costs milliseconds for a 150k-vertex mesh. `trimesh.intersections.mesh_multiplane` is an alternative if it proves faster (optional dependency, to benchmark).
+Each surface is intersected with the slice plane: for each triangle, signed distances of its three vertices to the plane; triangles with sign changes contribute one segment between the two edge crossings. A vertex exactly on the plane counts as on the positive side, so no triangle yields a degenerate case. A per-axis index of the faces (sorted by their lowest coordinate) limits each cut to the faces near the plane; one cut of a 164k-vertex mesh takes about 1 ms.
 
-Segments are drawn with matplotlib `LineCollection` on the Agg canvas, antialiased, linewidth about 1.25 px at the output resolution, onto a transparent RGBA tile. The white surface is drawn first and the pial surface over it.
+Segments that share endpoints are joined into polylines and drawn as stroked paths on the matplotlib Agg canvas, antialiased, with round joins, linewidth 1.25 px at the output resolution, onto a transparent RGBA tile. Joining matters: separately drawn segments blend twice where they meet, which thickens the line unevenly (by 8% to 28%, measured). Zero-length segments are dropped. The white surface is drawn first and the pial surface over it.
 
 Default colours: pial yellow (#FFD400), white surface red (#FF3B30), on grayscale. The gist used white pial and red white; white pial is hard to see against bright tissue, hence the change. Colours are configurable and the defaults must be checked for visibility on both 3T and 7T T1 contrasts in the pilot.
 
 ## Grayscale tiles and intensity window
 
-The grayscale tile samples the slice by nearest neighbour at each pixel centre, as Freeview does (decision D18); pixels outside the volume are black.
+The grayscale tile samples the slice by nearest neighbour at each pixel centre, as Freeview does (decision D18); pixels outside the volume are black. The window maps linearly to 0 to 255, clipped and rounded.
 
 Per subject, the window runs from the 1st to the 99.5th percentile of `T1.mgz` within a dilated brainmask (three iterations of binary dilation of `brainmask.mgz > 0`). Without a brainmask, the percentiles are taken over the non-zero voxels of `T1.mgz`. A fixed window (FreeSurfer normalizes WM to 110) is an option, but the percentile window is more forgiving of residual bias field at 7T. The window is recorded in `render.json`.
 
@@ -67,12 +67,12 @@ media/<subject_uid>/
   tiles/sagittal_000_c.webp ...        # contour tiles, lossless RGBA WebP, transparent background
   tiles/coronal_000.webp ...  tiles/axial_000.webp ...
   anim.mp4                             # synchronized mode, composite strip, H.264, for passive viewing and the gallery
-  poster.webp                          # middle synchronized frame as a composite strip, for thumbnails
+  poster.webp                          # middle forward synchronized frame as a composite strip, for thumbnails
   render.json                          # see below
   vertex_map.npz                       # native vertices in the box -> fsaverage6, for click marks
 ```
 
-Tile numbers index the panel's slice list in `render.json`. The browser stacks the two layers of each panel, lays the three panels out side by side, and draws crosshairs, orientation letters and marks itself (decision D11). The composite strip used for `anim.mp4` and `poster.webp` is the same composition done in Python: sagittal, coronal, axial from left to right, contours over grayscale, crosshairs and orientation letters on top.
+Tile numbers index the panel's slice list in `render.json`. The browser stacks the two layers of each panel, lays the three panels out side by side, and draws crosshairs, orientation letters and marks itself (decision D11). The composite strip used for `anim.mp4` and `poster.webp` is the same composition done in Python: sagittal, coronal, axial from left to right, contours over grayscale, crosshairs and orientation letters on top. The letters use Pillow's built-in bitmap font, so no system font is involved.
 
 `render.json` holds everything the app needs to turn a click into anatomy and to play the animation. Its schema is the pydantic model `RenderInfo` in `src/surfcensus/render/model.py`:
 
@@ -86,13 +86,19 @@ Tile numbers index the panel's slice list in `render.json`. The browser stacks t
 
 It contains no timestamps, so identical inputs give an identical file. A unit test round-trips random voxels through pixel space and back for every panel and slice.
 
-Frame tables. Synchronized: with N the largest slice count of the three panels, forward frame f (0 to N − 1) shows slice `round(f × (n − 1) / (N − 1))` of a panel with n slices; the loop is the forward frames followed by the same frames in reverse without the two end frames, 2N − 2 frames in all (120 by default). One at a time: for each panel in turn, the same ping-pong over its own slices while the other two panels hold the slice nearest the box centre (346 frames by default). Neither mode needs extra images.
+Frame tables. Synchronized: with N the largest slice count of the three panels, forward frame f (0 to N − 1) shows slice `round(f × (n − 1) / (N − 1))` of a panel with n slices (an exact half rounds to the even slice); the loop is the forward frames followed by the same frames in reverse without the two end frames, 2N − 2 frames in all (120 by default; a single slice gives one frame). One at a time: for each panel in turn, the same ping-pong over its own slices while the other two panels hold the slice nearest the box centre (346 frames by default). Neither mode needs extra images.
 
-`vertex_map.npz` holds, per hemisphere, the indices and tkr RAS coordinates (float32) of the native vertices whose pial or white position lies inside the box plus a 10 mm margin, and each vertex's fsaverage6 counterpart from the sphere mapping in `metrics.md`. Until that mapping exists (milestone 3) the fsaverage6 entries are −1. This makes it cheap to resolve click marks to vertices after the Tier C files have been deleted. Size is well under a megabyte per subject (estimate).
+`vertex_map.npz` holds, per hemisphere, the indices and tkr RAS coordinates (float32) of the native vertices whose pial or white position lies inside the box plus a 10 mm margin, and each vertex's fsaverage6 counterpart from the sphere mapping in `metrics.md`. Until that mapping exists (milestone 3) the fsaverage6 entries are −1. This makes it cheap to resolve click marks to vertices after the Tier C files have been deleted. The archive is written uncompressed with fixed entry dates, so its bytes do not depend on the zlib build or the clock. On `ds000102` sub-01 it holds 56,031 vertices and takes 1.8 MB.
 
-Sizes: three panels of 320 × 320 px. Measured on 15 sagittal tiles of `ds000102` sub-01 with one hemisphere's surfaces: 8.7 kB per grayscale tile and 16.3 kB per contour tile, so about 176 tile pairs come to roughly 4 MB per subject and on the order of 20 GB for 5,000 subjects, served statically. To measure properly in the pilot.
+Sizes: three panels of 320 × 320 px. Measured on a full render of `ds000102` sub-01 (176 tile pairs): grayscale tiles 10.5 kB on average (1.9 MB in all), contour tiles 12.5 kB (2.2 MB), `anim.mp4` 4.3 MB, `vertex_map.npz` 1.8 MB, `poster.webp` 67 kB, `render.json` 26 kB; 10.2 MB per subject, of which the app needs the tiles (4.1 MB) and the vertex map. For 5,000 subjects that is about 50 GB with videos and about 30 GB without. One subject; to measure across datasets in the pilot.
 
-Video: H.264 via imageio-ffmpeg, `-preset veryfast`, CRF 23, `yuv420p`, 12 fps, single-threaded and with bit-exact flags so the file is reproducible. 120 frames gives a 10 s loop.
+Video: H.264 through the ffmpeg binary of imageio-ffmpeg, `-preset veryfast`, CRF 23, `yuv420p` (BT.709, limited range, tagged), 12 fps, single-threaded and with bit-exact flags, so the file is reproducible for a given ffmpeg binary. 120 frames gives a 10 s loop. The 4:2:0 chroma subsampling desaturates the thin contours in the video (mean absolute error about 47 of 255 on line pixels); the tiles are exact, and raters work from the tiles.
+
+## Failures and re-rendering
+
+A subject that cannot be rendered raises `RenderError` with one of the unratable reasons of the rating protocol: `missing surface` (a required file is absent), `wrong orientation` (see Geometry), or `render failure` (unreadable file, degenerate mesh, white and pial surfaces of different vertex counts, brainmask on another grid, box outside the volume). Every refusal happens before anything is written.
+
+`render.json` is removed when rendering starts and written last, so its presence marks a complete render. Rendering into a directory that already holds a complete render of the same inputs (size and SHA-256), config and video setting does nothing. Otherwise the directory is rendered again and the tiles and video of the earlier render are removed; other files in the directory are left alone. All files are written to a temporary name and renamed into place.
 
 ## Optional views
 
@@ -101,4 +107,4 @@ Video: H.264 via imageio-ffmpeg, `-preset veryfast`, CRF 23, `yuv420p`, 12 fps, 
 
 ## Performance target
 
-About 176 tile pairs and 120 composite video frames per subject: target under 20 s per subject per core, excluding download. On a 32-core machine that is about 1 hour per 5,000 subjects of compute, so download throughput will dominate. Measure in pilot.
+About 176 tile pairs and 120 composite video frames per subject: target under 20 s per subject per core, excluding download. Measured on `ds000102` sub-01: 9 s on one core, of which WebP encoding takes about 3.4 s, the video 2.5 s and contour drawing 2 s. On a 32-core machine that is about 25 minutes per 5,000 subjects of compute, so download throughput will dominate.

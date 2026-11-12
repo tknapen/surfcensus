@@ -22,7 +22,7 @@ Everything in the package serves one of these two numbers.
 
 ## Status
 
-Specification complete; scaffold only (`pyproject.toml`, `justfile`, package `__init__`, default rating protocol, smoke test). The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
+Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestones 2 to 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
 
 ## Build order
 
@@ -55,6 +55,17 @@ Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep
 - `surf/lh.pial` is a regular key; there is no `lh.pial.T1` (FreeSurfer 6 layout).
 - Lossy WebP at quality 80 desaturates thin coloured contours: on 15 sagittal tiles (292 x 320 px, `lh` surfaces only) the mean absolute error on contour pixels was 47, 16 and 70 (R, G, B, of 255). Tile sizes: 14.7 kB with contours baked in; 8.7 kB grayscale only; 16.3 kB for the contours as a separate lossless RGBA layer.
 - Both buckets are reachable anonymously from the Claude Code cloud environment; `gist.githubusercontent.com` is not.
+
+Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 as installed); none of it checked against a running Freeview or FreeSurfer 7 data:
+
+- Freeview's default 2D views are radiological in coronal and axial (subject's left on the right), anterior up in axial, and in sagittal show posterior at the left and anterior at the right (`RenderView2D.cpp`: sagittal camera at +x, view-up +z).
+- Freeview treats an integer voxel index as the voxel centre and cuts the surface with the plane through that centre; no half-voxel offset between image and contour in the code path.
+- `nibabel.freesurfer.read_geometry` returns coordinates as stored (tkr RAS) and does not apply the footer's `c_ras`. `MGHHeader.get_vox2ras_tkr()` ignores the direction cosines.
+- From FreeSurfer 7.0.0, recon-all writes `?h.pial.T1` and makes `?h.pial` a relative link to it (or to `?h.pial.T2` / `?h.pial.FLAIR`).
+- `MRISmeasureCorticalThickness` clamps each of its two distance measurements at the maximum and stores their mean, in v6.0.0, v7.0.0 and v7.4.1; recon-all in FreeSurfer 7 calls it through `mris_place_surface --thickness` with a maximum of 5.
+- Lossy WebP is always 4:2:0; Pillow's lossless WebP zeroes RGB under alpha 0 unless `exact=True`.
+
+Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.2 MB of media (tiles 4.1 MB, `anim.mp4` 4.3 MB, `vertex_map.npz` 1.8 MB); 155 of 176 tiles contain contours.
 
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 

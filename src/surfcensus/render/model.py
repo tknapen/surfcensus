@@ -11,7 +11,7 @@ import json
 from typing import Literal
 
 import numpy as np
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 RENDER_SCHEMA_VERSION = 1
 
@@ -50,7 +50,8 @@ class RenderConfig(_Frozen):
 
     radiological: bool = True
     """Subject's left on the right of the coronal and axial panels (decision D13)."""
-    sagittal_anterior_left: bool = True
+    sagittal_anterior_left: bool = False
+    """Anterior at the left of the sagittal panel. Freeview shows anterior at the right."""
 
     pial_colour: str = "#FFD400"
     white_colour: str = "#FF3B30"
@@ -92,6 +93,14 @@ class InputFile(_Frozen):
     """File name only (for example ``lh.pial.T1``), never a path."""
     size: int
     sha256: str
+
+    @field_validator("name")
+    @classmethod
+    def _no_path(cls, name: str) -> str:
+        # render.json is served to raters, and a path could name the dataset
+        if not name or "/" in name or "\\" in name or name in (".", ".."):
+            raise ValueError(f"a file name without directories is required, got {name!r}")
+        return name
 
 
 class PoleInfo(_Frozen):

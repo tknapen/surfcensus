@@ -63,7 +63,7 @@ Fetch tiers:
 
 Template: the fsaverage sphere, cortex label and annotation, fetched once per FreeSurfer major version from the `fsaverage/` directory that fMRIPrep places next to the subjects (verified present in `ds000102-fmriprep/sourcedata/freesurfer/`, alongside `fsaverage5/`), or from a local FreeSurfer install, or nilearn (see `metrics.md`).
 
-Note on `?h.pial` in FreeSurfer 7: it may be a symlink to `?h.pial.T1` or `?h.pial.T2` (to verify). On S3, symlinks may appear as separate keys or be absent. The resolver checks `?h.pial`, then `?h.pial.T2`, `?h.pial.FLAIR`, `?h.pial.T1`, and records which it used.
+Note on `?h.pial` in FreeSurfer 7: from 7.0.0 on, recon-all writes `?h.pial.T1` and links `?h.pial` to it, or to `?h.pial.T2` or `?h.pial.FLAIR` when those refinements run (read in `scripts/recon-all` at v7.0.0 to v7.4.1 on 2026-11-12; FreeSurfer 6 writes `?h.pial` as a regular file). How these links appear on S3 (separate keys, copies, or absent) is to verify on a FreeSurfer 7 dataset. The resolver checks `?h.pial`, then `?h.pial.T2`, `?h.pial.FLAIR`, `?h.pial.T1`, and records which it used.
 
 ## Provenance fields
 

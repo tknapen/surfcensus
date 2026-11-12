@@ -35,7 +35,7 @@ D11 (2026-11-12). Render output is per-panel slice tiles in two layers, composed
 
 D12 (2026-11-12). The occipital box is anchored on the geometric pole (most posterior pial vertex per hemisphere). From milestone 3 the renderer also maps a fixed fsaverage pole vertex to native space through `sphere.reg` and records its distance to the geometric pole in `render.json`. The pilot decides from those distances whether the anchor should change. Reason: the geometric pole needs no template, so single-subject rendering stays self-contained, but it depends on head pitch and on the pial surface being correct at the pole.
 
-D13 (2026-11-12). Panels follow Freeview's default 2D display orientation, with orientation letters on the panel edges, so the phase 0 comparison with Freeview is like for like. Implemented as two config switches (`radiological`, default true: subject's left on the right of the coronal and axial panels; `sagittal_anterior_left`, default true). Both defaults are from memory of Freeview and must be confirmed in the by-eye comparison of milestone 1; `render.json` records the orientation used.
+D13 (2026-11-12). Panels follow Freeview's default 2D display orientation, with orientation letters on the panel edges, so the phase 0 comparison with Freeview is like for like. Implemented as two config switches (`radiological`, default true: subject's left on the right of the coronal and axial panels; `sagittal_anterior_left`, default false: posterior at the left). `render.json` records the orientation used. The defaults were first set from memory, with anterior at the left of the sagittal panel; reading Freeview's source the same day corrected that. In `RenderView2D.cpp` (dev branch; the sagittal and radiological cases are the same in v6.0.0 and v7.1.1) the sagittal camera sits at +x with view-up +z, which puts anterior at the right; the coronal camera sits at +y and the axial camera at −z with view-up +y, which is radiological with anterior up. A published Freeview screenshot shows the same edge labels. A neurological view exists only as an option (`-neuro-view`, from 7.4.0). The by-eye comparison of milestone 1 remains the check on a rendered frame.
 
 D14 (2026-11-12). The fsaverage6 template (spheres, cortex label, search-region labels) is looked up in this order: a local FreeSurfer install, an `fsaverage/` directory next to the subjects, then a copy bundled in the wheel (about 1 to 2 MB). Reason: D1 requires `surfcensus review` to work offline, which fetch-on-first-use does not. Condition: bundling goes ahead only after Tomas confirms that the FreeSurfer licence permits redistributing these fsaverage-derived files (nilearn and TemplateFlow do so; the terms have not been read for this project).
 
@@ -47,6 +47,19 @@ D17 (2026-11-12). The code is licensed BSD-3-Clause. The licence for released ra
 
 D18 (2026-11-12). Working conventions. Geometry is in mm throughout, so volumes that are not 1 mm conformed are handled. The T1 is upsampled by nearest neighbour, as in Freeview. "Deterministic" (hard rule in `CLAUDE.md`) means for a given input, config and locked environment (`uv.lock`); golden tests use a tolerance. The catalog uses stdlib `sqlite3` with `PRAGMA user_version` migrations, and `sqlmodel` stays in the `app` extra. The version stays static until the first tagged release. Regional metrics, ceiling fraction and scoring are built in milestone 3 because `review` orders its queue by the composite score; the intensity metric follows milestone 4. CI runs lint and tests on Linux and macOS for Python 3.11 and 3.13.
 
+D19 (2026-11-12). Choices made while building milestone 1, with their reasons.
+
+- Orientation check. nibabel's vox2ras-tkr ignores the direction cosines, so the documented test (tkr matrix not a signed permutation) could never fail on a file. The renderer refuses a volume whose scanner affine and tkr affine differ in their linear part, that is, any volume not in conformed LIA orientation.
+- Contours are joined into polylines before drawing (see `rendering.md`); `LineCollection` of separate segments gave unevenly heavy lines.
+- The video setting is part of a render's identity: asking for a render without video in a directory that has one renders again and removes the video.
+- `vertex_map.npz` is stored uncompressed with fixed entry dates, for byte identity across zlib builds (1.8 MB instead of about 1.3 MB on one subject).
+- The video is converted with the BT.709 matrix, limited range, and tagged, so players need not guess; swscale's bit-exact path is forced because its SIMD path gave different bytes.
+- `three_plane(subject, "x.mp4")` renders into a hidden temporary directory next to the target and moves the video into place.
+- A link to a pial variant in the same directory (`lh.pial -> lh.pial.T1`, FreeSurfer 7) is recorded in `render.json` under the variant's name; a link into another directory under the link's own name, so no foreign name reaches `render.json`.
+- A directory is treated as an fsaverage template if its own name or the name of its link target starts with `fsaverage`.
+- Tests run the package under jaxtyping and beartype with the PEP 484 numeric tower (an `int` passes where `float` is annotated), in agreement with the static checker.
+- Byte identity of renders was checked on one machine across Python 3.11 (numpy 2.4) and 3.13 (numpy 2.5): identical media bytes. Not checked across machines or operating systems.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.
@@ -55,7 +68,7 @@ O2. When and how to reveal dataset identities. D10 settles the default (pseudony
 
 O12. Licence for released ratings (CC0 proposed in `phases.md`). The code licence is settled in D17.
 
-O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject; FreeSurfer 7 not checked.
+O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject, and clamped in the source of `MRISmeasureCorticalThickness` at v6.0.0, v7.0.0 and v7.4.1 (see `metrics.md`). No FreeSurfer 7 data inspected yet.
 
 O4. Whether the view box scales with brain size. Decided by pilot renders on atypical brains.
 
