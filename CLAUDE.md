@@ -46,6 +46,16 @@ Phase 0 of the census (pilot, `docs/phases.md`) can start as soon as milestone 4
 - Tomas's Freeview gist (`https://gist.github.com/tknapen/85d9a23a09c95d15f4b23ba1965fa54d`) renders sagittal slices with white (red) and pial (white) surfaces over `T1.mgz` through `freeview -cmd`, then joins frames with ffmpeg. It uses fixed voxel slices (x = 90 to 239, y = z = 127).
 - `mris_thickness` documents a default maximum thickness of 5 mm (`-max`). How vertices above the maximum are stored is not documented on that page and must be checked in source or empirically (see `docs/metrics.md`).
 
+Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep 21.0.2; nothing here is checked for FreeSurfer 7):
+
+- Over-maximum thickness is clamped, not zeroed. `lh.thickness` has a maximum of exactly 5.0, with 16 vertices at that value (41 in `rh`); at those vertices the white-to-pial vertex distance has a median of 7.3 mm. Zeros are the medial wall: 5,914 of the 5,919 zero-valued `lh` vertices lie outside `label/lh.cortex.label`, 5 lie inside it.
+- In `fsaverage/surf/`, `lh.sphere.reg` and `lh.sphere` hold identical coordinates, at radius 100 (99.992 to 100.008). The subject's `lh.sphere.reg` also has radius 100.
+- Icosahedral nesting holds for fsaverage5: `fsaverage5/surf/lh.sphere.reg` equals the first 10,242 vertices of fsaverage `lh.sphere.reg` exactly. fsaverage6 by truncation to 40,962 vertices is inferred from this, not checked directly (the folder has no `fsaverage6/`).
+- `mri/T1.mgz` is 256 x 256 x 256, 1 mm, uint8, with vox2ras-tkr rows `[-1 0 0 128]`, `[0 0 1 -128]`, `[0 -1 0 128]`.
+- `surf/lh.pial` is a regular key; there is no `lh.pial.T1` (FreeSurfer 6 layout).
+- Lossy WebP at quality 80 desaturates thin coloured contours: on 15 sagittal tiles (292 x 320 px, `lh` surfaces only) the mean absolute error on contour pixels was 47, 16 and 70 (R, G, B, of 255). Tile sizes: 14.7 kB with contours baked in; 8.7 kB grayscale only; 16.3 kB for the contours as a separate lossless RGBA layer.
+- Both buckets are reachable anonymously from the Claude Code cloud environment; `gist.githubusercontent.com` is not.
+
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 
 ## Hard rules

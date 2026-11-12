@@ -27,7 +27,7 @@ Target mesh: fsaverage6 by default (40,962 vertices per hemisphere), with fsaver
 2. the `fsaverage/` directory shipped next to the subjects in the same fMRIPrep derivative (present in `ds000102-fmriprep/sourcedata/freesurfer/`, with `surf/lh.sphere.reg` at 5.9 MB), which also matches the FreeSurfer version that produced the subject's registration;
 3. nilearn's `fetch_surf_fsaverage`, which returns sphere meshes for fsaverage3 to fsaverage7 as GIFTI. Whether its coordinates match FreeSurfer's `sphere.reg` convention (radius 100, same orientation) is to verify.
 
-fsaverage templates are fetched and cached on first use, not bundled in the wheel. Lower-resolution icosahedral meshes are believed to be the first N vertices of fsaverage (nesting), so fsaverage6 can be derived from the fsaverage sphere by truncation (to verify).
+fsaverage templates are fetched and cached on first use, not bundled in the wheel. Lower-resolution icosahedral meshes are believed to be the first N vertices of fsaverage (nesting), so fsaverage6 can be derived from the fsaverage sphere by truncation (verified for fsaverage5 on 2026-11-12, inferred for fsaverage6; see `CLAUDE.md`).
 
 Algorithm: normalize both spheres to unit radius. For each target vertex, query a KD-tree of subject sphere vertices for the k nearest, test the faces in their one-rings for containment, and interpolate thickness barycentrically. Fall back to nearest neighbour if no containing face is found. This is pure numpy and scipy. FreeSurfer's `mri_surf2surf` uses a different default mapping (to verify which), so values will differ slightly; the pilot compares the two on a few subjects and reports the difference.
 
@@ -60,7 +60,7 @@ Each cluster centroid maps back to the subject's native surface (via the barycen
 
 ## The 5 mm ceiling
 
-`mris_thickness` documents a default maximum thickness of 5 mm. How vertices exceeding it are stored (clamped to 5 mm, or set to 0) is not stated on that page (to verify in source and empirically). Clamping produces a pile-up at 5.0 that is itself a sign of capture. Zeroing would make captured cortex look thin and would also corrupt interpolation on fsaverage. In that case zero-valued vertices inside the cortex label must be treated as missing and counted separately. Phase 0 settles this by inspecting thickness histograms of known-bad subjects. Either way, the ceiling fraction (fraction of native search-region vertices at or above 4.9 mm, or at exactly 0) is reported as its own metric.
+`mris_thickness` documents a default maximum thickness of 5 mm. How vertices exceeding it are stored (clamped to 5 mm, or set to 0) is not stated on that page (to verify in source and empirically). Clamping produces a pile-up at 5.0 that is itself a sign of capture. Zeroing would make captured cortex look thin and would also corrupt interpolation on fsaverage. In that case zero-valued vertices inside the cortex label must be treated as missing and counted separately. On `ds000102` sub-01 (FreeSurfer 6.0.1) values are clamped at exactly 5.0 and in-cortex zeros are negligible (5 vertices; see `CLAUDE.md`). Phase 0 still inspects thickness histograms of known-bad subjects and of a FreeSurfer 7 subject before this is treated as settled. Either way, the ceiling fraction (fraction of native search-region vertices at or above 4.9 mm, or at exactly 0) is reported as its own metric.
 
 ## Regional metrics (Tier A, every subject, no surfaces needed)
 

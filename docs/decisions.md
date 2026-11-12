@@ -39,7 +39,7 @@ O2. When and how to reveal dataset identities. D10 settles the default (pseudony
 
 O12. Licence for the package (code) and for released ratings (CC0 proposed in `phases.md`).
 
-O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions.
+O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject; FreeSurfer 7 not checked.
 
 O4. Whether the view box scales with brain size. Decided by pilot renders on atypical brains.
 
