@@ -38,7 +38,8 @@ def render_subject(
     no_video: bool = typer.Option(False, "--no-video", help="Do not write anim.mp4."),
 ) -> None:
     """Render one subject without a run directory: tiles, poster, video, render.json."""
-    from surfcensus.render import RenderError, three_plane  # imports matplotlib
+    # imports matplotlib
+    from surfcensus.render import OutputInSourceError, RenderError, three_plane
     from surfcensus.render.model import PANEL_ORDER
 
     if not out.strip():  # an unset shell variable; as a path it would be the current directory
@@ -50,10 +51,10 @@ def render_subject(
     try:
         with _terminated_like_interrupted():
             info = three_plane(subject_dir, target, video=not no_video, force=force)
-    except RenderError as exc:
-        typer.echo(f"render failed: {' '.join(str(exc).split())}", err=True)
-        raise typer.Exit(1) from exc
-    except OSError as exc:  # the output cannot be written: not a directory, read-only, full
+    except OutputInSourceError as exc:  # a call that cannot be meant, like an empty --out
+        raise typer.BadParameter(str(exc), param_hint="--out") from exc
+    except (RenderError, OSError) as exc:
+        # OSError: the output cannot be written (not a directory, read-only, disk full)
         typer.echo(f"render failed: {' '.join(str(exc).split())}", err=True)
         raise typer.Exit(1) from exc
     counts = ", ".join(f"{len(info.panels[name].slices)} {name}" for name in PANEL_ORDER)

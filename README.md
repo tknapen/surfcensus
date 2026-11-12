@@ -23,7 +23,7 @@ This reads `mri/T1.mgz`, `surf/?h.white` and `surf/?h.pial` (and `mri/brainmask.
 - `anim.mp4` and `poster.webp`: the three panels side by side, sweeping through a box around the occipital pole;
 - `render.json` and `vertex_map.npz`: the geometry that turns a click on a tile into a voxel, a tkr RAS coordinate and a surface vertex.
 
-An `--out` that ends in `.mp4` writes the video alone; `--no-video` leaves the video out. No FreeSurfer installation or licence is needed, and the subject directory is only read.
+An `--out` that ends in `.mp4` writes the video alone; `--no-video` leaves the video out. No FreeSurfer installation or licence is needed. The subject directory is only read, and an `--out` inside it is refused.
 
 The same from Python:
 

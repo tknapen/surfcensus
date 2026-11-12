@@ -454,8 +454,10 @@ def test_renderer_draws_every_loop_and_open_line_of_a_layer() -> None:
     assert ndimage.label(together > 0, structure=np.ones((3, 3)))[1] == 5
     assert np.abs(together.astype(int) - np.max(apart, axis=0)).max() <= 2
     assert np.abs(together.astype(int) - in_order).max() <= 2
+    # total coverage: length times width, and a round cap of half a disc at each open end
     length = 2 * np.pi * (12 + 9 + 15) + 2 * np.pi * (10 + 6) / 3
-    assert together.sum() / 255 == pytest.approx(length * 1.25, rel=0.02)
+    caps = 2 * np.pi * (1.25 / 2) ** 2
+    assert together.sum() / 255 == pytest.approx(length * 1.25 + caps, rel=0.02)
 
 
 def test_renderer_is_stateless_between_calls(

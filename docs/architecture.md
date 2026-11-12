@@ -217,7 +217,7 @@ Core tables in `catalog.sqlite`:
 
 ## Testing
 
-- Unit tests on synthetic meshes (a sphere, a folded slab) for slicing, normals, pole finding and ROI construction.
+- Unit tests on synthetic meshes (ellipsoids, and a folded closed surface that a slice crosses in several loops) for slicing, contour drawing, normals, pole finding and ROI construction.
 - Layout detection tests for the local source on fake directory trees (SUBJECTS_DIR, fMRIPrep old and new layouts, BIDS derivatives).
 - Golden-image tests for frame composition with a tolerance, using a tiny synthetic volume.
 - One network fixture: a single real subject from a small OpenNeuroDerivatives dataset, fetched once into a pytest cache, marked `network`. The same subject, copied locally, doubles as the end-to-end test of `surfcensus review --no-browser`.

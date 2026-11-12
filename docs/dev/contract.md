@@ -2,9 +2,9 @@
 
 > Working interface contract for milestones 2 to 5, produced by a design pass on 2026-11-12 (two independent proposals, a merge, three reviews). It is a build aid, not part of the specification that `CLAUDE.md` imports. When a milestone lands, the code and the docs in `docs/` are authoritative; this file is not kept in sync afterwards. Paths that mention a scratch directory refer to experiments that are not in the repository.
 
-Written 2026-11-12. Read against commit `2b5c71c` plus the uncommitted milestone 1 hardening that was in the working tree when this was written (other agents were still changing it). Two things in that working tree differ from what the draft assumed, and the contract follows the working tree: `RENDER_SCHEMA_VERSION` is already 2 (the vertex map is selected by the clickable region of the tiles, carries `{h}_visible`, and reaches `vertex_map_margin_mm` = 5 mm beyond it), so milestone 3 bumps the schema to 3; and `docs/rendering.md` still describes the vertex map as "the box plus 10 mm", which the code no longer does.
+Written 2026-11-12. Read against commit `2b5c71c` plus the uncommitted milestone 1 hardening that was in the working tree when this was written (other agents were still changing it). Two things in that working tree differ from what the draft assumed, and the contract follows the working tree: `RENDER_SCHEMA_VERSION` is already 2 (the vertex map is selected by the clickable region of the tiles, carries `{h}_visible`, and reaches `vertex_map_margin_mm` = 5 mm beyond it), so milestone 3 bumps the schema to 3. When this was first written `docs/rendering.md` and D15 still described the vertex map as "the box plus 10 mm"; both follow the code since the milestone 1 review (row G14).
 
-Nothing here is implemented, and the repository was not touched. This file replaces `contract_draft.md` in the same directory, which three reviewers read; what was done with each of their 54 problems is in section 11.
+Nothing here is implemented, and the repository was not touched. This file replaces a draft (`contract_draft.md`, not in the repository), which three reviewers read; what was done with each of their 54 problems is in section 11.
 
 Contents
 
@@ -134,12 +134,12 @@ Assumed, not checked
 - The OpenNeuro GraphQL endpoint (unreachable from this environment), and the old fMRIPrep layout on S3 (not seen in 15 datasets).
 - The `mri_surf2surf` flags in section 9.3.
 
-The scripts behind the items marked * above are in `merge/` next to this file.
+The scripts behind the items marked * above were scratch experiments (`merge/`) and are not in the repository.
 
-Checked again for this revision (2026-11-12, script in `final_checks/` next to this file)
+Checked again for this revision (2026-11-12; the script, `final_checks/chk.py`, is a scratch experiment and not in the repository)
 
-- The working tree: `render/model.py` has `RENDER_SCHEMA_VERSION = 2` and `vertex_map_margin_mm = 5.0`; `render/vertexmap.py` selects vertices by `geometry.clickable_region` and writes `{h}_visible`; `RenderConfig.config_hash()` hashes the schema number and every field, including `fps`, `crf`, the crosshair settings and `vertex_map_margin_mm`; `sources/__init__.py` is empty; `pyproject.toml` has `sqlmodel` only in the `app` extra, `scikit-learn` and `krippendorff` only in `analysis`, and `imageio` as a core dependency that no module imports (only `imageio_ffmpeg` is).
-- The draft's `tile_signature` can be computed from the public bucket listing alone: the formula over the six tile roles of `ds000102` sub-01, from `data/sub01_listing.xml` with no file downloaded, gives `f6501bd0d69d68d1`, the value the reviewer reported.
+- The working tree: `render/model.py` has `RENDER_SCHEMA_VERSION = 2` and `vertex_map_margin_mm = 5.0`; `render/vertexmap.py` selects vertices by `geometry.clickable_region` and writes `{h}_visible`; `RenderConfig.config_hash()` hashes the schema number and every field, including `fps`, `crf`, the crosshair settings and `vertex_map_margin_mm`; `sources/__init__.py` holds a module docstring and no code; `pyproject.toml` has `sqlmodel` only in the `app` extra, `scikit-learn` and `krippendorff` only in `analysis`, and `imageio` as a core dependency that no module imports (only `imageio_ffmpeg` is).
+- The draft's `tile_signature` can be computed from the public bucket listing alone: the formula over the six tile roles of `ds000102` sub-01, from a saved listing of the subject's prefix (`sub01_listing.xml`, not in the repository) with no file downloaded, gives `f6501bd0d69d68d1`, the value the reviewer reported.
 - The draft's scale cascade: 26 zeros and the values 10, 50, 200, 1000 have MAD 0 and IQR 0, so the SD (184.7) is used and the z values are 0.05, 0.27, 1.08, 5.41. Normal scores with minimum-rank ties give -2.13 for the zeros and 1.19, 1.38, 1.64, 2.13.
 - D16 ranking on 12 subjects with no ceiling vertex: average-rank ties give 7 distinct composites of 12, minimum-rank ties 12 of 12.
 - The expected maximum of 2 standard normal scores is 0.57, of 4 it is 1.03.
@@ -987,7 +987,7 @@ surfcensus status    --run-dir DIR [--failures]
 - `render` shows a progress bar and one closing line with counts and the failed subjects with their reasons. `--check-sample` renders nothing; without `--seed` it draws one and prints it.
 - `status` prints one line per phase with done, failed and pending, from the catalog; pseudonyms only. `--failures` lists every failed unit with its reason and detail; it reads the private catalog and its output is for the operator's terminal, not for a log.
 - `--backend mpl|freeview` of `architecture.md` is not offered until the Freeview backend exists.
-- `render-subject` and `three_plane` gain one refusal, which the milestone 1 review left to this milestone: an output that resolves to a place inside the subject directory raises `ValueError` before anything is written (exit code 2), since a source directory is never written to.
+- `render-subject`, `three_plane` and `render_subject` refuse an output that resolves to a place inside the subject directory: `OutputInSourceError`, a `ValueError`, before anything is written (exit code 2), since a source directory is never written to. The milestone 1 review had left this to this milestone; it was built when the review's fixes were verified (`rendering.md`, "Failures and re-rendering"), so nothing remains to do here.
 
 ---
 
@@ -2181,9 +2181,19 @@ def synthetic_cohort(root: Path, n: int, template: SyntheticTemplate, *, seed: i
 - `small_run` (session, read-only): three synthetic subjects in a `write_tree` with a template, one of them with a `ThickPatch`, prepared without `review` and without the app:
 
   ```python
-  run = Run(run_dir, sources.local(tree), config=new_local_config(
-      tree, render=RenderConfig(panel_px=64), metrics=MetricsConfig(min_reference_n=3, min_vertex_n=2)))
-  run.inventory(); run.metrics(); run.public().replace_selection(all_present, ["all"]); run.render(video=False)
+  run = Run(
+      run_dir,
+      sources.local(tree),
+      config=new_local_config(
+          tree,
+          render=RenderConfig(panel_px=64),
+          metrics=MetricsConfig(min_reference_n=3, min_vertex_n=2),
+      ),
+  )
+  run.inventory()
+  run.metrics()
+  run.public().replace_selection(all_present, ["all"])
+  run.render(video=False)
   ```
 
   With `min_reference_n=3` the three subjects are scored within the set, so the run has z-maps, a cluster with a native centroid, and `composite_z` scores; the D16 path is covered by `small_cohort`. The fixture needs milestones 2 and 3 only, so the app agents can use it from the first step of milestone 4.
@@ -2438,13 +2448,13 @@ Silent, with the choice made:
 | S44 | `pydantic-settings` | Used only for `RuntimeSettings` in milestone 5 |
 | S45 | `TestClient` with httpx is deprecated in Starlette 1.10 | Tests filter that one warning; if it becomes an error they switch to `httpx.AsyncClient` with `ASGITransport` |
 | S46 | The `mri_surf2surf` comparison array | Needs a FreeSurfer install; the test exists and skips until the array is stored (T22) |
-| S47 | `render-subject` with an output inside the subject directory (left open by the milestone 1 review) | Refused |
+| S47 | `render-subject` with an output inside the subject directory (left open by the milestone 1 review) | Refused; built in milestone 1 when the review's fixes were verified |
 
 Added in this revision. Docs that disagree with the code, with each other, or with a hard rule:
 
 | # | Doc statement | Finding | Choice |
 |---|---|---|---|
-| G14 | `rendering.md`: the vertex map holds vertices "inside the box plus a 10 mm margin"; D15: evaluable vertices are those "inside that subject's rendered box (the vertices in `vertex_map.npz`)" | The working tree selects the map by the clickable region of the tiles plus `vertex_map_margin_mm` (5 mm), marks `{h}_visible`, and is at schema 2. The box and the map are no longer the same set | Follow the code. Milestone 3 is schema 3. Evaluable vertices are the `visible` ones (what a rater can see and click); `box_dist_mm` on marks and the box corners in `render.json` allow the stricter reading as a filter (T30) |
+| G14 | `rendering.md`: the vertex map holds vertices "inside the box plus a 10 mm margin"; D15: evaluable vertices are those "inside that subject's rendered box (the vertices in `vertex_map.npz`)" | The working tree selects the map by the clickable region of the tiles plus `vertex_map_margin_mm` (5 mm), marks `{h}_visible`, and is at schema 2. The box and the map are no longer the same set | Resolved in the milestone 1 review: `rendering.md`, D15 and `analysis_plan.md` now state the rule of the code. Milestone 3 is schema 3. Evaluable vertices are the `visible` ones, those whose pial position lies in the region the tiles sweep; a mark can resolve to a vertex just outside it and is kept (`analysis_plan.md`). `box_dist_mm` on marks and the box corners in `render.json` allow the stricter reading as a filter (T30) |
 | G15 | `architecture.md`: the cache is "content-addressed, keyed by (bucket, key, etag)"; hard rule: no unkeyed hash that can be inverted by enumeration | Key and ETag are in the public listing, so the directory name identifies the subject | Cache names are an HMAC with the run secret (8.2) |
 | G16 | D10 and `architecture.md`: `export --reveal` writes the mapping table | Written into the export directory, it sits next to files meant for release | `--reveal-out DIR` is required and must lie outside the run directory (8.1) |
 | G17 | D10: released per-dataset tables report the subject count binned; `phases.md`: the release holds "ratings, scores and provenance" per subject | A per-subject table with pseudonyms gives the exact count, and exact age and sampling probability match `participants.tsv` and the listing | Two export profiles, `analysis` and `release` (7.8); T26 |

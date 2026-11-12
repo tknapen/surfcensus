@@ -624,8 +624,27 @@ def test_vox2pix_is_the_inverse_in_closed_form_without_negative_zeros(case: Case
         assert "-0.0," not in dumped and "-0.0]" not in dumped
 
 
+def test_a_tile_edge_on_voxel_coordinate_0_gives_no_negative_zero() -> None:
+    """The field of view of the default box around x = 88 ends at tkr x = 128, which is voxel
+    coordinate 0 of a conformed volume. The shift of the coronal and the axial ``pix2vox`` is
+    then (128 - 128) / -1, a negative zero as it is computed, and ``-0.0`` in ``render.json``
+    if it is stored so. No case of ``CASES`` has a shift of zero."""
+    case = Case(LIA_1MM, (256, 256, 256), centre=(88.0, -95.2, -10.6))
+    assert case.fov_edges("coronal")[0] == 128.0 and case.amap.offset[0] == 128.0
+    for name in ("coronal", "axial"):
+        assert case.panels[name].pix2vox[0] == (0.25, 0.0, 0.0)
+        assert case.panels[name].vox2pix[0] == (4.0, 0.0, 0.0)
+    for panel in case.panels.values():
+        for matrix in (panel.pix2vox, panel.vox2pix):
+            assert not np.signbit(np.array(matrix)[np.array(matrix) == 0]).any()
+        assert "-0.0" not in json.dumps(panel.model_dump(mode="json"))
+
+
 def test_a_box_without_extent_is_refused() -> None:
-    flat = RenderConfig(box_x_mm=(0, 0), box_y_mm=(0, 0), box_z_mm=(0, 0), margin_mm=0)
+    # RenderConfig refuses this when it is made; model_copy does not validate
+    flat = RenderConfig().model_copy(
+        update={"box_x_mm": (0, 0), "box_y_mm": (0, 0), "box_z_mm": (0, 0), "margin_mm": 0}
+    )
     case = Case(LIA_1MM, (256, 256, 256), config=flat)
     with pytest.raises(ValueError, match="no extent"):
         g.build_panels(case.box, case.amap, flat)

@@ -477,26 +477,47 @@ def test_an_incomplete_directory_is_rendered_again(
     assert tree(small_copy) == before
 
 
+@pytest.mark.parametrize(
+    "old", ["as version 1 wrote it", "version 1 that loads", "version alone", "hash alone"]
+)
 def test_a_render_of_schema_version_1_is_rendered_again(
-    coarse_subject: SyntheticSubject, small_copy: Path
+    coarse_subject: SyntheticSubject, small_copy: Path, old: str
 ) -> None:
     """Schema 1 selected the vertex map by the view box and had no ``visible`` arrays. Its
     ``vertex_map_margin_mm`` meant another thing under the same name, so a render of that
-    version must not pass for a complete render of the same config."""
+    version must not pass for a complete render of the same config.
+
+    A ``render.json`` as version 1 wrote it lacks two required fields and does not load, so it
+    is rendered again whatever its version says. The other cases load under the present
+    model: the version number and the config hash of version 1 together, and each of the two
+    alone, since each is a reason of its own to render again."""
     before = tree(small_copy)
     doc = json.loads(before["render.json"])
     assert doc["schema_version"] == 2
-    # render.json and the vertex map as version 1 wrote them, for the very same config
-    payload = json.dumps(
-        {"schema": 1, "config": doc["config"]}, sort_keys=True, separators=(",", ":")
-    )
-    doc["schema_version"] = 1
-    doc["config_hash"] = hashlib.sha256(payload.encode()).hexdigest()[:12]
-    del doc["vertex_map"]["n_lh_visible"], doc["vertex_map"]["n_rh_visible"]
-    (small_copy / "render.json").write_text(json.dumps(doc, indent=1, sort_keys=True) + "\n")
-    vmap = read_vertex_map(small_copy / "vertex_map.npz")
-    with (small_copy / "vertex_map.npz").open("wb") as stream:
-        np.savez(stream, **{key: a for key, a in vmap.items() if not key.endswith("visible")})
+    if old != "hash alone":
+        doc["schema_version"] = 1
+    if old != "version alone":  # the hash that version 1 gave the very same config
+        payload = json.dumps(
+            {"schema": 1, "config": doc["config"]}, sort_keys=True, separators=(",", ":")
+        )
+        doc["config_hash"] = hashlib.sha256(payload.encode()).hexdigest()[:12]
+        assert doc["config_hash"] != SMALL.config_hash()
+    if old == "as version 1 wrote it":
+        del doc["vertex_map"]["n_lh_visible"], doc["vertex_map"]["n_rh_visible"]
+        vmap = read_vertex_map(small_copy / "vertex_map.npz")
+        with (small_copy / "vertex_map.npz").open("wb") as stream:
+            np.savez(stream, **{key: a for key, a in vmap.items() if not key.endswith("visible")})
+    text = json.dumps(doc, indent=1, sort_keys=True) + "\n"
+    (small_copy / "render.json").write_text(text)
+    # the file is a render.json of the present model in every case but the first
+    if old == "as version 1 wrote it":
+        with pytest.raises(ValidationError):
+            RenderInfo.model_validate_json(text)
+    else:
+        assert (
+            RenderInfo.model_validate_json(text).inputs
+            == RenderInfo.model_validate_json(before["render.json"]).inputs
+        )
     age(small_copy)
     info = render_subject(resolve_subject_files(coarse_subject.path), small_copy, SMALL)
     assert info.schema_version == 2 and info.config_hash == SMALL.config_hash()
@@ -542,9 +563,15 @@ def test_rendering_again_removes_only_what_a_render_writes(
         "tiles/.mine.webp.0123456789abcdef.tmp",
         "tiles/mine.webp",
         "tiles/sagittal_13.webp",  # tiles have at least three digits
+        "tiles/axial_0001.webp",  # and a fourth digit only from tile 1000 on
         "tiles/axial_000_d.webp",
+        "tiles/axial_\u0660\u0660\u0660.webp",  # Arabic-Indic digits: not what "{:03d}" writes
+        "tiles/sagittal_\uff10\uff10\uff11_c.webp",  # full-width digits
         "notes.txt",
+        "anim.mp4.txt",
     ]
+    # directories under the names of a stale tile and of an abandoned temporary file
+    folders = ["tiles/coronal_998.webp", "tiles/.axial_001.webp.0123456789abcdef.tmp"]
     # what a killed render leaves behind, and tiles of an earlier, wider box
     abandoned = [
         ".poster.webp.0123456789abcdef.tmp",
@@ -559,6 +586,10 @@ def test_rendering_again_removes_only_what_a_render_writes(
     ]
     for name in others + abandoned:
         (small_copy / name).write_text("not a file of this render")
+    for name in folders:
+        (small_copy / name).mkdir()
+        (small_copy / name / "kept.txt").write_text("not a file of this render")
+        others.append(name + "/kept.txt")
 
     files = resolve_subject_files(coarse_subject.path)
     if change == "force":
@@ -571,6 +602,195 @@ def test_rendering_again_removes_only_what_a_render_writes(
     counts = {"sagittal": 13, "coronal": 13, "axial": 13}
     assert set(tree(small_copy)) == expected_files(counts, video=change != "no video") | set(others)
     assert {(small_copy / name).read_text() for name in others} == {"not a file of this render"}
+
+
+@pytest.mark.parametrize("earlier", ["none", "interrupted", "not json", "without video"])
+def test_a_video_that_no_render_json_lists_is_left_alone(
+    coarse_subject: SyntheticSubject, small_copy: Path, earlier: str
+) -> None:
+    """``anim.mp4`` is a name a render writes, and a name a user may give a file of their own
+    in a directory they render into. A render without video removes it only if the
+    ``render.json`` in the directory says that a render wrote it."""
+    files = resolve_subject_files(coarse_subject.path)
+    video = small_copy / "anim.mp4"
+    if earlier == "none":  # a directory that was never rendered into
+        shutil.rmtree(small_copy / "tiles")
+        for name in ("render.json", "poster.webp", "vertex_map.npz"):
+            (small_copy / name).unlink()
+    elif earlier == "interrupted":  # a render that died: no render.json says whose video it is
+        (small_copy / "render.json").unlink()
+    elif earlier == "not json":
+        (small_copy / "render.json").write_text("my notes on rendering")
+    else:
+        render_subject(files, small_copy, SMALL, video=False)
+        assert not video.exists()
+    video.write_text("holiday film")
+
+    info = render_subject(files, small_copy, SMALL, video=False, force=True)
+    assert info.video is None and video.read_text() == "holiday film"
+    # and again, now next to the render.json of a render without video
+    render_subject(files, small_copy, SMALL.model_copy(update={"fps": 6}), video=False)
+    assert video.read_text() == "holiday film"
+    counts = {"sagittal": 13, "coronal": 13, "axial": 13}
+    assert set(tree(small_copy)) == expected_files(counts)  # the render's files and the film
+
+
+@pytest.mark.parametrize("earlier", ["this schema", "schema 1", "listed and absent"])
+def test_the_video_of_an_earlier_render_is_removed_by_a_render_without_video(
+    coarse_subject: SyntheticSubject, small_copy: Path, earlier: str
+) -> None:
+    files = resolve_subject_files(coarse_subject.path)
+    doc = json.loads((small_copy / "render.json").read_text())
+    assert doc["video"]["file"] == "anim.mp4" and (small_copy / "anim.mp4").is_file()
+    if earlier == "schema 1":  # does not load as a RenderInfo, and lists its video all the same
+        doc["schema_version"] = 1
+        del doc["vertex_map"]["n_lh_visible"], doc["vertex_map"]["n_rh_visible"]
+        (small_copy / "render.json").write_text(json.dumps(doc))
+    elif earlier == "listed and absent":
+        (small_copy / "anim.mp4").unlink()
+    info = render_subject(files, small_copy, SMALL, video=False)
+    assert info.video is None
+    counts = {"sagittal": 13, "coronal": 13, "axial": 13}
+    assert set(tree(small_copy)) == expected_files(counts, video=False)
+
+
+def test_the_video_goes_before_the_render_json_that_lists_it(
+    coarse_subject: SyntheticSubject, small_copy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A render without video that dies at its first tile has removed the earlier video
+    together with ``render.json``. Were the video left for the end of the render, it would
+    stay behind with no ``render.json`` to say whose it is, and no later render would remove
+    it."""
+    files = resolve_subject_files(coarse_subject.path)
+
+    def fail(*args: object) -> None:
+        raise OSError("disk full")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(api.encode, "write_gray_webp", fail)
+        with pytest.raises(OSError, match="disk full"):
+            render_subject(files, small_copy, SMALL, video=False)
+    assert not (small_copy / "render.json").exists() and not (small_copy / "anim.mp4").exists()
+    render_subject(files, small_copy, SMALL, video=False)
+    counts = {"sagittal": 13, "coronal": 13, "axial": 13}
+    assert set(tree(small_copy)) == expected_files(counts, video=False)
+
+
+def test_a_directory_under_the_name_of_the_video_is_left_alone(
+    coarse_subject: SyntheticSubject, small_copy: Path
+) -> None:
+    # render.json lists a video, and what is there under its name is no file of a render
+    (small_copy / "anim.mp4").unlink()
+    (small_copy / "anim.mp4").mkdir()
+    (small_copy / "anim.mp4" / "kept.txt").write_text("kept")
+    render_subject(resolve_subject_files(coarse_subject.path), small_copy, SMALL, video=False)
+    assert (small_copy / "anim.mp4" / "kept.txt").read_text() == "kept"
+    assert (small_copy / "render.json").is_file()
+
+
+# ---------------------------------------------------------------- the source is only read
+
+
+def _into_the_subject(subject: Path, tmp_path: Path, where: str) -> Path:
+    """An output location that is the subject directory or lies inside it."""
+    if where == "by a link":
+        (tmp_path / "link").symlink_to(subject, target_is_directory=True)
+        return tmp_path / "link" / "media"
+    if where == "by a relative path":
+        return subject / "surf" / ".." / ".." / subject.name / "media"
+    return {
+        "itself": subject,
+        "inside": subject / "media",
+        "deep inside": subject / "qc" / "render" / "media",
+        "mri": subject / "mri",
+        "surf": subject / "surf",
+        "a video inside": subject / "clip.mp4",
+        "a video in mri": subject / "mri" / "clip.mp4",
+    }[where]
+
+
+INSIDE = ["itself", "inside", "deep inside", "mri", "surf", "by a link", "by a relative path"]
+
+
+@pytest.mark.parametrize(
+    ("call", "where"),
+    [("three_plane", where) for where in [*INSIDE, "a video inside", "a video in mri"]]
+    + [("render_subject", where) for where in INSIDE],  # which writes a directory only
+)
+def test_an_output_inside_the_subject_directory_is_refused(
+    subject_copy: Path, tmp_path: Path, where: str, call: str
+) -> None:
+    """Local sources are read in place and never modified (hard rule in CLAUDE.md)."""
+    (subject_copy / "anim.mp4").write_text("my video")
+    (subject_copy / ".notes.tmp").write_text("mine")
+    out = _into_the_subject(subject_copy, tmp_path, where)
+    before = source_state(subject_copy)
+    with pytest.raises(api.OutputInSourceError, match="only read") as raised:
+        if call == "three_plane":
+            three_plane(subject_copy, out, SMALL, video=out.suffix == ".mp4")
+        else:
+            render_subject(resolve_subject_files(subject_copy), out, SMALL, video=False)
+    assert isinstance(raised.value, ValueError)
+    assert source_state(subject_copy) == before
+
+
+def test_the_subject_may_be_given_by_a_link_or_a_relative_path(
+    subject_copy: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The refusal compares directories, not spellings: the subject as a link, the output as
+    a path into the directory the link leads to, and both relative to the working directory."""
+    (tmp_path / "link").symlink_to(subject_copy, target_is_directory=True)
+    before = source_state(subject_copy)
+    with pytest.raises(api.OutputInSourceError):
+        three_plane(tmp_path / "link", subject_copy / "media", SMALL, video=False)
+    monkeypatch.chdir(subject_copy)
+    for out in (".", "media", "mri/../media"):
+        with pytest.raises(api.OutputInSourceError):
+            three_plane(".", out, SMALL, video=False)
+    monkeypatch.chdir(subject_copy / "surf")
+    with pytest.raises(api.OutputInSourceError):
+        three_plane("..", ".", SMALL, video=False)
+    assert source_state(subject_copy) == before
+
+
+def test_an_output_next_to_or_around_the_subject_is_accepted(
+    subject_copy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Only the subject directory is a source. The directory that holds it is not, also when
+    its name starts like the subject's, and neither is a directory that an input links from."""
+    before = source_state(subject_copy)
+    parent = subject_copy.parent
+    counts = {"sagittal": 13, "coronal": 13, "axial": 13}
+    for out in (parent / (subject_copy.name + "-media"), parent / "sub"):
+        three_plane(subject_copy, out, SMALL, video=False)
+        assert set(tree(out)) == expected_files(counts, video=False)
+    monkeypatch.chdir(parent)
+    three_plane(subject_copy.name, ".", SMALL, video=False)  # around the subject
+    assert (parent / "render.json").is_file() and (parent / "tiles").is_dir()
+    assert source_state(subject_copy) == before
+
+
+def test_an_output_where_a_linked_input_is_stored_is_refused(
+    subject_copy: Path, tmp_path: Path
+) -> None:
+    """Inputs handed over by role need not sit in a subject directory (a download cache). The
+    directory that holds a file is then the source, and so is the one a link leads to."""
+    store = tmp_path / "store"
+    store.mkdir()
+    shutil.move(subject_copy / "mri" / "T1.mgz", store / "0a1b2c")
+    (subject_copy / "mri" / "T1.mgz").symlink_to(store / "0a1b2c")
+    flat = tmp_path / "flat"
+    flat.mkdir()
+    files = resolve_subject_files(subject_copy)
+    for role in SURFACES:
+        files[FileRole(role)] = Path(shutil.copy(files[FileRole(role)], flat / role))
+    for out in (store, store / "media", flat, flat / "media" / "a"):
+        with pytest.raises(api.OutputInSourceError):
+            render_subject(files, out, SMALL, video=False)
+    assert sorted(p.name for p in store.iterdir()) == ["0a1b2c"]
+    assert sorted(p.name for p in flat.iterdir()) == sorted(SURFACES)
+    info = render_subject(files, tmp_path / "media", SMALL, video=False)
+    assert info.inputs["t1"].name == "T1.mgz"
 
 
 def test_changed_inputs_render_again(subject_copy: Path, tmp_path: Path) -> None:
@@ -978,12 +1198,23 @@ DAMAGE = {
     "truncated surface": (
         lambda s: (s / "surf" / "lh.white").write_bytes(b"\xff\xff\xfe"),
         "render failure",
-        "unreadable",
+        r"unreadable input \(lh\.white: ",
     ),
     "not an mgz": (
         lambda s: (s / "mri" / "T1.mgz").write_bytes(b"not a volume"),
         "render failure",
-        "unreadable",
+        r"unreadable input \(T1\.mgz: ",
+    ),
+    # nibabel names an empty file by its whole path, which the message must not repeat
+    "empty t1": (
+        lambda s: (s / "mri" / "T1.mgz").write_bytes(b""),
+        "render failure",
+        r"unreadable input \(T1\.mgz: Empty file: 'T1\.mgz'\)",
+    ),
+    "empty brainmask": (
+        lambda s: (s / "mri" / "brainmask.mgz").write_bytes(b""),
+        "render failure",
+        r"unreadable input \(brainmask\.mgz: Empty file: 'brainmask\.mgz'\)",
     ),
     "brainmask on another grid": (_other_grid_brainmask, "render failure", "brainmask"),
 }
@@ -1001,6 +1232,8 @@ def test_unrenderable_subjects_raise_with_a_protocol_reason(
     assert raised.value.reason == reason
     assert str(raised.value).startswith(reason + ": ")
     assert reason in protocol_reasons()
+    # the message may be logged and shown: no directory in it, which could name the dataset
+    assert str(tmp_path) not in str(raised.value) and subject_copy.name not in str(raised.value)
     assert not out.exists()
 
 
@@ -1154,6 +1387,10 @@ BAD_CONFIG = [
     {"crosshair_colour": "#33c7ff80"},
     {"line_width_px": 400.0},
     {"line_width_px": 8.5},  # more than panel_px / 8
+    {"box_x_mm": (30.0, -30.0)},  # high end first
+    {"box_z_mm": (6.0, float("nan"))},
+    # no extent along any axis and no margin: panels 0 mm wide
+    {"box_x_mm": (0.0, 0.0), "box_y_mm": (5.0, 5.0), "box_z_mm": (0.0, 0.0), "margin_mm": 0.0},
 ]
 
 
@@ -1173,6 +1410,12 @@ def test_colours_and_line_widths_that_can_be_drawn_are_accepted() -> None:
     assert RenderConfig(panel_px=16).line_width_px == 1.25  # the default line on the smallest panel
     assert RenderConfig(panel_px=64, line_width_px=8.0).line_width_px == 8.0
     assert RenderConfig(line_width_px=40.0).panel_px == 320
+    # a box may be flat along any axis as long as the panels have an extent
+    flat = RenderConfig(box_x_mm=(0, 0), box_y_mm=(5, 5), box_z_mm=(0, 0))
+    assert (flat.box_y_mm, flat.margin_mm) == ((5, 5), 10)
+    assert (
+        RenderConfig(box_x_mm=(0, 0), box_y_mm=(5, 5), box_z_mm=(0, 1), margin_mm=0).margin_mm == 0
+    )
 
 
 @pytest.mark.parametrize("update", BAD_CONFIG)
@@ -1339,6 +1582,7 @@ def test_importing_surfcensus_does_not_import_matplotlib() -> None:
     assert done.returncode == 0, done.stderr
     assert surfcensus.render.three_plane is three_plane
     assert set(surfcensus.render.__all__) == {
+        "OutputInSourceError",
         "RenderConfig",
         "RenderError",
         "RenderInfo",
@@ -1444,9 +1688,12 @@ def in_boxes(xyz: np.ndarray, boxes: np.ndarray, grow: float) -> np.ndarray:
     return inside
 
 
-def tile_points(doc: dict, surfaces: dict[str, tuple[np.ndarray, np.ndarray]]) -> np.ndarray:
+def tile_points(
+    doc: dict, surfaces: dict[str, tuple[np.ndarray, np.ndarray]], clicks: bool = True
+) -> np.ndarray:
     """tkr RAS of points on every tile: three on each contour segment of the given meshes,
-    where they fall inside the tile, and a grid of clicks that includes the tile's edges."""
+    where they fall inside the tile, and, with ``clicks``, a grid of clicks that includes the
+    tile's edges."""
     vox2tkr = np.array(doc["volume"]["vox2ras_tkr"])
     tkr2vox = np.linalg.inv(vox2tkr)
     points = []
@@ -1472,6 +1719,8 @@ def tile_points(doc: dict, surfaces: dict[str, tuple[np.ndarray, np.ndarray]]) -
                 ]
                 shown = (cx >= 0) & (cx <= size) & (cy >= 0) & (cy <= size)
                 points.append(on_contour[shown])
+            if not clicks:
+                continue
             ijk = np.empty((len(px), 3))
             ijk[:, h_axis], ijk[:, v_axis], ijk[:, s_axis] = grid_h, grid_v, index
             points.append(ijk @ vox2tkr[:3, :3].T + vox2tkr[:3, 3])
@@ -1571,3 +1820,35 @@ def test_vertex_map_selection_and_visible_flag_follow_the_tiles(
         in_box = ((pial >= low) & (pial <= high)).all(axis=1)
         assert in_box.sum() < visible.sum() < len(index) < len(pial)
         assert seen[in_box].all()
+
+
+@pytest.mark.parametrize("which", ["default_render", "hires_render"])
+def test_a_mark_on_a_drawn_pial_contour_may_resolve_to_a_vertex_just_outside_the_region(
+    which: str, request: pytest.FixtureRequest
+) -> None:
+    """``visible`` says where a vertex is, not what a mark can resolve to (docs/rendering.md).
+    A drawn contour point lies in the clickable region, on a face of the mesh, and the vertex
+    nearest to it can lie outside the region: past half a slice step at the ends of a sweep,
+    or past the tile edge. It is then no farther outside than the point is from the nearest
+    corner of its face, which is at most the longest edge divided by the square root of 3.
+    The analysis must not take a mark's vertex for a visible one (docs/analysis_plan.md)."""
+    rendered: Rendered = request.getfixturevalue(which)
+    doc = json.loads((rendered.out / "render.json").read_text())
+    vmap = read_vertex_map(rendered.out / doc["vertex_map"]["file"])
+    region = tile_region(doc)
+    meshes, longest = {}, 0.0
+    for hemi in ("lh", "rh"):
+        pial = read_surface(rendered.subject.path / "surf" / f"{hemi}.pial")
+        meshes[hemi] = (pial.vertices, pial.faces)
+        corners = pial.vertices[pial.faces]
+        longest = max(longest, np.linalg.norm(corners - np.roll(corners, 1, axis=1), axis=2).max())
+    marks = tile_points(doc, meshes, clicks=False)
+    assert len(marks) > 50_000 and in_boxes(marks, region, 1e-6).all()
+    stored = np.concatenate([vmap["lh_pial"], vmap["rh_pial"]]).astype(float)
+    visible = np.concatenate([vmap["lh_visible"], vmap["rh_visible"]])
+    _, nearest = cKDTree(stored).query(marks)
+    beyond = ~visible[nearest]
+    # measured: 346 of 101,596 points on the 1 mm subject, 373 of 101,104 on the 0.8 mm one
+    assert 0.001 < beyond.mean() < 0.01
+    assert in_boxes(stored[nearest[beyond]], region, longest / np.sqrt(3)).all()
+    assert not in_boxes(stored[nearest[beyond]], region, 0.0).any()

@@ -5,15 +5,20 @@ Run with ``uv run pytest -m network tests/test_network_render.py -q -s`` to see 
 
 from __future__ import annotations
 
+import hashlib
 import time
 from pathlib import Path
 
+import numpy as np
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 
-from surfcensus.render import three_plane
+from surfcensus.fsio.surfaces import read_surface
+from surfcensus.fsio.volumes import read_volume
+from surfcensus.render import frames, three_plane
 from surfcensus.render.encode import read_image
 from surfcensus.render.model import PANEL_ORDER
+from surfcensus.render.slicing import MeshSlicer
 
 pytestmark = pytest.mark.network
 
@@ -31,18 +36,47 @@ def test_real_subject_renders(real_subject: Path, tmp_path: Path) -> None:
     assert info.poles["lh"].tkr == pytest.approx((-17.56, -83.64, -15.74), abs=0.01)
     assert info.poles["rh"].tkr == pytest.approx((9.15, -85.33, -15.48), abs=0.01)
     assert info.box.centre == pytest.approx((-4.34, -84.485, -15.61), abs=0.01)
-    assert {role: used.name for role, used in info.inputs.items()} == {
-        "t1": "T1.mgz", "brainmask": "brainmask.mgz", "lh_white": "lh.white",
-        "rh_white": "rh.white", "lh_pial": "lh.pial", "rh_pial": "rh.pial",
+    files = {
+        "t1": "mri/T1.mgz", "brainmask": "mri/brainmask.mgz", "lh_white": "surf/lh.white",
+        "rh_white": "surf/rh.white", "lh_pial": "surf/lh.pial", "rh_pial": "surf/rh.pial",
     }  # fmt: skip
+    assert set(info.inputs) == set(files)
+    for role, relative in files.items():  # files of 1.7 to 5.6 MB, hashed whole
+        content = (real_subject / relative).read_bytes()
+        used = info.inputs[role]
+        assert used.name == Path(relative).name
+        assert (used.size, used.sha256) == (len(content), hashlib.sha256(content).hexdigest())
 
-    gray, contours, drawn = [], [], 0
+    t1 = read_volume(real_subject / "mri" / "T1.mgz")
+    slicers = {}
+    for role in ("lh_white", "rh_white", "lh_pial", "rh_pial"):
+        surface = read_surface(real_subject / files[role])
+        slicers[role] = MeshSlicer(surface.vertices, surface.faces)
+    size, line_width = info.config.panel_px, info.config.line_width_px
+    gray, contours, drawn, covered, expected = [], [], 0, 0.0, 0.0
     for name in PANEL_ORDER:
-        for pos in range(len(info.panels[name].slices)):
+        panel = info.panels[name]
+        for pos in range(len(panel.slices)):
             gray.append((out / info.tiles.gray_path(name, pos)).stat().st_size)
             path = out / info.tiles.contours_path(name, pos)
             contours.append(path.stat().st_size)
-            drawn += bool(read_image(path)[..., 3].any())
+            alpha = read_image(path)[..., 3]
+            drawn += bool(alpha.any())
+            # Every line of every surface is drawn: the lines cover nearly the length of the
+            # contours on the tile times the line width. On 152 of the 155 tiles with contours
+            # a surface gives more than one line, up to 15. With only the first closed loop of
+            # each surface drawn, the worst tile comes to 0.37 and all tiles together to 0.88.
+            on_tile = 0.0
+            for segments, _ in frames.contour_layers(
+                panel, pos, t1.vox2ras_tkr, slicers, info.config
+            ):
+                ends = np.clip(segments, 0, size)
+                on_tile += float(np.linalg.norm(ends[:, 1] - ends[:, 0], axis=1).sum())
+            covered += alpha.sum() / 255
+            expected += on_tile * line_width
+            if on_tile * line_width > 200:  # measured: 0.952 to 1.005
+                assert 0.93 < alpha.sum() / 255 / (on_tile * line_width) < 1.02, (name, pos)
+    assert 0.96 < covered / expected < 0.99  # measured: 0.976
     sizes = {p.name: p.stat().st_size for p in out.iterdir() if p.is_file()}
     total = sum(gray) + sum(contours) + sum(sizes.values())
     assert info.vertex_map is not None

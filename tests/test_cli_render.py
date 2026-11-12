@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -162,6 +164,41 @@ def test_an_empty_out_is_refused(
     assert result.exit_code == 2
     assert "--out" in said(result.output) and "the output path is empty" in said(result.output)
     assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize("where", [".", "media", "mri", "surf/clip.mp4"])
+def test_an_out_inside_the_subject_directory_is_refused(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path, where: str, terminal: str
+) -> None:
+    """A source directory is only read. With ``--out .`` given from inside it, a render
+    without video would also have removed an ``anim.mp4`` found there."""
+    subject = Path(shutil.copytree(synth_subject_pial_t1.path, tmp_path / "sub-01"))
+    (subject / "anim.mp4").write_text("my video")
+    before = {p.relative_to(subject).as_posix() for p in subject.rglob("*")}
+    flags = [] if where.endswith(".mp4") else ["--no-video"]
+    result = CliRunner().invoke(
+        app, ["render-subject", str(subject), "--out", str(subject / where), *flags]
+    )
+    assert result.exit_code == 2
+    assert "--out" in said(result.output)
+    assert "lies in a directory that the inputs are read from" in said(result.output)
+    assert {p.relative_to(subject).as_posix() for p in subject.rglob("*")} == before
+    assert (subject / "anim.mp4").read_text() == "my video"
+
+
+def test_a_video_of_the_users_in_the_output_directory_is_kept(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``--out .`` in a directory that holds other things: ``anim.mp4`` is a name the
+    renderer writes, and without a ``render.json`` that lists it the file is not its own."""
+    (tmp_path / "anim.mp4").write_text("holiday film")
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(
+        app, ["render-subject", str(synth_subject_pial_t1.path), "--out", ".", "--no-video"]
+    )
+    assert result.exit_code == 0, result.output
+    assert (tmp_path / "anim.mp4").read_text() == "holiday film"
+    assert json.loads((tmp_path / "render.json").read_text())["video"] is None
 
 
 def test_an_output_that_cannot_be_written_exits_with_1_and_one_line(

@@ -45,6 +45,8 @@ class RenderConfig(_Frozen):
     """Everything that changes the rendered output. Hashed into ``config_hash``."""
 
     box_x_mm: tuple[float, float] = (-30.0, 30.0)
+    """Low and high end relative to the box centre, low at or below high; likewise
+    ``box_y_mm`` and ``box_z_mm``. One of the three, or ``margin_mm``, must have an extent."""
     box_y_mm: tuple[float, float] = (-8.0, 45.0)
     box_z_mm: tuple[float, float] = (-35.0, 25.0)
     margin_mm: float = Field(default=10.0, ge=0)
@@ -84,6 +86,25 @@ class RenderConfig(_Frozen):
         if not re.fullmatch(r"#[0-9a-fA-F]{6}", colour):
             raise ValueError(f"colour must be '#RRGGBB', got {colour!r}")
         return colour.upper()
+
+    @model_validator(mode="after")
+    def _box_can_be_shown(self) -> RenderConfig:
+        # a box that no panel can show would otherwise be refused once per subject, as a
+        # failure of the subject (geometry.field_of_view, geometry.build_panels)
+        extents = []
+        for name in ("box_x_mm", "box_y_mm", "box_z_mm"):
+            low, high = getattr(self, name)
+            if not low <= high:
+                raise ValueError(
+                    f"{name} must run from its low to its high end, got {low:g}, {high:g}"
+                )
+            extents.append(high - low)
+        if not max(extents) + 2 * self.margin_mm > 0:
+            raise ValueError(
+                "box_x_mm, box_y_mm and box_z_mm without extent and a margin_mm of 0 "
+                "leave the panels nothing to show"
+            )
+        return self
 
     @model_validator(mode="after")
     def _line_narrower_than_panel(self) -> RenderConfig:
