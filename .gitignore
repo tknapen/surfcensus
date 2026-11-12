@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+.venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+uv.lock.bak
+
+# run directories and caches never belong in the repo
+surfcensus-run/
+runs/
+*.sqlite
+cache/
+media/
+
+# the dataset key must never be committed (decision D10)
+*.key

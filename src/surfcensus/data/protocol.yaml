@@ -1,0 +1,34 @@
+# Default rating protocol, read by the rater app. Copied into each run directory,
+# where it can be edited. Wording is a draft until phase 0 (docs/rating_protocol.md).
+version: "0.1-draft"
+
+scale:
+  - {value: 0, label: none, help: "No inclusion visible in any frame."}
+  - {value: 1, label: minor, help: "Visible but confined: fewer than about 5 consecutive slices in any plane, cortex extended outward by no more than about 2 mm (placeholder anchors)."}
+  - {value: 2, label: major, help: "Larger extent, or the structure clearly enclosed within the pial surface. A careful analyst would edit or exclude."}
+
+criteria:
+  - id: A
+    label: Superior sagittal sinus / falx
+    question: "Does the pial surface include the superior sagittal sinus, falx or dura along the medial occipital or parietal surface?"
+    keys: ["1", "2", "3"]
+    mark_key: a
+  - id: B
+    label: Tentorium / transverse sinus
+    question: "Does the pial surface include the tentorium, transverse or straight sinus, or cerebellum along the inferior occipital or posterior inferior temporal surface?"
+    keys: ["4", "5", "6"]
+    mark_key: b
+  - id: C
+    label: White surface
+    question: "Is the white surface misplaced within the box: cutting into white matter, missing a gyral core, or including non-brain tissue?"
+    keys: ["7", "8", "9"]
+    mark_key: c
+
+other_mark_key: x
+require_marks_for_positive: true   # census default; `surfcensus review` sets false unless --require-marks
+
+unratable_reasons:
+  - render failure
+  - wrong orientation
+  - missing surface
+  - image too poor to judge
