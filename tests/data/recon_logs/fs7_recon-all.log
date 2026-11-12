@@ -1,0 +1,99 @@
+
+Sat Apr 22 01:24:39 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -autorecon1 -i /data/work/ds999999_sub-UTS01/fmriprep_23_0_wf/single_subject_UTS01_wf/anat_preproc_wf/anat_validate/sub-UTS01_ses-1_T1w_ras_valid.nii.gz -noskullstrip -noT2pial -noFLAIRpial -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 478 lines cut ...]
+#@#%# recon-all-run-time-hours 0.149
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 01:33:34 UTC 2023
+[... 3 lines cut ...]
+#New# invocation of recon-all 
+
+
+
+
+Sat Apr 22 03:06:17 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -gcareg
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 301 lines cut ...]
+#@#%# recon-all-run-time-hours 0.033
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 03:08:16 UTC 2023
+[... 3 lines cut ...]
+#New# invocation of recon-all 
+
+
+
+
+Sat Apr 22 03:09:00 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -autorecon2-volonly -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -nogcareg
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 2309 lines cut ...]
+#@#%# recon-all-run-time-hours 1.421
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 04:34:15 UTC 2023
+[... 3 lines cut ...]
+#New# invocation of recon-all 
+
+
+
+
+Sat Apr 22 05:33:04 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -parallel -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -cortribbon
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 186 lines cut ...]
+#@#%# recon-all-run-time-hours 0.080
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 05:37:51 UTC 2023
+[... 3 lines cut ...]
+#New# invocation of recon-all 
+
+
+
+
+Sat Apr 22 05:41:42 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -autorecon3 -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -nosphere -nosurfreg -nojacobian_white -noavgcurv -nocortparc -nopial -noparcstats -nocortparc2 -noparcstats2 -nocortparc3 -noparcstats3 -nopctsurfcon -nocortribbon -nobalabels
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 507 lines cut ...]
+orig.nofix lheno =   -6, rheno = -28
+orig.nofix lhholes =    4, rhholes = 15
+Loading mri/aseg.mgz
+[... 14 lines cut ...]
+#@#%# recon-all-run-time-hours 0.136
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 05:49:51 UTC 2023

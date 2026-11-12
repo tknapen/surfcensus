@@ -20,8 +20,11 @@ from surfcensus.privacy import (
     new_local_salt,
     render_key,
     scrub,
+    scrub_with,
     subject_uid,
 )
+from surfcensus.sources.base import DatasetRecord
+from surfcensus.store import Catalog
 
 SECRET = bytes(range(32))
 KEY = HashKey(SECRET, "dataset-key")
@@ -297,3 +300,44 @@ def test_scrub_keeps_only_the_last_component_of_any_posix_path(parts: list[str])
     cleaned = scrub(f"cannot open '{path}' today")
     assert cleaned == f"cannot open '{parts[-1]}' today"
     assert scrub(f"cannot open {path}") == f"cannot open {parts[-1]}"
+
+
+# --- scrub with what a catalog holds ---------------------------------------------------------
+
+
+@pytest.mark.parametrize("mode", ["local", "census"])
+def test_scrub_with_a_catalog_uses_its_roots_and_in_a_census_run_its_pseudonyms(
+    tmp_path, mode: str
+) -> None:
+    key = KEY if mode == "census" else new_local_salt()
+    remote = DatasetRecord(
+        source="openneuro-derivatives",
+        identity="ds999999",
+        accession="ds999999",
+        root="s3://openneuro-derivatives/fmriprep/ds999999-fmriprep/",
+        fs_root="sourcedata/freesurfer",
+        layout="fmriprep",
+        pipeline="fmriprep",
+    )
+    text = "ds999999: cannot list /data/CANARYROOT for sub-CANARY7"
+    with Catalog.create(tmp_path / "catalog.sqlite", mode=mode, key=key) as catalog:
+        before = scrub_with(catalog, text)
+        local = DatasetRecord(
+            source="local",
+            identity="/data/CANARYROOT",
+            accession=None,
+            root="/data/CANARYROOT",
+            fs_root="freesurfer",
+            layout="bids_derivatives",
+            pipeline="freesurfer",
+        )
+        catalog.upsert_dataset(local, "D-00000001", None)
+        if mode == "census":
+            catalog.upsert_dataset(remote, "D-0badcafe", None)
+        after = scrub_with(catalog, text)  # with what the catalog holds now
+    if mode == "local":  # the labels of a local run are the user's own
+        assert before == "D-?: cannot list CANARYROOT for sub-CANARY7"
+        assert after == "D-?: cannot list <root> for sub-CANARY7"
+    else:
+        assert before == "D-?: cannot list CANARYROOT for sub-?"
+        assert after == "D-0badcafe: cannot list <root> for sub-?"

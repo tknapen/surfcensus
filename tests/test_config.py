@@ -32,6 +32,7 @@ from surfcensus.config import (
     run_key,
     stage_hash,
     stage_hashes,
+    with_changes,
     write_config,
 )
 from surfcensus.privacy import HashKey, new_local_salt
@@ -568,3 +569,30 @@ def test_the_tile_hash_changes_with_the_tile_fields_and_with_no_other() -> None:
             assert other.tile_hash() == base.tile_hash(), name
     # two spellings of one colour are one tile
     assert RenderConfig(pial_colour="#ffd400").tile_hash() == base.tile_hash()
+
+
+# --- with_changes -----------------------------------------------------------------------------
+
+
+def test_with_changes_replaces_fields_and_validates_the_whole_again(tmp_path: Path) -> None:
+    config = local_config(tmp_path)
+    assert with_changes(config) == config
+    video = with_changes(config, render_video=True, cache={"batch_subjects": 4})
+    assert (video.render_video, video.cache.batch_subjects) == (True, 4)
+    assert video.model_copy(update={"render_video": False, "cache": config.cache}) == config
+    assert config.render_video is False  # the original is untouched
+
+    sources = [s.model_dump() | {"field_strength": 7.0} for s in config.sources]
+    assert with_changes(config, sources=sources).sources[0].field_strength == 7.0
+    by_model = with_changes(config, render=RenderConfig(panel_px=64))
+    assert by_model.render.panel_px == 64 and by_model.identity == config.identity
+
+    for changes, problem in (
+        ({"colour": "blue"}, "colour: unknown key"),
+        ({"cache": {"batch_subjects": 0}}, "cache.batch_subjects"),
+        ({"sources": [s | {"field_strength": -3.0} for s in sources]}, "field_strength"),
+        ({"mode": "census"}, "census run"),
+    ):
+        with pytest.raises(ConfigError) as raised:
+            with_changes(config, **changes)
+        assert raised.value.reason == "invalid" and problem in raised.value.detail

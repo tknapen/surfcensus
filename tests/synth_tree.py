@@ -15,6 +15,7 @@ template of the metrics tests is ``synth_template.write_synthetic_template`` (mi
 from __future__ import annotations
 
 import json
+import shutil
 from collections.abc import Collection, Sequence
 from pathlib import Path
 
@@ -34,6 +35,11 @@ FS_ROOT: dict[Layout, str] = {
 """Where each layout keeps its subjects, relative to the path that ``write_tree`` returns."""
 
 DANGLING_TARGET = "../missing-freesurfer/subjects/fsaverage"
+RECON_LOGS = Path(__file__).parent / "data" / "recon_logs"
+BUILD_STAMPS = {  # the build-stamp.txt of the two subjects the log excerpts are cut from
+    "fs6": "freesurfer-Linux-centos6_x86_64-stable-pub-v6.0.1-f53a55a",
+    "fs7": "freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275",
+}
 _PARCELS = ("unknown", "cuneus", "lateraloccipital", "superiorfrontal")
 
 
@@ -51,6 +57,22 @@ def write_light_subject(path: Path, *, complete: bool = True) -> None:
     )
     if not complete:
         (path / "surf" / "lh.pial").unlink()
+
+
+def write_tier_a(subject_dir: Path, version: str = "fs6") -> None:
+    """Add what the inventory reads to a subject: the build stamp and the three recon-all
+    logs, which are the excerpts of a real subject under ``tests/data/recon_logs``
+    (``fs6``: ds000102 sub-01, FreeSurfer 6.0.1; ``fs7``: ds003020 sub-UTS01, 7.3.2), and
+    stats files of one line, which the inventory lists and does not read."""
+    scripts = Path(subject_dir) / "scripts"
+    scripts.mkdir(exist_ok=True)
+    (scripts / "build-stamp.txt").write_text(BUILD_STAMPS[version] + "\n")
+    for name in ("recon-all.log", "recon-all-lh.log", "recon-all-rh.log"):
+        shutil.copyfile(RECON_LOGS / f"{version}_{name}", scripts / name)
+    stats = Path(subject_dir) / "stats"
+    stats.mkdir(exist_ok=True)
+    for name in ("lh.aparc.stats", "rh.aparc.stats", "aseg.stats"):
+        (stats / name).write_text("# Measure Cortex, NumVert, Number of Vertices, 42, unitless\n")
 
 
 def write_label(path: Path, vertices: np.ndarray, coords: np.ndarray) -> None:

@@ -63,12 +63,17 @@ class RenderError(Exception):
     """A subject that cannot be rendered.
 
     ``reason`` is one of the unratable reasons of ``data/protocol.yaml``: ``missing surface``,
-    ``wrong orientation`` or ``render failure``.
+    ``wrong orientation`` or ``render failure``; ``detail`` says what was found.
     """
 
     def __init__(self, reason: str, detail: str) -> None:
         super().__init__(f"{reason}: {detail}")
         self.reason = reason
+        self.detail = detail
+
+    def __reduce__(self) -> tuple[type[RenderError], tuple[str, str]]:
+        # pickle would call __init__ with the one argument of Exception.args
+        return type(self), (self.reason, self.detail)
 
 
 class OutputInSourceError(ValueError):

@@ -24,11 +24,11 @@ Source  ->  inventory  ->  metrics  ->  scoring  ->  select  ->  render  ->  rat
 
 ## Sources
 
-- `local`: a path. Auto-detects three layouts: a FreeSurfer `SUBJECTS_DIR` (children containing `surf/` and `mri/`); an fMRIPrep output (`sourcedata/freesurfer/` or, for older versions, `freesurfer/` next to the fMRIPrep folder); a BIDS derivatives root containing `freesurfer/`. Skips `fsaverage*` and other template subjects. Accepts `--subjects` globs. Reads in place, never copies or modifies source files.
+- `local`: a path. Auto-detects three layouts: a FreeSurfer `SUBJECTS_DIR` (children containing `surf/` and `mri/`); an fMRIPrep output (`sourcedata/freesurfer/` or, for older versions, `freesurfer/` next to the fMRIPrep folder); a BIDS derivatives root containing `freesurfer/`. Skips `fsaverage*` and other template subjects. Accepts `--subjects` globs. Reads in place, never copies or modifies source files. A path that is one subject directory is read as its parent directory restricted to that subject. When both `sourcedata/freesurfer/` and `freesurfer/` hold subjects, the first is used and a warning names the other. A directory with `mri/` and `surf/` that lacks files or cannot be examined is listed with what it has or with its problem, not dropped. Two names for one directory are listed once, under the first in name order. A run directory inside the subjects directory is refused.
 - `openneuro-derivatives`: the `s3://openneuro-derivatives/fmriprep/` prefixes (see `data_sources.md`).
 - `openneuro-embedded`: `derivatives/` folders inside raw OpenNeuro datasets.
 
-Each source yields `SubjectRecord`s with a resolver that turns a file role (`t1`, `lh_pial`, ...) into a local path, downloading into the cache when needed. Downstream code only ever sees local paths.
+Each source implements the `Source` protocol of `sources/base.py`. It yields `DatasetRecord`s and, per dataset, `SubjectRecord`s in label order, from a listing alone: one `FileRef` (location relative to the subject directory, size, ETag or modification time) per file role (`t1`, `lh_pial`, ...) that the subject has. Two calls hand out content. `read_bytes(subject, role)` returns a small text file (build stamp, logs), whole or as a byte range. `lease(subject, roles)` is a context manager that gives local paths for the requested roles while it is open: a local source yields the files where they are, a remote one downloads into the cache and removes them on exit. Both first compare the file with its `FileRef` and raise `SourceError("changed")` when size or modification time differ, so nothing is computed from a file other than the one that was inventoried. `config()` returns the `SourceConfig` that a run stores, from which `run.from_config` builds an equal source. Downstream code only ever sees local paths.
 
 ## Scoring with a normative reference
 
@@ -48,9 +48,9 @@ surfcensus/
   src/surfcensus/
     __init__.py
     cli.py                 # typer app
-    config.py              # pydantic settings; YAML config per run, sensible defaults for local use
+    config.py              # RunConfig, the config.yaml of a run; stage identities
     privacy.py             # keyed pseudonyms, subject_uid, render keys, scrubbing; dataset key, reveal mapping
-    store.py               # SQLite catalog + parquet tables; schema migrations
+    store.py               # SQLite catalog (private Catalog, PublicCatalog) + parquet tables; schema migrations
     records.py             # plain records shared between modules (provenance, ledger rows, RunContext)
     schemas.py             # Arrow schemas and keys of the parquet tables
     run.py                 # Run: a run directory, its sources and the phases
@@ -58,7 +58,7 @@ surfcensus/
     _io.py                 # atomic writes, byte-stable .npz, digests
     log.py                 # the package logger
     sources/
-      base.py              # Source protocol, SubjectRecord, file roles
+      base.py              # Source protocol, DatasetRecord, SubjectRecord, FileRef, file roles and tiers
       local.py             # SUBJECTS_DIR / fMRIPrep / BIDS-derivatives layouts
       openneuro_derivatives.py
       openneuro_embedded.py
@@ -68,7 +68,7 @@ surfcensus/
       openneuro.py         # OpenNeuro GraphQL client
       cache.py             # content-addressed cache keyed by (bucket, key, etag)
     inventory/
-      subjects.py          # file presence, sizes, etags or mtimes
+      subjects.py          # phase 2 for a run: listing, skip test, subjects and files into the catalog
       provenance.py        # FreeSurfer version, recon-all flags, fMRIPrep version
     enrich/                # census only
       participants.py      # age, sex from participants.tsv
@@ -100,8 +100,8 @@ surfcensus/
       frames.py            # grayscale tiles, contour overlays, composite strips
       encode.py            # WebP and MP4 writers
       vertexmap.py         # vertex_map.npz
-      api.py               # three_plane()
-      batch.py             # rendering the subjects of a run
+      api.py               # three_plane(), render_subject()
+      batch.py             # phase 6 for a run: pending subjects, the renders table, the check sample
       freeview.py          # optional backend, wraps the original gist approach
     app/
       server.py            # FastAPI
@@ -156,17 +156,31 @@ Census (and power users), one subcommand per phase:
 ```
 surfcensus key init   [--path FILE]          # create the dataset key (census only)
 surfcensus discover   --run-dir DIR [--source openneuro-derivatives|openneuro-embedded]
-surfcensus inventory  --run-dir DIR [--dataset ds000102 ...]
+surfcensus inventory  --run-dir DIR [--source PATH] [--subjects GLOB]... [--field-strength T]
+                      [--dataset ID]... [--force] [--relocate [PSEUDONYM]]
 surfcensus enrich     --run-dir DIR
 surfcensus metrics    --run-dir DIR
 surfcensus select     --run-dir DIR --n N --seed S
-surfcensus render     --run-dir DIR [--backend mpl|freeview] [--jobs J]
+surfcensus render     --run-dir DIR [--jobs J] [--dataset ID]... [--all | --selected]
+                      [--video / --no-video] [--force] [--retry-failed]
+surfcensus render     --run-dir DIR --check-sample [--fraction 0.02] [--seed S]
+surfcensus status     --run-dir DIR [--failures]
 surfcensus serve      --run-dir DIR --host 0.0.0.0 --port 8000
 surfcensus export     --run-dir DIR [--reveal]   # --reveal writes the pseudonym mapping, needs the key
 surfcensus reference build --run-dir DIR --out reference/
 ```
 
 Every phase command is idempotent and resumable. It skips work whose outputs exist with a matching config hash, and accepts `--dataset` filters so Snakemake can parallelize per dataset. Remote concurrency is bounded (`remote.max_concurrency`, default 8) with exponential backoff on 5xx and S3 `SlowDown`.
+
+`inventory`, `render` and `status` are built (milestone 2), for local sources:
+
+- `inventory --source PATH` creates a local run in `DIR` when it holds none, and says which layout it found, how many subjects are complete and have Tier A and Tier B files, their FreeSurfer versions, and which subjects lack what. On a run that exists, `--source` only says which source is meant: it must be the stored root, or come with `--relocate` when the data moved. `--relocate` replaces the stored root and nothing else, so every `subject_uid`, render and rating stays; with several local sources it takes the pseudonym of the dataset that moved.
+- `render` renders what is pending and prints counts and one line per failure reason. `--all` renders every complete subject, `--selected` only the selection (which is every complete subject while nothing is selected). `--check-sample` renders nothing: it draws a seeded sample of the done renders for the by-eye check of phase 6 and writes `logs/render-check-<seed>.txt` and `.html`.
+- `status` prints one line per phase from the catalog: subjects inventoried and unreadable; renders done, failed and pending, where pending is what `render` would do now. `--failures` lists every failed unit with its reason and detail. It reads the private catalog, so its output is for the operator's terminal, not for a log.
+- `--dataset` takes a pseudonym or an accession. An accession given on the command line is resolved in the catalog and stored nowhere.
+- Options that are stored in `config.yaml` (`--subjects`, `--field-strength`, `--video`) hold until they are given again: a command run a second time without them changes nothing. A subject glob that matches nothing is refused before it is stored.
+- Exit codes: 0 when no unit is in the failed state when the command ends; 1 when at least one is, also when it failed in an earlier call and was not tried again; 2 for a usage or configuration error, including a source that cannot be found, printed as one line `reason: detail`. `status` reports and always ends with 0.
+- `--backend mpl|freeview` is not offered until the Freeview backend exists.
 
 ## Python API
 
@@ -184,21 +198,28 @@ scores = run.scores()  # pandas DataFrame
 sc.render.three_plane(subject_dir, out="sub-01.mp4")  # single subject, no run dir
 ```
 
+`Run(run_dir, source)` creates a run in a new or empty directory; `Run(run_dir)` opens one, without a key also for a census run (only `inventory` and, later, `discover` need the key). Each phase method returns a `PhaseReport` with the counts of units done, skipped and failed. `run.metrics()`, `run.scores()` and `run.clusters()` arrive in milestone 3.
+
+`Run` holds the private catalog and only delegates. A phase function receives a `RunContext` (`records.py`), never the `Run`: the run directory, the configuration, a `PublicCatalog`, a `lease(subject_uid, roles)` function that looks the subject up and leases through its source, a `render_key` function with the run secret bound, and a `scrub` function for the text of exceptions. So code downstream of the inventory names subjects by `subject_uid` and datasets by pseudonym, and cannot reach an accession, a root or an input signature even by attribute access. `run.public()` and `PublicCatalog.open(run_dir)` give the same public side to the app and to exports.
+
 ## Run directory and data model
 
 ```
 run/
-  config.yaml
-  catalog.sqlite         # sources, datasets, subjects, files, provenance, selection, renders
+  config.yaml            # RunConfig. A local run: its salt and the root of its source. Never the
+                         # dataset key, the run secret or an accession; in a census run no path either
+  catalog.sqlite         # datasets, subjects, files, provenance, the work ledger, selection, renders
   tables/
     regional.parquet     # subject x hemisphere x parcel
     vertex_summary.parquet
     scores.parquet       # one row per subject
     clusters.parquet     # outlier clusters per subject: hemi, area, peak z, centroid vertex, native tkr RAS
+    _parts/<table>/<pseudonym>.parquet   # the rows of one dataset; merged into the table above
     fsavg/<subject_uid>.npz   # fsaverage6 thickness (and z) maps, float16
     reference/           # per-vertex reference maps per stratum for this run
   templates/             # cached fsaverage sphere, cortex label, search-region label
   cache/                 # remote downloads only, content-addressed, prunable
+  logs/                  # render-check-<seed>.txt and .html; in a census run also the phase logs
   media/<subject_uid>/
     anim.mp4
     tiles/               # per-panel WebP slice tiles in two layers, see rendering.md
@@ -208,26 +229,38 @@ run/
   app.sqlite             # rater app state, separate from the catalog
 ```
 
-Datasets appear everywhere outside `catalog.sqlite` by keyed pseudonym (`D-3f9a1c07`), never by accession; see decision D10 in `decisions.md`. `privacy.py` owns key loading, pseudonym computation and the reveal path, and nothing else in the package computes or prints accessions for display. `config.yaml` records the key fingerprint.
+Datasets appear everywhere outside `catalog.sqlite` by keyed pseudonym (`D-3f9a1c07`), never by accession; see decisions D10 and D20 in `decisions.md`. `privacy.py` owns every keyed identifier (the pseudonym, `subject_uid`, `render_key`, the names of cached files), the scrubbing of text that comes from exceptions and, from milestone 5, key loading and the reveal path. Nothing else in the package computes one of these or prints an accession for display. `config.yaml` records the key fingerprint.
 
-`subject_uid` is a keyed hash (same key) of `(source, accession or root path, pipeline, subject_label)`, so media paths do not reveal the dataset to raters. Local runs do not need the dataset key: `surfcensus review` generates a random per-run salt, stored in `config.yaml`, since nothing about local identities needs protecting beyond keeping raters blind.
+`subject_uid` is 16 hex characters of a keyed hash (same key) of `(source, identity, pipeline, subject_label)`, so media paths do not reveal the dataset to raters. `identity` is the accession of a remote dataset. For a local one it is the resolved root path when the run was created; it is stored and never recomputed, so data that moved (`--relocate`) keeps every `subject_uid` and with it every render and rating. Local runs do not need the dataset key: a new local run draws a random per-run salt, stored in `config.yaml`, since nothing about local identities needs protecting beyond keeping raters blind.
 
 Because subject and dataset identifiers depend on the key, the key is part of a census run's identity. Losing it means the run cannot be extended consistently, so `surfcensus key init` prints a reminder to back it up.
 
-Core tables in `catalog.sqlite`:
+A second secret, the run secret, is 32 random bytes drawn when the catalog is created and kept in it (`meta.run_secret`), in both modes. `render_key` and the names of cached files are keyed with it. Both are derived from files whose sizes and ETags are public, so an unkeyed hash of them could be recomputed from the bucket listing by anyone who holds an export or a media URL. `render_key` says which tiles a rating was made on: it is built from `RenderConfig.tile_hash()` and the SHA-256 digests of the files the render read, so a file that was only touched or moved keeps its key.
 
-- `datasets(dataset_id, pseudonym, source, accession, root, pipeline, pipeline_version, derivative_ref, snapshot_tag, n_subjects_listed, discovered_at)`; for a local source, one row with `root` set to the path.
-- `subjects(subject_uid, dataset_id, subject_label, fs_dir, complete, fs_version, recon_flags, t2pial, flairpial, age, sex, field_strength, manufacturer)`
-- `files(subject_uid, role, location, size, etag_or_mtime)` with roles `t1`, `brainmask`, `lh_white`, `rh_white`, `lh_pial`, `rh_pial`, `lh_thickness`, `rh_thickness`, `lh_sphere_reg`, `rh_sphere_reg`, `lh_annot`, `rh_annot`, `lh_stats`, `rh_stats`, `aseg_stats`, `talairach`, `recon_log`, `build_stamp`, `recon_log_lh`, `recon_log_rh`
-- `selection(subject_uid, stratum, reason, seed)`
-- `renders(subject_uid, config_hash, status, media_path, n_frames, rendered_at)`
+`catalog.sqlite` is SQLite through the standard library, with `PRAGMA user_version` migrations. A migration is one transaction, and each statement of a migration script ends at the end of a line. A local run uses the default rollback journal, because run directories on network file systems are common and SQLite's write-ahead log does not work there, with a busy timeout of 30 s on every connection. A census run uses the write-ahead log, with 60 s for writers and 5 s for read-only connections, and warns when its directory is on a network file system (detected on Linux only, from `/proc/mounts`). Every write is one short `BEGIN IMMEDIATE` transaction, so several processes can write to one catalog.
+
+Tables in `catalog.sqlite` (the DDL is migration 1 in `store.py`):
+
+- `meta(key, value)`: run id, mode, key kind and fingerprint, creation time, package version, later the template id; and the run secret.
+- `datasets(dataset_id, pseudonym, source, identity, accession, root, fs_root, template_location, layout, pipeline, pipeline_version, derivative_ref, snapshot_tag, n_subjects_listed, ..., discovered_at)`, unique on `(source, identity, pipeline)`; for a local source, one row with `root` set to the path.
+- `subjects(subject_uid, dataset_id, subject_label, participant, fs_dir, present, complete, tier_a, tier_b, missing_roles, problem, longitudinal, fs_build_stamp, fs_version, fs_major, recon_flags, n_invocations, recon_finished, t2pial, flairpial, hires, expert, xopts, edited, pial_variant, holes_lh, holes_rh, trunc_lh_1, trunc_lh_2, trunc_rh_1, trunc_rh_2, age, sex, field_strength, manufacturer, inventory_hash, inventoried_at)`. `complete` means every file a render needs is present; `tier_a` and `tier_b` that the stats files, and the thickness and `sphere.reg` files, are. `present = 0` marks a subject that the source no longer lists; its row, render and ratings stay.
+- `files(subject_uid, role, location, variant, size, etag_or_mtime, last_modified, version_id, sha256)` with roles `t1`, `brainmask`, `lh_white`, `rh_white`, `lh_pial`, `rh_pial`, `lh_thickness`, `rh_thickness`, `lh_sphere_reg`, `rh_sphere_reg`, `lh_annot`, `rh_annot`, `lh_stats`, `rh_stats`, `aseg_stats`, `talairach`, `recon_log`, `build_stamp`, `recon_log_lh`, `recon_log_rh`. `location` is relative to the subject directory, so the table holds no accession. `sha256` is set when a file was read in full (by a render).
+- `dataset_files(...)`: dataset-level files that a stored value was read from (`dataset_description.json`, `participants.tsv`, a T1w sidecar). Empty until milestone 5.
+- `templates(...)`: empty until milestone 3.
+- `work(phase, unit, config_hash, input_signature, status, reason, detail, output, surfcensus_version, finished_at)`: the ledger of every phase but inventory and render; a unit is a `subject_uid`, `dataset:<pseudonym>` or `run`.
+- `renders(subject_uid, config_hash, input_signature, tile_hash, render_key, video, status, reason, detail, media_path, n_frames, template_id, rendered_at)`
+- `selection(subject_uid, reason, stratum, inclusion_prob, seed)`
+
+What is private stays in the catalog and is reached only through `store.Catalog`, which `run.py`, `cli.py` and the inventory use: `dataset_id` (assigned in the order of the bucket listing), identity, accession, root, `fs_root`, template location, derivative ref and snapshot tag; `fs_dir`; file locations, sizes, ETags and digests; every input signature; the run secret; and in a census run the subject labels and every failure detail (a local run shows the details of its own renders). Three views (`public_datasets`, `public_subjects`, `public_files`) leave these out, and no frame that `store.PublicCatalog` returns holds any of them. It hands out an input signature only as a value to pass back for the skip test. Everything `PublicCatalog` returns is ordered by pseudonym or `subject_uid`, never by `dataset_id`.
+
+An input signature is 16 hex characters of the SHA-256 over role, location, size and ETag or modification time of the files a stage reads. It comes from the listing, so deciding to skip a unit opens no source file. The skip rule is the same in every phase: a unit is skipped when its row is `done`, its config hash and input signature are those of the present configuration and listing, and its output exists. A `failed` row that matches is not tried again unless `--retry-failed`; a changed configuration or input tries it again; `--force` ignores the row. Outputs are written first and the row last, so a crash leaves an output without a row, which the next run redoes, never a row without its output. The inventory has no ledger rows; its skip test is `subjects.inventory_hash`, the signature over all listed files of the subject.
 
 ## Testing
 
 - Unit tests on synthetic meshes (ellipsoids, and a folded closed surface that a slice crosses in several loops) for slicing, contour drawing, normals, pole finding and ROI construction.
 - Layout detection tests for the local source on fake directory trees (SUBJECTS_DIR, fMRIPrep old and new layouts, BIDS derivatives).
 - Golden-image tests for frame composition with a tolerance, using a tiny synthetic volume.
-- One network fixture: a single real subject from a small OpenNeuroDerivatives dataset, fetched once into a pytest cache, marked `network`. The same subject, copied locally, doubles as the end-to-end test of `surfcensus review --no-browser`.
+- Network fixtures, marked `network`: `ds000102` sub-01 (FreeSurfer 6.0.1; Tier A, B and C, 43 MB) and `ds003020` sub-UTS01 (FreeSurfer 7.3.2; Tier A, Tier C and thickness, 25 MB), each fetched once into the pytest cache. Linked into an fMRIPrep layout, they are the end-to-end test of inventory and render through `Run`, and later of `surfcensus review --no-browser`.
 - Property tests (hypothesis) for mesh-plane intersection: every segment endpoint lies on the plane and on a mesh edge.
 - Resampling tests: resampling fsaverage onto itself is the identity; a smooth field on a synthetic sphere survives resampling within tolerance; agreement with `mri_surf2surf` on the network fixture within a stated tolerance (run once by a developer with FreeSurfer, stored as a reference array).
 - Click round-trip tests: random voxels to panel pixels and back for every panel and slice in `render.json`; marks resolve to the expected vertex on a synthetic mesh.

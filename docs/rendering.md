@@ -121,7 +121,7 @@ A config that cannot be drawn raises `ValueError`: a colour that is not `#RRGGBB
 
 Every refusal happens before anything is written. The ffmpeg binary is looked for at that point too, when the video is asked for: it is used only after `render.json` has been removed and every tile written, so a render that found it missing then would leave a complete render incomplete. The check is that the file exists and may be executed; nothing is started, so a binary that exists and fails is still found only when the video is encoded, as a `RuntimeError`. That holds for a video target as well (`three_plane(subject, "x.mp4")`): no directory is created for a refused subject, and directories that the call created are removed again if the render fails later.
 
-The render config has two identities. `config_hash()` covers the schema number and every setting, and decides whether a directory holds the render that is asked for. `tile_hash()` covers only the settings that change a tile's pixels or geometry: the box, the margin, the slice step, the panel size, the two orientation switches, the contour colours and line width, the window percentiles, the brainmask dilation and the WebP quality. It has no schema number and no video, crosshair or vertex-map setting in it, so it stays the same when a render is only encoded again or its vertex map rewritten. It is not written to `render.json`. `privacy.render_key` combines it with the SHA-256 digests of the inputs under a per-run secret; a run is to store that key with each render and each rating (milestones 2 and 4), so that a rating stays with the tiles it was made on.
+The render config has two identities. `config_hash()` covers the schema number and every setting, and decides whether a directory holds the render that is asked for. `tile_hash()` covers only the settings that change a tile's pixels or geometry: the box, the margin, the slice step, the panel size, the two orientation switches, the contour colours and line width, the window percentiles, the brainmask dilation and the WebP quality. It has no schema number and no video, crosshair or vertex-map setting in it, so it stays the same when a render is only encoded again or its vertex map rewritten. It is not written to `render.json`. `privacy.render_key` combines it with the SHA-256 digests of the inputs under a per-run secret. A run stores that key with each render (`renders.render_key`) and, from milestone 4, with each rating, so that a rating stays with the tiles it was made on. A file that was only touched or moved keeps its key; changed content or a changed tile setting gives another.
 
 `render.json` is removed when rendering starts and written last, so its presence marks a complete render. Rendering into a directory that already holds a complete render of the same inputs (size and SHA-256), config and video setting does nothing. Otherwise the directory is rendered again and what the earlier render left is removed, by name: tiles named `<panel>_<number>.webp` or `<panel>_<number>_c.webp` that the new render does not list, with the number as the renderer writes it (ASCII digits, three of them, or more without a leading zero), and the temporary files (`.<name>.<16 hex digits>.tmp`, for the names a render writes) of a render that was killed. Only files and links are removed: a directory under such a name stays. Every other file in the directory is left alone, whatever its extension. All files are written to a temporary name and renamed into place.
 
@@ -133,6 +133,34 @@ Two renders into one directory run one after the other. A render holds an exclus
 
 `surfcensus render-subject` exits with status 1 and one line on stderr for a `RenderError` and for an output location that cannot be written. It refuses an empty `--out` (an unset shell variable), which as a path would be the current directory, and an `--out` in the subject directory, both as usage errors with status 2. It turns SIGTERM into an exit with status 143, so that a render stopped by a scheduler removes its temporary files as one stopped by Ctrl-C does.
 
+## FreeSurfer 7
+
+The renderer was run on one FreeSurfer 7.3.2 subject on 2026-11-12 (`ds003020` sub-UTS01 from OpenNeuroDerivatives, pial surfaces as `?h.pial.T1` only). `mri/T1.mgz` is 256³ at 1 mm and passes the orientation check; the default box gives 61, 54 and 61 slices; 156 of 176 tiles have contours; the render took 8.1 s without video and 6.3 MB. `render.json` records the pial inputs as `lh.pial.T1` and `rh.pial.T1`. On the poster frame, looked at once, the white and pial contours lie on the tissue boundaries. No frame was compared with Freeview, and no other FreeSurfer 7 subject was rendered.
+
+## Rendering a run
+
+`surfcensus render --run-dir DIR` and `Run.render()` render the subjects of a run into `media/<subject_uid>/` and record every outcome in the `renders` table of the catalog (`render/batch.py`).
+
+Which subjects: every complete present subject in a census run (`select.render_scope`, or `--all`); in a local run the selection, which is every complete present subject until a selection exists. Without an order given they go by pseudonym, then `subject_uid`.
+
+What is pending is decided from the catalog before any source file is opened. A subject is skipped when its row says `done` for the present render config, the same input signature (the listing of the files a render reads) and the same video setting, and `render.json` is on disk. A row that says `failed` for them is not tried again unless `--retry-failed`. `--force` renders over what is there. The rest is rendered batch by batch (`cache.batch_subjects`, 32 by default): the files of a batch are leased from the source, rendered in `--jobs` worker processes by `render_subject`, recorded in one transaction, and released. The files and rows are the same for one worker process and for several.
+
+Failures are recorded, not raised, and the batch goes on:
+
+- a `RenderError` with its reason (`missing surface`, `wrong orientation`, `render failure`);
+- `source changed` when a file differs in size or modification time from what the inventory listed; the next inventory picks the change up;
+- `render failure` with the type of the exception for anything else, a worker process that died included.
+
+The detail of a failure is stored after `privacy.scrub`, so it holds file names and no path. Every present subject that lacks a file a render cannot do without gets a `missing surface` row that names the roles, without its files being touched, so that it appears in review and export with its reason.
+
+What is wrong with the run and not with a subject stops the phase before anything is recorded against one (exit code 2): a video without an ffmpeg binary, a video with an odd panel size, a run directory inside a subject directory, a source that cannot be found.
+
+After a render the SHA-256 digests in `render.json` are copied to the catalog and the render key is stored with the row. The row is written after the files. A crash in between leaves a complete render without a row; the next call finds it complete, renders nothing and records it.
+
+A new local run renders without `anim.mp4` (`render_video` is false; `--video` turns it on and is remembered): the rater app plays the tiles.
+
+`surfcensus render --check-sample` supports the exit check of phase 6. It draws `ceil(fraction × n)` of the `n` done renders (2% by default) with a seed that it prints, and writes `logs/render-check-<seed>.txt` (the seed in the first line, then one `subject_uid` and poster path per line) and a page `logs/render-check-<seed>.html` that shows the posters.
+
 ## Optional views
 
 Neither is built yet; the patch-centred view needs the outlier clusters of milestone 3.
@@ -142,4 +170,4 @@ Neither is built yet; the patch-centred view needs the outlier clusters of miles
 
 ## Performance target
 
-About 176 tile pairs and 120 composite video frames per subject: target under 20 s per subject per core, excluding download. Measured on `ds000102` sub-01: 9 s on one core, of which WebP encoding takes about 3.4 s, the video 2.5 s and contour drawing 2 s. On a 32-core machine that is about 25 minutes per 5,000 subjects of compute, so download throughput will dominate.
+About 176 tile pairs and 120 composite video frames per subject: target under 20 s per subject per core, excluding download. Measured on `ds000102` sub-01: 9 s on one core, of which WebP encoding takes about 3.4 s, the video 2.5 s and contour drawing 2 s. Through a run, the two real subjects of the network tests took 9.0 s together without video in two worker processes and 17.5 s with video in one (2026-11-12, one machine). On a 32-core machine that is about 25 minutes per 5,000 subjects of compute, so download throughput will dominate.

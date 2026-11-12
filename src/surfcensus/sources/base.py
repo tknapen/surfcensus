@@ -165,6 +165,11 @@ class SourceError(Exception):
         self.reason = reason
         self.detail = detail
 
+    def __reduce__(self) -> tuple[type[SourceError], tuple[str, str]]:
+        # pickle would call __init__ with the one argument of Exception.args; workers of a
+        # process pool send their exceptions to the parent pickled
+        return type(self), (self.reason, self.detail)
+
 
 @runtime_checkable
 class Source(Protocol):

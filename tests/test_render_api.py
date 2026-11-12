@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1298,6 +1299,20 @@ def test_missing_roles_are_all_named(tmp_path: Path, subject_copy: Path) -> None
     with pytest.raises(RenderError, match=r"no file for lh_pial$"):
         render_subject(files, tmp_path / "media")
     assert not (tmp_path / "media").exists()
+
+
+@pytest.mark.parametrize("damage", ["missing white", "not LIA", "empty t1"])
+def test_a_render_error_has_its_reason_and_its_detail_apart(
+    subject_copy: Path, tmp_path: Path, damage: str
+) -> None:
+    """A run stores the two in separate columns of its ``renders`` table (render/batch.py)."""
+    change, reason, hint = DAMAGE[damage]
+    change(subject_copy)
+    with pytest.raises(RenderError) as raised:
+        render_subject(resolve_subject_files(subject_copy), tmp_path / "media", SMALL)
+    error = raised.value
+    assert error.reason == reason and re.search(hint, error.detail)
+    assert str(error) == f"{reason}: {error.detail}" and not error.detail.startswith(reason)
 
 
 def test_a_box_outside_the_volume_is_a_render_failure(

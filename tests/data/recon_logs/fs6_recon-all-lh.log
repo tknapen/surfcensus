@@ -1,0 +1,35 @@
+Thu Feb 10 09:23:38 UTC 2022
+/data/ds999999-fmriprep/sourcedata/freesurfer/sub-01
+/opt/freesurfer/bin/recon-all
+-autorecon-hemi lh -noparcstats -noparcstats2 -noparcstats3 -nohyporelabel -nobalabels -openmp 7 -subjid sub-01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer
+subjid sub-01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-Linux-centos6_x86_64-stable-pub-v6.0.1-f53a55a
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 1624 lines cut ...]
+125000 of 148332 vertices processed
+thickness calculation complete, 39:225 truncations.
+42393 vertices at 0 distance
+[... 247 lines cut ...]
+#@#%# recon-all-run-time-hours 1.074
+recon-all -s sub-01 finished without error at Thu Feb 10 10:28:03 UTC 2022
+[... 3 lines cut ...]
+New invocation of recon-all 
+
+
+
+Thu Feb 10 10:37:02 UTC 2022
+/data/ds999999-fmriprep/sourcedata/freesurfer/sub-01
+/opt/freesurfer/bin/recon-all
+-autorecon-hemi lh -nohyporelabel -openmp 7 -subjid sub-01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -notessellate -nosmooth1 -noinflate1 -noqsphere -nofix -nowhite -nosmooth2 -noinflate2 -nocurvHK -nocurvstats -nosphere -nosurfreg -nojacobian_white -noavgcurv -nocortparc -nopial -nocortparc2 -nocortparc3 -nopctsurfcon
+subjid sub-01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-Linux-centos6_x86_64-stable-pub-v6.0.1-f53a55a
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 1821 lines cut ...]
+#@#%# recon-all-run-time-hours 0.091
+recon-all -s sub-01 finished without error at Thu Feb 10 10:42:28 UTC 2022

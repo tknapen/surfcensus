@@ -113,6 +113,95 @@ Added in the verification of the review fixes (2026-11-12). Independent checks o
 - Two tests did not fail when the thing they are named for was removed. The test for negative zeros had no case with a shift of zero; a case with a tile edge on voxel coordinate 0 was added (the default box around x = 88 in a conformed volume). The test of a schema 1 render used a `render.json` that does not load under the present model, so it was rendered again whatever the version logic did; it now also runs on files that load, with the version number of schema 1, with its config hash, and with both. Each new and each changed test of this round was run against a copy of the package with its fix undone, and fails there.
 - `docs/dev/contract.md` was corrected where it described the working tree or the other documents wrongly.
 
+D20 (2026-11-12). The privacy boundary of D10 is built into what code can reach, not left to convention. Implementation, milestone 2:
+
+- Private values exist only in `catalog.sqlite` and are read only through `store.Catalog`, which `run.py`, `cli.py` and the inventory use: accessions, roots and identities, `dataset_id` (assigned in the order of the bucket listing), file locations, sizes, ETags and digests, input signatures, failure details, the run secret, and in a census run the subject labels. Code downstream of the inventory gets a `store.PublicCatalog`, which returns none of these, inside a `records.RunContext`; a phase function never receives the `Run`.
+- No unkeyed hash of public bucket metadata leaves the catalog. An input signature is a plain hash of sizes and ETags, so it stays inside. What identifies a render elsewhere is `render_key`, an HMAC under a per-run secret of 32 random bytes (`meta.run_secret`) over the tile settings and the SHA-256 digests of the files read. Cache names are keyed the same way.
+- `config.yaml` of a census run holds no path and no accession: a local source in it is stored by its pseudonym, and its root is in the catalog.
+- The text of a failure that is recorded (a row, a report note, a log line) passes through `privacy.scrub` first: dataset roots, absolute paths, accessions and, in a census run, subject labels are taken out. A configuration error that stops a command is printed as it is, on the terminal of whoever ran it.
+- Everything written or returned outside the catalog is ordered by pseudonym or `subject_uid`, never by `dataset_id`.
+
+- A test reads the source of the downstream packages (`metrics/`, `render/`, `app/`, `export/`, `select/`, `reference/`, `calibration.py`; today only `render/` exists) and fails on an import of the private catalog, of `run.py` or of the reveal path, on an attribute named `_catalog`, and on the string literals `accession` and `dataset_id`.
+
+Reason: a rule that every module must remember fails at the first module that forgets. Not yet built: the canary run on a fake bucket dataset, which needs the remote source of milestone 5, and the reveal path.
+
+D21 (2026-11-12). One skip rule for every phase, decided from the listing. A unit is skipped when its row says `done`, its config hash and input signature are those of the present configuration and listing, and its output exists. A failed unit with the same hashes is not tried again unless `--retry-failed`; `--force` ignores the row. The input signature is computed from role, location, size and ETag or modification time, so the decision opens no source file. Outputs are written before the row, so a crash never leaves a row without its output. Rows live in the `work` ledger (keyed by phase and unit) and, for renders, in `renders`. Reasons: a phase that is interrupted or run twice redoes nothing that is done, and a census can be resumed per dataset. Consequences worked out in milestone 2:
+
+- The inventory has no ledger rows; its skip test is `subjects.inventory_hash`, the signature over all listed files with the inventory stage hash. Two cases add lines to that hash: a directory that could not be listed adds its problem text, and a subject whose build stamp, log or stats file could not be read gets a marker that no listing gives, so the next inventory reads it again. An unread Tier A file is not a failed unit. A dataset whose subjects cannot be listed is a failed unit `dataset:<pseudonym>`; its subjects are not marked absent, and the detail is in the report notes and the log only.
+- Frames from the catalog and from `read_table` have fixed column types whatever the rows hold: text is `object` with None, a flag that may be unknown is pandas `boolean`, an integer that may be missing a pandas nullable integer. Parquet tables are sorted by their key and then by the remaining columns, and a NaN is written as a missing value, so the bytes of a table depend on its set of rows and the locked pyarrow only. Checked on Python 3.11 and 3.13 on one machine.
+- `Catalog.mark_absent` sets `present` from the listing in both directions. `Catalog.relocate` refuses data of another pipeline, because the pipeline is hashed into `subject_uid`. A dataset never changes its pseudonym: a different one for a stored dataset is treated as a wrong key.
+
+D23 (2026-11-12). The three recon-all logs are part of Tier A and are read whole by default (`inventory.logs = "full"`). Reason: under fMRIPrep the flags are spread over the invocations of three logs, of which the first 64 kB of `recon-all.log` show 2 of 4 (FreeSurfer 6.0.1) or 2 of 5 (7.3.2); the thickness truncation counts are in the per-hemisphere logs only; and the closing line is at the end. Seen on one subject of each version (`data_sources.md`). Cost: 0.7 to 1.0 MB per subject, instead of about 90 kB for the stats files, the build stamp and the first 64 kB of one log. `inventory.logs = "head"` remains, and then stores what the head does not show as unknown.
+
+D29 (2026-11-12). Choices made while building milestone 2 (local source, config, catalog, inventory, `Run`, the `inventory`, `render` and `status` commands), with their reasons. The numbers D22 and D24 to D28 are held for decisions that land with milestones 3 to 5 (`docs/dev/contract.md`, section 10). Where a choice departs from that contract, it says so.
+
+Decisions taken for this build, from the contract's list of questions for Tomas: no fsaverage-derived file ships in the wheel (the condition of D14 is not met); a local run renders without video unless `--video` (`render_video` is false in a new local run), since the rater app plays tiles and the video costs 2.5 of 9 s and 4.3 of 10.2 MB per subject; the embedded-derivatives source is deferred (O9).
+
+Local source.
+
+- A path that is not a directory is `SourceError("not found")`, one that cannot be listed is `unreadable`; `layout` means a readable directory without subjects. The contract named only `layout`.
+- A subject glob that matches nothing is reported when the subjects are listed, not when the source is built, so a run whose stored glob no longer matches can still be opened. The command line checks a glob before it creates a run or stores the glob.
+- One subject directory as path: the source is its parent restricted to that name. Globs given as well must match the name.
+- `template_location` is recorded when an `fsaverage` directory exists next to the subjects, also when it lacks template files, so the template lookup can name what is missing; `template_dir()` returns it only when all eight files are present. `template_files_missing()` and `LocalSource.subjects_dir` were added.
+- A subject directory reached through a link keeps the link's name as its label. A folder named `fmriprep` next to `freesurfer/` is recognised by the name as given and by the name of what it links to.
+- Paths are built from the source's own root, not from the root in a record, so a record from a catalog that still names an earlier place is served from where the data is. `FileRef.variant` is set only for roles with several candidate names. A local source ignores the `only` argument of `datasets()`.
+- `read_bytes` raises `not found` for a role the subject lacks, `changed` for a file that is gone or differs from the listing, `unreadable` for one that cannot be opened; the detail holds the location relative to the subject, never an absolute path. Modification times are compared in nanoseconds. Run on one Linux file system only.
+
+Provenance. The rules were fixed on the logs of two real subjects and on `scripts/recon-all` at v6.0.0 and v7.4.1 (`data_sources.md`); excerpts of the six logs, with directory names, accession and host replaced, are test data.
+
+- Flag names: besides tokens of the form `-name`, `-3T` and `-3t` are kept (real flags, the only ones that start with a digit), and a flag-shaped token that contains an accession is dropped.
+- T2pial, FLAIRpial and hires use the spellings that recon-all's argument parser takes (`-T2pial`, `-t2pial`, `-T2pial-only`, `-autorecon3-T2pial`; off: `-noT2pial`, `-no-T2pial`, `-no_T2pial` and the lower-case forms; likewise FLAIR; `-hires`, `-highres`). recon-all has no flag that clears `-hires`.
+- `finished` is the verdict of the last invocation, not of the last verdict line in the file: a log whose last invocation was killed is not finished.
+- A flag is stored as false only when the logs can show it (every log the subject has was read in full, and an invocation was found); otherwise an unseen flag is unknown. The contract had unknown only for "no log read".
+- A bare carriage return ends a line (the logs hold progress output). Numbers in the patterns are bounded in length, because nothing in this module may raise on any text. With a partial text, a last line without a line end is ignored.
+- The version comes from the build stamp file, else from the stamp line of `recon-all.log`, also when the file's stamp holds no version. Holes come from `recon-all.log`, else from a per-hemisphere log.
+- The contract's statement that the 7.3.2 log does not separate invocations was wrong: it writes `#New# invocation of recon-all`.
+- Not checked: a log of a plain `recon-all -all` run; which of the two truncation counts is white-to-pial; where `-T2pial` appears when a T2 was used; `-autorecon2-pial`, which is in neither version read and is kept as an edit flag from memory.
+
+Catalog.
+
+- Beside the methods of the contract, `Catalog` has `query`, `pseudonym` and `scrub_terms`, and the module has `media_dir`, `table_path`, `part_path` and a `schema` argument on the part functions (the intensity table of a run with other depths has its own schema).
+- `upsert_dataset` keeps a stored derivative ref, snapshot tag and subject count when given None. `upsert_subject` keeps the digest of a file whose location, size and ETag are unchanged, stores `recon_flags` as NULL when no log was read, and raises `ConfigError("invalid")` on a collision of two subjects on one `subject_uid` and `ConfigError("key")` when a subject is stored under another one.
+- `PublicCatalog.meta` raises for a key that is not public, so a request for the run secret is loud. `Catalog.set_meta` refuses to change what identifies the run.
+- `Catalog.failures` also lists unreadable subjects (phase `inventory`) and failed renders (phase `render`).
+- A migration is split into statements by line and run in one transaction; `executescript` would commit on its own.
+- One connection per catalog, usable from several threads behind a lock (the rater app answers from a thread pool). Methods cannot be called inside an open `write()` block.
+- Not checked: write-ahead mode on a real network file system; the list of file system types treated as network mounts is from memory; the two-process write test ran on one local disk.
+
+Batches.
+
+- An exception comes back from a worker process as an instance of its own class. The package's error classes take `(reason, detail)`, and pickle could not read them back: a process pool that received one was broken for the whole batch (seen with `SourceError` on Python 3.13). `run_batches` carries exceptions as class, arguments and attributes, and `SourceError`, `ConfigError` and `RenderError` now also pickle on their own. An exception that cannot be sent arrives as `batches.WorkerError`.
+- A subject whose worker process dies gets `BrokenProcessPool`; the subjects lost with it are run again one at a time, so a work function must be safe to repeat.
+- Workers ignore SIGINT: on Ctrl-C the parent waits for running work, releases the leases and stops, and the interrupted batch is not committed.
+- Log records of the package logger made in a worker are logged in the parent when the subject finishes, so a filter on the package logger sees them. The progress bar is drawn only when stderr is a terminal.
+- A work function that cannot be pickled is a `TypeError` before anything is leased.
+
+Inventory. See D21 for the hash. Also: a listed subject with a problem is a failed unit whether it was stored now or skipped, so a second run reports the same count; a pseudonym in `--dataset` that no source yields is a failed unit; two sources that yield the same dataset are refused; `field_strength` of a source is written to the listed subjects, also to skipped ones, so a changed `--field-strength` needs no `--force`. `dataset_files` is not written yet. Behaviour with a remote source is tested only with a local source posing as one.
+
+Rendering a run (`render/batch.py`).
+
+- `run_render` has no `template` argument yet; milestone 3 adds it with `templates.py`. `RenderError` gained `detail`, since a run stores reason and detail in separate columns.
+- Refused before anything is recorded against a subject (`ConfigError`): a video without an ffmpeg binary, a video with an odd `panel_px`, a `subject_uid` the run does not have, and a run directory inside a subject directory.
+- A render that is complete on disk and has no row (a crash between the files and the row) is found complete by `render_subject`, which does nothing, and is then recorded.
+- `render_status` says what a call would find now (done, failed, pending) without rendering; `surfcensus status` uses it. It was split off from `run_render` so that the two cannot disagree.
+- The check sample is drawn from the sorted `subject_uid`s of the done renders; the text file names the seed in its first line. It is written to `logs/` in a local run as well.
+
+`Run` and the command line.
+
+- `relocate` is a flag or the pseudonym of the dataset that moved (the contract had a flag and left the pseudonym to the command line). It replaces the root alone; the stored subject globs and field strength stay. A source given on opening whose root matches a stored one replaces that source's globs and field strength: from Python the source given is the truth. On the command line `--source` on an existing local run only says which source is meant, and `--subjects` and `--field-strength` change the stored values.
+- `identity` of a local source is fixed when the run is created, not at the first inventory; the two differ only if the data moves in between.
+- Sources are built when a phase first needs them, so `status` works on a run whose data is not mounted. A source that cannot be built stops `inventory` and `render` with exit code 2 before anything is recorded: a missing disk is not a property of its subjects.
+- A run is created only in a new or empty directory. A run directory inside the subjects directory is refused, also for one subject directory as path, whose subjects directory is its parent. A run directory beside the subjects directory inside an fMRIPrep or derivatives folder is allowed.
+- A `config` given on opening replaces the stored one when it is of the same run (mode and identity); this is how stored options are changed. `config.with_changes` validates a changed configuration as a whole. `from_config` takes `root` and `identity` from its caller when given, because a census run stores neither for a local source.
+- A census run can be created from Python with the dataset key, with local sources or none, and opened without the key; its `inventory` needs the key. No command creates one before milestone 5.
+- In a local run `Run.render(subjects=...)` accepts labels as well as `subject_uid`s.
+- `--relocate [PSEUDONYM]` takes an optional value, which typer cannot declare; the command rewrites a bare `--relocate` before parsing.
+- `status` prints done and failed for the inventory and no pending count, which the catalog cannot know without listing the source; for the render, pending is what `render` would do now. It always ends with 0.
+- A phase command stopped by Ctrl-C ends with 130, not with the 1 that means failed units.
+- Summary lines name subjects by label in a local run and by `subject_uid` in a census run.
+
+Checked on real data (2026-11-12). Both subjects of the network tests, linked into one fMRIPrep layout in a scratch directory: `inventory` took under 0.1 s for the two (whole logs, local files) and gave FreeSurfer 6.0.1 and 7.3.2, 8 and 9 invocations over three logs, truncations 39:225 and 93:434, and 22:230 and 23:325; `render --jobs 2` took 9.0 s without video and `render --video` 17.5 s on one core; second calls did nothing; the source files had the same sizes and modification times afterwards. The FreeSurfer 7.3.2 subject is the first of that version that the renderer was run on: 8.1 s, 6.3 MB, contours on 156 of 176 tiles, and one poster frame that an agent looked at showed white and pial contours on the tissue boundaries. That is not the comparison with Freeview.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.
@@ -121,7 +210,7 @@ O2. When and how to reveal dataset identities. D10 settles the default (pseudony
 
 O12. Licence for released ratings (CC0 proposed in `phases.md`). The code licence is settled in D17.
 
-O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject, and clamped in the source of `MRISmeasureCorticalThickness` at v6.0.0, v7.0.0 and v7.4.1 (see `metrics.md`). No FreeSurfer 7 data inspected yet.
+O3. How over-maximum thickness is stored (clamped or zeroed). Decided by phase 0 inspection; changes metric definitions. Evidence so far (2026-11-12): clamped at 5.0 in one FreeSurfer 6.0.1 subject and in one FreeSurfer 7.3.2 subject (`ds003020` sub-UTS01: the maximum of `lh.thickness` and of `rh.thickness` is exactly 5.0; zeros were not counted there), and clamped in the source of `MRISmeasureCorticalThickness` at v6.0.0, v7.0.0 and v7.4.1 (see `metrics.md`). No known-bad subject inspected yet.
 
 O4. Whether the view box scales with brain size. Decided by pilot renders on atypical brains.
 
@@ -138,3 +227,11 @@ O7. Whether the normative reference ships in the first release or waits for cens
 O8. Hosting for the team app and media (lab server at the Spinoza Centre or VU, or a cloud VM and bucket).
 
 O9. Whether to include the embedded-derivatives source in the first paper or defer it. It is more work (heterogeneous paths) and answers a secondary question.
+
+O13. Whether the truncation counts of the thickness measurement enter the composite score. Default: stored per subject (`trunc_lh_1` to `trunc_rh_2`), used as a baseline in the detectability analysis, not a component. The cost of reading the logs whole is settled in D23.
+
+O14. Unit of analysis when a dataset has several FreeSurfer directories per participant (sessions, `*.long.*`). Default in force: every directory is a subject; the participant label is stored so the analysis can cluster on it; longitudinal directories are flagged, not excluded.
+
+O15. Whether the census renders every complete subject or only the rating sample. Default in force: every one (`select.render_scope = "all"`), as `phases.md` says; `"selected"` renders the sample only.
+
+O16. Local `review`: whether `anim.mp4` is rendered and when the app opens. Default in force for the video: off unless `--video` (D29). When the app opens is decided with milestone 4.

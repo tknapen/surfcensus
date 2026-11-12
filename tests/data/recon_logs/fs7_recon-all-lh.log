@@ -1,0 +1,39 @@
+
+Sat Apr 22 05:00:06 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -autorecon-hemi lh -noparcstats -noparcstats2 -noparcstats3 -nohyporelabel -nobalabels -lh-only -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 2276 lines cut ...]
+125000 of 131402 vertices processed
+thickness calculation complete, 22:230 truncations.
+56322 vertices at 0 distance
+[... 272 lines cut ...]
+#@#%# recon-all-run-time-hours 0.361
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 05:21:45 UTC 2023
+[... 3 lines cut ...]
+#New# invocation of recon-all 
+
+
+
+
+Sat Apr 22 05:37:57 UTC 2023
+cd /data/ds999999-fmriprep/sourcedata/freesurfer/sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+/opt/freesurfer/bin/recon-all -autorecon-hemi lh -nohyporelabel -lh-only -openmp 7 -subjid sub-UTS01 -sd /data/ds999999-fmriprep/sourcedata/freesurfer -notessellate -nosmooth1 -noinflate1 -noqsphere -nofix -nowhite -nosmooth2 -noinflate2 -nocurvHK -nocurvstats -nosphere -nosurfreg -nojacobian_white -noavgcurv -nocortparc -nopial -nocortparc2 -nocortparc3 -nopctsurfcon
+
+subjid sub-UTS01
+setenv SUBJECTS_DIR /data/ds999999-fmriprep/sourcedata/freesurfer
+FREESURFER_HOME /opt/freesurfer
+Actual FREESURFER_HOME /opt/freesurfer
+build-stamp.txt: freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275
+Linux HOST 3.10.0-1160.45.1.el7.x86_64 #1 SMP Wed Oct 13 17:20:51 UTC 2021 x86_64 x86_64 x86_64 GNU/Linux
+[... 2165 lines cut ...]
+#@#%# recon-all-run-time-hours 0.059
+recon-all -s sub-UTS01 finished without error at Sat Apr 22 05:41:30 UTC 2023

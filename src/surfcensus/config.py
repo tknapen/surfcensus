@@ -39,6 +39,10 @@ class ConfigError(Exception):
         self.reason = reason
         self.detail = detail
 
+    def __reduce__(self) -> tuple[type[ConfigError], tuple[str, str]]:
+        # pickle would call __init__ with the one argument of Exception.args
+        return type(self), (self.reason, self.detail)
+
 
 class SourceConfig(_Frozen):
     """A source as a run stores it; ``run.from_config`` builds the source from it."""
@@ -312,6 +316,17 @@ def new_census_config(key: HashKey, **overrides: object) -> RunConfig:
         "app": AppConfig(raters_per_subject=2, repeat_rate=0.05, queue_seed=_queue_seed()),
     }
     return _build(defaults, overrides)
+
+
+def with_changes(config: RunConfig, **changes: object) -> RunConfig:
+    """``config`` with fields of :class:`RunConfig` replaced, validated as a whole again.
+
+    Raises ``ConfigError("invalid", ...)`` when the result is not a configuration.
+    """
+    try:
+        return RunConfig.model_validate(config.model_dump() | changes)
+    except ValidationError as exc:
+        raise ConfigError("invalid", _validation_detail(exc)) from exc
 
 
 def _validation_detail(exc: ValidationError) -> str:

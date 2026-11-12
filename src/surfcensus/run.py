@@ -1,42 +1,79 @@
 """A run: a run directory, its sources and the phases that fill it.
 
-``Run`` is the Python API of docs/architecture.md; the CLI is a thin layer over it. It only
-delegates: each method imports the phase it calls. ``from_config`` is complete; the body of
-``Run`` is written in the last step of milestone 2 (work package 2.Z), and the metrics
-methods in milestone 3.
+``Run`` is the Python API of docs/architecture.md; the CLI is a thin layer over it. It holds
+the configuration, the private catalog and the sources, and only delegates: each phase
+method imports the phase it calls and hands it the public side of the run
+(``records.RunContext``), never the run itself. The metrics methods arrive in milestone 3.
 """
 
 from __future__ import annotations
 
-from collections.abc import Collection, Sequence
+import os
+from collections.abc import Collection, Mapping, Sequence
+from contextlib import AbstractContextManager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from surfcensus.config import ConfigError, RunConfig, SourceConfig
+from surfcensus import privacy
+from surfcensus.config import (
+    CONFIG_FILE,
+    ConfigError,
+    RunConfig,
+    SourceConfig,
+    load_config,
+    new_census_config,
+    new_local_config,
+    run_key,
+    with_changes,
+    write_config,
+)
 from surfcensus.privacy import HashKey
 from surfcensus.records import PhaseReport, RunContext
-from surfcensus.sources.base import Source
+from surfcensus.sources.base import DatasetRecord, FileRole, Source, SourceError
+from surfcensus.store import CATALOG_FILE, Catalog, PublicCatalog, media_dir
 
 if TYPE_CHECKING:
     import httpx
     import pandas as pd
 
-    from surfcensus.store import PublicCatalog
-
 METRIC_STAGES: tuple[str, ...] = ("regional", "fsaverage", "reference", "score")
 
-_PACKAGE = "work package 2.Z (run.py)"
 _METRICS = "metrics arrive in milestone 3"
+
+
+@dataclass(frozen=True)
+class _StoredLocal:
+    """A local source as the run holds it."""
+
+    index: int
+    """Position in ``config.sources``."""
+    root: str
+    identity: str
+    pseudonym: str
 
 
 class Run:
     """``Run(run_dir, source)`` creates a run; ``Run(run_dir)`` opens an existing one.
 
-    Creating: ``config.yaml`` (a local run gets a new salt, each source contributes its
-    ``config()``) and the catalog with its run secret; a census run requires ``key``.
-    Opening rebuilds the sources from ``config.yaml``. A local source whose root matches no
-    stored one raises ``ConfigError("other root", ...)`` unless ``relocate``, which replaces
-    the stored root and keeps every ``subject_uid``.
+    Creating, in a directory that is empty or absent: ``config.yaml`` and the catalog with
+    its run secret. A local run gets a new salt; a census run is created with the dataset
+    key as ``key`` and stores its fingerprint only. ``config`` is the configuration to
+    start from (``config.new_local_config``); its sources are replaced by those given.
+
+    Opening needs no key, also for a census run; ``Run.inventory`` of a census run does.
+    The sources are rebuilt from ``config.yaml`` when a phase first needs them, so a run
+    whose data is not mounted can still be opened. A ``source`` given on opening is matched
+    to a stored one by kind and, for a local source, by root; its subject globs and field
+    strength then replace the stored ones. A local source whose root matches none raises
+    ``ConfigError("other root", ...)``, unless ``relocate``: then the stored root of the
+    run's one local source is replaced by the root of the source given, and nothing else
+    of it, and every ``subject_uid`` stays as it was. With several local sources
+    ``relocate`` is the pseudonym of the dataset that moved. A ``config`` given on opening
+    replaces the stored one; it must be of the same run (same mode and identity).
+
+    A run directory inside the subjects directory of a local source is refused
+    (``ConfigError("invalid", ...)``): a source is only read.
     """
 
     run_dir: Path
@@ -49,16 +86,330 @@ class Run:
         *,
         config: RunConfig | None = None,
         key: HashKey | None = None,
-        relocate: bool = False,
+        relocate: bool | str = False,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        raise NotImplementedError(_PACKAGE)
+        self.run_dir = Path(run_dir)
+        self._key = key
+        self._transport = transport
+        self._built: dict[int, Source] = {}
+        if source is None:
+            given: tuple[Source, ...] = ()
+        elif isinstance(source, Sequence):
+            given = tuple(source)
+        else:
+            given = (source,)
+        if (self.run_dir / CONFIG_FILE).is_file():
+            self._open(given, config, relocate)
+        else:
+            if relocate:
+                raise ConfigError("missing", f"{self.run_dir} holds no run to relocate")
+            self._create(given, config)
+
+    # creating and opening
+
+    def _create(self, given: tuple[Source, ...], config: RunConfig | None) -> None:
+        key = self._key
+        census = config.mode == "census" if config is not None else key is not None
+        if not census and key is not None:
+            raise ConfigError("key", "a local run draws its own salt; a key is for a census run")
+        if not census and not given and (config is None or not config.sources):
+            raise ConfigError(
+                "missing", f"{self.run_dir} holds no run; give a source to create one"
+            )
+        try:
+            occupied = sorted(n for n in os.listdir(self.run_dir) if not n.startswith("."))
+        except FileNotFoundError:
+            occupied = []
+        except NotADirectoryError:
+            raise ConfigError("invalid", f"{self.run_dir} is not a directory") from None
+        if occupied:
+            raise ConfigError(
+                "invalid",
+                f"{self.run_dir} holds no run and is not empty ({occupied[0]}, ...); a run is "
+                "created in a new or empty directory",
+            )
+
+        if census:
+            if key is None:
+                raise ConfigError("key", "a census run is created with the dataset key")
+            base = config if config is not None else new_census_config(key)
+            hash_key = run_key(base, key)
+            if config is not None and config.sources and not given:
+                raise ConfigError(
+                    "invalid", "the sources of a new census run are given as sources, not stored"
+                )
+        else:
+            if not given:
+                assert config is not None  # checked above
+                given = tuple(
+                    from_config(stored, config, self.run_dir, transport=self._transport)
+                    for stored in config.sources
+                )
+            base = config if config is not None else new_local_config(given[0].config().root or ".")
+            hash_key = run_key(base)
+        stored = []
+        for source in given:
+            self._refuse_inside(source)
+            described = source.config()
+            if census and described.kind == "local":
+                assert described.identity is not None  # a source knows its identity
+                described = SourceConfig(
+                    kind="local",
+                    dataset=privacy.dataset_pseudonym(hash_key, "local", described.identity),
+                    subjects=described.subjects,
+                    field_strength=described.field_strength,
+                )
+            stored.append(described)
+        if len(set(stored)) != len(stored):
+            raise ConfigError("invalid", "the same source was given twice")
+        self.config = with_changes(base, sources=tuple(stored))
+
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        write_config(self.run_dir, self.config)
+        self._catalog = Catalog.create(
+            self.run_dir / CATALOG_FILE, mode=self.config.mode, key=hash_key
+        )
+        for index, (source, described) in enumerate(zip(given, stored, strict=True)):
+            self._built[index] = source
+            if census and described.kind == "local":
+                # the root of a local source of a census run is in the catalog only
+                assert described.dataset is not None
+                for dataset in source.datasets():
+                    self._catalog.upsert_dataset(dataset, described.dataset, None)
+
+    def _open(
+        self, given: tuple[Source, ...], config: RunConfig | None, relocate: bool | str
+    ) -> None:
+        stored = load_config(self.run_dir)
+        if config is not None and (config.mode, config.identity) != (stored.mode, stored.identity):
+            raise ConfigError(
+                "invalid",
+                f"the configuration given is not of the run in {self.run_dir}: its mode or "
+                "identity differs",
+            )
+        self.config = config if config is not None else stored
+        if self.config.mode == "local" and self._key is not None:
+            raise ConfigError("key", "a local run is keyed with its own salt, not with a key")
+        self._catalog = self._open_catalog()
+        try:
+            if relocate and not given:
+                raise ConfigError("invalid", "to relocate, give the source at its new place")
+            for source in given:
+                self._adopt(source, relocate)
+            if self.config != stored:
+                write_config(self.run_dir, self.config)
+        except BaseException:
+            self._catalog.close()
+            raise
+
+    def _open_catalog(self) -> Catalog:
+        path = self.run_dir / CATALOG_FILE
+        identity = self.config.identity
+        if not path.is_file():
+            # a run whose creation stopped between its two files
+            if self.config.mode == "census" and self._key is None:
+                raise ConfigError(
+                    "key", f"{self.run_dir} has no {CATALOG_FILE}; making it needs the key"
+                )
+            return Catalog.create(path, mode=self.config.mode, key=run_key(self.config, self._key))
+        catalog = Catalog(path)
+        found = (catalog.meta("mode"), catalog.meta("key_fingerprint"))
+        if found != (self.config.mode, identity.key_fingerprint):
+            catalog.close()
+            raise ConfigError(
+                "invalid",
+                f"{CONFIG_FILE} and {CATALOG_FILE} in {self.run_dir} are of different runs",
+            )
+        return catalog
+
+    def _stored_locals(self) -> list[_StoredLocal]:
+        """The local sources of the run with where the run believes them to be."""
+        found = []
+        for index, stored in enumerate(self.config.sources):
+            if stored.kind != "local":
+                continue
+            if self.config.mode == "local":
+                assert stored.root is not None  # RunConfig checks it
+                identity = stored.identity or stored.root
+                pseudonym = privacy.dataset_pseudonym(run_key(self.config), "local", identity)
+                found.append(_StoredLocal(index, stored.root, identity, pseudonym))
+                continue
+            rows = self._catalog.query(
+                "SELECT root, identity FROM datasets WHERE source = 'local' AND pseudonym = ?",
+                (stored.dataset,),
+            )
+            if not rows:
+                raise ConfigError(
+                    "invalid", f"the catalog has no dataset {stored.dataset} of {CONFIG_FILE}"
+                )
+            assert stored.dataset is not None  # RunConfig checks it
+            found.append(_StoredLocal(index, rows[0]["root"], rows[0]["identity"], stored.dataset))
+        return found
+
+    def _adopt(self, source: Source, relocate: bool | str) -> None:
+        """Match a source given on opening to a stored one and take over what it says."""
+        described = source.config()
+        if described.kind != "local":
+            matches = [i for i, s in enumerate(self.config.sources) if s == described]
+            if not matches:
+                raise ConfigError("invalid", f"this run has no such {described.kind} source")
+            self._built[matches[0]] = source
+            return
+        locals_ = self._stored_locals()
+        match = next((s for s in locals_ if s.root == described.root), None)
+        moved = match is None
+        if match is None:
+            match = self._relocation_target(locals_, relocate)
+        current = self.config.sources[match.index]
+        # on a move the root alone changes; the subject set and field strength stay as stored
+        subjects = current.subjects if moved else described.subjects
+        field_strength = current.field_strength if moved else described.field_strength
+        if self.config.mode == "local":
+            updated = SourceConfig(
+                kind="local",
+                root=described.root,
+                identity=match.identity,
+                subjects=subjects,
+                field_strength=field_strength,
+            )
+        else:
+            updated = SourceConfig(
+                kind="local",
+                dataset=match.pseudonym,
+                subjects=subjects,
+                field_strength=field_strength,
+            )
+        if updated != current:
+            sources = list(self.config.sources)
+            sources[match.index] = updated
+            self.config = with_changes(self.config, sources=tuple(sources))
+        if (described.identity, described.subjects, described.field_strength) == (
+            match.identity,
+            subjects,
+            field_strength,
+        ):
+            self._refuse_inside(source)
+            self._built[match.index] = source
+        else:  # the source given is not the one to use: rebuild it as the run stores it
+            self._built.pop(match.index, None)
+            source = self._source(match.index, root=described.root)
+        if moved:
+            rows = self._catalog.query(
+                "SELECT dataset_id FROM datasets WHERE source = 'local' AND identity = ?",
+                (match.identity,),
+            )
+            for dataset in source.datasets():
+                for row in rows:
+                    self._catalog.relocate(row["dataset_id"], dataset)
+
+    def _relocation_target(
+        self, locals_: Sequence[_StoredLocal], relocate: bool | str
+    ) -> _StoredLocal:
+        if not locals_:
+            raise ConfigError("invalid", "this run has no local source")
+        if not relocate:
+            # a census run keeps its roots out of sight: name its datasets by pseudonym
+            local = self.config.mode == "local"
+            old = ", ".join(s.root if local else s.pseudonym for s in locals_)
+            raise ConfigError(
+                "other root",
+                f"this run directory belongs to {old}; pass --run-dir for a new run, or "
+                "--relocate if the data moved",
+            )
+        if isinstance(relocate, str):
+            named = [s for s in locals_ if s.pseudonym == relocate]
+            if not named:
+                raise ConfigError("invalid", f"this run has no local dataset {relocate}")
+            return named[0]
+        if len(locals_) > 1:
+            names = ", ".join(sorted(s.pseudonym for s in locals_))
+            raise ConfigError(
+                "invalid",
+                f"this run has {len(locals_)} local sources ({names}); say which one moved: "
+                "--relocate D-xxxxxxxx",
+            )
+        return locals_[0]
+
+    def _refuse_inside(self, source: Source) -> None:
+        subjects_dir = getattr(source, "subjects_dir", None)
+        if not isinstance(subjects_dir, Path):
+            return
+        if self.run_dir.resolve().is_relative_to(subjects_dir.resolve()):
+            raise ConfigError(
+                "invalid",
+                f"the run directory {self.run_dir} lies inside the subjects directory "
+                f"{subjects_dir}, which is only read; choose a run directory outside it",
+            )
+
+    # sources
+
+    def _source(self, index: int, *, root: str | None = None) -> Source:
+        """The source of ``config.sources[index]``, built on first use."""
+        if index not in self._built:
+            stored = self.config.sources[index]
+            identity = None
+            if stored.kind == "local":
+                local = next(s for s in self._stored_locals() if s.index == index)
+                root, identity = root or local.root, local.identity
+            source = from_config(
+                stored,
+                self.config,
+                self.run_dir,
+                root=root,
+                identity=identity,
+                transport=self._transport,
+            )
+            self._refuse_inside(source)
+            self._built[index] = source
+        return self._built[index]
+
+    def _sources(self) -> list[Source]:
+        """Every source of the run. Raises ``SourceError`` when one cannot be built, for
+        example because its root is gone."""
+        return [self._source(index) for index in range(len(self.config.sources))]
+
+    def _source_of(self, dataset: DatasetRecord) -> Source:
+        for source in self._sources():
+            if source.kind != dataset.source:
+                continue
+            if source.kind != "local" or source.config().identity == dataset.identity:
+                return source
+        raise SourceError("not found", "no source of this run holds the subject's dataset")
+
+    def _lease(
+        self, subject_uid: str, roles: Collection[FileRole]
+    ) -> AbstractContextManager[Mapping[FileRole, Path]]:
+        record = self._catalog.subject_record(subject_uid)
+        return self._source_of(record.dataset).lease(record, roles)
+
+    def _pseudonyms(self, datasets: Collection[str] | None) -> list[str] | None:
+        """Accessions or pseudonyms, as a user names datasets, to pseudonyms."""
+        return None if datasets is None else self._catalog.pseudonyms(datasets)
+
+    # phases
 
     def inventory(
         self, *, datasets: Collection[str] | None = None, force: bool = False
     ) -> PhaseReport:
-        """``datasets``: accessions or pseudonyms, here and in the other phases."""
-        raise NotImplementedError(_PACKAGE)
+        """List the sources and record their subjects (phase 2).
+
+        ``datasets``: accessions or pseudonyms, here and in the other phases; a value the
+        run does not know raises ``ConfigError("invalid", ...)``. A census run needs to
+        have been opened with its key: ``ConfigError("key", ...)`` otherwise. Raises
+        ``SourceError`` when a source cannot be built.
+        """
+        from surfcensus.inventory.subjects import run_inventory
+
+        key = run_key(self.config, self._key)
+        return run_inventory(
+            self._catalog,
+            self._sources(),
+            self.config,
+            key,
+            datasets=self._pseudonyms(datasets),
+            force=force,
+        )
 
     def metrics(
         self,
@@ -82,7 +433,47 @@ class Run:
         force: bool = False,
         retry_failed: bool = False,
     ) -> PhaseReport:
-        raise NotImplementedError(_PACKAGE)
+        """Render the pending subjects into ``media/<subject_uid>/`` (phase 6); see
+        ``render.batch.run_render``.
+
+        ``subjects`` are ``subject_uid``s; in a local run a subject may also be named by
+        its label. Raises ``SourceError`` when a source cannot be built, before anything is
+        recorded against a subject.
+        """
+        from surfcensus.render.batch import run_render
+
+        self._sources()  # a source that is gone is not a property of its subjects
+        return run_render(
+            self.context(),
+            jobs=jobs,
+            datasets=self._pseudonyms(datasets),
+            subjects=None if subjects is None else self._subject_uids(subjects),
+            all_subjects=all_subjects,
+            video=video,
+            force=force,
+            retry_failed=retry_failed,
+        )
+
+    def _subject_uids(self, names: Sequence[str]) -> list[str]:
+        named = [names] if isinstance(names, str) else list(names)
+        if self.config.mode != "local":
+            return named
+        rows = self._catalog.query("SELECT subject_uid, subject_label, present FROM subjects")
+        uids = {row["subject_uid"] for row in rows}
+        by_label: dict[str, list[str]] = {}
+        for row in rows:
+            if row["present"]:
+                by_label.setdefault(row["subject_label"], []).append(row["subject_uid"])
+        resolved = []
+        for name in named:
+            matches = by_label.get(name, [])
+            if name not in uids and len(matches) > 1:
+                raise ConfigError(
+                    "invalid",
+                    f"{name} names subjects of {len(matches)} datasets; use a subject_uid",
+                )
+            resolved.append(matches[0] if name not in uids and matches else name)
+        return resolved
 
     def scores(self) -> pd.DataFrame:
         """The primary rows of ``tables/scores.parquet``, sorted by rank."""
@@ -93,17 +484,27 @@ class Run:
         raise NotImplementedError(_METRICS)
 
     def public(self) -> PublicCatalog:
-        raise NotImplementedError(_PACKAGE)
+        """The public side of the catalog, on the run's connection."""
+        return self._catalog.public()
 
     def context(self) -> RunContext:
         """What phase functions receive in place of the run."""
-        raise NotImplementedError(_PACKAGE)
+        catalog = self._catalog
+        secret = catalog.run_secret()
+        return RunContext(
+            run_dir=self.run_dir,
+            config=self.config,
+            public=catalog.public(),
+            lease=self._lease,
+            render_key=lambda tile_hash, digests: privacy.render_key(secret, tile_hash, digests),
+            scrub=lambda text: privacy.scrub_with(catalog, text),
+        )
 
     def media_dir(self, subject_uid: str) -> Path:
-        raise NotImplementedError(_PACKAGE)
+        return media_dir(self.run_dir, subject_uid)
 
     def close(self) -> None:
-        raise NotImplementedError(_PACKAGE)
+        self._catalog.close()
 
     def __enter__(self) -> Run:
         return self
@@ -118,13 +519,15 @@ def from_config(
     run_dir: Path,
     *,
     root: str | None = None,
+    identity: str | None = None,
     transport: httpx.BaseTransport | None = None,
 ) -> Source:
     """The source that ``config`` describes.
 
-    ``root`` overrides ``config.root``: a local source in a census run is stored without a
-    path, and its root comes from the catalog. The remote kinds arrive in milestone 5; they
-    take their client and cache from ``run_config``, ``run_dir`` and ``transport``.
+    ``root`` and ``identity`` override those of ``config``: a local source in a census run
+    is stored without either, and both come from the catalog. The remote kinds arrive in
+    milestone 5; they take their client and cache from ``run_config``, ``run_dir`` and
+    ``transport``.
     """
     if config.kind != "local":
         raise NotImplementedError(f"the {config.kind} source arrives in milestone 5")
@@ -136,6 +539,6 @@ def from_config(
     return LocalSource(
         path,
         subjects=config.subjects,
-        identity=config.identity,
+        identity=identity if identity is not None else config.identity,
         field_strength=config.field_strength,
     )

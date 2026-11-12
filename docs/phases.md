@@ -1,6 +1,6 @@
 # Phases of the search
 
-The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`.
+The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`; until `review` exists (milestone 4) they run phases 2 and 6 with `surfcensus inventory` and `surfcensus render`.
 
 Cheap phases run on everything; expensive phases run on what the cheap phases select. The guiding cost asymmetry is that downloading and computing are cheap compared with rater time, so the pipeline spends compute freely to make every rated minute informative.
 
@@ -33,11 +33,14 @@ Exit check: count of datasets with at least one FreeSurfer subject, per source. 
 
 Input: `datasets`. Output: `subjects`, `files`.
 
-- One prefix-scoped listing per subject directory. Record presence, size and ETag for every required file role.
-- Fetch Tier A files (stats, build stamp, recon-all.log head) and parse provenance.
-- Mark a subject `complete` if all Tier C roles are present.
+- One prefix-scoped listing per subject directory. Record presence, size and ETag (for a local source, the modification time) for every file role.
+- Fetch Tier A files (stats, build stamp, the three recon-all logs, whole; see `data_sources.md`) and parse provenance.
+- Mark a subject `complete` if every file a render cannot do without is present (T1, white and pial of both hemispheres), and record separately whether it has the stats files (`tier_a`) and the thickness and `sphere.reg` files (`tier_b`). A directory with `mri/` and `surf/` that lacks render files is recorded as incomplete, with the roles it lacks.
+- A subject whose listing is what the catalog already holds is skipped without reading a file. A subject that the listing no longer contains is marked absent; its render and ratings stay.
 
-Exit check: number of complete subjects by source, FreeSurfer version, and T2/FLAIR-pial use. A second reportable number. Also decides whether the remaining phases fit in time and storage (Tier B about 12 MB per subject, Tier B plus C about 39 MB).
+Exit check: number of complete subjects by source, FreeSurfer version, and T2/FLAIR-pial use. A second reportable number. Also decides whether the remaining phases fit in time and storage (Tier B 13 to 14 MB per subject, Tier B plus C 36 to 43 MB).
+
+Built (milestone 2) for local sources: `surfcensus inventory --run-dir DIR --source PATH`.
 
 ## Phase 3: enrichment
 
@@ -79,9 +82,12 @@ Input: selected (or all) subjects. Output: `media/<subject_uid>/`.
 
 - Streaming batches: fetch Tier C (and Tier B if already deleted) for a batch, render, write `vertex_map.npz`, compute 4d intensity metrics, delete source files, next batch. Disk use stays at batch size × 39 MB.
 - Render parameters and the config hash are written to `render.json`.
-- Failed renders (missing or unreadable files, degenerate meshes) are recorded with a reason, not retried silently.
+- Failed renders (missing or unreadable files, degenerate meshes, a file that changed since the inventory) are recorded with a reason, not retried silently: a failed subject is tried again when its files or the render settings change, or with `--retry-failed`. Every present subject that lacks a render file gets a `missing surface` row, so that it appears in review and export with its reason.
+- A census run renders every complete subject by default (`select.render_scope`); a local run renders its selection, which is every complete subject until one is made.
 
-Exit check: a random 2% of renders is opened and inspected by eye. Blank panels, missing contours, wrong orientation or pole misplacement stop the phase.
+Exit check: a random 2% of renders is opened and inspected by eye. Blank panels, missing contours, wrong orientation or pole misplacement stop the phase. `surfcensus render --check-sample` draws the sample from the done renders with a seed that it names, and writes the list and a page of posters to `logs/`.
+
+Built (milestone 2) for local sources: `surfcensus render --run-dir DIR`. The 4d intensity metrics follow in milestone 5.
 
 ## Phase 7: rating
 

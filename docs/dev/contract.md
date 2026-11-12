@@ -58,7 +58,7 @@ The changes since the draft that move an interface, in one list:
 | 9 | Template lookup | `--fsaverage DIR` first, then the run's own cached template, then D14 order | D14 order, pin, `--retemplate` | both | L's order (a run stays scorable offline after first use); C's refusal when an explicit directory differs from the pin unless `--retemplate`. After review the pin is looked at first, so a pinned run survives an explicit directory that has gone (6.3). |
 | 10 | Medial / inferior split | smoothed normal direction | by parcel | C | Measured today, see T1. |
 | 11 | Region cut | 45 mm on white y | 50 mm on pial y | L | Matches the render box; needs no pial file. T2. |
-| 12 | Invocations in `recon-all.log` | anchored on each `subjid NAME` line | split on `New invocation of recon-all` | L | Checked today: the FreeSurfer 7.3.2 log has five invocations and no `New invocation` line. L's rule finds 4 and 5 on the two real logs. |
+| 12 | Invocations in `recon-all.log` | anchored on each `subjid NAME` line | split on `New invocation of recon-all` | L | Checked today: the FreeSurfer 7.3.2 log has five invocations and spells its separator `#New# invocation of recon-all`, not as 6.0.1 does (corrected when milestone 2 was built). L's rule finds 4 and 5 on the two real logs. |
 | 13 | T2 / FLAIR flags | whole-token, case-sensitive | `-noX` cancels `-X`; `pial_variant` also sets the flag | both | Case-sensitive whole tokens (recon-all's `switch` is); C's `-noX` rule, applied per invocation; variant as second evidence. |
 | 14 | Flags stored | whitelist of 11 | every flag-shaped token | C, narrowed | Tokens matching `^-[A-Za-z][A-Za-z0-9_-]*$`: full provenance, and no path, number or subject name can match. Checked on the three real logs. |
 | 15 | Containing-face rule | best of the incident faces, `det > 0` required, k = 4 | first containing face, `abs(det)` test, k = 8 | both | First containing face in a fixed order (simpler, deterministic), `det > 0` required (a flipped face never matches), k = 8 (3 and 2 fallbacks on sub-01 against 14 and 9). |
@@ -103,7 +103,7 @@ File formats
 
 recon-all logs under fMRIPrep*
 
-- `recon-all.log` holds 4 (FreeSurfer 6.0.1) and 5 (7.3.2) invocations, each ending its header with a line `subjid NAME`. The last non-blank line before it holds the arguments: alone in FreeSurfer 6, after the script path in FreeSurfer 7. The 6.0.1 log separates invocations with `New invocation of recon-all`; the 7.3.2 log does not.
+- `recon-all.log` holds 4 (FreeSurfer 6.0.1) and 5 (7.3.2) invocations, each ending its header with a line `subjid NAME`. The last non-blank line before it holds the arguments: alone in FreeSurfer 6, after the script path in FreeSurfer 7. The 6.0.1 log separates invocations with `New invocation of recon-all`; the 7.3.2 log with `#New# invocation of recon-all` (corrected when milestone 2 was built: the first reading, that the 7.3.2 log has no separator, had searched for the 6.0.1 spelling).
 - The first 64 kB of the 6.0.1 log (220,842 bytes) contain 2 of the 4 invocations.
 - `thickness calculation complete, 39:225 truncations.` is in `recon-all-lh.log` and not in `recon-all.log`.
 - The 7.3.2 log passes `-noT2pial -noFLAIRpial`.

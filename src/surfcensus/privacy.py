@@ -20,9 +20,12 @@ import re
 import secrets
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from surfcensus._io import canonical_json
+
+if TYPE_CHECKING:
+    from surfcensus.store import Catalog
 
 KeyKind = Literal["local-salt", "dataset-key"]
 _SECRET_BYTES = 32
@@ -160,3 +163,12 @@ def scrub(
     if pseudonyms is not None:
         text = _SUBJECT.sub("sub-?", text)
     return " ".join(text.split())
+
+
+def scrub_with(catalog: Catalog, text: str) -> str:
+    """:func:`scrub` with what ``catalog`` holds when this is called: the roots and
+    identities of its datasets and, in a census run, their pseudonyms. A local run keeps
+    subject labels: they are the user's own."""
+    pseudonyms, roots = catalog.scrub_terms()
+    census = catalog.meta("mode") == "census"
+    return scrub(text, pseudonyms=pseudonyms if census else None, roots=roots)

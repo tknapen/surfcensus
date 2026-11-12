@@ -6,6 +6,7 @@ order the test session happened to import things in.
 
 from __future__ import annotations
 
+import ast
 import subprocess
 import sys
 from pathlib import Path
@@ -178,3 +179,96 @@ def test_sources_local_is_callable_under_the_type_checking_hook_of_the_tests() -
 
     assert surfcensus.sources.local is module and callable(module)
     assert surfcensus.sources.LocalSource is module.LocalSource
+
+
+# ---------------------------------------------------------------------------------------
+# the privacy boundary (decision D20): what code downstream of the inventory may name
+
+DOWNSTREAM = ("metrics", "render", "app", "export", "select", "reference", "calibration.py")
+"""Packages and modules that hold the public side of a run only. Those that do not exist
+yet are checked from the day they do."""
+NO_SIGNATURE = ("app", "export")
+
+
+def private_names(source: str, *, signatures_too: bool, may_import_run: bool = False) -> list[str]:
+    """What a module names of the private side of a run, each as ``line: what``."""
+    found = []
+    banned_literals = {"accession", "dataset_id"} | (
+        {"input_signature"} if signatures_too else set()
+    )
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+            names: list[str] = []
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+            names = [alias.name for alias in node.names]
+        else:
+            modules, names = [], []
+        for module in modules:
+            if module == "surfcensus.run" and not may_import_run:
+                found.append(f"{node.lineno}: imports surfcensus.run")
+            if module == "surfcensus" and "run" in names and not may_import_run:
+                found.append(f"{node.lineno}: imports surfcensus.run")
+            if module == "surfcensus.store" and "Catalog" in names:
+                found.append(f"{node.lineno}: imports the private Catalog")
+            if module.endswith("privacy") and {"reveal_table", "write_reveal"} & set(names):
+                found.append(f"{node.lineno}: imports the reveal path")
+        if isinstance(node, ast.Attribute):
+            if node.attr == "_catalog":
+                found.append(f"{node.lineno}: reaches for _catalog")
+            if node.attr == "Catalog" and isinstance(node.value, ast.Name):
+                found.append(f"{node.lineno}: names the private Catalog")
+            if node.attr in ("reveal_table", "write_reveal"):
+                found.append(f"{node.lineno}: names the reveal path")
+        if isinstance(node, ast.Constant) and node.value in banned_literals:
+            found.append(f"{node.lineno}: the literal {node.value!r}")
+    return found
+
+
+def test_code_downstream_of_the_inventory_names_nothing_private() -> None:
+    checked = 0
+    for name in DOWNSTREAM:
+        target = PACKAGE_DIR / name
+        paths = sorted(target.rglob("*.py")) if target.is_dir() else [target]
+        for path in paths:
+            if not path.is_file():
+                continue
+            checked += 1
+            found = private_names(path.read_text(), signatures_too=name in NO_SIGNATURE)
+            assert found == [], f"{path.relative_to(PACKAGE_DIR)}: {found}"
+    assert checked >= 9  # the render package, at least
+
+
+@pytest.mark.parametrize(
+    ("source", "what"),
+    [
+        ("from surfcensus.store import Catalog", "imports the private Catalog"),
+        ("from surfcensus.store import PublicCatalog, Catalog as C", "imports the private Catalog"),
+        ("import surfcensus.run", "imports surfcensus.run"),
+        ("from surfcensus.run import Run", "imports surfcensus.run"),
+        ("from surfcensus import run", "imports surfcensus.run"),
+        ("from surfcensus.privacy import reveal_table", "imports the reveal path"),
+        ("from surfcensus import store\nstore.Catalog('x')", "names the private Catalog"),
+        ("def f(run):\n    return run._catalog", "reaches for _catalog"),
+        ("COLUMNS = ['subject_uid', 'accession']", "the literal 'accession'"),
+        ("row['dataset_id']", "the literal 'dataset_id'"),
+    ],
+)
+def test_the_boundary_check_finds_what_it_is_for(source: str, what: str) -> None:
+    assert [text.split(": ", 1)[1] for text in private_names(source, signatures_too=False)] == [
+        what
+    ]
+
+
+def test_the_boundary_check_knows_its_exemptions() -> None:
+    signature = "frame['input_signature']"
+    assert private_names(signature, signatures_too=False) == []
+    assert private_names(signature, signatures_too=True) == ["1: the literal 'input_signature'"]
+    public = "from surfcensus.store import PublicCatalog\nfrom surfcensus.records import RunContext"
+    assert private_names(public, signatures_too=True) == []
+    # review.py is a user of the public API and may open a run; nothing else is waived for it
+    opens = "from surfcensus.run import Run\nRun('x')._catalog"
+    assert private_names(opens, signatures_too=False, may_import_run=True) == [
+        "2: reaches for _catalog"
+    ]

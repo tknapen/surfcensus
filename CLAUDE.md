@@ -22,7 +22,7 @@ Everything in the package serves one of these two numbers.
 
 ## Status
 
-Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestone 2 (local source, config, catalog, inventory, `Run`) is under way. Its shared modules are built and tested: `_io`, `log`, `records`, `schemas`, `privacy` (keyed identifiers and scrubbing of text), `config`, the roles, tiers and records of `sources/base`, the subject-candidate and template patterns, and the synthetic directory trees for tests. `store`, `sources/local`, `inventory`, `batches`, `render/batch` and `Run` are typed stubs that raise `NotImplementedError`, so no command beyond `render-subject` works yet. Milestones 3 to 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
+Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestone 2 (local source, config, catalog, inventory, `Run`) is built: `surfcensus inventory`, `surfcensus render` and `surfcensus status` work on a local directory and are resumable, and `sc.Run(...)` and `sc.sources.local(...)` are the Python API behind them. It is tested on synthetic directory trees and, end to end, on two real subjects linked into an fMRIPrep layout (`ds000102` sub-01, FreeSurfer 6.0.1; `ds003020` sub-UTS01, FreeSurfer 7.3.2). A census run can be created and opened from Python, with local sources only; no command creates one yet. There are no metrics, no scores and no rater app yet, so `surfcensus review` does not exist. Milestones 3 to 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
 
 ## Build order
 
@@ -46,7 +46,7 @@ Phase 0 of the census (pilot, `docs/phases.md`) can start as soon as milestone 4
 - Tomas's Freeview gist (`https://gist.github.com/tknapen/85d9a23a09c95d15f4b23ba1965fa54d`) renders sagittal slices with white (red) and pial (white) surfaces over `T1.mgz` through `freeview -cmd`, then joins frames with ffmpeg. It uses fixed voxel slices (x = 90 to 239, y = z = 127).
 - `mris_thickness` documents a default maximum thickness of 5 mm (`-max`). How vertices above the maximum are stored is not documented on that page and must be checked in source or empirically (see `docs/metrics.md`).
 
-Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep 21.0.2; nothing here is checked for FreeSurfer 7):
+Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep 21.0.2; what was checked for FreeSurfer 7 is in the next list):
 
 - Over-maximum thickness is clamped, not zeroed. `lh.thickness` has a maximum of exactly 5.0, with 16 vertices at that value (41 in `rh`); at those vertices the white-to-pial vertex distance has a median of 7.3 mm. Zeros are the medial wall: 5,914 of the 5,919 zero-valued `lh` vertices lie outside `label/lh.cortex.label`, 5 lie inside it.
 - In `fsaverage/surf/`, `lh.sphere.reg` and `lh.sphere` hold identical coordinates, at radius 100 (99.992 to 100.008). The subject's `lh.sphere.reg` also has radius 100.
@@ -58,7 +58,18 @@ Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep
 - Lossy WebP at quality 80 desaturates thin coloured contours: on 15 sagittal tiles (292 x 320 px, `lh` surfaces only) the mean absolute error on contour pixels was 47, 16 and 70 (R, G, B, of 255). Tile sizes: 14.7 kB with contours baked in; 8.7 kB grayscale only; 16.3 kB for the contours as a separate lossless RGBA layer.
 - Both buckets are reachable anonymously from the Claude Code cloud environment; `gist.githubusercontent.com` is not.
 
-Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 as installed); none of it checked against a running Freeview or FreeSurfer 7 data:
+Checked 2026-11-12 on `ds003020` sub-UTS01 (one subject, FreeSurfer 7.3.2, fMRIPrep 23.0.1) and on the logs of both subjects:
+
+- The listing of the subject's prefix (337 keys) has `surf/lh.pial.T1` and `surf/rh.pial.T1` and no `surf/?h.pial` key: the link that recon-all makes is absent on S3.
+- Over-maximum thickness is clamped in FreeSurfer 7.3.2 as well: the maximum of `lh.thickness` and of `rh.thickness` is exactly 5.0. Zeros were not counted for this subject.
+- `scripts/recon-all.log` holds 4 recon-all invocations in the 6.0.1 subject and 5 in the 7.3.2 subject; each per-hemisphere log holds 2. An invocation's header ends with a line `subjid NAME`; the arguments are on the last non-blank line above it, alone in 6.0.1 and after the script path in 7.3.2. Invocations are separated by `New invocation of recon-all` in 6.0.1 and `#New# invocation of recon-all` in 7.3.2. The first 64 kB of either `recon-all.log` hold 2 invocations.
+- The truncation lines are in the per-hemisphere logs only, in both subjects: `lh` 39:225 and `rh` 93:434 (6.0.1), `lh` 22:230 and `rh` 23:325 (7.3.2). The line `orig.nofix lhholes = N, rhholes = M` is in `recon-all.log`: 41 and 26, and 4 and 15. `stats/aseg.stats` has the same numbers in both subjects.
+- Both `recon-all.log` files end with a line `recon-all -s NAME finished without error at DATE`. The 7.3.2 logs pass `-noT2pial -noFLAIRpial`. No log holds a T2, FLAIR, hires, expert or edit flag.
+- Build stamps: `freesurfer-Linux-centos6_x86_64-stable-pub-v6.0.1-f53a55a` and `freesurfer-linux-ubuntu22_x86_64-7.3.2-20220804-6354275`. The `fsaverage` next to `ds000102` has `freesurfer-x86_64-redhat-linux-gnu-dev4-20090216`, which holds no version number.
+- Sizes from the two listings: Tier A (three stats files, build stamp, three logs) 0.66 and 0.98 MB; Tier B (thickness, `sphere.reg`, `aparc.annot`) 14.2 and 12.7 MB, with `?h.aparc.annot` at 1.05 to 1.19 MB; Tier C (T1, brainmask, white, pial) 28.5 and 23.2 MB.
+- The renderer runs on the 7.3.2 subject: `mri/T1.mgz` is 256 x 256 x 256 at 1 mm and passes the orientation check, 156 of 176 tiles have contours, 8.1 s and 6.3 MB without video. One poster frame was looked at; the contours lie on the tissue boundaries. Nothing was compared with Freeview.
+
+Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 as installed); none of it checked against a running Freeview, and against FreeSurfer 7 data only where the list above says so:
 
 - Freeview's default 2D views are radiological in coronal and axial (subject's left on the right), anterior up in axial, and in sagittal show posterior at the left and anterior at the right (`RenderView2D.cpp`: sagittal camera at +x, view-up +z).
 - Freeview treats an integer voxel index as the voxel centre and cuts the surface with the plane through that centre; no half-voxel offset between image and contour in the code path.
@@ -66,8 +77,11 @@ Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 a
 - From FreeSurfer 7.0.0, recon-all writes `?h.pial.T1` and makes `?h.pial` a relative link to it (or to `?h.pial.T2` / `?h.pial.FLAIR`).
 - `MRISmeasureCorticalThickness` clamps each of its two distance measurements at the maximum and stores their mean, in v6.0.0, v7.0.0 and v7.4.1; recon-all in FreeSurfer 7 calls it through `mris_place_surface --thickness` with a maximum of 5.
 - Lossy WebP is always 4:2:0; Pillow's lossless WebP zeroes RGB under alpha 0 unless `exact=True`.
+- `scripts/recon-all` at v6.0.0 and v7.4.1: `-hemi lh` sets the log name to `recon-all-lh.log`. T2pial is set by `-T2pial`, `-t2pial`, `-T2pial-only` and `-autorecon3-T2pial` and cleared by `-noT2pial`, `-no-T2pial`, `-no_T2pial`, `-no-t2pial` and `-no_t2pial`; FLAIRpial likewise. The argument parser compares whole arguments, case-sensitively. There is no flag that clears `-hires`. `-3T` and `-3t` are the only flags that start with a digit. `-autorecon2-pial` is in neither version.
 
 Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.9 MB of media (tiles 4.1 MB, `anim.mp4` 4.3 MB, `vertex_map.npz` 2.5 MB since it follows the tiles and not the box, 1.8 MB before); 155 of 176 tiles contain contours.
+
+Measured 2026-11-12 on a local run over the two real subjects (one machine, files on a local disk): `surfcensus inventory` under 0.1 s for the phase, with the logs read whole; `surfcensus render --jobs 2` 9.0 s without video; `surfcensus render --video` 17.5 s in one process; a second call of either does nothing in under 0.1 s; `catalog.sqlite` 64 kB; the source files unchanged in size and modification time.
 
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 
@@ -79,7 +93,7 @@ Anything else in these docs marked "(to verify)" has not been checked. Do not pr
 - Every derived number traces back to an exact source: dataset accession, snapshot or derivative commit, subject, file key, file size or ETag. Store these in the inventory.
 - Renders and metrics are deterministic for a given input and config. Any randomness (rater queue order, sampling) takes an explicit seed that is recorded.
 - Raters never see dataset IDs, metric scores, or other raters' ratings while rating.
-- Datasets are identified by keyed pseudonym (HMAC with a secret key, `D-xxxxxxxx`) in every output: app, gallery, figures, tables, exports, logs. Accessions live only in `catalog.sqlite`. Never use an unkeyed hash of an accession; the accession space is small enough to invert one by enumeration. Never commit or copy the key into the repo or a run directory. See decision D10.
+- Datasets are identified by keyed pseudonym (HMAC with a secret key, `D-xxxxxxxx`) in every output: app, gallery, figures, tables, exports, logs. Accessions live only in `catalog.sqlite`. Never use an unkeyed hash of an accession; the accession space is small enough to invert one by enumeration. The same holds for bucket metadata: no unkeyed hash of an object's key, size or ETag leaves `catalog.sqlite` either. Never commit or copy the key into the repo or a run directory. See decisions D10 and D20.
 - Network-touching tests are marked `@pytest.mark.network` and excluded from the default test run.
 
 ## Lab conventions this project follows
@@ -90,20 +104,29 @@ Anything else in these docs marked "(to verify)" has not been checked. Do not pr
 - `justfile` for developer commands; Snakemake (in `workflow/`) orchestrates the full census run by calling the package CLI; marimo notebooks (in `notebooks/`) for analysis.
 - DataLad is acceptable for fetching specific files from OpenNeuro datasets where S3 keys are not directly usable.
 
-## Planned commands
+## Commands
+
+Built:
 
 ```
 just setup            # uv sync with dev extras
 just test             # pytest, no network
 just test-network     # pytest -m network
 just lint             # ruff check + ruff format --check + pyrefly
+surfcensus render-subject SUBJECT_DIR --out DIR   # one subject, no run directory
+surfcensus inventory --run-dir DIR [--source PATH]   # phase 2; --source creates a local run
+surfcensus render --run-dir DIR [--jobs J]           # phase 6
+surfcensus status --run-dir DIR [--failures]         # where a run stands
+```
+
+Planned:
+
+```
 surfcensus review PATH   # local data: inventory, metrics, render, open rater app
 surfcensus discover   # phase 1
-surfcensus inventory  # phase 2
 surfcensus enrich     # phase 3
 surfcensus metrics    # phase 4
 surfcensus select     # phase 5
-surfcensus render     # phase 6
 surfcensus serve      # phase 7, rater web app
 surfcensus export     # phase 8, tables for analysis
 ```
