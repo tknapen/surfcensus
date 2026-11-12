@@ -8,6 +8,7 @@ from __future__ import annotations
 import errno
 import stat
 from collections.abc import Iterable, Mapping
+from fnmatch import fnmatchcase
 from pathlib import Path
 
 from surfcensus.sources.base import RENDER_ROLES, FileRole
@@ -38,8 +39,32 @@ ROLE_CANDIDATES: dict[FileRole, tuple[str, ...]] = {
     FileRole.TALAIRACH: ("mri/transforms/talairach.xfm",),
     FileRole.RECON_LOG: ("scripts/recon-all.log",),
     FileRole.BUILD_STAMP: ("scripts/build-stamp.txt",),
+    FileRole.RECON_LOG_LH: ("scripts/recon-all-lh.log",),
+    FileRole.RECON_LOG_RH: ("scripts/recon-all-rh.log",),
 }
 """Paths relative to the subject directory for each role, in order of preference."""
+
+TEMPLATE_FILES: tuple[str, ...] = (
+    "surf/{h}.sphere.reg",
+    "surf/{h}.white",
+    "label/{h}.cortex.label",
+    "label/{h}.aparc.annot",
+)
+"""What an fsaverage directory must hold to serve as the template, for each hemisphere ``h``,
+relative to that directory."""
+
+TEMPLATE_OPTIONAL_FILES: tuple[str, ...] = ("surf/{h}.white.avg.area.mgh",)
+"""Used when present."""
+
+TEMPLATE_NAME_PATTERNS: tuple[str, ...] = (
+    "fsaverage*",
+    "cvs_avg35*",
+    "V1_average",
+    "?h.EC_average",
+)
+"""Directory names of the template subjects that a FreeSurfer subjects directory can hold.
+``fsaverage`` and ``fsaverage5`` were seen next to the subjects of ds000102-fmriprep; the
+other names are from memory of a FreeSurfer installation and have not been checked."""
 
 # errors of stat() that say nothing is there: no such entry, a parent that is a file, a cycle
 # of links, a name longer than the file system stores
@@ -73,6 +98,34 @@ def is_file(path: Path | str) -> bool:
     return mode is not None and stat.S_ISREG(mode)
 
 
+def is_template_name(name: str) -> bool:
+    """Whether a directory of this name is a template subject, not a person."""
+    return any(fnmatchcase(name, pattern) for pattern in TEMPLATE_NAME_PATTERNS)
+
+
+def is_subject_candidate(path: Path | str) -> bool:
+    """A directory with subdirectories ``mri/`` and ``surf/`` that is not a template.
+
+    This is what a source lists as a subject (docs/architecture.md). A candidate that fails
+    :func:`is_freesurfer_subject_dir` is an incomplete subject, such as a recon-all run that
+    crashed, and is inventoried as one. Links are followed; templates are recognized by the
+    name of the directory as given and of what it links to.
+
+    Raises OSError when the directory cannot be examined.
+    """
+    path = Path(path)
+    mode = _mode(path)
+    if mode is None or not stat.S_ISDIR(mode):
+        return False
+    if is_template_name(path.name) or is_template_name(path.resolve().name):
+        return False
+    for name in ("mri", "surf"):
+        mode = _mode(path / name)
+        if mode is None or not stat.S_ISDIR(mode):
+            return False
+    return True
+
+
 def resolve_subject_files(subject_dir: Path | str) -> dict[FileRole, Path]:
     """The first existing candidate of each role; roles with none are absent.
 
@@ -89,6 +142,24 @@ def resolve_subject_files(subject_dir: Path | str) -> dict[FileRole, Path]:
                 files[role] = path
                 break
     return files
+
+
+def variant_name(role: FileRole, path: Path | str) -> str:
+    """The name FreeSurfer gives the file that ``path`` is read as, among the role's candidates.
+
+    A link inside its own directory names its target when that is a candidate of the role
+    (FreeSurfer 7: ``lh.pial -> lh.pial.T1`` reads as ``lh.pial.T1``). A link into another
+    directory, or a file under a name of someone's choosing, reads under the candidate's own
+    name, so that no foreign name is recorded. This is the rule by which ``render.json``
+    names its inputs (``render/api.py``); a source records the same name as
+    ``FileRef.variant``.
+    """
+    path = Path(path)
+    names = [Path(candidate).name for candidate in ROLE_CANDIDATES[role]]
+    target = path.resolve()
+    if target.parent == path.parent.resolve() and target.name in names:
+        return target.name
+    return path.name if path.name in names else names[0]
 
 
 def missing_roles(

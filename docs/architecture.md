@@ -49,8 +49,14 @@ surfcensus/
     __init__.py
     cli.py                 # typer app
     config.py              # pydantic settings; YAML config per run, sensible defaults for local use
-    privacy.py             # dataset key, keyed pseudonyms, reveal mapping
+    privacy.py             # keyed pseudonyms, subject_uid, render keys, scrubbing; dataset key, reveal mapping
     store.py               # SQLite catalog + parquet tables; schema migrations
+    records.py             # plain records shared between modules (provenance, ledger rows, RunContext)
+    schemas.py             # Arrow schemas and keys of the parquet tables
+    run.py                 # Run: a run directory, its sources and the phases
+    batches.py             # leased, batched per-subject work
+    _io.py                 # atomic writes, byte-stable .npz, digests
+    log.py                 # the package logger
     sources/
       base.py              # Source protocol, SubjectRecord, file roles
       local.py             # SUBJECTS_DIR / fMRIPrep / BIDS-derivatives layouts
@@ -95,6 +101,7 @@ surfcensus/
       encode.py            # WebP and MP4 writers
       vertexmap.py         # vertex_map.npz
       api.py               # three_plane()
+      batch.py             # rendering the subjects of a run
       freeview.py          # optional backend, wraps the original gist approach
     app/
       server.py            # FastAPI
@@ -113,7 +120,7 @@ surfcensus/
 
 ## Dependencies
 
-Core: `nibabel`, `numpy`, `scipy`, `pandas`, `pyarrow`, `matplotlib`, `imageio`, `imageio-ffmpeg`, `pillow`, `httpx`, `typer`, `pydantic`, `pydantic-settings`, `pyyaml`, `jaxtyping`, `tqdm`.
+Core: `nibabel`, `numpy`, `scipy`, `pandas`, `pyarrow`, `matplotlib`, `imageio-ffmpeg`, `pillow`, `httpx`, `typer`, `pydantic`, `pydantic-settings`, `pyyaml`, `jaxtyping`, `tqdm`.
 
 Extras:
 
@@ -211,7 +218,7 @@ Core tables in `catalog.sqlite`:
 
 - `datasets(dataset_id, pseudonym, source, accession, root, pipeline, pipeline_version, derivative_ref, snapshot_tag, n_subjects_listed, discovered_at)`; for a local source, one row with `root` set to the path.
 - `subjects(subject_uid, dataset_id, subject_label, fs_dir, complete, fs_version, recon_flags, t2pial, flairpial, age, sex, field_strength, manufacturer)`
-- `files(subject_uid, role, location, size, etag_or_mtime)` with roles `t1`, `brainmask`, `lh_white`, `rh_white`, `lh_pial`, `rh_pial`, `lh_thickness`, `rh_thickness`, `lh_sphere_reg`, `rh_sphere_reg`, `lh_annot`, `rh_annot`, `lh_stats`, `rh_stats`, `aseg_stats`, `talairach`, `recon_log`, `build_stamp`
+- `files(subject_uid, role, location, size, etag_or_mtime)` with roles `t1`, `brainmask`, `lh_white`, `rh_white`, `lh_pial`, `rh_pial`, `lh_thickness`, `rh_thickness`, `lh_sphere_reg`, `rh_sphere_reg`, `lh_annot`, `rh_annot`, `lh_stats`, `rh_stats`, `aseg_stats`, `talairach`, `recon_log`, `build_stamp`, `recon_log_lh`, `recon_log_rh`
 - `selection(subject_uid, stratum, reason, seed)`
 - `renders(subject_uid, config_hash, status, media_path, n_frames, rendered_at)`
 

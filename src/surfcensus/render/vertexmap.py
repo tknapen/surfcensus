@@ -18,19 +18,17 @@ the map as on the full surface, whenever that vertex is no farther away than the
 
 from __future__ import annotations
 
-import io
-import zipfile
 from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
 from jaxtyping import Float
 
+from surfcensus._io import read_npz, write_npz
 from surfcensus.fsio.surfaces import Surface
-from surfcensus.render.encode import atomic_path
 from surfcensus.render.geometry import in_region
+from surfcensus.sources.base import HEMIS
 
-HEMIS = ("lh", "rh")
 _DTYPES = {"index": "<i4", "pial": "<f4", "white": "<f4", "fsavg6": "<i4", "visible": "|b1"}
 KEYS = tuple(f"{hemi}_{field}" for hemi in HEMIS for field in _DTYPES)
 
@@ -62,22 +60,17 @@ def build_vertex_map(
 def write_vertex_map(path: Path | str, vmap: Mapping[str, np.ndarray]) -> None:
     """Write an ``.npz`` that ``numpy.load`` reads, byte-identical for identical input.
 
-    ``numpy.savez`` stamps every zip entry with the current time, so the archive is written
-    here: entries in the order of ``KEYS``, stored uncompressed, dated 1980-01-01. Atomic.
+    The entries are written in the order of ``KEYS``, each cast to the dtype of its field,
+    by the byte-stable writer of ``surfcensus._io``. Atomic.
     """
     if set(vmap) != set(KEYS):
         raise ValueError(f"a vertex map has exactly the keys {KEYS}, got {sorted(vmap)}")
-    with atomic_path(path) as tmp, zipfile.ZipFile(tmp, "w", zipfile.ZIP_STORED) as archive:
-        for key in KEYS:
-            buffer = io.BytesIO()
-            dtype = _DTYPES[key.split("_")[1]]
-            np.lib.format.write_array(buffer, np.ascontiguousarray(vmap[key], dtype=dtype))
-            entry = zipfile.ZipInfo(f"{key}.npy", date_time=(1980, 1, 1, 0, 0, 0))
-            entry.create_system = 3  # Unix on every platform, with fixed permissions
-            entry.external_attr = 0o644 << 16
-            archive.writestr(entry, buffer.getvalue())
+    write_npz(
+        path,
+        {key: np.ascontiguousarray(vmap[key], dtype=_DTYPES[key.split("_")[1]]) for key in KEYS},
+    )
 
 
 def read_vertex_map(path: Path | str) -> dict[str, np.ndarray]:
-    with np.load(path, allow_pickle=False) as archive:
-        return {key: archive[key] for key in KEYS}
+    archive = read_npz(path)
+    return {key: archive[key] for key in KEYS}

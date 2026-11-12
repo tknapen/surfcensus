@@ -18,6 +18,34 @@ RENDER_SCHEMA_VERSION = 2
 """Version of ``render.json`` and of the files it lists. 2: the vertex map is selected by the
 clickable region of the tiles and carries ``{hemi}_visible``; 1 selected it by the view box."""
 
+TILE_FIELDS: tuple[str, ...] = (
+    "box_x_mm",
+    "box_y_mm",
+    "box_z_mm",
+    "margin_mm",
+    "slice_step_mm",
+    "panel_px",
+    "radiological",
+    "sagittal_anterior_left",
+    "pial_colour",
+    "white_colour",
+    "line_width_px",
+    "window_percentiles",
+    "brainmask_dilation",
+    "webp_quality",
+)
+"""Fields of :class:`RenderConfig` that change a tile's pixels or its geometry."""
+
+NON_TILE_FIELDS: tuple[str, ...] = (
+    "crosshair_colour",
+    "crosshair_alpha",
+    "fps",
+    "crf",
+    "vertex_map_margin_mm",
+)
+"""The other fields: they change the video, the poster or the vertex map only. Every field of
+:class:`RenderConfig` is in one of the two tuples."""
+
 PanelName = Literal["sagittal", "coronal", "axial"]
 PANEL_ORDER: tuple[PanelName, ...] = ("sagittal", "coronal", "axial")
 
@@ -124,6 +152,20 @@ class RenderConfig(_Frozen):
     def config_hash(self) -> str:
         payload = json.dumps(
             {"schema": RENDER_SCHEMA_VERSION, "config": self.model_dump(mode="json")},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(payload.encode()).hexdigest()[:12]
+
+    def tile_hash(self) -> str:
+        """Identity of the tiles alone: 12 hex characters over :data:`TILE_FIELDS`.
+
+        Unlike :meth:`config_hash` it has no schema number and no video, crosshair or
+        vertex-map setting in it, so it stays the same when a render is only re-encoded or
+        its vertex map rewritten. A rating belongs to the tiles it was made on.
+        """
+        payload = json.dumps(
+            self.model_dump(mode="json", include=set(TILE_FIELDS)),
             sort_keys=True,
             separators=(",", ":"),
         )

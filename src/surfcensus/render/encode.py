@@ -14,13 +14,10 @@ Conventions:
 
 from __future__ import annotations
 
-import os
-import secrets
 import shutil
 import subprocess
 import threading
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable
 from itertools import chain
 from pathlib import Path
 
@@ -28,6 +25,8 @@ import imageio_ffmpeg
 import numpy as np
 from jaxtyping import UInt8
 from PIL import Image
+
+from surfcensus._io import atomic_path
 
 _LOSSY = {"lossless": False, "method": 4}
 # exact=True keeps RGB under alpha 0 as given instead of zeroing it, so any tile round-trips.
@@ -38,19 +37,6 @@ _VIDEO_FILTER = (
     "scale=flags=bicubic+accurate_rnd+bitexact:out_color_matrix=bt709:out_range=tv,"
     "setparams=color_primaries=bt709:color_trc=bt709,format=yuv420p"
 )
-
-
-@contextmanager
-def atomic_path(path: Path | str) -> Iterator[Path]:
-    """Yield a temporary path next to ``path``; rename it into place on success, else remove it."""
-    final = Path(path)
-    final.parent.mkdir(parents=True, exist_ok=True)
-    tmp = final.with_name(f".{final.name}.{secrets.token_hex(8)}.tmp")
-    try:
-        yield tmp
-        os.replace(tmp, final)
-    finally:
-        tmp.unlink(missing_ok=True)
 
 
 def _write_webp(path: Path | str, image: Image.Image, **params: bool | int) -> None:

@@ -22,7 +22,7 @@ Everything in the package serves one of these two numbers.
 
 ## Status
 
-Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestones 2 to 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
+Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestone 2 (local source, config, catalog, inventory, `Run`) is under way. Its shared modules are built and tested: `_io`, `log`, `records`, `schemas`, `privacy` (keyed identifiers and scrubbing of text), `config`, the roles, tiers and records of `sources/base`, the subject-candidate and template patterns, and the synthetic directory trees for tests. `store`, `sources/local`, `inventory`, `batches`, `render/batch` and `Run` are typed stubs that raise `NotImplementedError`, so no command beyond `render-subject` works yet. Milestones 3 to 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
 
 ## Build order
 
@@ -53,6 +53,8 @@ Checked 2026-11-12 on `ds000102` sub-01 (one subject, FreeSurfer 6.0.1, fMRIPrep
 - Icosahedral nesting holds for fsaverage5: `fsaverage5/surf/lh.sphere.reg` equals the first 10,242 vertices of fsaverage `lh.sphere.reg` exactly. fsaverage6 by truncation to 40,962 vertices is inferred from this, not checked directly (the folder has no `fsaverage6/`).
 - `mri/T1.mgz` is 256 x 256 x 256, 1 mm, uint8, with vox2ras-tkr rows `[-1 0 0 128]`, `[0 0 1 -128]`, `[0 -1 0 128]`.
 - `surf/lh.pial` is a regular key; there is no `lh.pial.T1` (FreeSurfer 6 layout).
+- `scripts/recon-all.log` (220,842 bytes) has no `thickness calculation complete` line. The line is in `scripts/recon-all-lh.log` (212,143 bytes; `39:225 truncations`) and in `scripts/recon-all-rh.log` (206,247 bytes; `93:434 truncations`), once each.
+- The `fsaverage/` and `fsaverage5/` directories next to the subjects each hold `mri/`, `surf/`, `label/` and `scripts/`, and `fsaverage5/mri/T1.mgz` exists (bucket listing). A template directory therefore passes for a subject directory but for its name.
 - Lossy WebP at quality 80 desaturates thin coloured contours: on 15 sagittal tiles (292 x 320 px, `lh` surfaces only) the mean absolute error on contour pixels was 47, 16 and 70 (R, G, B, of 255). Tile sizes: 14.7 kB with contours baked in; 8.7 kB grayscale only; 16.3 kB for the contours as a separate lossless RGBA layer.
 - Both buckets are reachable anonymously from the Claude Code cloud environment; `gist.githubusercontent.com` is not.
 

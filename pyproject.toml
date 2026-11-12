@@ -14,7 +14,6 @@ dependencies = [
   "pandas>=2",
   "pyarrow",
   "matplotlib>=3.8",
-  "imageio>=2.34",
   "imageio-ffmpeg",
   "pillow",
   "httpx",

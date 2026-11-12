@@ -53,6 +53,7 @@ Sizes from `ds000102-fmriprep/sourcedata/freesurfer/sub-01` (FreeSurfer default 
 | aseg_stats | `stats/aseg.stats` | small | Euler number / holes, eTIV |
 | talairach | `mri/transforms/talairach.xfm` | <1 kB | approximate MNI placement |
 | recon_log | `scripts/recon-all.log` | 220 kB (fetch first 64 kB by Range) | flags |
+| recon_log_lh/rh | `scripts/recon-all-?h.log` | 212 and 206 kB | thickness truncation counts |
 | build_stamp | `scripts/build-stamp.txt` | <1 kB | FreeSurfer version |
 
 Fetch tiers:
@@ -69,6 +70,7 @@ Note on `?h.pial` in FreeSurfer 7: from 7.0.0 on, recon-all writes `?h.pial.T1` 
 
 - FreeSurfer version: `scripts/build-stamp.txt`.
 - recon-all command line and flags: first lines of `scripts/recon-all.log`. Flags of interest: `-T2pial`, `-FLAIRpial`, `-hires`, `-expert`, `-xopts-*`, and any manual-edit reruns (`-autorecon2-wm`, `-autorecon-pial`), which suggest the subject was edited.
+- Thickness truncation counts: `scripts/recon-all-lh.log` and `scripts/recon-all-rh.log`, the per-hemisphere logs that recon-all writes under fMRIPrep (see `metrics.md`, "The 5 mm ceiling").
 - fMRIPrep version: `dataset_description.json`, `GeneratedBy`.
 - Field strength, manufacturer: raw dataset T1w JSON sidecar (`MagneticFieldStrength`, `Manufacturer`); often missing, then null.
 - Age, sex: raw dataset `participants.tsv`; column names vary and need a small mapping table.
