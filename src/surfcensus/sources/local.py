@@ -10,6 +10,7 @@ Read-only by construction: nothing here opens for writing, creates or removes.
 from __future__ import annotations
 
 import dataclasses
+import math
 import os
 import re
 import sys
@@ -280,8 +281,10 @@ class LocalSource:
         identity: str | None = None,
         field_strength: float | None = None,
     ) -> None:
-        if field_strength is not None and not field_strength > 0:
-            raise ValueError(f"field_strength is in tesla and positive, not {field_strength}")
+        if field_strength is not None and not 0 < field_strength < math.inf:
+            raise ValueError(
+                f"field_strength is in tesla, positive and finite, not {field_strength}"
+            )
         given = (subjects,) if isinstance(subjects, str) else tuple(subjects)
         globs = tuple(dict.fromkeys(given))
         record, implied = detect_layout(path)
@@ -314,8 +317,9 @@ class LocalSource:
     def subjects(self, dataset: DatasetRecord) -> Iterator[SubjectRecord]:
         """The subject candidates among the children of the subjects directory, by name.
 
-        Templates are skipped, by their name and by the name of what they link to. A child
-        that cannot be examined is yielded with ``problem`` set and no files. Of two names
+        Templates are skipped, by their name and by the name of what they link to, and so
+        is a child whose name is not valid UTF-8, with a warning: a label has to be text. A
+        child that cannot be examined is yielded with ``problem`` set and no files. Of two names
         for one directory the first is kept. Everything is listed before the first record
         is returned, so a glob that matches nothing raises ``SourceError("not found", ...)``
         here and not half-way through. ``dataset`` is attached to the records as given.
@@ -328,18 +332,28 @@ class LocalSource:
         if names is None:
             raise SourceError("not found", f"{subjects_dir} is no longer a directory")
 
+        log = get_logger()
         problems: dict[str, str] = {}
         labels = []
         for name in names:
+            problem = None
             try:
                 if not is_subject_candidate(subjects_dir / name):
                     continue
             except OSError as exc:
-                problems[name] = f"unreadable: {_strerror(exc)}"
+                problem = f"unreadable: {_strerror(exc)}"
+            try:
+                name.encode("utf-8")
+            except UnicodeEncodeError:
+                # a label is hashed into the subject_uid and stored as text; bytes that are
+                # no text can be neither
+                log.warning("%r in %s is skipped: its name is not valid UTF-8", name, subjects_dir)
+                continue
+            if problem is not None:
+                problems[name] = problem
             labels.append(name)
         labels = self._select(labels)
 
-        log = get_logger()
         seen: dict[Path, str] = {}
         records = []
         for label in labels:

@@ -11,6 +11,7 @@ changed option redoes that stage and what follows it, and nothing else.
 from __future__ import annotations
 
 import hashlib
+import os
 import secrets
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -58,7 +59,7 @@ class SourceConfig(_Frozen):
     """Local source in a census run: its pseudonym, the link to the catalog row."""
     subjects: tuple[str, ...] = ()
     """Local only: globs on directory names; empty means all."""
-    field_strength: float | None = Field(default=None, gt=0)
+    field_strength: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Local only: tesla, copied to the subjects of the source."""
     bucket: str | None = None
     """Remote only; likewise ``prefix``."""
@@ -377,10 +378,42 @@ def dump_config(config: RunConfig) -> str:
     return yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True)
 
 
-def write_config(run_dir: Path | str, config: RunConfig) -> None:
-    """Write ``config.yaml`` atomically."""
-    with atomic_path(Path(run_dir) / CONFIG_FILE) as tmp:
-        tmp.write_text(dump_config(config), encoding="utf-8")
+def write_config(run_dir: Path | str, config: RunConfig, *, exclusive: bool = False) -> None:
+    """Write ``config.yaml`` atomically.
+
+    ``exclusive`` is for creating a run: a ``config.yaml`` that is there already is left as
+    it is and ``ConfigError("invalid", ...)`` is raised, so of two processes that create a
+    run in one directory at the same time only one does, and the other cannot replace its
+    salt.
+    """
+    final = Path(run_dir) / CONFIG_FILE
+    if not exclusive:
+        with atomic_path(final) as tmp:
+            tmp.write_text(dump_config(config), encoding="utf-8")
+        return
+    taken = ConfigError(
+        "invalid",
+        f"{run_dir} already holds a run: another process made one while this one was being made",
+    )
+    text = dump_config(config)
+    tmp = final.with_name(f".{final.name}.{secrets.token_hex(8)}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        try:
+            os.link(tmp, final)  # atomic, and fails when the name is taken
+        except FileExistsError:
+            raise taken from None
+        except OSError:  # a file system without hard links: exclusive still, not atomic
+            try:
+                with final.open("x", encoding="utf-8") as stream:
+                    stream.write(text)
+            except FileExistsError:
+                raise taken from None
+            except OSError:
+                final.unlink(missing_ok=True)  # half written, and made here
+                raise
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def run_key(config: RunConfig, dataset_key: HashKey | None = None) -> HashKey:

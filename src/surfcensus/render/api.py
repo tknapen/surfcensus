@@ -7,7 +7,6 @@ source directory. Renders into one directory run one after the other (``_exclusi
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
@@ -21,6 +20,7 @@ from pathlib import Path
 import numpy as np
 
 import surfcensus
+from surfcensus._io import sha256_file
 from surfcensus.fsio.surfaces import Surface, read_surface
 from surfcensus.fsio.volumes import Volume, intensity_window, read_volume
 from surfcensus.render import encode, frames, geometry, vertexmap
@@ -38,7 +38,12 @@ from surfcensus.render.model import (
 )
 from surfcensus.render.slicing import MeshSlicer
 from surfcensus.sources.base import RENDER_ROLES, FileRole
-from surfcensus.sources.patterns import ROLE_CANDIDATES, is_file, resolve_subject_files
+from surfcensus.sources.patterns import (
+    ROLE_CANDIDATES,
+    is_file,
+    resolve_subject_files,
+    variant_name,
+)
 
 try:
     import fcntl
@@ -419,18 +424,11 @@ def _exclusive(out_dir: Path) -> Iterator[bool]:
 
 
 def _input_file(role: FileRole, path: Path) -> InputFile:
-    with path.open("rb") as stream:
-        digest = hashlib.file_digest(stream, "sha256").hexdigest()
-    # render.json is served to raters, so only a name that FreeSurfer gives a file of this role
-    # is recorded, never one chosen by whoever stored the data. A link inside its own directory
-    # (FreeSurfer 7: lh.pial -> lh.pial.T1) names the variant.
-    names = [Path(candidate).name for candidate in ROLE_CANDIDATES[role]]
-    target = path.resolve()
-    if target.parent == path.parent.resolve() and target.name in names:
-        name = target.name
-    else:
-        name = path.name if path.name in names else names[0]
-    return InputFile(name=name, size=target.stat().st_size, sha256=digest)
+    digest = sha256_file(path)
+    # render.json lies with the media of a run, so only a name that FreeSurfer gives a file of
+    # this role is recorded, never one chosen by whoever stored the data (patterns.variant_name)
+    name = variant_name(role, path)
+    return InputFile(name=name, size=path.stat().st_size, sha256=digest)
 
 
 def _check_meshes(surfaces: Mapping[str, Surface]) -> None:

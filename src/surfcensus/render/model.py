@@ -189,7 +189,7 @@ class InputFile(_Frozen):
     @field_validator("name")
     @classmethod
     def _no_path(cls, name: str) -> str:
-        # render.json is served to raters, and a path could name the dataset
+        # render.json lies with the media of a run, and a path could name the dataset
         if not name or "/" in name or "\\" in name or name in (".", ".."):
             raise ValueError(f"a file name without directories is required, got {name!r}")
         return name

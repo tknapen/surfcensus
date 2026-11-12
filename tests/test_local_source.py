@@ -9,6 +9,7 @@ import io
 import logging
 import os
 import shutil
+import sys
 from pathlib import Path
 
 import pytest
@@ -512,6 +513,33 @@ def test_a_subject_that_cannot_be_examined_is_listed_with_its_problem(
     assert set(subjects[0].files) == set(TIER_C) == set(subjects[2].files)
     with source.lease(subjects[1], TIER_C) as paths:
         assert paths == {}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs file names of any bytes")
+def test_a_name_that_is_not_utf8_is_skipped_with_a_warning(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A label is hashed into the ``subject_uid`` and stored as text. A name of other bytes
+    (Latin-1, which Linux file systems take) can be neither, and must not stop the listing."""
+    tree = write_tree(tmp_path / "study", "subjects_dir", list(LABELS))
+    os.rename(os.fsencode(tree / "sub-02"), os.fsencode(tree) + b"/sub-\xff02")
+    Path(os.fsdecode(os.fsencode(tree) + b"/notes-\xe9.txt")).write_text("no subject\n")
+    source = LocalSource(tree)
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        subjects = list(source.subjects(source.dataset))
+    assert [s.subject_label for s in subjects] == ["sub-01", "sub-03"]
+    assert all(s.problem is None for s in subjects)
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert warning.startswith("'sub-\\udcff02' in ") and "not valid UTF-8" in warning
+    salt = new_local_salt()
+    for subject in subjects:  # what the inventory does with a label
+        subject_uid(salt, "local", source.dataset.identity, "freesurfer", subject.subject_label)
+
+    # named alone, it is a subject that the source does not have
+    with pytest.raises(SourceError, match="no subject matches") as raised:
+        only = LocalSource(os.fsdecode(os.fsencode(tree) + b"/sub-\xff02"))
+        list(only.subjects(only.dataset))
+    assert raised.value.reason == "not found"
 
 
 def test_two_names_for_one_directory_are_listed_once_under_the_first(
@@ -1190,8 +1218,8 @@ def test_the_config_of_one_subject_rebuilds_an_equal_source(tmp_path: Path) -> N
     assert _labels(rebuilt) == ["sub-[2]"] == _labels(source)
 
 
-@pytest.mark.parametrize("value", [0, -1.5, float("nan")])
-def test_the_field_strength_is_positive(tmp_path: Path, value: float) -> None:
+@pytest.mark.parametrize("value", [0, -1.5, float("nan"), float("inf")])
+def test_the_field_strength_is_positive_and_finite(tmp_path: Path, value: float) -> None:
     tree = write_tree(tmp_path / "study", "subjects_dir", ["sub-01"])
     with pytest.raises(ValueError, match="field_strength"):
         LocalSource(tree, field_strength=value)
@@ -1272,10 +1300,8 @@ def _check_real_subject(root: Path) -> None:
     assert snapshot_tree(root) == before
 
 
-def test_the_cached_real_subject_is_listed_as_the_bucket_lists_it(
-    request: pytest.FixtureRequest,
-) -> None:
-    root = request.config.rootpath / ".pytest_cache" / "d" / "ds000102-sub-01"
+def test_the_cached_real_subject_is_listed_as_the_bucket_lists_it(cached_subjects: Path) -> None:
+    root = cached_subjects / "ds000102-sub-01"
     present = all(
         (root / name).is_file() and (root / name).stat().st_size == size
         for name, size in REAL_SUBJECT_FILES.items()

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -170,8 +171,9 @@ def test_a_source_config_has_the_fields_of_its_kind_only() -> None:
         SourceConfig(kind="openneuro-derivatives")
     with pytest.raises(ValidationError, match="has no root, subjects"):
         SourceConfig(kind="openneuro-derivatives", bucket="b", root="/data", subjects=("a",))
-    with pytest.raises(ValidationError, match="field_strength"):
-        SourceConfig(kind="local", root="/data", field_strength=0)
+    for value in (0, -3, float("inf"), float("nan")):
+        with pytest.raises(ValidationError, match="field_strength"):
+            SourceConfig(kind="local", root="/data", field_strength=value)
 
 
 def test_the_identity_holds_a_salt_only_for_a_local_run() -> None:
@@ -242,6 +244,33 @@ def test_defaults_round_trip_through_yaml_byte_identically(tmp_path: Path) -> No
         assert (run_dir / "config.yaml").read_bytes() == first
         assert sorted(p.name for p in run_dir.iterdir()) == ["config.yaml"]
         assert first.decode() == dump_config(config)
+
+
+@pytest.mark.parametrize("hard_links", [True, False])
+def test_an_exclusive_write_leaves_the_config_that_is_there(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hard_links: bool
+) -> None:
+    """Two processes that create a run in one directory each draw a salt. The second must
+    not replace the first one's, which its catalog was made with."""
+    if not hard_links:  # a file system that has none, like FAT
+
+        def no_link(*args: object, **kwargs: object) -> None:
+            raise PermissionError(1, "Operation not permitted")
+
+        monkeypatch.setattr(os, "link", no_link)
+    first, second = local_config(tmp_path), local_config(tmp_path)
+    assert first.identity.local_salt != second.identity.local_salt
+    write_config(tmp_path, first, exclusive=True)
+    stored = (tmp_path / "config.yaml").read_bytes()
+    assert stored.decode() == dump_config(first)
+
+    with pytest.raises(ConfigError, match="already holds a run") as raised:
+        write_config(tmp_path, second, exclusive=True)
+    assert raised.value.reason == "invalid"
+    assert (tmp_path / "config.yaml").read_bytes() == stored
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["config.yaml"]  # no temporary file
+    write_config(tmp_path, second)  # the plain write replaces
+    assert load_config(tmp_path) == second
 
 
 def test_a_changed_config_round_trips_with_every_section(tmp_path: Path) -> None:

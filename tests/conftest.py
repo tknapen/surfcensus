@@ -130,6 +130,17 @@ def _fetched(request: pytest.FixtureRequest, name: str, url: str, files: dict[st
 
 
 @pytest.fixture(scope="session")
+def cached_subjects(request: pytest.FixtureRequest) -> Path:
+    """Where the network fixtures keep the real subjects, fetched or not: default tests that
+    read them skip when they are absent, and fetch nothing."""
+    try:
+        cache_dir = str(request.config.getini("cache_dir"))
+    except ValueError:  # pytest was started without its cache plugin
+        cache_dir = ".pytest_cache"
+    return request.config.rootpath / cache_dir / "d"
+
+
+@pytest.fixture(scope="session")
 def real_subject(request: pytest.FixtureRequest) -> Path:
     """ds000102 sub-01 (FreeSurfer 6.0.1, fMRIPrep 21.0.2): Tier A, B and C, 43.4 MB, in the
     pytest cache. Network tests only."""

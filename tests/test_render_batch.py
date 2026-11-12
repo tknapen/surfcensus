@@ -8,6 +8,7 @@ used, so these tests need neither.
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
 import math
 import os
@@ -43,8 +44,13 @@ from surfcensus.config import (
 from surfcensus.inventory.provenance import subject_provenance
 from surfcensus.privacy import HashKey
 from surfcensus.records import PhaseReport, RenderResult, RunContext
-from surfcensus.render import api, batch
-from surfcensus.render.batch import render_check_sample, run_render
+from surfcensus.render import api, batch, encode
+from surfcensus.render.batch import (
+    render_check_sample,
+    render_failures,
+    render_status,
+    run_render,
+)
 from surfcensus.render.model import RenderConfig, RenderInfo
 from surfcensus.schemas import KEYS, SCHEMAS, intensity_schema
 from surfcensus.sources.base import (
@@ -404,6 +410,58 @@ def test_a_subject_that_gets_its_surface_is_rendered(new_bench: Callable[..., Be
     assert bench.rows()[two]["status"] == "done" and bench.rows()[two]["reason"] is None
 
 
+def test_the_failures_of_the_status_are_the_ones_it_counts(
+    new_bench: Callable[..., Bench],
+) -> None:
+    bench = new_bench(["sub-01", "sub-02", "sub-03"], incomplete=["sub-02"])
+    (bench.subject_dir("sub-03") / "mri" / "T1.mgz").write_bytes(b"")
+    bench.inventory()
+    unreadable = bench.store(
+        1,
+        SubjectRecord(
+            bench.sources[0].dataset,
+            "sub-04",
+            "sub-04",
+            {},
+            f"unreadable: Permission denied: '{bench.subject_dir('sub-04')}'",
+        ),
+    )
+    two, three = bench.uid("sub-02"), bench.uid("sub-03")
+    ctx = bench.ctx()
+
+    # before a render: the incomplete subjects, with the detail that their rows will have
+    assert render_status(ctx) == (0, 2, 2)
+    before = render_failures(ctx)
+    assert before == {
+        two: ("missing surface", "no file for lh_pial"),
+        unreadable: (
+            "missing surface",
+            "no file for t1, lh_white, rh_white, lh_pial, rh_pial "
+            "(unreadable: Permission denied: 'sub-04')",
+        ),
+    }
+    assert bench.rows() == {} and bench.leased == []
+
+    run_render(ctx)
+    rows = bench.rows()
+    assert {uid: rows[uid]["detail"] for uid in before} == {
+        uid: detail for uid, (_, detail) in before.items()
+    }
+    assert render_status(ctx) == (1, 3, 0)
+    assert render_failures(ctx) == {
+        two: ("missing surface", None),
+        three: ("render failure", None),
+        unreadable: ("missing surface", None),
+    }
+
+    # under another configuration the failed render is pending, and the rows of the
+    # incomplete subjects are still to be written
+    other = bench.ctx(render=CONFIG.model_copy(update={"crosshair_alpha": 0.2}))
+    assert render_status(other) == (0, 2, 2)
+    assert render_failures(other) == before
+    assert bench.rows() == rows
+
+
 # ---------------------------------------------------------------- the skip rule
 
 
@@ -565,6 +623,52 @@ def test_changed_content_changes_the_render_key(
     row = bench.rows()[one]
     assert row["render_key"] == bench.expected_key(one) != before["render_key"]
     assert row["tile_hash"] == before["tile_hash"]
+
+
+def test_a_pial_link_that_leads_to_another_variant_of_equal_size_and_time_is_rendered_again(
+    new_bench: Callable[..., Bench], rendered: list[tuple[str, bool, bool]]
+) -> None:
+    # FreeSurfer 7: lh.pial -> lh.pial.T1, or -> lh.pial.T2 after a T2 refinement. The two
+    # have one size, and here one modification time, so of the listing only the variant
+    # differs; the tiles would otherwise stay those of the other surface
+    bench = new_bench(["sub-01", "sub-02"])
+    surf = bench.subject_dir("sub-01") / "surf"
+    first, second, link = surf / "lh.pial.T1", surf / "lh.pial.T2", surf / "lh.pial"
+    os.replace(link, first)
+    link.symlink_to(first.name)
+    bench.inventory()
+    run_render(bench.ctx())
+    one = bench.uid("sub-01")
+    before = bench.rows()[one]
+    listed = bench.catalog.subject_record(one).files[FileRole.LH_PIAL]
+    assert (listed.location, listed.variant) == ("surf/lh.pial", "lh.pial.T1")
+
+    coords, faces, info, stamp = nib.freesurfer.read_geometry(
+        str(first), read_metadata=True, read_stamp=True
+    )
+    nib.freesurfer.write_geometry(
+        str(second), coords * 0.9, faces, create_stamp=stamp, volume_info=info
+    )
+    os.utime(second, ns=(first.stat().st_atime_ns, first.stat().st_mtime_ns))
+    link.unlink()
+    link.symlink_to(second.name)
+    bench.inventory()
+    again = bench.catalog.subject_record(one).files[FileRole.LH_PIAL]
+    assert again == dataclasses.replace(listed, variant="lh.pial.T2")
+    del rendered[:]
+
+    report = run_render(bench.ctx())
+
+    assert uids_of(rendered) == [one] and (report.done, report.skipped) == (1, 1)
+    row = bench.rows()[one]
+    assert row["input_signature"] != before["input_signature"]
+    assert row["render_key"] == bench.expected_key(one) != before["render_key"]
+    render_json = bench.run_dir / "media" / one / "render.json"
+    read = RenderInfo.model_validate_json(render_json.read_text()).inputs["lh_pial"]
+    assert (read.name, read.sha256) == (
+        "lh.pial.T2",
+        hashlib.sha256(second.read_bytes()).hexdigest(),
+    )
 
 
 def test_a_file_that_no_render_reads_does_not_render_again(
@@ -954,6 +1058,115 @@ def test_any_other_exception_is_a_render_failure_with_its_type_and_a_scrubbed_te
     assert row["detail"] == "RuntimeError: cannot use 'T1.mgz' of sub-02 in D-?"
     assert bench.catalog.public().render(two).detail == row["detail"]
     assert bench.rows()[one]["status"] == "done"
+
+
+@pytest.mark.parametrize("code", [errno.ENOSPC, errno.EROFS, errno.EDQUOT, errno.EACCES])
+def test_media_that_cannot_be_written_stop_the_phase_and_are_not_charged_to_a_subject(
+    new_bench: Callable[..., Bench], monkeypatch: pytest.MonkeyPatch, code: int
+) -> None:
+    """A full or read-only disk fails every subject alike. Recorded as failures, the
+    subjects would stay failed after room was made, until ``retry_failed``."""
+    labels = ["sub-01", "sub-02", "sub-03", "sub-04"]
+    bench = new_bench(labels, incomplete=["sub-04"], cache=CacheConfig(batch_subjects=2))
+    one, two, three = sorted(bench.uid(label) for label in labels[:3])  # as they are rendered
+    four = bench.uid("sub-04")
+    original = encode.write_rgb_webp
+
+    def no_room(path: Path, *args: object, **kwargs: object) -> None:
+        if Path(path).parent.name == three:  # the poster, after the tiles of the subject
+            raise OSError(code, os.strerror(code), str(path))
+        original(path, *args, **kwargs)
+
+    with monkeypatch.context() as full:
+        full.setattr(encode, "write_rgb_webp", no_room)
+        with pytest.raises(ConfigError, match="the media cannot be written") as raised:
+            run_render(bench.ctx())
+    assert raised.value.reason == "invalid" and os.strerror(code) in raised.value.detail
+    assert isinstance(raised.value.__cause__, OSError)
+    # the batch before is recorded; of the batch that met the error, nothing
+    rows = bench.rows()
+    assert {uid: row["status"] for uid, row in rows.items()} == {
+        one: "done",
+        two: "done",
+        four: "failed",
+    }
+    assert rows[four]["reason"] == "missing surface"
+
+    # with room again, the same call does the rest
+    report = run_render(bench.ctx())
+    assert (report.done, report.skipped) == (1, 2) and failed(report) == {four: "missing surface"}
+    assert bench.rows()[three]["status"] == "done"
+
+
+def test_a_refusal_outside_the_media_is_charged_to_its_subject(
+    new_bench: Callable[..., Bench], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    bench = new_bench(["sub-01", "sub-02"])
+    one, two = bench.uid("sub-01"), bench.uid("sub-02")
+    original = api.render_subject
+    elsewhere = tmp_path / "elsewhere" / "file"
+
+    def breaks(files: Mapping[FileRole, Path], out_dir: Path, *args: object, **kwargs: object):
+        if Path(out_dir).name == two:
+            raise PermissionError(errno.EACCES, os.strerror(errno.EACCES), str(elsewhere))
+        return original(files, out_dir, *args, **kwargs)
+
+    monkeypatch.setattr(api, "render_subject", breaks)
+    report = run_render(bench.ctx())
+    assert report.done == 1 and failed(report) == {two: "render failure"}
+    assert bench.rows()[two]["detail"].startswith("PermissionError: ")
+    assert bench.rows()[one]["status"] == "done"
+
+
+def test_a_video_that_the_disk_has_no_room_for_stops_the_phase(
+    new_bench: Callable[..., Bench], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ffmpeg writes the video itself, so its failed write arrives in words. The text is
+    what the ffmpeg of imageio-ffmpeg printed on a full tmpfs (Linux, seen once)."""
+    bench = new_bench(["sub-01"])
+    said = (
+        "ffmpeg failed with status 228: [out#0/mp4 @ 0x55758b27a340] Error writing trailer: "
+        "No space left on device"
+    )
+
+    def full(*args: object, **kwargs: object) -> int:
+        raise RuntimeError(said)
+
+    real = encode.write_mp4
+    with monkeypatch.context() as patched:
+        # the probe of the encoder is let through; the video of the subject is not
+        patched.setattr(
+            encode,
+            "write_mp4",
+            lambda path, *args: (real if Path(path).name == "probe.mp4" else full)(path, *args),
+        )
+        with pytest.raises(ConfigError, match="the media cannot be written") as raised:
+            run_render(bench.ctx(), video=True)
+    assert raised.value.reason == "invalid" and bench.rows() == {}
+    assert run_render(bench.ctx(), video=True).done == 1
+
+
+def test_an_encoder_that_cannot_encode_stops_the_phase_and_records_nothing(
+    new_bench: Callable[..., Bench],
+    rendered: list[tuple[str, bool, bool]],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A binary that is there and fails (here: one that exits with 1, like a build without
+    libx264) would otherwise fail every subject with the same ``render failure``."""
+    bench = new_bench(["sub-01", "sub-02", "sub-03"], incomplete=["sub-03"])
+    exe = tmp_path / "ffmpeg-broken"
+    exe.write_text("#!/bin/sh\ncat > /dev/null\necho 'Unknown encoder libx264' >&2\nexit 1\n")
+    exe.chmod(0o755)
+    with monkeypatch.context() as broken:
+        broken.setenv("IMAGEIO_FFMPEG_EXE", str(exe))
+        with pytest.raises(ConfigError, match="the video cannot be encoded") as raised:
+            run_render(bench.ctx(), video=True)
+    assert raised.value.reason == "missing"
+    assert "status 1" in raised.value.detail and "Unknown encoder libx264" in raised.value.detail
+    assert rendered == [] and bench.leased == [] and bench.rows() == {}
+    assert not (bench.run_dir / "media").exists()
+    assert run_render(bench.ctx(), video=True).done == 2  # with the encoder back
 
 
 def test_a_census_run_keeps_no_label_in_a_detail_and_shows_no_detail(

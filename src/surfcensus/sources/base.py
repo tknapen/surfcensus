@@ -226,14 +226,25 @@ def input_signature(
 
     The SHA-256 of one line ``role<TAB>location<TAB>size<TAB>etag_or_mtime`` per requested
     role that the subject has (every role it has when ``roles`` is None), in
-    :class:`FileRole` definition order, followed by one line per ``extra`` string. It is
-    built from the listing alone, so deciding to skip reads no source file.
+    :class:`FileRole` definition order, followed by one line per ``extra`` string. A role
+    with a ``variant`` adds ``<TAB>variant`` to its line. It is built from the listing
+    alone, so deciding to skip reads no source file.
 
     For a remote subject this is a function of the public bucket listing: it is stored in
     ``catalog.sqlite`` and written nowhere else.
     """
+
+    def line(role: FileRole, ref: FileRef) -> str:
+        fields = [role.value, ref.location, str(ref.size), ref.etag_or_mtime]
+        if ref.variant is not None:
+            # a link keeps its location when it is pointed at another variant, and the pial
+            # variants of one subject have one size: with an equal modification time (a
+            # copy that keeps it) nothing else in the line would differ
+            fields.append(ref.variant)
+        return "\t".join(fields)
+
     lines = [
-        f"{role.value}\t{files[role].location}\t{files[role].size}\t{files[role].etag_or_mtime}"
+        line(role, files[role])
         for role in FileRole
         if role in files and (roles is None or role in roles)
     ]

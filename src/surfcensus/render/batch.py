@@ -13,8 +13,11 @@ in milestone 3, when ``templates.py`` exists.
 
 from __future__ import annotations
 
+import errno
 import html
 import math
+import os
+import tempfile
 import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
@@ -130,7 +133,30 @@ def render_status(ctx: RunContext) -> tuple[int, int, int]:
     and inputs and is on disk; ``failed`` those recorded as failed for them, and every
     present subject that lacks a render role; ``pending`` what a call would render.
     """
-    plan = _plan(
+    plan = _status_plan(ctx)
+    return plan.skipped, len(plan.failures), len(plan.pending)
+
+
+def render_failures(ctx: RunContext) -> dict[str, tuple[str, str | None]]:
+    """``subject_uid -> (reason, detail)`` for the subjects that ``render_status`` counts as
+    failed.
+
+    The detail is None where the failure is recorded: its row of the ``renders`` table has
+    it, in the private catalog. An incomplete subject that has no ``missing surface`` row
+    for its present inputs yet (``run_render`` writes it) comes with the detail that the
+    row will have.
+    """
+    plan = _status_plan(ctx)
+    details = _missing_details(ctx, plan.unrecorded)
+    return {
+        uid: (reason, ctx.scrub(details[uid]) if uid in details else None)
+        for uid, reason in plan.failures.items()
+    }
+
+
+def _status_plan(ctx: RunContext) -> _Plan:
+    """What ``run_render(ctx)`` would find now."""
+    return _plan(
         ctx,
         datasets=None,
         subjects=None,
@@ -139,7 +165,31 @@ def render_status(ctx: RunContext) -> tuple[int, int, int]:
         force=False,
         retry_failed=False,
     )
-    return plan.skipped, len(plan.failures), len(plan.pending)
+
+
+def render_pending(
+    ctx: RunContext,
+    *,
+    datasets: Collection[str] | None = None,
+    subjects: Sequence[str] | None = None,
+    all_subjects: bool | None = None,
+    video: bool | None = None,
+    force: bool = False,
+    retry_failed: bool = False,
+) -> int:
+    """How many subjects ``run_render`` would render when called with the same arguments.
+    Like the call itself it raises ``ConfigError`` for a subject the run does not have; it
+    opens no source file and records nothing. Zero means that the call needs no source."""
+    plan = _plan(
+        ctx,
+        datasets=datasets,
+        subjects=subjects,
+        all_subjects=all_subjects,
+        video=video,
+        force=force,
+        retry_failed=retry_failed,
+    )
+    return len(plan.pending)
 
 
 def run_render(
@@ -178,11 +228,15 @@ def run_render(
     The report counts the subjects rendered now (``done``), skipped, and in the failed
     state when the call returns, whether tried now or not (``failed``, ``failures``).
 
-    Raises ``ConfigError`` for what is wrong with the run and not with a subject, before
-    anything is recorded against one: ``missing`` when a video is asked for and there is no
-    ffmpeg binary, ``invalid`` for a video with an odd ``render.panel_px``, for a
-    ``subject_uid`` that the run does not have, and for a run directory inside a subject
-    directory. ``KeyboardInterrupt`` ends the call; the batches before it are recorded.
+    Raises ``ConfigError`` for what is wrong with the run or the machine and not with a
+    subject: ``missing`` when a video is asked for and ffmpeg is absent or cannot encode
+    (two small frames are encoded to find out), ``invalid`` for a video with an odd
+    ``render.panel_px``, for a ``subject_uid`` that the run does not have, for a run
+    directory inside a subject directory, and when the media cannot be written (a full or
+    read-only disk, a quota, no permission under ``media/``). The first three are raised
+    before anything is recorded; the last two end the call at the batch in which they occur,
+    and nothing of that batch is recorded. ``KeyboardInterrupt`` ends the call as well; the
+    batches before it are recorded.
     """
     started = time.perf_counter()
     public, config = ctx.public, ctx.config
@@ -217,11 +271,7 @@ def run_render(
         )
 
     if video and pending:
-        # the encoder belongs to the environment: its absence is not recorded once per subject
-        try:
-            encode.ffmpeg_exe()
-        except RuntimeError as exc:
-            raise ConfigError("missing", f"the video cannot be encoded: {exc}") from exc
+        _check_encoder(render_config)
 
     if plan.unrecorded:
         details = _missing_details(ctx, plan.unrecorded)
@@ -230,10 +280,21 @@ def run_render(
         )
 
     tile_hash = render_config.tile_hash()
+    media_root = Path(ctx.run_dir) / MEDIA_DIR
     done = 0
 
     def commit(outcomes: Sequence[tuple[str, RenderResult | BaseException]]) -> None:
         nonlocal done
+        unwritable = [
+            o for _, o in outcomes if isinstance(o, Exception) and _is_unwritable(o, media_root)
+        ]
+        if unwritable:
+            # A full or read-only disk fails every subject alike. Nothing of the batch is
+            # recorded, so the next call does the work once there is room: the renders that
+            # did succeed are found complete on disk.
+            raise ConfigError(
+                "invalid", f"the media cannot be written: {unwritable[0]}"
+            ) from unwritable[0]
         refused = [o for _, o in outcomes if isinstance(o, api.OutputInSourceError)]
         if refused:
             # nothing can be rendered into this run directory, whatever the subject
@@ -279,7 +340,7 @@ def run_render(
 
     work = partial(
         _render_one,
-        media_root=Path(ctx.run_dir) / MEDIA_DIR,
+        media_root=media_root,
         config=render_config,
         video=video,
         force=force,
@@ -450,6 +511,47 @@ def _missing_details(ctx: RunContext, uids: Sequence[str]) -> dict[str, str]:
         problem = problems.get(uid)
         details[uid] = f"{detail} ({problem})" if isinstance(problem, str) and problem else detail
     return details
+
+
+def _check_encoder(config: RenderConfig) -> None:
+    """Find the ffmpeg binary and have it encode two small frames in a temporary directory.
+
+    The encoder belongs to the environment: one that is absent, cannot be started or cannot
+    encode (a build without libx264) fails every subject alike and is not recorded once per
+    subject. Raises ``ConfigError("missing", ...)``.
+    """
+    try:
+        encode.ffmpeg_exe()
+        with tempfile.TemporaryDirectory(prefix="surfcensus-") as folder:
+            frames = [np.zeros((16, 16, 3), dtype=np.uint8)] * 2
+            encode.write_mp4(Path(folder) / "probe.mp4", frames, config.fps, config.crf)
+    except (RuntimeError, OSError) as exc:
+        raise ConfigError("missing", f"the video cannot be encoded: {exc}") from exc
+
+
+_NO_ROOM = (errno.ENOSPC, errno.EDQUOT, errno.EROFS)
+_NOT_ALLOWED = (errno.EACCES, errno.EPERM)
+
+
+def _is_unwritable(exc: Exception, media_root: Path) -> bool:
+    """Whether a failed render says that the media cannot be written, whatever the subject:
+    the disk is full, over quota or read-only, or a path under ``media_root`` may not be
+    written. Such a failure is of the run directory and is not recorded against a subject.
+
+    The inputs are no cause of these: ``render_subject`` turns every error of reading them
+    into a ``RenderError``. ffmpeg writes the video itself and reports a failed write in
+    words, as a RuntimeError of ``encode.write_mp4``.
+    """
+    if isinstance(exc, OSError):
+        if exc.errno in _NO_ROOM:
+            return True
+        name = exc.filename
+        if exc.errno in _NOT_ALLOWED and isinstance(name, str | bytes | os.PathLike):
+            return Path(os.fsdecode(name)).is_relative_to(media_root)
+        return False
+    if isinstance(exc, RuntimeError):
+        return any(os.strerror(code) in str(exc) for code in _NO_ROOM)
+    return False
 
 
 def _failure(exc: BaseException) -> tuple[str, str]:

@@ -9,6 +9,7 @@ method imports the phase it calls and hands it the public side of the run
 from __future__ import annotations
 
 import os
+import sqlite3
 from collections.abc import Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
@@ -60,6 +61,9 @@ class Run:
     its run secret. A local run gets a new salt; a census run is created with the dataset
     key as ``key`` and stores its fingerprint only. ``config`` is the configuration to
     start from (``config.new_local_config``); its sources are replaced by those given.
+    Of two processes that create a run in one directory at the same time, one is refused
+    and changes nothing. A place where no run can be made (no permission, a read-only or
+    full disk) raises ``ConfigError("invalid", ...)``.
 
     Opening needs no key, also for a census run; ``Run.inventory`` of a census run does.
     The sources are rebuilt from ``config.yaml`` when a phase first needs them, so a run
@@ -165,11 +169,18 @@ class Run:
             raise ConfigError("invalid", "the same source was given twice")
         self.config = with_changes(base, sources=tuple(stored))
 
-        self.run_dir.mkdir(parents=True, exist_ok=True)
-        write_config(self.run_dir, self.config)
-        self._catalog = Catalog.create(
-            self.run_dir / CATALOG_FILE, mode=self.config.mode, key=hash_key
-        )
+        try:
+            self.run_dir.mkdir(parents=True, exist_ok=True)
+            # exclusive: a process that creates a run here at the same time is refused, or
+            # refuses this one, before either can replace the other's salt
+            write_config(self.run_dir, self.config, exclusive=True)
+            self._catalog = Catalog.create(
+                self.run_dir / CATALOG_FILE, mode=self.config.mode, key=hash_key
+            )
+        except (OSError, sqlite3.OperationalError) as exc:
+            raise ConfigError(
+                "invalid", f"no run can be made in {self.run_dir}: {' '.join(str(exc).split())}"
+            ) from exc
         for index, (source, described) in enumerate(zip(given, stored, strict=True)):
             self._built[index] = source
             if census and described.kind == "local":
@@ -296,12 +307,25 @@ class Run:
             source = self._source(match.index, root=described.root)
         if moved:
             rows = self._catalog.query(
-                "SELECT dataset_id FROM datasets WHERE source = 'local' AND identity = ?",
+                "SELECT dataset_id, pipeline FROM datasets WHERE source = 'local' AND identity = ?",
                 (match.identity,),
             )
             for dataset in source.datasets():
-                for row in rows:
-                    self._catalog.relocate(row["dataset_id"], dataset)
+                # A row of another pipeline is what the data was before an inventory found
+                # it in the layout of this one; its subjects are absent. It follows to the
+                # new root and is left alone otherwise. With no row of this pipeline,
+                # Catalog.relocate refuses the move.
+                ids = [row["dataset_id"] for row in rows]
+                found = [row["dataset_id"] for row in rows if row["pipeline"] == dataset.pipeline]
+                for dataset_id in found or ids:
+                    self._catalog.relocate(dataset_id, dataset)
+                earlier = [dataset_id for dataset_id in ids if dataset_id not in found]
+                if found and earlier:
+                    with self._catalog.write() as conn:
+                        conn.executemany(
+                            "UPDATE datasets SET root = ? WHERE dataset_id = ?",
+                            [(dataset.root, dataset_id) for dataset_id in earlier],
+                        )
 
     def _relocation_target(
         self, locals_: Sequence[_StoredLocal], relocate: bool | str
@@ -437,17 +461,31 @@ class Run:
         ``render.batch.run_render``.
 
         ``subjects`` are ``subject_uid``s; in a local run a subject may also be named by
-        its label. Raises ``SourceError`` when a source cannot be built, before anything is
-        recorded against a subject.
+        its label. Raises ``SourceError`` when there is something to render and a source
+        cannot be built, before anything is recorded against a subject. A call that finds
+        every render recorded needs no source.
         """
-        from surfcensus.render.batch import run_render
+        from surfcensus.render.batch import render_pending, run_render
 
-        self._sources()  # a source that is gone is not a property of its subjects
+        context = self.context()
+        pseudonyms = self._pseudonyms(datasets)
+        uids = None if subjects is None else self._subject_uids(subjects)
+        pending = render_pending(
+            context,
+            datasets=pseudonyms,
+            subjects=uids,
+            all_subjects=all_subjects,
+            video=video,
+            force=force,
+            retry_failed=retry_failed,
+        )
+        if pending:
+            self._sources()  # a source that is gone is not a property of its subjects
         return run_render(
-            self.context(),
+            context,
             jobs=jobs,
-            datasets=self._pseudonyms(datasets),
-            subjects=None if subjects is None else self._subject_uids(subjects),
+            datasets=pseudonyms,
+            subjects=uids,
             all_subjects=all_subjects,
             video=video,
             force=force,

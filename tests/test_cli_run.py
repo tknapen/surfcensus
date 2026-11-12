@@ -3,8 +3,11 @@ codes, what they store between calls, and that a source is only read."""
 
 from __future__ import annotations
 
+import errno
 import re
 import shutil
+import sqlite3
+import sys
 from pathlib import Path
 
 import pandas as pd
@@ -19,6 +22,7 @@ from surfcensus.privacy import HashKey
 from surfcensus.render import RenderConfig, api, encode
 from surfcensus.run import Run
 from surfcensus.sources.local import local
+from surfcensus.store import CATALOG_FILE, Catalog
 
 LABELS = ("sub-01", "sub-02", "sub-03")
 FS_ROOT = "sourcedata/freesurfer"
@@ -182,6 +186,57 @@ def test_inventory_stops_with_exit_2_for_what_is_wrong_with_the_call(
     assert cli("inventory").exit_code == 2  # --run-dir is required
 
 
+@pytest.mark.parametrize("value", ["-3", "0", "nan", "inf"])
+def test_a_field_strength_that_is_none_is_exit_2_on_a_new_run_too(
+    study: Path, tmp_path: Path, value: str
+) -> None:
+    run_dir = tmp_path / "new"
+    result = cli("inventory", "--run-dir", run_dir, "--source", study, f"--field-strength={value}")
+    assert result.exit_code == 2, result.output
+    assert result.output == (
+        f"invalid: --field-strength is in tesla, positive and finite, not {float(value)}\n"
+    )
+    assert not run_dir.exists()
+
+
+def test_a_run_directory_that_cannot_be_written_is_exit_2_with_one_line(
+    study: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Exit code 1 means that units failed. A disk that is read-only or full is no unit."""
+    if sys.platform == "linux":  # no directory can be made in /proc
+        nowhere = cli("inventory", "--run-dir", "/proc/surfcensus-nowhere/run", "--source", study)
+        assert nowhere.exit_code == 2, nowhere.output
+        assert nowhere.output.startswith("invalid: no run can be made in /proc/")
+        assert nowhere.output.count("\n") == 1
+
+    def read_only(*args: object, **kwargs: object) -> int:
+        raise sqlite3.OperationalError("attempt to write a readonly database")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Catalog, "upsert_dataset", read_only)
+        refused = cli("inventory", "--run-dir", run_dir)
+    assert refused.exit_code == 2, refused.output
+    assert refused.output == (
+        "invalid: the run directory cannot be used: attempt to write a readonly database\n"
+    )
+
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+
+    def full(*args: object, **kwargs: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device", str(run_dir / "media" / "x"))
+
+    with monkeypatch.context() as patched:
+        patched.setattr(encode, "write_gray_webp", full)
+        refused = cli("render", "--run-dir", run_dir)
+    assert refused.exit_code == 2, refused.output
+    assert refused.output.startswith("invalid: the media cannot be written: [Errno 28] No space")
+    assert refused.output.count("\n") == 1
+    # nothing was held against a subject: with room again, the plain call does the work
+    assert "render: 0 done, 1 failed, 2 pending" in lines(cli("status", "--run-dir", run_dir))
+    done = cli("render", "--run-dir", run_dir)
+    assert done.exit_code == 1 and "render: 2 done, 0 skipped, 1 failed" in done.output
+
+
 def test_inventory_refuses_another_root_and_relocates_when_asked(
     study: Path, run_dir: Path, tmp_path: Path
 ) -> None:
@@ -298,6 +353,43 @@ def test_a_subject_that_cannot_be_rendered_is_listed_with_a_scrubbed_detail(
     (line,) = [text for text in failed if two in text]
     assert line.startswith(f"render {two} (sub-02): render failure: ") and "T1.mgz" in line
     assert str(tmp_path) not in status.output
+
+
+def test_status_lists_the_render_failures_that_it_counts(study: Path, run_dir: Path) -> None:
+    def status() -> tuple[str, list[str]]:
+        result = cli("status", "--run-dir", run_dir, "--failures")
+        assert result.exit_code == 0, result.output
+        return lines(result)[2], lines(result)[3:]
+
+    # an incomplete subject is counted, and listed, before render has recorded it
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+    three = uid(run_dir, "sub-03")
+    missing = f"render {three} (sub-03): missing surface: no file for lh_pial"
+    assert status() == ("render: 0 done, 1 failed, 2 pending", [missing])
+    with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+        assert len(catalog.failures()) == 0  # status recorded nothing
+    assert cli("render", "--run-dir", run_dir).exit_code == 1
+    assert status() == ("render: 2 done, 1 failed, 0 pending", [missing])
+
+    # its recorded row is of other inputs once a file changed: still one line
+    surf = study / FS_ROOT / "sub-03" / "surf"
+    (surf / "rh.pial").write_bytes((surf / "rh.pial").read_bytes() + b"\n")
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+    assert status() == ("render: 2 done, 1 failed, 0 pending", [missing])
+
+    # with the file it lacked, the subject is pending and its old failure is not listed
+    shutil.copy(study / FS_ROOT / "sub-01" / "surf" / "lh.pial", surf / "lh.pial")
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+    assert status() == ("render: 2 done, 0 failed, 1 pending", [])
+
+    # nor is the failure of a subject that left the source
+    (surf / "lh.pial").unlink()
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+    assert cli("render", "--run-dir", run_dir).exit_code == 1
+    assert status() == ("render: 2 done, 1 failed, 0 pending", [missing])
+    shutil.rmtree(surf.parent)
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+    assert status() == ("render: 2 done, 0 failed, 0 pending", [])
 
 
 def test_the_video_option_is_stored_and_a_missing_encoder_is_exit_2(
@@ -465,6 +557,20 @@ def test_status_of_a_run_before_and_after_its_phases(study: Path, run_dir: Path)
         "render: 1 done, 1 failed, 0 pending",
     ]
     assert not list(run_dir.rglob("*.log"))  # status writes nothing
+
+    # the subjects move to where a plain FreeSurfer run keeps them: another pipeline, so a
+    # second row of the same dataset, which is named once
+    shutil.move(study / FS_ROOT, study / "freesurfer")
+    shutil.rmtree(study / "sourcedata")
+    moved = cli("inventory", "--run-dir", run_dir)
+    assert moved.exit_code == 0, moved.output
+    assert "subjects: 2 found, 1 complete" in moved.output
+    assert f"  {name}: the data is now found as pipeline freesurfer, not fmriprep; " in moved.output
+    assert lines(cli("status", "--run-dir", run_dir)) == [
+        f"local run, datasets: {name}",
+        "inventory: 2 done, 0 failed (3 no longer in the source)",
+        "render: 0 done, 1 failed, 1 pending",
+    ]
 
 
 @pytest.mark.parametrize("command", ["inventory", "render", "status"])

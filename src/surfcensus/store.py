@@ -27,7 +27,7 @@ import uuid
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from datetime import UTC, datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Literal, cast
 
 import pandas as pd
@@ -347,6 +347,12 @@ def _flag(value: bool | None) -> int | None:
     return None if value is None else int(value)
 
 
+def _check_digests(digests: Mapping[FileRole, str]) -> None:
+    for role, digest in digests.items():
+        if not _SHA256.fullmatch(digest):
+            raise ValueError(f"not a SHA-256 digest for {role.value}: {digest!r}")
+
+
 def _statements(script: str) -> Iterator[str]:
     """The statements of an SQL script, one at a time; each must end at the end of a line.
 
@@ -378,8 +384,27 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute(f"PRAGMA user_version = {number + 1}")
         conn.execute("COMMIT")
     except BaseException:
-        conn.execute("ROLLBACK")
+        _roll_back(conn)
         raise
+
+
+def _roll_back(conn: sqlite3.Connection) -> None:
+    """End the open transaction, if there still is one. SQLite ends it by itself on some
+    errors (a full disk), and a ROLLBACK would then raise and hide the error."""
+    if conn.in_transaction:
+        conn.execute("ROLLBACK")
+
+
+def _in_use(exc: sqlite3.Error, name: str) -> ConfigError | None:
+    """The error to raise when ``exc`` says that another connection holds the file locked
+    for longer than the busy timeout, else None."""
+    code = getattr(exc, "sqlite_errorcode", None)
+    # the low byte of an extended code (SQLITE_BUSY_TIMEOUT, ...) is the primary one
+    if isinstance(code, int) and code & 0xFF in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED):
+        return ConfigError(
+            "invalid", f"{name} is in use by another process; try again when that is done"
+        )
+    return None
 
 
 def filesystem_type(path: Path | str, mounts: str | None = None) -> str | None:
@@ -446,7 +471,11 @@ class _Db:
             self._conn.execute("PRAGMA foreign_keys = ON")
             version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         except sqlite3.DatabaseError as exc:
-            raise ConfigError("invalid", f"{name} is not a SQLite database: {exc}") from exc
+            # a locked file is whole: saying otherwise invites deleting the catalog
+            raise (
+                _in_use(exc, name)
+                or ConfigError("invalid", f"{name} is not a SQLite database: {exc}")
+            ) from exc
         if version > SCHEMA_VERSION:
             raise ConfigError(
                 "newer schema",
@@ -500,12 +529,18 @@ class _Db:
         with self._lock:
             if self._conn.in_transaction:
                 raise RuntimeError("a transaction is already open on this catalog")
-            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                busy = _in_use(exc, self.path.name)
+                if busy is None:
+                    raise
+                raise busy from exc
             try:
                 yield self._conn
                 self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                _roll_back(self._conn)
                 raise
 
     def close(self) -> None:
@@ -704,12 +739,16 @@ class Catalog:
         record: SubjectRecord,
         provenance: Provenance,
         inventory_hash: str,
+        *,
+        digests: Mapping[FileRole, str] | None = None,
     ) -> None:
         """Store what the inventory found for one subject, and mark it present.
 
-        Replaces the subject's ``files`` rows in the same transaction; the digest of a file
-        whose location, size and ETag or mtime are unchanged is kept. The columns of phase
-        3 (age, sex, field strength, manufacturer) are not touched.
+        Replaces the subject's ``files`` rows in the same transaction. ``digests`` are the
+        SHA-256 digests of the files that this inventory read in full; a role the subject
+        does not have is ignored. A file that is not among them keeps the digest it has
+        while its location, variant, size and ETag or mtime are unchanged. The columns of
+        phase 3 (age, sex, field strength, manufacturer) are not touched.
 
         Raises ``ConfigError("invalid", ...)`` when ``uid`` already names another subject
         (a collision of the keyed hash), and ``ConfigError("key", ...)`` when the subject
@@ -717,6 +756,8 @@ class Catalog:
         """
         if not _UID.fullmatch(uid):
             raise ValueError(f"a subject_uid is 16 hex characters, got {uid!r}")
+        digests = {} if digests is None else digests
+        _check_digests(digests)
         files = record.files
         truncations = [provenance.truncations.get(hemi) or (None, None) for hemi in HEMIS]
         holes = provenance.holes or (None, None)
@@ -796,19 +837,22 @@ class Catalog:
             kept = {
                 row["role"]: row
                 for row in conn.execute(
-                    "SELECT role, location, size, etag_or_mtime, version_id, sha256 FROM files "
-                    "WHERE subject_uid = ?",
+                    "SELECT role, location, variant, size, etag_or_mtime, version_id, sha256 "
+                    "FROM files WHERE subject_uid = ?",
                     (uid,),
                 )
             }
             conn.execute("DELETE FROM files WHERE subject_uid = ?", (uid,))
             for role, ref in files.items():
                 old = kept.get(role.value)
-                if old is not None and (ref.location, ref.size, ref.etag_or_mtime) != (
-                    old["location"],
-                    old["size"],
-                    old["etag_or_mtime"],
-                ):
+                # the variant too: a link that now leads to another file of the same size
+                # and time has the location, size and time it had
+                if old is not None and (
+                    ref.location,
+                    ref.variant,
+                    ref.size,
+                    ref.etag_or_mtime,
+                ) != (old["location"], old["variant"], old["size"], old["etag_or_mtime"]):
                     old = None  # another file now: what was read of the old one does not hold
                 conn.execute(
                     "INSERT INTO files (subject_uid, role, location, variant, size, etag_or_mtime, "
@@ -822,7 +866,7 @@ class Catalog:
                         ref.etag_or_mtime,
                         ref.last_modified,
                         old["version_id"] if old is not None else None,
-                        old["sha256"] if old is not None else None,
+                        digests.get(role, old["sha256"] if old is not None else None),
                     ),
                 )
 
@@ -882,10 +926,15 @@ class Catalog:
         The stored ``identity`` stays, whatever ``record`` holds, so every ``subject_uid``
         stays. Source and pipeline are hashed into the uids as well, so a record of another
         source or pipeline is refused: ``ConfigError("invalid", ...)``.
+
+        When ``fs_root`` changes (the data moved into another layout), the ``fs_dir`` of
+        every subject of the dataset moves with it, listed or not: the inventory skips a
+        subject whose files are unchanged, so nothing else would correct it.
         """
         with self._db.write() as conn:
             row = conn.execute(
-                "SELECT source, pipeline FROM datasets WHERE dataset_id = ?", (dataset_id,)
+                "SELECT source, pipeline, fs_root FROM datasets WHERE dataset_id = ?",
+                (dataset_id,),
             ).fetchone()
             if row is None:
                 raise KeyError(f"no dataset {dataset_id} in the catalog")
@@ -907,6 +956,21 @@ class Catalog:
                     record.pipeline_version,
                     dataset_id,
                 ),
+            )
+            old, new = PurePosixPath(row["fs_root"]), PurePosixPath(record.fs_root)
+            if old == new:
+                return
+            subjects = conn.execute(
+                "SELECT subject_uid, subject_label, fs_dir FROM subjects WHERE dataset_id = ?",
+                (dataset_id,),
+            ).fetchall()
+            conn.executemany(
+                "UPDATE subjects SET fs_dir = ? WHERE subject_uid = ?",
+                [
+                    ((new / subject["subject_label"]).as_posix(), subject["subject_uid"])
+                    for subject in subjects
+                    if PurePosixPath(subject["fs_dir"]) == old / subject["subject_label"]
+                ],
             )
 
     def _datasets_named(self, only: Collection[str] | None) -> list[sqlite3.Row]:
@@ -1195,9 +1259,7 @@ class PublicCatalog:
     def set_file_digests(self, uid: str, digests: Mapping[FileRole, str]) -> None:
         """Store SHA-256 digests of files that were read in full. Write-only. A role the
         subject does not have is ignored."""
-        for role, digest in digests.items():
-            if not _SHA256.fullmatch(digest):
-                raise ValueError(f"not a SHA-256 digest for {role.value}: {digest!r}")
+        _check_digests(digests)
         with self._db.write() as conn:
             conn.executemany(
                 "UPDATE files SET sha256 = ? WHERE subject_uid = ? AND role = ?",

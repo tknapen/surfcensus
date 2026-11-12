@@ -32,7 +32,7 @@ uv run surfcensus status --run-dir runs/mystudy
 - `render` writes `media/<id>/` for every subject that has a T1 and white and pial surfaces of both hemispheres: the tiles, `poster.webp`, `render.json` and `vertex_map.npz` described below, and `anim.mp4` with `--video`. Subjects get an identifier that does not show their name, because the rating app will keep raters blind.
 - `status` says how many subjects are inventoried and rendered, failed or pending; `status --failures` lists each failure with its reason.
 
-All three can be run again at any time. A second call does only what is new: a subject whose files changed is read and rendered again, the others are skipped, and a subject that failed is tried again when its files change or with `--retry-failed`. If the data moves, `inventory --source /new/place --relocate` keeps the run. The exit code is 0 when nothing is in the failed state, 1 when a subject is, and 2 for a wrong call.
+All three can be run again at any time. A second call does only what is new: a subject whose files changed is read and rendered again, the others are skipped, and a subject that failed is tried again when its files change or with `--retry-failed`. If the data moves, `inventory --source /new/place --relocate` keeps the run. The exit code is 0 when nothing is in the failed state, 1 when a subject is, and 2 for a wrong call or for what lies in the machine (a full or read-only disk, a video encoder that does not work): that is held against no subject, and the same command does the work once it is put right.
 
 The same from Python:
 

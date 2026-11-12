@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import math
 import re
 import secrets
 import signal
+import sqlite3
 import threading
 import time
 from collections.abc import Iterator, Sequence
@@ -126,8 +128,8 @@ class _RelocateCommand(TyperCommand):
 
 @contextmanager
 def _stops_with_exit_2() -> Iterator[None]:
-    """What is wrong with the call, the run or a source, and not with a subject: one line
-    ``reason: detail`` on stderr and exit code 2."""
+    """What is wrong with the call, the run, a source or the machine, and not with a
+    subject: one line ``reason: detail`` on stderr and exit code 2."""
     from surfcensus.config import ConfigError
     from surfcensus.sources.base import SourceError
 
@@ -135,6 +137,15 @@ def _stops_with_exit_2() -> Iterator[None]:
         yield
     except (ConfigError, SourceError) as exc:
         typer.echo(" ".join(str(exc).split()), err=True)
+        raise typer.Exit(2) from exc
+    except BrokenPipeError:  # the reader of the output went away; click ends the command
+        raise
+    except (sqlite3.OperationalError, OSError) as exc:
+        # The catalog or a file of the run could not be read or written: a read-only or full
+        # disk, a run directory that cannot be made. Sources and renders turn their own
+        # errors into SourceError and failed units, so what arrives here is the run's.
+        text = " ".join(str(exc).split())
+        typer.echo(f"invalid: the run directory cannot be used: {text}", err=True)
         raise typer.Exit(2) from exc
 
 
@@ -307,6 +318,13 @@ def inventory(
     if relocate is not None:
         moved = True if relocate == _RELOCATE_ANY else relocate
     with _stops_with_exit_2():
+        if field_strength is not None and not 0 < field_strength < math.inf:
+            from surfcensus.config import ConfigError
+
+            raise ConfigError(
+                "invalid",
+                f"--field-strength is in tesla, positive and finite, not {field_strength}",
+            )
         run = _open_for_inventory(run_dir, source, subjects, field_strength, moved)
         with run, _interrupted_is_exit_130(), _terminated_like_interrupted():
             report = run.inventory(datasets=dataset or None, force=force)
@@ -397,27 +415,46 @@ def status(
     ),
 ) -> None:
     """Say where a run stands: one line per phase, from its catalog."""
-    from surfcensus.render.batch import render_status
+    from surfcensus.render.batch import PHASE as RENDER
+    from surfcensus.render.batch import render_failures, render_status
     from surfcensus.run import Run
     from surfcensus.store import CATALOG_FILE, Catalog
 
     with _stops_with_exit_2(), Run(run_dir) as run:
+        context = run.context()
         public = run.public()
         subjects = public.subjects()
         present = subjects[subjects["present"]]
-        pseudonyms = ", ".join(public.datasets()["pseudonym"]) or "none"
+        # a dataset found in another pipeline's layout has a second row, the same pseudonym
+        pseudonyms = ", ".join(dict.fromkeys(public.datasets()["pseudonym"])) or "none"
         typer.echo(f"{run.config.mode} run, datasets: {pseudonyms}")
         unreadable = int(present["problem"].notna().sum())
         absent = len(subjects) - len(present)
         gone = f" ({absent} no longer in the source)" if absent else ""
         typer.echo(f"inventory: {len(present) - unreadable} done, {unreadable} failed{gone}")
-        done, failed, pending = render_status(run.context())
+        done, failed, pending = render_status(context)
         typer.echo(f"render: {done} done, {failed} failed, {pending} pending")
         if failures:
             with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
                 frame = catalog.failures()
-            for row in frame.itertuples(index=False):
-                name = _names(subjects, [row.unit])
-                unit = row.unit if name == row.unit else f"{row.unit} ({name})"
-                detail = f": {row.detail}" if isinstance(row.detail, str) else ""
-                typer.echo(f"{row.phase} {unit}: {row.reason}{detail}")
+            # The renders listed are the ones counted on the line above. A recorded failure
+            # that the count leaves out is not one now: its subject left the source, or is
+            # pending again under another configuration or with other files. An incomplete
+            # subject is counted before ``render`` has recorded its missing surface.
+            counted = render_failures(context)
+            recorded = {uid for uid, (_, detail) in counted.items() if detail is None}
+            listed = [
+                (row.unit, row.phase, row.reason, row.detail)
+                for row in frame.itertuples(index=False)
+                if row.phase != RENDER or row.unit in recorded
+            ]
+            listed += [
+                (uid, RENDER, reason, detail)
+                for uid, (reason, detail) in counted.items()
+                if detail is not None
+            ]
+            for uid, phase, reason, detail in sorted(listed, key=lambda row: (row[1], row[0])):
+                name = _names(subjects, [uid])
+                unit = uid if name == uid else f"{uid} ({name})"
+                text = f": {detail}" if isinstance(detail, str) else ""
+                typer.echo(f"{phase} {unit}: {reason}{text}")

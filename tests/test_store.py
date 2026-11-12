@@ -340,6 +340,52 @@ def test_opening_what_is_not_a_catalog(tmp_path: Path) -> None:
         assert caught.value.reason == "invalid"
 
 
+def test_a_catalog_that_another_connection_holds_is_in_use_and_not_damaged(
+    local: Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = run_dir_of(local) / CATALOG_FILE
+    monkeypatch.setitem(store._BUSY_MS, "census", 50)  # the timeout a connection starts with
+    local.query("PRAGMA busy_timeout = 50")
+    holder = sqlite3.connect(path, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        for opener in (lambda: Catalog(path), lambda: PublicCatalog.open(path.parent)):
+            with pytest.raises(ConfigError, match="in use by another process") as caught:
+                opener()
+            assert caught.value.reason == "invalid"
+            assert "not a SQLite database" not in caught.value.detail
+            assert isinstance(caught.value.__cause__, sqlite3.OperationalError)
+        # the connection that is open already says the same when it comes to write
+        with pytest.raises(ConfigError, match=r"catalog\.sqlite is in use by another process"):
+            local.set_meta("template_id", "x")
+    finally:
+        holder.close()
+    local.set_meta("template_id", "x")
+    assert local.meta("template_id") == "x"
+
+
+def test_a_full_disk_is_reported_as_what_it_is(local: Catalog, tmp_path: Path) -> None:
+    """SQLite ends the transaction itself when the file cannot grow. A ROLLBACK then fails
+    with "cannot rollback - no transaction is active", which would hide the cause."""
+    pages = local.query("PRAGMA page_count")[0][0]
+    local.query(f"PRAGMA max_page_count = {pages}")  # of this connection: no room to grow
+    with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+        local.set_meta("template_id", "x" * 1_000_000)
+    with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+        with local.write() as conn:
+            conn.execute("INSERT INTO meta (key, value) VALUES ('big', ?)", ("x" * 1_000_000,))
+    local.query("PRAGMA max_page_count = 1000000")
+    local.set_meta("template_id", "x")  # the connection is usable again
+    assert local.meta("template_id") == "x" and local.meta("big") is None
+
+    path = tmp_path / "empty.sqlite"
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("PRAGMA max_page_count = 1")
+    with pytest.raises(sqlite3.OperationalError, match="database or disk is full"):
+        store._migrate(conn)
+    conn.close()
+
+
 def test_the_identity_of_a_run_cannot_be_overwritten(local: Catalog) -> None:
     secret = local.run_secret()
     for key in ("run_id", "mode", "key_kind", "key_fingerprint", "created_at", "run_secret"):
@@ -883,6 +929,84 @@ def test_a_new_inventory_replaces_the_files_and_keeps_digests_of_unchanged_ones(
     assert local.inventory_hash(uid) == "h2"
 
 
+def test_a_link_that_leads_to_another_file_of_equal_size_and_time_loses_its_digest(
+    local: Catalog,
+) -> None:
+    # lh.pial -> lh.pial.T1, then -> lh.pial.T2: the location stays surf/lh.pial, and the
+    # variants of one subject have one size, so only the variant tells the two apart
+    dataset = make_dataset()
+    record = make_subject(dataset)
+    files = dict(record.files)
+    for role, name in ((FileRole.LH_PIAL, "lh.pial.T1"), (FileRole.RH_PIAL, "rh.pial.T1")):
+        files[role] = dataclasses.replace(files[role], variant=name)
+    record = dataclasses.replace(record, files=files)
+    uid = uid_of(SALT, dataset, record.subject_label)
+    dataset_id = local.upsert_dataset(dataset, pseudonym_of(SALT, dataset), None)
+    local.upsert_subject(uid, dataset_id, record, UNKNOWN, "h")
+    public = local.public()
+    public.set_file_digests(uid, {FileRole.LH_PIAL: DIGEST, FileRole.RH_PIAL: "1" * 64})
+    render_before = public.input_signature(uid, RENDER_ROLES)
+    stats_before = public.input_signature(uid, TIER_A_REQUIRED)
+
+    files[FileRole.LH_PIAL] = dataclasses.replace(files[FileRole.LH_PIAL], variant="lh.pial.T2")
+    local.upsert_subject(uid, dataset_id, dataclasses.replace(record, files=files), UNKNOWN, "h2")
+    # a render of the subject is not skipped either; a stage that reads no pial is
+    assert public.input_signature(uid, RENDER_ROLES) != render_before
+    assert public.input_signature(uid, TIER_A_REQUIRED) == stats_before
+    stored = {
+        r["role"]: (r["variant"], r["sha256"])
+        for r in local.query("SELECT role, variant, sha256 FROM files WHERE role LIKE '%pial'")
+    }
+    assert stored == {"lh_pial": ("lh.pial.T2", None), "rh_pial": ("rh.pial.T1", "1" * 64)}
+
+
+def test_an_inventory_stores_the_digests_of_what_it_read_with_the_subject(
+    local: Catalog,
+) -> None:
+    dataset = make_dataset()
+    record = make_subject(dataset, roles=[r for r in FileRole if r != FileRole.RECON_LOG_RH])
+    uid = uid_of(SALT, dataset, record.subject_label)
+    dataset_id = local.upsert_dataset(dataset, pseudonym_of(SALT, dataset), None)
+
+    def digests() -> dict[str, str]:
+        rows = local.query("SELECT role, sha256 FROM files WHERE sha256 IS NOT NULL")
+        return {r["role"]: r["sha256"] for r in rows}
+
+    # a role that the subject does not have is ignored, as by set_file_digests
+    read = {
+        FileRole.BUILD_STAMP: DIGEST,
+        FileRole.RECON_LOG: "1" * 64,
+        FileRole.RECON_LOG_RH: DIGEST,
+    }
+    local.upsert_subject(uid, dataset_id, record, UNKNOWN, "h", digests=read)
+    assert digests() == {"build_stamp": DIGEST, "recon_log": "1" * 64}
+    assert count(local, "files") == len(FileRole) - 1
+
+    # the digest of this reading replaces the one kept; one that was not read now stays
+    local.public().set_file_digests(uid, {FileRole.T1: "2" * 64})
+    local.upsert_subject(
+        uid, dataset_id, record, UNKNOWN, "h", digests={FileRole.RECON_LOG: DIGEST}
+    )
+    assert digests() == {"build_stamp": DIGEST, "recon_log": DIGEST, "t1": "2" * 64}
+
+    # a changed file that was read gets the new digest, one that was not read gets none
+    changed = make_subject(dataset, roles=list(record.files), stamp="2")
+    local.upsert_subject(
+        uid, dataset_id, changed, UNKNOWN, "h", digests={FileRole.RECON_LOG: "3" * 64}
+    )
+    assert digests() == {"recon_log": "3" * 64}
+
+    # nothing is written with a digest that is none
+    before = [tuple(r) for r in local.query("SELECT * FROM subjects")]
+    for bad in ("", "abc", DIGEST.upper(), DIGEST + "0"):
+        with pytest.raises(ValueError, match="not a SHA-256 digest"):
+            local.upsert_subject(
+                uid, dataset_id, record, UNKNOWN, "h3", digests={FileRole.BUILD_STAMP: bad}
+            )
+    assert [tuple(r) for r in local.query("SELECT * FROM subjects")] == before
+    assert digests() == {"recon_log": "3" * 64}
+
+
 def test_two_subjects_cannot_share_a_uid_and_a_subject_cannot_change_its_uid(
     local: Catalog,
 ) -> None:
@@ -966,6 +1090,8 @@ def test_relocate_keeps_identity_and_every_uid(local: Catalog) -> None:
     for uid, label in zip(uids, labels, strict=True):
         record = local.subject_record(uid)
         assert record.dataset.root == "/mnt/new/place" and record.subject_label == label
+        # where the source at the new place lists the subject, so its files are found there
+        assert record.fs_dir == f"freesurfer/{label}"
         # what the next inventory computes from the stored record is the uid already stored
         assert uid_of(SALT, record.dataset, label) == uid
     render = public.render(uids[0])
@@ -984,6 +1110,30 @@ def test_relocate_keeps_identity_and_every_uid(local: Catalog) -> None:
     with pytest.raises(KeyError):
         local.relocate(7, moved)
     assert local.dataset_record(1) == stored
+
+
+def test_relocate_moves_fs_dir_with_fs_root_also_of_absent_subjects(local: Catalog) -> None:
+    # a SUBJECTS_DIR that is later given as the derivatives root one level up
+    dataset = make_dataset(
+        fs_root=".", layout="subjects_dir", pipeline="freesurfer", template_location=None
+    )
+    uids = {label: add_subject(local, SALT, dataset, label) for label in ("sub-01", "sub-02")}
+    assert local.subject_record(uids["sub-01"]).fs_dir == "sub-01"
+    assert local.mark_absent(1, ["sub-01"]) == [uids["sub-02"]]
+    hashes = {uid: local.inventory_hash(uid) for uid in uids.values()}
+
+    up = dataclasses.replace(dataset, root="/CANARYROOT", fs_root="study")
+    local.relocate(1, up)
+    for label, uid in uids.items():
+        assert local.subject_record(uid).fs_dir == f"study/{label}"
+    assert {uid: local.inventory_hash(uid) for uid in uids.values()} == hashes
+    assert local.public().subject_uids(present=False) == [uids["sub-02"]]
+
+    # the same fs_root at another root leaves the subjects alone
+    local.relocate(1, dataclasses.replace(up, root="/mnt/elsewhere"))
+    assert local.subject_record(uids["sub-01"]).fs_dir == "study/sub-01"
+    local.relocate(1, dataclasses.replace(up, fs_root="."))
+    assert local.subject_record(uids["sub-02"]).fs_dir == "sub-02"
 
 
 def test_dataset_files_and_templates_are_recorded(

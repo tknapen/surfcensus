@@ -477,7 +477,8 @@ def test_the_input_signature_is_the_documented_hash() -> None:
     _, subject = _records()
     lines = [
         "t1\tmri/T1.mgz\t5576738\t1731400000000000000",
-        "lh_pial\tsurf/lh.pial.T1\t4731523\t1731400000000000001",
+        # a role with several candidate names also says which one was read
+        "lh_pial\tsurf/lh.pial.T1\t4731523\t1731400000000000001\tlh.pial.T1",
         "build_stamp\tscripts/build-stamp.txt\t58\t17",
     ]
     expected = hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
@@ -518,9 +519,27 @@ def test_the_input_signature_ignores_what_is_not_in_its_lines() -> None:
     _, subject = _records()
     files = dict(subject.files)
     files[FileRole.LH_PIAL] = dataclasses.replace(
-        files[FileRole.LH_PIAL], variant=None, last_modified="2026-11-12T00:00:00Z"
+        files[FileRole.LH_PIAL], last_modified="2026-11-12T00:00:00Z"
     )
     assert input_signature(files) == input_signature(subject.files)
+
+
+@pytest.mark.parametrize("variant", ["lh.pial.T2", None])
+def test_the_input_signature_changes_with_the_file_a_link_leads_to(variant: str | None) -> None:
+    # lh.pial -> lh.pial.T1 and lh.pial -> lh.pial.T2 are one location, and the two files
+    # have one size: with the same modification time only the variant tells them apart
+    _, subject = _records()
+    link = dataclasses.replace(subject.files[FileRole.LH_PIAL], location="surf/lh.pial")
+    files = dict(subject.files) | {FileRole.LH_PIAL: link}
+    other = files | {FileRole.LH_PIAL: dataclasses.replace(link, variant=variant)}
+    assert input_signature(other) != input_signature(files)
+    assert input_signature(other, TIER_C) != input_signature(files, TIER_C)
+    assert input_signature(other, TIER_A) == input_signature(files, TIER_A)
+    # a role without a variant has the four fields and no trailing tab
+    assert (
+        input_signature({FileRole.T1: files[FileRole.T1]})
+        == (hashlib.sha256(b"t1\tmri/T1.mgz\t5576738\t1731400000000000000").hexdigest()[:16])
+    )
 
 
 class _MinimalSource:
@@ -751,6 +770,24 @@ def test_the_variant_of_a_file_is_the_name_freesurfer_gives_it(tmp_path: Path) -
     assert variant_name(FileRole.LH_WHITE, store) == "lh.white"
 
 
+def test_a_link_into_another_directory_reads_under_its_own_name(tmp_path: Path) -> None:
+    subject = _fake_subject(tmp_path, "sub-01", ("mri/T1.mgz", "surf/rh.pial"))
+    surf = subject / "surf"
+    for name in ("lh.pial.T1", "lh.pial.T2"):  # candidate names, in another directory
+        (tmp_path / "elsewhere" / name).parent.mkdir(exist_ok=True)
+        (tmp_path / "elsewhere" / name).touch()
+    (surf / "lh.pial").symlink_to(tmp_path / "elsewhere" / "lh.pial.T1")
+    assert variant_name(FileRole.LH_PIAL, surf / "lh.pial") == "lh.pial"
+    (surf / "lh.pial.FLAIR").symlink_to(Path("..", "..", "..", "elsewhere", "lh.pial.T2"))
+    assert variant_name(FileRole.LH_PIAL, surf / "lh.pial.FLAIR") == "lh.pial.FLAIR"
+    # the directory itself may be reached through a link: the target is still inside it
+    (surf / "rh.pial.T1").touch()
+    (surf / "rh.pial").unlink()
+    (surf / "rh.pial").symlink_to("rh.pial.T1")
+    (tmp_path / "linked").symlink_to(subject, target_is_directory=True)
+    assert variant_name(FileRole.RH_PIAL, tmp_path / "linked" / "surf" / "rh.pial") == "rh.pial.T1"
+
+
 def test_the_variant_is_the_name_that_render_json_records(tmp_path: Path) -> None:
     from surfcensus.render import api  # imports matplotlib
 
@@ -762,13 +799,19 @@ def test_the_variant_is_the_name_that_render_json_records(tmp_path: Path) -> Non
     moved.parent.mkdir()
     moved.write_bytes((plain.path / "surf" / "lh.pial").read_bytes())
     (plain.path / "surf" / "lh.pial.T2").symlink_to(moved)
+    named = tmp_path / "elsewhere" / "lh.pial.T1"  # a candidate name, in another directory
+    named.write_bytes(moved.read_bytes())
+    (plain.path / "surf" / "lh.pial.FLAIR").symlink_to(named)
     cases = [
         *resolve_subject_files(plain.path).items(),
         *resolve_subject_files(linked.path).items(),
         (FileRole.LH_PIAL, plain.path / "surf" / "lh.pial.T2"),
+        (FileRole.LH_PIAL, plain.path / "surf" / "lh.pial.FLAIR"),
         (FileRole.LH_PIAL, moved),
     ]
     assert (FileRole.LH_PIAL, linked.path / "surf" / "lh.pial") in cases
     for role, path in cases:
         assert variant_name(role, path) == api._input_file(role, path).name, (role, path)
     assert variant_name(FileRole.LH_PIAL, linked.path / "surf" / "lh.pial") == "lh.pial.T1"
+    foreign = api._input_file(FileRole.LH_PIAL, plain.path / "surf" / "lh.pial.FLAIR")
+    assert (foreign.name, foreign.size) == ("lh.pial.FLAIR", named.stat().st_size)

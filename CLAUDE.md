@@ -81,7 +81,7 @@ Read in source on 2026-11-12 (FreeSurfer and Freeview on GitHub, nibabel 5.5.0 a
 
 Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.9 MB of media (tiles 4.1 MB, `anim.mp4` 4.3 MB, `vertex_map.npz` 2.5 MB since it follows the tiles and not the box, 1.8 MB before); 155 of 176 tiles contain contours.
 
-Measured 2026-11-12 on a local run over the two real subjects (one machine, files on a local disk): `surfcensus inventory` under 0.1 s for the phase, with the logs read whole; `surfcensus render --jobs 2` 9.0 s without video; `surfcensus render --video` 17.5 s in one process; a second call of either does nothing in under 0.1 s; `catalog.sqlite` 64 kB; the source files unchanged in size and modification time.
+Measured 2026-11-12 on a local run over the two real subjects (one machine, files on a local disk): `surfcensus inventory` under 0.1 s for the phase, with the logs read whole; `surfcensus render --jobs 2` 9.0 s without video; `surfcensus render --video` 17.5 s in one process; a second call of either does nothing in under 0.1 s; `catalog.sqlite` 64 kB; the source files unchanged in size and modification time. The media of `ds000102` sub-01 rendered through a run with video are byte-identical, file for file, to the render that `render-subject` made of it at the end of milestone 1 (same machine).
 
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 

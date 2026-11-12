@@ -171,6 +171,23 @@ def fragile(unit: str, files: Mapping[FileRole, Path]) -> object:
     return describe(unit, files)
 
 
+def counted(unit: str, files: Mapping[FileRole, Path]) -> str:
+    """Leave one file per call. ``die-after-a-b`` kills its process once ``a`` and ``b`` have
+    run and their results have had time to reach the parent."""
+    root = files[FileRole.T1].parents[2]
+    (root / f"ran-{unit}-{os.getpid()}-{time.time_ns()}").touch()
+    if unit.startswith("die-after-"):
+        others = unit.removeprefix("die-after-").split("-")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            if all(list(root.glob(f"ran-{other}-*")) for other in others):
+                break
+            time.sleep(0.01)
+        time.sleep(0.5)
+        os._exit(7)
+    return unit
+
+
 def process_state(unit: str, files: Mapping[FileRole, Path]) -> tuple[int, bool]:
     return os.getpid(), signal.getsignal(signal.SIGINT) == signal.SIG_IGN
 
@@ -483,6 +500,29 @@ def test_a_worker_that_dies_is_charged_to_its_own_unit_only(
     lost = record.args[0]
     assert isinstance(lost, int)
     assert 2 <= lost <= 5
+
+
+def test_only_the_lost_subjects_run_again(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    units = ["a", "b", "die-after-a-b"]
+    leases = Leases(tmp_path)
+    commits = Commits(leases)
+
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        run_batches(units, leases, counted, commits, batch_subjects=3, jobs=2)
+    outcomes = dict(commits.flat())
+    runs = {unit: len(list(tmp_path.glob(f"ran-{unit}-*"))) for unit in units}
+
+    assert (outcomes["a"], outcomes["b"]) == ("a", "b")
+    assert type(outcomes["die-after-a-b"]) is BrokenProcessPool
+    (record,) = caplog.records
+    assert isinstance(record.args, tuple)
+    lost = record.args[0]
+    # a and b have normally reached the parent when the worker dies (lost == 1); if one had
+    # not, it is lost with the pool and runs a second time, and that is all that runs again
+    assert isinstance(lost, int)
+    assert runs["die-after-a-b"] == 2
+    assert sum(runs.values()) == len(units) + lost, runs
+    assert all(count in (1, 2) for count in runs.values()), runs
 
 
 @pytest.mark.parametrize("jobs", [1, 2])

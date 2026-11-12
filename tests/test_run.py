@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import pickle
 import shutil
+import sqlite3
+import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -251,6 +253,55 @@ def test_a_catalog_that_was_never_made_is_made_on_opening(
         assert again.inventory().done == 3
 
 
+def test_of_two_creations_at_once_the_second_leaves_the_run_of_the_first(
+    study: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both processes found the directory empty, and each drew a salt. The catalog is made
+    with the salt of the first; the second must not put its own into ``config.yaml``."""
+    run_dir = tmp_path / "run"
+    Run(run_dir, local(study)).close()  # the first to write
+    stored = (run_dir / CONFIG_FILE).read_bytes()
+    catalog = (run_dir / CATALOG_FILE).read_bytes()
+
+    second = local(study)
+    is_file = Path.is_file
+    with monkeypatch.context() as early:  # what the second saw when it looked: nothing yet
+        early.setattr(Path, "is_file", lambda path: path.name != CONFIG_FILE and is_file(path))
+        early.setattr(os, "listdir", lambda path: [])
+        with pytest.raises(ConfigError, match="already holds a run") as raised:
+            Run(run_dir, second)
+    assert raised.value.reason == "invalid"
+    assert (run_dir / CONFIG_FILE).read_bytes() == stored
+    assert (run_dir / CATALOG_FILE).read_bytes() == catalog
+    assert {p.name for p in run_dir.iterdir()} == {CONFIG_FILE, CATALOG_FILE}
+    with Run(run_dir) as run:
+        assert run.inventory().done == 3
+
+
+def test_a_place_where_no_run_can_be_made_is_a_configuration_error(
+    study: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if sys.platform == "linux":  # no directory can be made in /proc
+        with pytest.raises(ConfigError, match="no run can be made in /proc/") as raised:
+            Run("/proc/surfcensus-nowhere/run", local(study))
+        assert raised.value.reason == "invalid"
+        assert isinstance(raised.value.__cause__, OSError)
+
+    def full(*args: object, **kwargs: object) -> Catalog:
+        raise sqlite3.OperationalError("database or disk is full")
+
+    run_dir = tmp_path / "run"
+    with monkeypatch.context() as patched:
+        patched.setattr(Catalog, "create", full)
+        with pytest.raises(ConfigError, match="database or disk is full") as raised:
+            Run(run_dir, local(study))
+    assert raised.value.reason == "invalid" and str(run_dir) in raised.value.detail
+    # what is left is a run whose catalog was never made, which the next call makes
+    assert [p.name for p in run_dir.iterdir()] == [CONFIG_FILE]
+    with Run(run_dir) as run:
+        assert run.inventory().done == 3
+
+
 # ---------------------------------------------------------------------------------------
 # inventory and render through the run
 
@@ -356,6 +407,94 @@ def test_a_subject_that_left_the_source_is_marked_absent_and_keeps_its_render(
     assert (report.done, report.skipped, report.failed) == (0, 1, 1)
     assert renders(run)[uid["sub-02"]]["status"] == "done"
     assert (run.media_dir(uid["sub-02"]) / "render.json").is_file()
+
+
+def test_data_found_in_the_layout_of_another_pipeline_is_not_counted_twice(
+    tmp_path: Path, rendered: list[Path]
+) -> None:
+    """The pipeline is part of every ``subject_uid``, so subjects that are found in the
+    layout of another pipeline are new subjects. The ones the run held before are no
+    longer listed, and are not present either."""
+    labels = ["sub-01", "sub-02"]
+    tree = write_tree(tmp_path / "study", "subjects_dir", labels)
+    run_dir = tmp_path / "run"
+    with Run(run_dir, local(tree), config=new_local_config(tree, render=SMALL)) as run:
+        run.inventory()
+        assert run.render().done == 2
+        before = uids(run)
+    (tree / FS_ROOT).mkdir(parents=True)  # where fMRIPrep keeps its subjects
+    for label in labels:
+        shutil.move(tree / label, tree / FS_ROOT / label)
+
+    with Run(run_dir) as run:
+        report = run.inventory()
+        assert (report.done, report.skipped, report.failed) == (2, 0, 0)
+        (note,) = report.notes
+        assert "now found as pipeline fmriprep, not freesurfer" in note
+        assert "the 2 subject(s) it had as freesurfer are no longer listed" in note
+        subjects = run.public().subjects()
+        present = subjects[subjects["present"]]
+        assert sorted(present["subject_label"]) == labels
+        assert set(present["subject_uid"]).isdisjoint(before.values())
+        assert set(subjects[~subjects["present"]]["subject_uid"]) == set(before.values())
+        datasets = run.public().datasets()
+        assert datasets["pseudonym"].nunique() == 1
+        listed = dict(zip(datasets["pipeline"], datasets["n_subjects_listed"], strict=True))
+        assert listed == {"fmriprep": 2, "freesurfer": 0}
+        # the renders of the subjects that left stay; the ones listed now are pending
+        assert {uid: row["status"] for uid, row in renders(run).items()} == dict.fromkeys(
+            before.values(), "done"
+        )
+        again = run.inventory()
+        assert (again.done, again.skipped, again.notes) == (0, 2, ())
+        assert run.render().done == 2 and len(renders(run)) == 4
+
+    # the data then moves: the run can still follow it, and the earlier row goes along
+    moved = tmp_path / "moved"
+    shutil.move(tree, moved)
+    del rendered[:]
+    with Run(run_dir, local(moved), relocate=True) as run:
+        report = run.inventory()
+        assert (report.done, report.skipped) == (0, 2)
+        assert run.render().skipped == 2 and rendered == []
+    with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+        rows = catalog.query("SELECT root, pipeline, fs_root FROM datasets ORDER BY pipeline")
+    assert [tuple(row) for row in rows] == [
+        (str(moved.resolve()), "fmriprep", FS_ROOT),
+        (str(moved.resolve()), "freesurfer", "."),
+    ]
+
+
+def test_subjects_that_moved_into_another_layout_of_the_same_pipeline_are_found_there(
+    tmp_path: Path, rendered: list[Path]
+) -> None:
+    """Same root, same pipeline, same files: only the place of the subjects under the root
+    differs, which no hash covers. Skipped, they would keep the old place, and every later
+    lease would find their files gone."""
+    labels = ["sub-01", "sub-02"]
+    tree = write_tree(tmp_path / "study", "bids_derivatives", labels)
+    run_dir = tmp_path / "run"
+    with Run(run_dir, local(tree), config=new_local_config(tree, render=SMALL)) as run:
+        run.inventory()
+        assert run.render().done == 2
+        uid = uids(run)
+    for label in labels:
+        shutil.move(tree / "freesurfer" / label, tree / label)
+    shutil.rmtree(tree / "freesurfer")
+    del rendered[:]
+
+    with Run(run_dir) as run:
+        report = run.inventory()
+        assert (report.done, report.skipped, report.notes) == (2, 0, ())
+        assert uids(run) == uid and run.public().subjects()["present"].all()
+        (layout,) = run.public().datasets()["layout"]
+        assert layout == "subjects_dir"
+        with run.context().lease(uid["sub-01"], [FileRole.T1]) as paths:
+            assert paths[FileRole.T1] == tree.resolve() / "sub-01" / "mri" / "T1.mgz"
+        assert run.render().skipped == 2 and rendered == []  # the files are the same
+        report = run.render(force=True)  # and can be read where they are now
+        assert (report.done, report.failed) == (2, 0)
+        assert run.inventory().skipped == 2
 
 
 def test_one_process_and_two_render_the_same_files(
@@ -464,6 +603,26 @@ def test_subjects_are_named_by_uid_or_in_a_local_run_by_label_and_datasets_by_ps
     assert run.inventory(datasets=[pseudonym]).skipped == 3
 
 
+def test_a_label_of_two_datasets_is_ambiguous(tmp_path: Path, rendered: list[Path]) -> None:
+    first = write_tree(tmp_path / "first", "subjects_dir", ["sub-01"])
+    second = write_tree(tmp_path / "second", "subjects_dir", ["sub-01", "sub-02"])
+    config = new_local_config(first, render=SMALL)
+    with Run(tmp_path / "run", [local(first), local(second)], config=config) as run:
+        assert run.inventory().done == 3
+        with pytest.raises(ConfigError, match="sub-01 names subjects of 2 datasets") as raised:
+            run.render(subjects=["sub-01"])
+        assert raised.value.reason == "invalid"
+        assert "use a subject_uid" in raised.value.detail
+        assert renders(run) == {} and rendered == []
+
+        # a label that one dataset has, and a subject_uid, name one subject each
+        subjects = run.public().subjects()
+        one, other = subjects.loc[subjects["subject_label"] == "sub-01", "subject_uid"]
+        assert run.render(subjects=["sub-02"]).done == 1
+        assert run.render(subjects=[one]).done == 1
+        assert other not in renders(run) and len(rendered) == 2
+
+
 def test_metrics_arrive_in_milestone_3(study: Path, new_run: Callable[..., Run]) -> None:
     run = new_run(study)
     assert METRIC_STAGES == ("regional", "fsaverage", "reference", "score")
@@ -525,6 +684,28 @@ def test_a_run_whose_data_is_gone_opens_and_stops_a_phase_before_anything_is_rec
         assert again.public().subjects()["present"].all()
 
 
+def test_a_render_with_nothing_to_do_needs_no_source(
+    study: Path, new_run: Callable[..., Run], tmp_path: Path, rendered: list[Path]
+) -> None:
+    run = new_run(study)
+    run.inventory()
+    assert run.render().done == 2
+    run.close()
+    shutil.move(study, tmp_path / "unmounted")
+    del rendered[:]
+
+    with Run(run.run_dir) as again:
+        before = renders(again)
+        report = again.render()
+        assert (report.done, report.skipped) == (0, 2) and rendered == []
+        assert dict(report.failures) == {uids(again)["sub-03"]: "missing surface"}
+        # work that reads the source still stops before anything is recorded
+        for asked in ({"force": True}, {"subjects": ["sub-01"], "video": True}):
+            with pytest.raises(SourceError, match="is not a directory"):
+                again.render(**asked)
+        assert renders(again) == before
+
+
 # ---------------------------------------------------------------------------------------
 # another root, and data that moved
 
@@ -579,6 +760,39 @@ def test_another_root_is_refused_and_relocate_keeps_every_uid_and_render_key(
         assert {u: row["render_key"] for u, row in renders(again).items()} == {
             u: row["render_key"] for u, row in rows.items()
         }
+
+
+def test_relocating_to_a_layout_with_another_fs_root_keeps_renders_usable(
+    study: Path, new_run: Callable[..., Run], tmp_path: Path, rendered: list[Path]
+) -> None:
+    run = new_run(study)
+    run.inventory()
+    assert run.render().done == 2
+    uid, rows = uids(run), renders(run)
+    run.close()
+    # the same subjects, now in the older fMRIPrep layout: freesurfer/ beside fmriprep/
+    moved = tmp_path / "moved"
+    (moved / "fmriprep").mkdir(parents=True)
+    shutil.move(study / FS_ROOT, moved / "freesurfer")
+    shutil.move(study / "dataset_description.json", moved / "fmriprep")
+    del rendered[:]
+
+    with Run(run.run_dir, local(moved), relocate=True) as again:
+        report = again.inventory()
+        assert (report.done, report.skipped) == (0, 3) and uids(again) == uid
+        assert again.render().skipped == 2 and rendered == []
+        subjects_dir = moved.resolve() / "freesurfer"
+        with again.context().lease(uid["sub-01"], [FileRole.T1]) as paths:
+            assert paths[FileRole.T1] == subjects_dir / "sub-01" / "mri" / "T1.mgz"
+        report = again.render(force=True)  # reads every file, from the new place
+        assert (report.done, report.failed) == (2, 1)
+        assert report.failures == ((uid["sub-03"], "missing surface"),)
+        after = renders(again)
+        for label in ("sub-01", "sub-02"):
+            assert after[uid[label]]["status"] == "done"
+            assert after[uid[label]]["render_key"] == rows[uid[label]]["render_key"]
+    with Run(run.run_dir) as again:
+        assert again.inventory().skipped == 3 and again.render().skipped == 2
 
 
 def test_relocating_keeps_the_subject_set_and_refuses_data_of_another_pipeline(

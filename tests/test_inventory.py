@@ -2,12 +2,14 @@
 
 The recon-all logs are the excerpts of two real subjects in ``tests/data/recon_logs/``
 (``fs6_*``: ds000102 sub-01, FreeSurfer 6.0.1; ``fs7_*``: ds003020 sub-UTS01, FreeSurfer
-7.3.2). One test reads the whole logs when the pytest cache has them.
+7.3.2). One test reads the whole logs when the pytest cache has them, which is after a run
+of the network tests and never in CI (docs/decisions.md, D29).
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import logging
 import os
@@ -53,7 +55,7 @@ from surfcensus.sources.base import (
 )
 from surfcensus.sources.local import LocalSource
 from surfcensus.sources.patterns import ROLE_CANDIDATES
-from surfcensus.store import Catalog
+from surfcensus.store import Catalog, PublicCatalog
 
 DATA = Path(__file__).parent / "data" / "recon_logs"
 LABELS = ("sub-01", "sub-02", "sub-03")
@@ -250,10 +252,15 @@ def upserted(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     original = Catalog.upsert_subject
 
     def recording(
-        self: Catalog, uid: str, dataset_id: int, record: SubjectRecord, *rest: object
+        self: Catalog,
+        uid: str,
+        dataset_id: int,
+        record: SubjectRecord,
+        *rest: object,
+        **more: object,
     ) -> None:
         labels.append(record.subject_label)
-        original(self, uid, dataset_id, record, *rest)
+        original(self, uid, dataset_id, record, *rest, **more)
 
     monkeypatch.setattr(Catalog, "upsert_subject", recording)
     return labels
@@ -350,6 +357,95 @@ def test_provenance_of_the_logs_is_stored(bench: Bench) -> None:
     for name in ("recon_finished", "t2pial", "edited", "holes_lh", "trunc_rh_2"):
         assert bare[name] is None, name
     assert (bare["pial_variant"], bare["participant"]) == ("pial", "sub-03")
+
+
+def digests(bench: Bench, label: str) -> dict[object, object]:
+    """role -> ``files.sha256`` of the roles that the inventory reads, for one subject."""
+    rows = bench.rows(
+        "SELECT role, sha256 FROM files WHERE subject_uid = ? ORDER BY role", bench.uid(label)
+    )
+    read = {role.value for role in PROVENANCE_ROLES}
+    return {row["role"]: row["sha256"] for row in rows if row["role"] in read}
+
+
+def file_digest(bench: Bench, label: str, role: FileRole) -> str:
+    path = bench.subjects_dir / label / ROLE_CANDIDATES[role][0]
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_the_files_that_the_inventory_reads_whole_get_their_digest(bench: Bench) -> None:
+    # recon_flags, n_invocations, holes and truncations come from these bytes; for a local
+    # file size and modification time do not say which bytes they were
+    bench.run()
+    for label in ("sub-01", "sub-02"):
+        assert digests(bench, label) == {
+            role.value: file_digest(bench, label, role) for role in PROVENANCE_ROLES
+        }
+    assert digests(bench, "sub-03") == {}
+    # nothing else was opened, so nothing else has a digest
+    others = bench.rows(
+        "SELECT DISTINCT sha256 FROM files WHERE role NOT IN (?, ?, ?, ?)",
+        *(role.value for role in PROVENANCE_ROLES),
+    )
+    assert others == [{"sha256": None}]
+
+    # a changed file is another file: the digest follows the bytes that were parsed
+    stamp = bench.subjects_dir / "sub-01" / "scripts" / "build-stamp.txt"
+    before = digests(bench, "sub-01")
+    stamp.write_text(STAMPS["fs7"] + "\n")
+    touch(stamp)
+    bench.run()
+    after = digests(bench, "sub-01")
+    assert after["build_stamp"] == file_digest(bench, "sub-01", FileRole.BUILD_STAMP)
+    assert after["build_stamp"] != before["build_stamp"]
+    assert {role: after[role] for role in after if role != "build_stamp"} == {
+        role: before[role] for role in before if role != "build_stamp"
+    }
+
+
+def test_a_file_that_was_not_read_whole_has_no_digest(bench: Bench) -> None:
+    sizes = {name: (DATA / f"fs6_{name}").stat().st_size for name in LOGS.values()}
+    assert sizes["recon-all-lh.log"] < 2000 < sizes["recon-all.log"]
+    head = bench.config.model_copy(
+        update={"inventory": InventoryConfig(logs="head", head_bytes=2000)}
+    )
+    spy = Spy(bench.source())
+    spy.fail_read[("sub-02", FileRole.RECON_LOG_LH)] = SourceError("unreadable", "no")
+    bench.run(spy, config=head)
+    whole = {role.value: file_digest(bench, "sub-01", role) for role in PROVENANCE_ROLES}
+    # the digest of a head would be the digest of no file
+    assert digests(bench, "sub-01") == whole | {"recon_log": None}
+    assert digests(bench, "sub-02")["recon_log_lh"] is None
+    assert digests(bench, "sub-02")["build_stamp"] == file_digest(
+        bench, "sub-02", FileRole.BUILD_STAMP
+    )
+
+    # read whole, the log gets its digest; a later head of the same file leaves it
+    bench.run()
+    assert digests(bench, "sub-01") == whole
+    bench.run(config=head)
+    assert digests(bench, "sub-01") == whole
+
+
+def test_an_interruption_leaves_no_stored_subject_without_its_digests(
+    bench: Bench, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # a subject stored without them would be skipped by every later inventory and never
+    # get them, so they are written with the subject, not by a second write after it
+    def interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PublicCatalog, "set_file_digests", interrupt)
+        try:
+            bench.run()
+        except KeyboardInterrupt:
+            pass
+    bench.run()
+    for label in ("sub-01", "sub-02"):
+        assert digests(bench, label) == {
+            role.value: file_digest(bench, label, role) for role in PROVENANCE_ROLES
+        }
 
 
 def test_only_the_stamp_and_the_logs_are_read_and_a_local_source_leases_nothing(
@@ -461,6 +557,56 @@ def test_a_changed_log_is_read_again(bench: Bench) -> None:
     report = bench.run()
     assert (report.done, report.skipped) == (1, 2)
     assert bench.subject("sub-01")["fs_version"] == "7.3.2"
+
+
+def test_a_pial_link_that_leads_to_another_variant_of_equal_size_and_time_is_read_again(
+    bench: Bench,
+) -> None:
+    # FreeSurfer 7: lh.pial is a link to lh.pial.T1, or to lh.pial.T2 after a T2 refinement.
+    # The variants of one subject have one size (one topology), and a copy that keeps the
+    # modification time (cp -p) leaves location, size and time of the role as they were.
+    surf = bench.subjects_dir / "sub-01" / "surf"
+    for hemi in ("lh", "rh"):
+        os.replace(surf / f"{hemi}.pial", surf / f"{hemi}.pial.T1")
+        (surf / f"{hemi}.pial").symlink_to(f"{hemi}.pial.T1")
+    bench.run()
+    row = bench.subject("sub-01")
+    assert (row["pial_variant"], row["t2pial"]) == ("pial.T1", 0)
+    uid = str(row["subject_uid"])
+    # as after a render, which stores the digest of every file it read
+    was_read = hashlib.sha256((surf / "lh.pial.T1").read_bytes()).hexdigest()
+    bench.catalog.public().set_file_digests(uid, {FileRole.LH_PIAL: was_read})
+    listed = bench.rows(
+        "SELECT location, size, etag_or_mtime FROM files "
+        "WHERE subject_uid = ? AND role LIKE ? ORDER BY role",
+        uid,
+        "%pial",
+    )
+
+    for hemi in ("lh", "rh"):
+        first, second = surf / f"{hemi}.pial.T1", surf / f"{hemi}.pial.T2"
+        second.write_bytes(first.read_bytes()[::-1])  # other content of the same size
+        os.utime(second, ns=(first.stat().st_atime_ns, first.stat().st_mtime_ns))
+        (surf / f"{hemi}.pial").unlink()
+        (surf / f"{hemi}.pial").symlink_to(f"{hemi}.pial.T2")
+
+    report = bench.run()
+    assert (report.done, report.skipped) == (1, 2)
+    row = bench.subject("sub-01")
+    assert (row["pial_variant"], row["t2pial"]) == ("pial.T2", 1)
+    stored = bench.rows(
+        "SELECT location, size, etag_or_mtime, variant, sha256 FROM files "
+        "WHERE subject_uid = ? AND role LIKE ? ORDER BY role",
+        uid,
+        "%pial",
+    )
+    # nothing but the variant tells the listing apart, and the digest was of the other file
+    assert [{k: r[k] for k in ("location", "size", "etag_or_mtime")} for r in stored] == listed
+    assert [(r["variant"], r["sha256"]) for r in stored] == [
+        ("lh.pial.T2", None),
+        ("rh.pial.T2", None),
+    ]
+    assert bench.run().skipped == 3
 
 
 def test_a_changed_inventory_setting_reads_everything_again_and_another_setting_nothing(
@@ -1129,7 +1275,7 @@ def test_the_source_tree_is_unchanged_by_every_kind_of_inventory(
     ],
 )
 def test_inventory_of_a_subject_with_the_whole_logs_of_a_real_one(
-    request: pytest.FixtureRequest,
+    cached_subjects: Path,
     bench: Bench,
     prefix: str,
     version: str,
@@ -1138,14 +1284,8 @@ def test_inventory_of_a_subject_with_the_whole_logs_of_a_real_one(
     truncations: list[int],
     holes: tuple[int, int],
 ) -> None:
-    # where the network fixtures of conftest.py keep the two real subjects
-    try:
-        cache_dir = str(request.config.getini("cache_dir"))
-    except ValueError:  # pytest was started without its cache plugin
-        cache_dir = ".pytest_cache"
-    cached = request.config.rootpath / cache_dir / "d"
     subject = {"fs6": "ds000102-sub-01", "fs7": "ds003020-sub-UTS01"}[prefix]
-    logs = [cached / subject / "scripts" / name for name in LOGS.values()]
+    logs = [cached_subjects / subject / "scripts" / name for name in LOGS.values()]
     if not all(path.is_file() for path in logs):
         pytest.skip("the whole logs are not in the pytest cache (the network tests fetch them)")
     scripts = bench.subjects_dir / "sub-03" / "scripts"

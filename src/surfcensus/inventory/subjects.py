@@ -12,6 +12,7 @@ the input signature over all of a subject's files, with the identity of the inve
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -55,11 +56,14 @@ class _TierA:
     """At least one log is a head."""
     unread: tuple[tuple[FileRole, SourceError], ...]
     """Roles that the subject has and that could not be read, with the reason."""
+    digests: Mapping[FileRole, str]
+    """SHA-256 of the files that were read whole. A head has none: it is no file's digest."""
 
 
 def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig) -> _TierA:
     texts: dict[FileRole, str] = {}
     unread: list[tuple[FileRole, SourceError]] = []
+    digests: dict[FileRole, str] = {}
     partial = False
     for role in PROVENANCE_ROLES:
         ref = record.files.get(role)
@@ -75,9 +79,11 @@ def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig)
             unread.append((role, exc))
             continue
         texts[role] = decode_text(data)
-        if head and role is not FileRole.BUILD_STAMP:  # of the stamp only the first line is used
+        if not head:
+            digests[role] = hashlib.sha256(data).hexdigest()
+        elif role is not FileRole.BUILD_STAMP:  # of the stamp only the first line is used
             partial = True
-    return _TierA(texts, partial, tuple(unread))
+    return _TierA(texts, partial, tuple(unread), digests)
 
 
 def inventory_subject(source: Source, record: SubjectRecord, config: InventoryConfig) -> Provenance:
@@ -155,13 +161,17 @@ def _inventory_dataset(
     stage: str,
     force: bool,
     tally: _Tally,
-) -> None:
+) -> bool:
+    """Whether the subjects of the dataset could be listed to the end."""
     log = get_logger()
     dataset_id = catalog.upsert_dataset(dataset, pseudonym, None)
+    # where the subject lies is not in its hash: a subject that moved with its dataset into
+    # another layout of the same pipeline is stored again, or no lease would find its files
     stored = {
-        row["subject_label"]: (row["subject_uid"], row["inventory_hash"])
+        row["subject_label"]: (row["subject_uid"], row["inventory_hash"], row["fs_dir"])
         for row in catalog.query(
-            "SELECT subject_label, subject_uid, inventory_hash FROM subjects WHERE dataset_id = ?",
+            "SELECT subject_label, subject_uid, inventory_hash, fs_dir FROM subjects "
+            "WHERE dataset_id = ?",
             (dataset_id,),
         )
     }
@@ -183,7 +193,8 @@ def _inventory_dataset(
                 tally.failures.append((uid, record.problem.partition(": ")[0]))
                 extra.append(f"problem\t{record.problem}")
             signature = input_signature(record.files, None, extra)
-            if not force and stored.get(record.subject_label) == (uid, signature):
+            known = (uid, signature, record.fs_dir)
+            if not force and stored.get(record.subject_label) == known:
                 skipped += 1
                 continue
 
@@ -207,7 +218,11 @@ def _inventory_dataset(
             provenance = subject_provenance(
                 read.texts, record.files, record.subject_label, partial=read.partial
             )
-            catalog.upsert_subject(uid, dataset_id, record, provenance, signature)
+            # with the subject, in one transaction: stored without its digests, a subject
+            # would be skipped from then on and never get them
+            catalog.upsert_subject(
+                uid, dataset_id, record, provenance, signature, digests=read.digests
+            )
             done += 1
     except SourceError as exc:  # from the listing; reading a subject raises none
         stopped = exc
@@ -228,7 +243,7 @@ def _inventory_dataset(
         log.warning("%s: the subjects could not be listed: %s", pseudonym, detail)
         tally.failures.append((f"dataset:{pseudonym}", stopped.reason))
         tally.note(pseudonym, f"the subjects could not be listed ({detail})")
-        return
+        return False
 
     catalog.upsert_dataset(dataset, pseudonym, len(labels))
     gone = catalog.mark_absent(dataset_id, labels)
@@ -254,6 +269,43 @@ def _inventory_dataset(
         skipped,
         len(gone),
     )
+    return True
+
+
+def _retire_other_pipelines(
+    catalog: Catalog,
+    dataset: DatasetRecord,
+    pseudonym: str,
+    yielded: Collection[str],
+    tally: _Tally,
+) -> None:
+    """Mark absent the subjects that the catalog holds for ``dataset`` under a pipeline
+    that no source yields any more.
+
+    The pipeline is part of a dataset row and of every ``subject_uid``. Data that is found
+    in the layout of another pipeline (a subjects directory moved into
+    ``sourcedata/freesurfer/``, an fMRIPrep output written beside ``freesurfer/``) is
+    therefore a new row with new subjects, and the listing no longer contains the subjects
+    of the old row. Left present, every subject would count twice.
+    """
+    rows = catalog.query(
+        "SELECT dataset_id, pipeline FROM datasets WHERE source = ? AND identity = ? "
+        "ORDER BY dataset_id",
+        (dataset.source, dataset.identity),
+    )
+    for row in rows:
+        if row["pipeline"] in yielded:
+            continue
+        gone = catalog.mark_absent(row["dataset_id"], ())
+        if gone:
+            catalog.upsert_dataset(catalog.dataset_record(row["dataset_id"]), pseudonym, 0)
+            tally.note(
+                pseudonym,
+                f"the data is now found as pipeline {dataset.pipeline}, not {row['pipeline']}; "
+                f"the {len(gone)} subject(s) it had as {row['pipeline']} are no longer listed "
+                "and were marked absent, their renders and ratings are kept, and the "
+                "subjects listed now have other identifiers",
+            )
 
 
 def run_inventory(
@@ -275,10 +327,14 @@ def run_inventory(
 
     Per dataset: the dataset row is written with its pseudonym; each listed subject gets its
     ``subject_uid`` and ``inventory_hash``, and is read, parsed and stored unless that hash
-    is the stored one; subjects of the dataset that are not listed get ``present = 0``, and
-    listed ones that were absent ``present = 1``; a ``field_strength`` of the source is
-    written to the listed subjects. For a remote source the stats files are fetched in the
-    same step, for its cache to keep.
+    is the stored one; the build stamp and the logs that were read whole are stored with
+    their SHA-256 (``files.sha256``), so that what was parsed traces to exact bytes;
+    subjects of the dataset that are not listed get ``present = 0``, and listed ones that
+    were absent ``present = 1``; a ``field_strength`` of the source is written to the listed
+    subjects. For a remote source the stats files are fetched in the
+    same step, for its cache to keep. The subjects that the catalog holds for the same
+    dataset under a pipeline that no source yields any more are not listed either and get
+    ``present = 0``, with a note (:func:`_retire_other_pipelines`).
 
     What the report counts:
 
@@ -317,6 +373,7 @@ def run_inventory(
     stage = stage_hashes(config)[PHASE]
     tally = _Tally()
     seen: dict[tuple[str, str, str], str] = {}
+    listed: list[DatasetRecord] = []
     for source in sources:
         for dataset in source.datasets(accessions):
             pseudonym = _pseudonym(catalog, key, dataset)
@@ -328,7 +385,7 @@ def run_inventory(
                     "invalid", f"two sources of this run hold the same dataset, {pseudonym}"
                 )
             seen[identity] = pseudonym
-            _inventory_dataset(
+            complete = _inventory_dataset(
                 catalog,
                 source,
                 dataset,
@@ -339,6 +396,16 @@ def run_inventory(
                 force=force,
                 tally=tally,
             )
+            if complete:  # half a listing says nothing about what is gone
+                listed.append(dataset)
+    for dataset in listed:
+        yielded = {
+            pipeline
+            for kind, identity, pipeline in seen
+            if (kind, identity) == (dataset.source, dataset.identity)
+        }
+        pseudonym = seen[dataset.source, dataset.identity, dataset.pipeline]
+        _retire_other_pipelines(catalog, dataset, pseudonym, yielded, tally)
     for pseudonym in sorted((wanted or set()) - set(seen.values())):
         tally.failures.append((f"dataset:{pseudonym}", "not found"))
         tally.note(pseudonym, "no source of this run has this dataset")
