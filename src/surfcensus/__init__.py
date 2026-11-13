@@ -13,6 +13,7 @@ __version__ = "0.0.1"
 _LAZY = {
     "render": "surfcensus.render",
     "sources": "surfcensus.sources",
+    "metrics": "surfcensus.metrics",
     "Run": "surfcensus.run:Run",
 }
 

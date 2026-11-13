@@ -24,6 +24,13 @@ if TYPE_CHECKING:
 
 Status = Literal["done", "failed"]
 
+METRIC_STAGES: tuple[str, ...] = ("regional", "fsaverage", "reference", "score")
+"""The stages of phase 4 that ``surfcensus metrics`` runs when none is named, in order."""
+
+ALL_METRIC_STAGES: tuple[str, ...] = (*METRIC_STAGES, "native", "merge")
+"""Every stage that can be named: ``native`` gives cluster centroids their native position
+from the vertex maps of the renders, ``merge`` joins the per-dataset parts of each table."""
+
 
 @dataclass(frozen=True)
 class Provenance:

@@ -41,7 +41,7 @@ Caveat: FreeSurfer's spherical registration is driven by folding patterns (curva
 
 Global normalization: subtract each subject's median cortical thickness over the whole hemisphere outside the occipital search region. This removes offsets from age, scanner and contrast that shift thickness everywhere.
 
-Reference distribution at each vertex: median and MAD of normalized thickness across reference subjects in a stratum. Strata, when they hold at least 30 subjects: dataset; else field strength × FreeSurfer major version; else all subjects. The MAD map is lightly smoothed on the mesh to stabilize it.
+Reference distribution at each vertex: median and MAD of normalized thickness across reference subjects in a stratum. Strata, when they hold at least 30 subjects: dataset; else field strength × FreeSurfer major version; else all subjects. They are named `dataset:<pseudonym>`, `field:<T>|fs:<major>` and `all`. Field strength is binned to the nearest of 1.5, 3 and 7 T, the lower one on a tie, because scanners report values such as 2.89 T; a subject whose field strength or FreeSurfer version is unknown has no stratum of the middle kind. The MAD map is lightly smoothed on the mesh to stabilize it.
 
 Subject z-map: z_v = (t_v − median_v) / (1.4826 × MAD_v).
 

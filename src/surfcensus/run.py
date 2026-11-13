@@ -30,7 +30,7 @@ from surfcensus.config import (
     write_config,
 )
 from surfcensus.privacy import HashKey
-from surfcensus.records import PhaseReport, RunContext
+from surfcensus.records import METRIC_STAGES, PhaseReport, RunContext
 from surfcensus.sources.base import DatasetRecord, FileRole, Source, SourceError
 from surfcensus.store import (
     CATALOG_FILE,
@@ -43,8 +43,6 @@ from surfcensus.store import (
 if TYPE_CHECKING:
     import httpx
     import pandas as pd
-
-METRIC_STAGES: tuple[str, ...] = ("regional", "fsaverage", "reference", "score")
 
 _METRICS = "metrics arrive in milestone 3"
 

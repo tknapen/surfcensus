@@ -77,7 +77,8 @@ surfcensus/
       surfaces.py          # read white/pial in tkr RAS, normals
       volumes.py           # read T1.mgz, vox2ras-tkr, intensity windows
       stats.py             # parse ?h.aparc.stats, aseg.stats
-      annot.py             # read ?h.aparc.annot
+      annot.py             # read ?h.aparc.annot and .label files
+      morph.py             # read ?h.thickness
     templates.py           # locate or fetch fsaverage spheres, cortex labels, search-region label
     fsio/registration.py   # sphere.reg mapping: barycentric resampling, vertex correspondences
     metrics/
@@ -87,9 +88,11 @@ surfcensus/
       ceiling.py           # ceiling fraction on native surfaces
       intensity.py
       scoring.py           # composite score
+      pipeline.py          # phase 4 for a run: the metric stages and their tables
     reference/
       build.py             # build a normative reference from a rated census run
-      load.py
+      load.py              # a reference in memory and on disk
+      strata.py            # names of strata and of references, field-strength bins
     data/reference/        # shipped reference tables (parquet + JSON metadata)
     select/
       sampling.py

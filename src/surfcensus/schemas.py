@@ -11,7 +11,62 @@ helpers of ``store.py`` know every key.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import pyarrow as pa
+
+NO_REFERENCE = "none"
+"""``reference_id`` of a row that was computed without a reference: the scores of decision
+D16, and those of a subject without a z-map."""
+
+SCORE_KINDS: tuple[str, ...] = ("composite_z", "fallback_rank")
+"""Values of ``scores.score_kind``: the maximum of standardised components, or the ranking
+of decision D16."""
+
+REGION_KINDS: tuple[str, ...] = ("template", "annot", "none")
+"""Values of ``vertex_summary.region_kind`` and ``scores.ceiling_region``: how the search
+region was placed on the native surface."""
+
+VERTEX_FLAGS: tuple[str, ...] = (
+    "degenerate_sphere",
+    "low_coverage",
+    "no_annot",
+    "no_sphere_reg",
+    "no_template",
+    "no_thickness",
+    "sphere_flipped",
+    "thickness_above_max",
+    "vertex_count_mismatch",
+)
+"""What ``vertex_summary.flags`` can hold for one hemisphere, sorted."""
+
+FLAG_OF_REASON: dict[str, str] = {
+    "degenerate sphere": "degenerate_sphere",
+    "low coverage": "low_coverage",
+    "vertex count mismatch": "vertex_count_mismatch",
+}
+"""The flag a hemisphere gets when its map fails with a ``MetricError`` of that reason. The
+other reasons (``missing file``, ``unreadable``) fail the subject, not the hemisphere."""
+
+SCORE_FLAGS: tuple[str, ...] = tuple(sorted((*VERTEX_FLAGS, "no_stats", "partial_score")))
+"""What ``scores.flags`` can hold: the union of the hemispheres' flags, ``no_stats`` for a
+subject without stats files, and ``partial_score`` for one scored on fewer components than
+configured."""
+
+
+def join_flags(flags: Iterable[str]) -> str:
+    """The text of a ``flags`` column: the distinct flags, sorted, joined with commas; empty
+    for none. Raises ValueError for a flag that is not in :data:`SCORE_FLAGS`."""
+    distinct = sorted(set(flags))
+    unknown = [flag for flag in distinct if flag not in SCORE_FLAGS]
+    if unknown:
+        raise ValueError(f"not a flag of the metric tables: {', '.join(unknown)}")
+    return ",".join(distinct)
+
+
+def split_flags(text: str) -> tuple[str, ...]:
+    """The flags in the text of a ``flags`` column, in its order; ``()`` for an empty text."""
+    return tuple(flag for flag in text.split(",") if flag)
 
 
 def _schema(*groups: tuple[pa.DataType, bool, tuple[str, ...]]) -> pa.Schema:
