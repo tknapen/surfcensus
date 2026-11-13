@@ -1,0 +1,49 @@
+{% extends "base.html" %}
+{% block title %}surfcensus: review{% endblock %}
+{% block body %}
+<main id="review" class="review" data-state="loading">
+  <header class="review-head">
+    <a id="rate-link" href="/">rating</a>
+    <h1>Review</h1>
+    <form id="filter-form" class="filter-form">
+      <input id="filter" type="text" autocomplete="off" spellcheck="false"
+             placeholder="filter, e.g. final_A:2,fs_version:7.3.2" aria-label="Filter">
+      <button type="submit" class="control">apply</button>
+    </form>
+    <span id="review-count" class="review-count"></span>
+    <a id="export-link" href="/api/export" download="ratings.csv">ratings as CSV</a>
+  </header>
+
+  <p id="review-message" class="message" role="status" hidden></p>
+
+  <div id="review-body" class="review-body">
+    <section class="review-list" aria-label="Subjects">
+      <figure class="scatter-box">
+        <svg id="scatter" class="scatter" role="img" aria-label="Composite score against final label"></svg>
+        <figcaption id="scatter-caption"></figcaption>
+      </figure>
+      <div class="table-wrap">
+        <table id="subjects" class="subjects">
+          <thead></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="pager">
+        <button type="button" id="page-previous" class="control">previous</button>
+        <span id="page-label"></span>
+        <button type="button" id="page-next" class="control">next</button>
+      </div>
+    </section>
+
+    <section id="subject" class="review-subject" aria-label="Subject" hidden>
+      <h2 id="subject-title"></h2>
+      <div id="viewer"></div>
+      <p id="subject-message" class="hint"></p>
+      <div id="subject-detail" class="subject-detail"></div>
+    </section>
+  </div>
+</main>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="{{ static }}/js/review.js?v={{ version }}"></script>
+{% endblock %}

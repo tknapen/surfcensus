@@ -1,0 +1,901 @@
+/* The rater app. One stylesheet, system fonts, nothing fetched from elsewhere. */
+
+:root {
+  color-scheme: dark;
+  --bg: #101317;
+  --surface: #191e25;
+  --raised: #242b35;
+  --line: #36404d;
+  --text: #dfe4ea;
+  --muted: #8f9aa7;
+  --accent: #4ea1ff;
+  --low: #2e7d5b;
+  --mid: #a8741a;
+  --high: #b83a31;
+  --mark-a: #ff5ae0;
+  --mark-b: #5bff8f;
+  --mark-c: #b9a8ff;
+  --mark-x: #ffffff;
+  --centroid: #ff9d2e;
+  --crosshair: #33c7ff;
+  --crosshair-alpha: 0.45;
+  --gap: 8px;
+  --pad: 10px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font: 14px/1.35 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+a {
+  color: var(--accent);
+}
+
+kbd {
+  display: inline-block;
+  min-width: 1.5em;
+  padding: 0 0.35em;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: #0c0f13;
+  color: var(--text);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: center;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+.control,
+.level,
+.class-key,
+.reason,
+.sort {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--raised);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.control:hover,
+.level:hover,
+.class-key:hover,
+.reason:hover {
+  border-color: var(--muted);
+}
+
+button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+button:focus-visible,
+input:focus-visible,
+textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+.control[aria-pressed="true"] {
+  border-color: var(--accent);
+  background: #1d3a5c;
+}
+
+.primary:not(:disabled) {
+  border-color: var(--accent);
+  background: #1f5fa8;
+}
+
+/* --- the rating page ------------------------------------------------------------------ */
+
+/* The page fills the window: the viewer takes what the rating bar leaves. In a window too
+   small for that the panels keep a third of the width each, and the page scrolls. */
+.rate {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 100vh;
+  padding: var(--pad);
+  position: relative;
+}
+
+.viewer {
+  display: flex;
+  flex: 1 1 auto;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.rate[data-state="rendering"] .viewer,
+.rate[data-state="done"] .viewer,
+.rate[data-state="loading"] .viewer,
+.rate[data-state="error"] .viewer {
+  visibility: hidden;
+}
+
+.rate[data-state="rendering"] .rating,
+.rate[data-state="done"] .rating,
+.rate[data-state="loading"] .rating,
+.rate[data-state="error"] .rating {
+  opacity: 0.35;
+}
+
+/* The three panels side by side, as large as the box of .panels allows: its width shared by
+   three, or its height less the caption, whichever is smaller. The viewer measures the box
+   and sets --side (viewer.js); the box does not depend on what is in it. */
+.panels {
+  contain: size;
+  display: flex;
+  flex: 1 1 auto;
+  justify-content: center;
+  gap: var(--gap);
+  min-height: min(calc((100vw - 2 * var(--pad) - 2 * var(--gap)) / 3 + 18px), 60vh);
+}
+
+.panel {
+  flex: 0 0 auto;
+  width: var(--side, 0px);
+  margin: 0;
+}
+
+.panel figcaption {
+  height: 18px;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 18px;
+  text-align: center;
+}
+
+.stage {
+  position: relative;
+  width: var(--side, 0px);
+  height: var(--side, 0px);
+  overflow: hidden;
+  background: #000;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.zoomable {
+  position: absolute;
+  inset: 0;
+  transform-origin: 50% 50%;
+}
+
+.viewer[data-zoom="2"] .zoomable {
+  transform: scale(2);
+}
+
+.tile,
+.panel-layer {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+}
+
+.tile {
+  display: block;
+  pointer-events: none;
+}
+
+.tile:not([src]) {
+  visibility: hidden;
+}
+
+.viewer[data-contours="hidden"] .tile-contours {
+  visibility: hidden;
+}
+
+.crosshair line {
+  stroke: var(--crosshair);
+  stroke-opacity: var(--crosshair-alpha);
+  stroke-width: 1;
+  pointer-events: none;
+}
+
+.letters {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+}
+
+.edge {
+  position: absolute;
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1;
+  text-shadow:
+    0 0 2px #000,
+    0 0 2px #000,
+    0 0 3px #000;
+}
+
+.edge-left {
+  left: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.edge-right {
+  right: 5px;
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.edge-top {
+  top: 5px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+.edge-bottom {
+  bottom: 5px;
+  left: 50%;
+  transform: translateX(-50%);
+}
+
+/* marks: a ring, so the tissue under the point stays visible */
+.mark,
+.centroid {
+  --mark: var(--mark-x);
+}
+
+.mark[data-class="A"] {
+  --mark: var(--mark-a);
+}
+
+.mark[data-class="B"] {
+  --mark: var(--mark-b);
+}
+
+.mark[data-class="C"] {
+  --mark: var(--mark-c);
+}
+
+.mark {
+  cursor: pointer;
+}
+
+.mark-hit {
+  fill: transparent;
+}
+
+.mark-halo {
+  fill: none;
+  stroke: #000;
+  stroke-opacity: 0.75;
+  stroke-width: 3.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.mark-ring {
+  fill: none;
+  stroke: var(--mark);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+}
+
+.mark-chosen {
+  fill: none;
+  stroke: var(--mark);
+  stroke-width: 1.2;
+  stroke-dasharray: 3 2;
+  vector-effect: non-scaling-stroke;
+}
+
+.mark-label {
+  fill: var(--mark);
+  font-weight: 700;
+  paint-order: stroke;
+  stroke: #000;
+  stroke-width: 2.5px;
+  stroke-linejoin: round;
+  vector-effect: non-scaling-stroke;
+  pointer-events: none;
+}
+
+.centroid {
+  --mark: var(--centroid);
+  pointer-events: none;
+}
+
+.centroid-halo {
+  fill: none;
+  stroke: #000;
+  stroke-opacity: 0.75;
+  stroke-width: 3.2;
+  vector-effect: non-scaling-stroke;
+}
+
+.centroid-shape {
+  fill: none;
+  stroke: var(--centroid);
+  stroke-width: 1.6;
+  vector-effect: non-scaling-stroke;
+}
+
+/* the active mark class shows in the cursor: a cross with the letter of the class */
+.viewer[data-active-class="A"] .stage {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23000' stroke-width='3'/%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23ff5ae0' stroke-width='1.4'/%3E%3Ctext x='17' y='31' font-family='sans-serif' font-size='13' font-weight='700' fill='%23ff5ae0' stroke='%23000' stroke-width='.6'%3EA%3C/text%3E%3C/svg%3E")
+      12 12,
+    crosshair;
+}
+
+.viewer[data-active-class="B"] .stage {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23000' stroke-width='3'/%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%235bff8f' stroke-width='1.4'/%3E%3Ctext x='17' y='31' font-family='sans-serif' font-size='13' font-weight='700' fill='%235bff8f' stroke='%23000' stroke-width='.6'%3EB%3C/text%3E%3C/svg%3E")
+      12 12,
+    crosshair;
+}
+
+.viewer[data-active-class="C"] .stage {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23000' stroke-width='3'/%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23b9a8ff' stroke-width='1.4'/%3E%3Ctext x='17' y='31' font-family='sans-serif' font-size='13' font-weight='700' fill='%23b9a8ff' stroke='%23000' stroke-width='.6'%3EC%3C/text%3E%3C/svg%3E")
+      12 12,
+    crosshair;
+}
+
+.viewer[data-active-class="X"] .stage {
+  cursor:
+    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='32' height='32'%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23000' stroke-width='3'/%3E%3Cpath d='M12 1v8M12 15v8M1 12h8M15 12h8' stroke='%23fff' stroke-width='1.4'/%3E%3Ctext x='17' y='31' font-family='sans-serif' font-size='13' font-weight='700' fill='%23fff' stroke='%23000' stroke-width='.6'%3EX%3C/text%3E%3C/svg%3E")
+      12 12,
+    crosshair;
+}
+
+.transport {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.transport input[type="range"] {
+  flex: 1 1 160px;
+  min-width: 120px;
+  accent-color: var(--accent);
+}
+
+.frame-label,
+.speed-label,
+.loading {
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.frame-label {
+  min-width: 8.5em;
+}
+
+.speed-label {
+  min-width: 2.6em;
+  text-align: center;
+}
+
+/* --- the rating bar ------------------------------------------------------------------- */
+
+.rating {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 5px;
+  padding: 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.criteria {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 4px 12px;
+  align-items: center;
+}
+
+.criterion {
+  display: contents;
+}
+
+.criterion-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.criterion-label b {
+  display: inline-block;
+  width: 1.3em;
+}
+
+.levels {
+  display: flex;
+  gap: 4px;
+}
+
+.level[aria-pressed="true"][data-rank="low"] {
+  border-color: #58c794;
+  background: var(--low);
+}
+
+.level[aria-pressed="true"][data-rank="mid"] {
+  border-color: #e3aa45;
+  background: var(--mid);
+}
+
+.level[aria-pressed="true"][data-rank="high"] {
+  border-color: #ef7a71;
+  background: var(--high);
+}
+
+.criteria[data-unratable="true"] .levels {
+  opacity: 0.4;
+}
+
+.class-cell {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.class-key[aria-pressed="true"] {
+  border-color: var(--text);
+  background: #3a4553;
+}
+
+.class-key[data-class="A"] kbd,
+.active-class[data-class="A"] {
+  color: var(--mark-a);
+}
+
+.class-key[data-class="B"] kbd,
+.active-class[data-class="B"] {
+  color: var(--mark-b);
+}
+
+.class-key[data-class="C"] kbd,
+.active-class[data-class="C"] {
+  color: var(--mark-c);
+}
+
+.class-key[data-class="X"] kbd,
+.active-class[data-class="X"] {
+  color: var(--mark-x);
+}
+
+.mark-count {
+  min-width: 4.6em;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.mark-count:not([data-count="0"]) {
+  color: var(--text);
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.active-class {
+  min-width: 7.5em;
+  color: var(--muted);
+  font-weight: 600;
+}
+
+.legend {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.legend kbd {
+  min-width: 0;
+  font-size: 11px;
+}
+
+.spacer {
+  flex: 1 1 0;
+}
+
+.note-box {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.note-box textarea {
+  flex: 1 1 auto;
+  min-height: 2.9em;
+  padding: 4px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #0c0f13;
+  color: var(--text);
+  font: inherit;
+  resize: vertical;
+}
+
+.note-hint {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.hint {
+  min-height: 1.35em;
+  margin: 0;
+  color: var(--muted);
+}
+
+.hint[data-kind="ready"] {
+  color: #7fd6a8;
+}
+
+.hint[data-kind="notice"] {
+  color: #ffc267;
+}
+
+.progress {
+  display: flex;
+  flex: 0 0 auto;
+  justify-content: space-between;
+  gap: 12px;
+  color: var(--muted);
+  font-size: 13px;
+  font-variant-numeric: tabular-nums;
+}
+
+.message {
+  margin: 0;
+  padding: 14px 18px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-size: 16px;
+}
+
+.rate > .message {
+  position: absolute;
+  top: 22%;
+  left: 50%;
+  width: min(560px, 90vw);
+  transform: translateX(-50%);
+  text-align: center;
+}
+
+/* --- dialogs: the unratable reasons, the help screen ---------------------------------- */
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  outline: none;
+  display: flex;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 5vh 12px;
+  overflow: auto;
+  background: rgb(0 0 0 / 62%);
+}
+
+.dialog {
+  width: min(460px, 100%);
+  padding: 14px 18px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.dialog-wide {
+  width: min(880px, 100%);
+}
+
+.dialog h2 {
+  margin: 10px 0 6px;
+  font-size: 16px;
+}
+
+.dialog h2:first-child {
+  margin-top: 0;
+}
+
+.dialog-lead,
+.dialog-foot {
+  margin: 6px 0;
+  color: var(--muted);
+}
+
+.reasons {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reasons li {
+  margin: 4px 0;
+}
+
+.reason {
+  width: 100%;
+  text-align: left;
+}
+
+.reason[aria-selected="true"] {
+  border-color: var(--accent);
+  background: #1d3a5c;
+}
+
+.help-table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+.help-table th,
+.help-table td {
+  padding: 3px 8px 3px 0;
+  border-top: 1px solid var(--line);
+  text-align: left;
+  vertical-align: top;
+}
+
+.help-table th {
+  width: 15em;
+  font-weight: 600;
+}
+
+.help-table .keys {
+  width: 15em;
+  white-space: nowrap;
+}
+
+.examples {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.example {
+  width: 200px;
+  margin: 0;
+}
+
+.example-tiles {
+  position: relative;
+  width: 200px;
+  height: 200px;
+  background: #000;
+}
+
+.example figcaption {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* --- the review page ------------------------------------------------------------------ */
+
+.review {
+  padding: var(--pad);
+}
+
+.review-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.review-head h1 {
+  margin: 0;
+  font-size: 18px;
+}
+
+.filter-form {
+  display: flex;
+  flex: 1 1 280px;
+  gap: 6px;
+}
+
+.filter-form input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 3px 6px;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: #0c0f13;
+  color: var(--text);
+  font: inherit;
+}
+
+.review-count {
+  color: var(--muted);
+}
+
+.review-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 14px;
+}
+
+.scatter-box {
+  margin: 0 0 8px;
+}
+
+.scatter {
+  display: block;
+  width: 100%;
+  max-width: 760px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.scatter-box figcaption {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.scatter-grid {
+  stroke: var(--line);
+  stroke-width: 1;
+}
+
+.scatter-label {
+  fill: var(--muted);
+  font-size: 11px;
+}
+
+.scatter-dot {
+  fill: var(--accent);
+  fill-opacity: 0.75;
+  stroke: #000;
+  stroke-width: 0.6;
+  cursor: pointer;
+}
+
+.scatter-chosen {
+  fill: #fff;
+  fill-opacity: 1;
+}
+
+.table-wrap {
+  max-height: 46vh;
+  overflow: auto;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+}
+
+.subjects {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+
+.subjects th,
+.subjects td {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--line);
+  text-align: left;
+  white-space: nowrap;
+}
+
+.subjects th {
+  position: sticky;
+  top: 0;
+  background: var(--raised);
+}
+
+.subjects tbody tr,
+.subject-detail tr {
+  cursor: pointer;
+}
+
+.subjects tr:hover td {
+  background: #1d232c;
+}
+
+.subjects tr[aria-selected="true"] td {
+  background: #1d3a5c;
+}
+
+.sort {
+  padding: 0;
+  border: 0;
+  background: none;
+  font-weight: 600;
+}
+
+.pager {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 6px;
+  color: var(--muted);
+}
+
+.review-subject h2 {
+  margin: 0 0 6px;
+  font-size: 16px;
+}
+
+.review-subject .viewer {
+  height: min(64vh, 620px);
+}
+
+.subject-detail h3 {
+  margin: 12px 0 4px;
+  font-size: 14px;
+}
+
+.scores {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 14px;
+  margin: 0;
+  font-size: 12.5px;
+}
+
+.scores dt {
+  color: var(--muted);
+}
+
+.scores dd {
+  margin: 0;
+}
+
+/* --- small windows -------------------------------------------------------------------- */
+
+@media (max-width: 1100px) {
+  .legend {
+    display: none;
+  }
+}
+
+@media (max-width: 760px) {
+  body {
+    font-size: 13px;
+  }
+
+  .criteria {
+    gap: 3px 6px;
+  }
+
+  .control,
+  .level,
+  .class-key {
+    padding: 2px 5px;
+  }
+
+  .mark-count {
+    min-width: 0;
+  }
+}

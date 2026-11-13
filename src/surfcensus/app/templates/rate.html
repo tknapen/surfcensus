@@ -1,0 +1,39 @@
+{% extends "base.html" %}
+{% block title %}surfcensus: rating{% endblock %}
+{% block body %}
+<main id="rate" class="rate" data-state="loading">
+  <section id="viewer" aria-label="Viewer"></section>
+
+  <section id="rating" class="rating" aria-label="Rating">
+    <div id="criteria" class="criteria"></div>
+    <div class="actions">
+      <span id="active-class" class="active-class" data-class="">no mark class</span>
+      <button type="button" id="unratable" class="control" aria-pressed="false"><kbd>u</kbd> unratable<span id="unratable-reason"></span></button>
+      <button type="button" id="other" class="control" aria-pressed="false"><kbd>o</kbd> other problem</button>
+      <button type="button" id="note-toggle" class="control" aria-pressed="false"><kbd>n</kbd> note</button>
+      <span class="legend">click: mark · <kbd>Delete</kbd> remove · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · hold <kbd>h</kbd> marks off · hold <kbd>s</kbd> contours off</span>
+      <span class="spacer"></span>
+      <button type="button" id="back" class="control"><kbd>Backspace</kbd> back</button>
+      <button type="button" id="help-toggle" class="control"><kbd>?</kbd> help</button>
+      <button type="button" id="submit" class="control primary" disabled><kbd>Enter</kbd> submit and next</button>
+    </div>
+    <div id="note-box" class="note-box" hidden>
+      <textarea id="note" rows="2" maxlength="10000" placeholder="Note" aria-label="Note"></textarea>
+      <span class="note-hint"><kbd>Esc</kbd> back to the keys</span>
+    </div>
+    <p id="hint" class="hint" role="status"></p>
+  </section>
+
+  <footer id="progress" class="progress">
+    <span id="progress-line"></span>
+    <a id="review-link" href="/review" hidden>review</a>
+  </footer>
+
+  <p id="message" class="message" role="status" hidden></p>
+  <div id="unratable-picker" class="overlay" role="dialog" aria-label="Unratable" hidden></div>
+  <div id="help" class="overlay" role="dialog" aria-label="Help" hidden></div>
+</main>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="{{ static }}/js/rate.js?v={{ version }}"></script>
+{% endblock %}

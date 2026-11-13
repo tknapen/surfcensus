@@ -67,40 +67,26 @@ class _HemiIndex:
     trees: Mapping[Surface, cKDTree]
     """Empty for a hemisphere without vertices."""
 
-    def distances(
-        self, surface: Surface, rows: Int[np.ndarray, " r"], point: Float[np.ndarray, " 3"]
-    ) -> Float[np.ndarray, " r"]:
-        # written out per axis: the sum of three squares in one fixed order
-        d = self.positions[surface][rows] - point
-        return np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2])
-
-    def ball(
-        self, surface: Surface, point: Float[np.ndarray, " 3"], radius: float
+    def search(
+        self, surface: Surface, point: Float[np.ndarray, " 3"], radius: float | None = None
     ) -> tuple[Int[np.ndarray, " r"], Float[np.ndarray, " r"]]:
         """Rows within ``radius`` of ``point`` (boundary included) and their distances, by
-        distance and then by native index."""
+        distance and then by native index. Without a radius: the nearest rows, which is
+        more than one row where several are equally near."""
         tree = self.trees.get(surface)
         if tree is None:
             return np.empty(0, dtype=np.int64), np.empty(0, dtype=float)
-        found = tree.query_ball_point(point, radius * (1.0 + _SLACK) + _SLACK)
+        # the tree names one of the nearest vertices, at about that distance
+        reach = float(tree.query(point)[0]) if radius is None else radius
+        found = tree.query_ball_point(point, reach * (1.0 + _SLACK) + _SLACK)
         rows = np.asarray(found, dtype=np.int64)
-        dist = self.distances(surface, rows, point)
-        keep = dist <= radius
+        # written out per axis: the sum of three squares in one fixed order
+        d = self.positions[surface][rows] - point
+        dist = np.sqrt(d[:, 0] * d[:, 0] + d[:, 1] * d[:, 1] + d[:, 2] * d[:, 2])
+        keep = dist <= (dist.min() if radius is None else radius)
         rows, dist = rows[keep], dist[keep]
         order = np.lexsort((self.native[rows], dist))
         return rows[order], dist[order]
-
-    def nearest(self, surface: Surface, point: Float[np.ndarray, " 3"]) -> tuple[int, float] | None:
-        """The row nearest ``point`` and its distance; the lowest native index among equally
-        near rows. None for a hemisphere without vertices."""
-        tree = self.trees.get(surface)
-        if tree is None:
-            return None
-        _, row = tree.query(point)
-        first = float(self.distances(surface, np.array([row], dtype=np.int64), point)[0])
-        # the tree names one of the nearest vertices; every vertex as near as that one
-        rows, dist = self.ball(surface, point, first)
-        return int(rows[0]), float(dist[0])
 
 
 class VertexIndex:
@@ -166,10 +152,10 @@ class VertexIndex:
         best: tuple[Hemi, int, float, int] | None = None
         for name in HEMIS if hemi is None else (hemi,):
             half = self._hemis[name]
-            found = half.nearest(surface, point)
-            if found is None:
+            rows, dists = half.search(surface, point)
+            if not len(rows):
                 continue
-            row, dist = found
+            row, dist = int(rows[0]), float(dists[0])
             if dist <= radius and (best is None or dist < best[2]):
                 best = (name, int(half.native[row]), dist, int(half.fsavg[row]))
         return best
@@ -183,7 +169,7 @@ class VertexIndex:
         out: list[tuple[Hemi, int, float, int]] = []
         for name in HEMIS if hemi is None else (hemi,):
             half = self._hemis[name]
-            rows, dist = half.ball(surface, point, radius)
+            rows, dist = half.search(surface, point, radius)
             out.extend(
                 (name, int(half.native[row]), float(d), int(half.fsavg[row]))
                 for row, d in zip(rows.tolist(), dist.tolist(), strict=True)
@@ -199,14 +185,14 @@ class VertexIndex:
         half = self._hemis[hemi]
         near = np.zeros(len(half.native), dtype=bool)
         for point in points:
-            rows, _ = half.ball(surface, point, radius)
+            rows, _ = half.search(surface, point, radius)
             near[rows] = True
-        return np.sort(half.native[near]).astype(np.int32)
+        return np.unique(half.native[near]).astype(np.int32)
 
 
 def _point(tkr: Sequence[float]) -> Float[np.ndarray, " 3"]:
-    point = np.array([float(tkr[0]), float(tkr[1]), float(tkr[2])], dtype=np.float64)
-    if len(tkr) != 3 or not np.isfinite(point).all():
+    point = np.array([float(x) for x in tkr], dtype=np.float64)
+    if point.shape != (3,) or not np.isfinite(point).all():
         raise ValueError(f"a point is three finite coordinates, got {tuple(tkr)}")
     return point
 

@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}surfcensus{% endblock %}</title>
+  {# no favicon file: an empty one keeps the browser from asking the server for it #}
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="{{ static }}/app.css?v={{ version }}">
+</head>
+<body data-mode="{{ mode }}" data-version="{{ version }}">
+{% block body %}{% endblock %}
+<noscript><p class="message">This page needs JavaScript.</p></noscript>
+{% block scripts %}{% endblock %}
+</body>
+</html>

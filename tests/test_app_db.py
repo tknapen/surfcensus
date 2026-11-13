@@ -3,6 +3,7 @@ writes that more than one module makes (a rater, a submission)."""
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 import subprocess
 import sys
@@ -581,8 +582,12 @@ def test_a_new_database_starts_at_the_present_schema_without_a_migration(
     assert read(tmp_path, "SELECT name FROM sqlite_master WHERE name = 'notes'") == []
 
 
-def test_migrations_are_applied_in_order(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_migrations_are_applied_in_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger="surfcensus")
     open_app_db(tmp_path, run_id=RUN_ID, mode="local").dispose()
+    assert caplog.messages == []
     monkeypatch.setattr(db, "APP_SCHEMA_VERSION", 3)
     monkeypatch.setattr(
         db,
@@ -595,6 +600,10 @@ def test_migrations_are_applied_in_order(tmp_path: Path, monkeypatch: pytest.Mon
     open_app_db(tmp_path, run_id=RUN_ID, mode="local").dispose()
     assert meta(tmp_path)["schema_version"] == "3"
     assert [row[1] for row in read(tmp_path, 'PRAGMA table_info("raters")')][-1] == "email"
+    assert caplog.messages == [
+        "app.sqlite brought from schema 1 to 2",
+        "app.sqlite brought from schema 2 to 3",
+    ]
 
 
 def test_a_migration_that_fails_changes_nothing(
@@ -625,7 +634,7 @@ def test_a_migration_that_fails_changes_nothing(
     )
     monkeypatch.setattr(db, "APP_SCHEMA_VERSION", 2)
     error = refused(other)
-    assert "from schema 1 to 2" in error.detail and "is as it was" in error.detail
+    assert "from schema 1 to 2" in error.detail and "nothing of that step" in error.detail
     # also the statements before the one that failed, a change of a table among them
     assert meta(other)["schema_version"] == "1" and rows_of(other) == before_other
     assert read(other, "SELECT name, sql FROM sqlite_master ORDER BY name") == schema

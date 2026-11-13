@@ -95,7 +95,8 @@ class Submission(SQLModel, table=True):
     revision: int
     """From 1."""
     current: bool = True
-    """True for the latest revision of the assignment, and for no other."""
+    """True for the latest revision of the assignment, and for no other: the unique index
+    ``ux_submissions_current`` refuses a second current submission of an assignment."""
     unratable_reason: str | None = None
     other: bool = False
     note: str = ""

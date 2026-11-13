@@ -9,8 +9,9 @@ sends its events while a rating is on its way. A transaction that reads first an
 the write lock afterwards is refused by SQLite at once, without waiting, when another did
 the same in the meantime. With the lock taken at the start the second request waits for the
 first instead, up to the busy timeout. The price: a second session opened in a thread
-while the first still has a transaction open waits for that long and then fails. Use one
-session per request and pass it on.
+while the first still has a transaction open waits for that long and then fails. So use
+one session per request, pass it on, and close it: a session that was committed begins
+its next transaction at its next read, and holds the lock again until it is closed.
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ from surfcensus.app import APP_DB_FILE, APP_TABLES, RATINGS_FLAT_VIEW
 from surfcensus.app.models import Assignment, Mark, Rater, Rating, Submission
 from surfcensus.app.schemas import AppMode, RaterRole, RatingIn, ResolvedMark
 from surfcensus.config import ConfigError
+from surfcensus.log import get_logger
 
 APP_SCHEMA_VERSION = 1
 """``app_meta.schema_version`` of a database made by this version of the package."""
@@ -137,13 +139,12 @@ def _engine(path: Path, mode: AppMode) -> Engine:
 
     @event.listens_for(engine, "connect")
     def _on_connect(dbapi_connection: Any, _record: object) -> None:
-        # the driver begins a transaction by rules of its own (none before a SELECT or a
-        # CREATE TABLE); without them the BEGIN below is the only one, and DDL rolls back
-        dbapi_connection.isolation_level = None
         dbapi_connection.execute("PRAGMA foreign_keys = ON")
 
     @event.listens_for(engine, "begin")
     def _on_begin(connection: Connection) -> None:
+        # left to itself the driver begins a transaction before the first INSERT, UPDATE
+        # or DELETE only: a SELECT or a CREATE TABLE before it would be outside of one
         connection.exec_driver_sql("BEGIN IMMEDIATE")
 
     return engine
@@ -230,8 +231,8 @@ def _step(connection: Connection, version: int) -> None:
         orig = exc.orig if isinstance(exc, DBAPIError) else exc
         raise ConfigError(
             "invalid",
-            f"{APP_DB_FILE} could not be brought from schema {version} to {version + 1}, and "
-            f"is as it was: {orig}",
+            f"{APP_DB_FILE} could not be brought from schema {version} to {version + 1}: "
+            f"{orig}; nothing of that step was applied",
         ) from exc
 
 
@@ -251,6 +252,12 @@ def _prepare(engine: Engine, run_id: str, mode: AppMode) -> None:
                 _check_tables(query)
                 return
             _step(connection, meta.schema_version)
+        get_logger().info(
+            "%s brought from schema %d to %d",
+            APP_DB_FILE,
+            meta.schema_version,
+            meta.schema_version + 1,
+        )
 
 
 def open_app_db(run_dir: Path | str, *, run_id: str, mode: AppMode) -> Engine:
@@ -316,9 +323,12 @@ def app_db_mode(run_dir: Path | str) -> AppMode | None:
     """The mode of the ``app.sqlite`` of a run directory (``app_meta.mode``), or None for a
     run that has none yet. For what opens the database of a run as it is, without being
     told a mode: ``surfcensus finalize`` and ``freeze_calibration`` pass it to
-    :func:`open_app_db`. It creates and changes nothing.
+    :func:`open_app_db`. It creates nothing, and changes nothing but for the journal of a
+    writer that was killed, which SQLite rolls back at any opening. A file that holds
+    nothing (a making that was interrupted) is no database yet: None.
 
-    Raises ``ConfigError("invalid", ...)`` for a file that is no database of the app.
+    Raises ``ConfigError("invalid", ...)`` for a file that is no database of the app, and
+    for one that another process keeps locked.
     """
     path = app_db_path(run_dir)
     if not path.exists():
