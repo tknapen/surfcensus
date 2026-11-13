@@ -12,6 +12,13 @@ clusters of every subject scored against it), ``score`` (one row per subject and
 
 A unit is skipped when its ledger row says ``done`` for the stage's present identity and
 input signature and its output is there. Files are written first and the ledger row last.
+The two stages that read source files store the SHA-256 of each file they read in the
+catalog, so that a row traces to the bytes it was computed from. For the same reason they
+remove what they hold of a subject that no longer has their files.
+
+An output of the run that is damaged is not a failure of a subject: a map that cannot be
+read stops the phase and is removed, to be made again; a vertex map that cannot be read is
+named in a note.
 
 A phase function receives a ``RunContext`` and never the run, so it names subjects by
 ``subject_uid`` and datasets by pseudonym.
@@ -23,11 +30,12 @@ import hashlib
 import math
 import shutil
 import time
+import zipfile
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 import pandas as pd
@@ -137,6 +145,7 @@ _SUBJECT_VALUES = (
     "trunc_rh_2",
 )
 """What the scores take from the catalog; part of the input signature of the ``score`` unit."""
+_MAX_NAMED = 5
 _NULLABLE_INTS = {pa.int8(): "Int8", pa.int16(): "Int16", pa.int32(): "Int32"}
 
 
@@ -214,7 +223,23 @@ def _signature(lines: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
 
 
+def _some(uids: Sequence[str]) -> str:
+    """The first of ``uids`` by name, and how many more there are."""
+    more = f" and {len(uids) - _MAX_NAMED} more" if len(uids) > _MAX_NAMED else ""
+    return ", ".join(uids[:_MAX_NAMED]) + more
+
+
 # --- the two stages that read source files --------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _Outcome:
+    """What the work on one subject hands back to the process that records it."""
+
+    frame: pd.DataFrame
+    digests: dict[FileRole, str]
+    """SHA-256 of every source file that the rows were computed from; each is read whole."""
+    has_map: bool = False
 
 
 @dataclass(frozen=True)
@@ -226,7 +251,10 @@ class _Stage:
     roles: tuple[FileRole, ...]
     config_hash: str
     units: list[str]
-    work: Callable[[str, Mapping[FileRole, Path]], Any]
+    work: Callable[[str, Mapping[FileRole, Path]], _Outcome]
+    left: list[str]
+    """The present subjects of the datasets that are not units: they have none of the files
+    that make a subject a unit of the stage, and may have had them at an earlier call."""
 
 
 @dataclass
@@ -282,10 +310,12 @@ def _run_stage(
     tally.skipped += plan.skipped
     tally.failures.update({(stage.name, uid): reason for uid, reason in plan.failures.items()})
     empty = SCHEMAS[stage.table].empty_table().to_pandas()
+    _drop_left(ctx, stage, empty)
 
     def commit(outcomes: Sequence[tuple[str, object]]) -> None:
         touched: dict[str, list[str]] = {}
         frames: dict[str, list[pd.DataFrame]] = {}
+        digests: dict[str, dict[FileRole, str]] = {}
         rows: list[WorkRow] = []
         for uid, outcome in outcomes:
             dataset = public.dataset_of(uid)
@@ -297,8 +327,10 @@ def _run_stage(
                 tally.failures[(stage.name, uid)] = reason
                 has_map = False
             else:
-                frame, has_map = outcome if isinstance(outcome, tuple) else (outcome, False)
-                frames.setdefault(dataset, []).append(frame)
+                result = cast(_Outcome, outcome)
+                has_map = result.has_map
+                frames.setdefault(dataset, []).append(result.frame)
+                digests[uid] = result.digests
                 status, reason, text = "done", None, None
                 tally.failures.pop((stage.name, uid), None)
                 tally.done += 1
@@ -328,6 +360,10 @@ def _run_stage(
                 pd.concat(parts, ignore_index=True) if parts else empty,
                 replace_uids=touched[dataset],
             )
+        # Before the ledger rows: a unit that is done is skipped from then on, so digests
+        # written after its row could be lost for good between the two.
+        for uid, read in digests.items():
+            public.set_file_digests(uid, read)
         public.record_work(rows)  # last: a row never stands for rows that are not written
 
     run_batches(
@@ -341,6 +377,41 @@ def _run_stage(
     )
 
 
+def _drop_left(ctx: RunContext, stage: _Stage, empty: pd.DataFrame) -> None:
+    """Remove what the stage holds of the subjects that are no longer its units: their rows
+    in the part of their dataset, their map and their ledger row. A subject whose stats or
+    thickness files are gone would otherwise be scored on the rows of files that no longer
+    exist. Reads no source file. The ledger rows go last, as they are written last: a call
+    that is interrupted finds them and removes the rest again."""
+    if not stage.left:
+        return
+    public = ctx.public
+    by_dataset: dict[str, list[str]] = {}
+    for uid in stage.left:
+        by_dataset.setdefault(public.dataset_of(uid), []).append(uid)
+        if stage.name == "fsaverage":
+            map_path(ctx.run_dir, uid).unlink(missing_ok=True)
+    dropped: set[str] = set()
+    for dataset, uids in sorted(by_dataset.items()):
+        path = part_path(ctx.run_dir, stage.table, dataset)
+        if not path.is_file():
+            continue
+        held = set(read_table(path, SCHEMAS[stage.table])["subject_uid"]) & set(uids)
+        if held:
+            upsert_part(ctx.run_dir, stage.table, dataset, empty, replace_uids=sorted(held))
+            dropped |= held
+    recorded = set(_recorded(ctx, stage.name)) & set(stage.left)
+    if recorded:
+        public.forget_work(stage.name, recorded)
+    if dropped or recorded:
+        get_logger().info(
+            "%s: %d subject(s) no longer have the files of this stage; what it held of them "
+            "was removed",
+            stage.name,
+            len(dropped | recorded),
+        )
+
+
 def _unreadable(path: Path, exc: Exception) -> MetricError:
     """A source file that is there and cannot be read fails its subject. The text of an
     ``OSError`` holds the path, so only its reason is kept."""
@@ -350,29 +421,40 @@ def _unreadable(path: Path, exc: Exception) -> MetricError:
     return MetricError("unreadable", text if text.startswith(path.name) else f"{path.name}: {text}")
 
 
-def _read(reader: Callable[[Path], Any], path: Path) -> Any:
+def _read(
+    reader: Callable[[Path], Any],
+    files: Mapping[FileRole, Path],
+    role: FileRole,
+    digests: dict[FileRole, str],
+) -> Any:
+    """The content of the subject's file of ``role`` and, in ``digests``, the SHA-256 of its
+    bytes: size and modification time of a local file do not say which bytes were parsed."""
+    path = files[role]
     try:
+        digests[role] = sha256_file(path)
         return reader(path)
     except (OSError, ValueError) as exc:
         raise _unreadable(path, exc) from exc
 
 
-def _regional_one(uid: str, files: Mapping[FileRole, Path]) -> pd.DataFrame:
-    """What a worker does for one subject in the ``regional`` stage. Top-level, so that it
-    can be sent to a process."""
+def _regional_one(uid: str, files: Mapping[FileRole, Path]) -> _Outcome:
+    """What a worker does for one subject in the ``regional`` stage: the parcel rows of the
+    stats files it has, one hemisphere's when the other file is missing. Top-level, so that
+    it can be sent to a process."""
     frames = []
+    digests: dict[FileRole, str] = {}
     for hemi in HEMIS:
-        path = files.get(_STATS[hemi])
-        if path is None:
+        role = _STATS[hemi]
+        if role not in files:
             continue
-        stats = _read(read_stats, path)
+        stats = _read(read_stats, files, role, digests)
         try:
             frames.append(regional_rows(uid, hemi, stats))
         except ValueError as exc:
-            raise _unreadable(path, exc) from exc
+            raise _unreadable(files[role], exc) from exc
     if not frames:
-        return SCHEMAS["regional"].empty_table().to_pandas()
-    return pd.concat(frames, ignore_index=True)
+        return _Outcome(SCHEMAS["regional"].empty_table().to_pandas(), digests)
+    return _Outcome(pd.concat(frames, ignore_index=True), digests)
 
 
 def _fraction(numerator: int, denominator: int) -> float | None:
@@ -385,19 +467,21 @@ def _hemisphere(
     files: Mapping[FileRole, Path],
     template: Template | None,
     config: MetricsConfig,
+    digests: dict[FileRole, str],
 ) -> tuple[dict[str, object] | None, np.ndarray | None]:
-    """The row of ``vertex_summary`` of one hemisphere and, when it has one, its map."""
+    """The row of ``vertex_summary`` of one hemisphere and, when it has one, its map. The
+    digests of the files it read are added to ``digests``."""
     thickness_file = files.get(_THICKNESS[hemi])
     if thickness_file is None:
         return None, None
-    thickness = _read(read_morph, thickness_file)
+    thickness = _read(read_morph, files, _THICKNESS[hemi], digests)
     finite = thickness[np.isfinite(thickness)]
     if finite.size == 0:
         raise MetricError("unreadable", f"{thickness_file.name}: no thickness value")
     flags: set[str] = set()
     annot = None
     if _ANNOT[hemi] in files:
-        annot = _read(read_annotation, files[_ANNOT[hemi]])
+        annot = _read(read_annotation, files, _ANNOT[hemi], digests)
     else:
         flags.add("no_annot")
     if thickness_above_max(thickness, max_mm=config.thickness_max_mm):
@@ -409,7 +493,7 @@ def _hemisphere(
     elif _SPHERE[hemi] not in files:
         flags.add("no_sphere_reg")
     else:
-        sphere = _read(read_surface, files[_SPHERE[hemi]])
+        sphere = _read(read_surface, files, _SPHERE[hemi], digests)
         try:
             hemi_map, smap = resample_hemi(
                 thickness, sphere, template.hemis[hemi], annot=annot, config=config
@@ -490,15 +574,16 @@ def _fsaverage_one(
     template_dir: str | None,
     config: MetricsConfig,
     out: str,
-) -> tuple[pd.DataFrame, bool]:
+) -> _Outcome:
     """What a worker does for one subject in the ``fsaverage`` stage: the rows of
     ``vertex_summary`` and, written here, the map file. Top-level, so that it can be sent to
     a process."""
     template = None if template_dir is None else load_template(template_dir)
     rows = []
     maps: dict[Hemi, np.ndarray] = {}
+    digests: dict[FileRole, str] = {}
     for hemi in HEMIS:
-        row, values = _hemisphere(uid, hemi, files, template, config)
+        row, values = _hemisphere(uid, hemi, files, template, config, digests)
         if row is not None:
             rows.append(row)
         if values is not None:
@@ -507,7 +592,20 @@ def _fsaverage_one(
         path = Path(out) / f"{uid}.npz"
         path.parent.mkdir(parents=True, exist_ok=True)
         write_maps(path, maps)
-    return frame_of(rows, VERTEX_SUMMARY), bool(maps)
+    return _Outcome(frame_of(rows, VERTEX_SUMMARY), digests, has_map=bool(maps))
+
+
+def _units(
+    ctx: RunContext, datasets: Collection[str] | None, any_of: Collection[FileRole]
+) -> tuple[list[str], list[str]]:
+    """The present subjects of ``datasets`` that have at least one file of ``any_of``, and
+    those that have none."""
+    wanted = set(any_of)
+    units: list[str] = []
+    left: list[str] = []
+    for uid in ctx.public.subject_uids(datasets=datasets):
+        (units if wanted & set(ctx.public.roles(uid)) else left).append(uid)
+    return units, left
 
 
 def _stages(
@@ -518,27 +616,25 @@ def _stages(
     *,
     for_work: bool,
 ) -> list[_Stage]:
-    public, config = ctx.public, ctx.config
+    config = ctx.config
     hashes = stage_hashes(config, template_id=None if template is None else template.template_id)
     found = []
     if "regional" in stages:
+        # one stats file is enough (docs/metrics.md); ``tier_a`` asks for both
+        units, left = _units(ctx, datasets, _REGIONAL_ROLES)
         found.append(
             _Stage(
                 "regional",
                 "regional",
                 _REGIONAL_ROLES,
                 hashes["regional"],
-                public.subject_uids(datasets=datasets, tier_a=True),
+                units,
                 _regional_one,
+                left,
             )
         )
     if "fsaverage" in stages:
-        thickness = set(_THICKNESS.values())
-        units = [
-            uid
-            for uid in public.subject_uids(datasets=datasets)
-            if thickness & set(public.roles(uid))
-        ]
+        units, left = _units(ctx, datasets, tuple(_THICKNESS.values()))
         template_dir = None
         if template is not None and for_work:
             # where the workers read the template from
@@ -550,7 +646,7 @@ def _stages(
             out=str(Path(ctx.run_dir) / FSAVG_DIR),
         )
         found.append(
-            _Stage("fsaverage", "vertex_summary", TIER_B, hashes["fsaverage"], units, work)
+            _Stage("fsaverage", "vertex_summary", TIER_B, hashes["fsaverage"], units, work, left)
         )
     return found
 
@@ -603,18 +699,26 @@ def run_metrics(
     run without one: no map is made then, no reference is built and the scores are the
     ranking of decision D16.
 
-    ``regional``: every subject with a stats file. ``fsaverage``: every subject with a
-    thickness file. A hemisphere whose map cannot be made (no ``sphere.reg``, a degenerate
-    sphere, low coverage, a vertex count that differs) gets a flag and no map; a subject
-    fails only when a file that is there cannot be read (``unreadable``) or differs from
-    what the inventory listed (``source changed``). A failed subject loses its rows and its
-    map, is recorded in the ledger with reason and scrubbed detail, and is not tried again
-    with the same files and settings unless ``retry_failed``. ``force`` ignores the ledger.
+    ``regional``: every subject with a stats file, of one hemisphere or of both.
+    ``fsaverage``: every subject with a thickness file. Each stores the SHA-256 of the
+    source files it read in the catalog, before the ledger row of the subject. A hemisphere
+    whose map cannot be made (no ``sphere.reg``, a degenerate sphere, low coverage, a vertex
+    count that differs) gets a flag and no map; a subject fails only when a file that is
+    there cannot be read (``unreadable``) or differs from what the inventory listed
+    (``source changed``). A failed subject loses its rows and its map, is recorded in the
+    ledger with reason and scrubbed detail, and is not tried again with the same files and
+    settings unless ``retry_failed``. ``force`` ignores the ledger.
+
+    A present subject that no longer has a stats file, or a thickness file, is no unit of
+    the stage any more: its rows, its map and its ledger row are removed, without a source
+    being read, so that it is scored as a subject without those files.
 
     The report counts the units worked on now (``done``), skipped, and in the failed state
     when the call returns (``failed``; ``failures`` holds ``(unit, "<stage>: <reason>")``).
 
-    Raises ``ConfigError("invalid", ...)`` for a stage that does not exist.
+    Raises ``ConfigError("invalid", ...)`` for a stage that does not exist, and for a map
+    of the run that the ``reference`` stage cannot read: the file is removed and the next
+    call makes it again.
     """
     started = time.perf_counter()
     wanted = _checked_stages(stages)
@@ -876,6 +980,31 @@ def _merge(ctx: RunContext, table: str) -> Path:
     return merge_parts(ctx.run_dir, table, present=ctx.public.subject_uids())
 
 
+def _read_run_maps(ctx: RunContext, uids: Sequence[str]) -> dict[str, dict[Hemi, np.ndarray]]:
+    """The maps of ``uids``. One that cannot be read is an output of the run that was
+    damaged, not a property of its subject: every such map is removed, so that the
+    ``fsaverage`` stage finds it missing and makes it again, and the phase stops.
+
+    Raises ``ConfigError("invalid", ...)`` that names the subjects.
+    """
+    maps: dict[str, dict[Hemi, np.ndarray]] = {}
+    damaged: list[str] = []
+    for uid in uids:
+        try:
+            maps[uid] = read_maps(map_path(ctx.run_dir, uid))
+        except (OSError, ValueError):
+            damaged.append(uid)
+    if damaged:
+        for uid in damaged:
+            map_path(ctx.run_dir, uid).unlink(missing_ok=True)
+        raise ConfigError(
+            "invalid",
+            f"the fsaverage map of {len(damaged)} subject(s) in {FSAVG_DIR} could not be read "
+            f"({_some(damaged)}) and was removed; run the metrics again to make it anew",
+        )
+    return maps
+
+
 def _reference_stage(
     ctx: RunContext, template: Template | None, tally: _Tally, *, force: bool, retry_failed: bool
 ) -> None:
@@ -897,7 +1026,7 @@ def _reference_stage(
             return
 
     uids = [str(uid) for uid in scored.with_map["subject_uid"]]
-    maps = {uid: read_maps(map_path(ctx.run_dir, uid)) for uid in uids}
+    maps = _read_run_maps(ctx, uids)
     medians = {
         uid: {hemi: global_median(maps[uid][hemi], template.hemis[hemi]) for hemi in HEMIS}
         for uid in uids
@@ -1060,7 +1189,9 @@ def _score_frame(
     frame["score_config_hash"] = pd.Series(
         [score_hash] * len(frame), index=frame.index, dtype=object
     )
-    # a subject with fewer than two rows of vertex_summary lacks a thickness file
+    # A subject with fewer than two rows of vertex_summary lacks a thickness file, or its
+    # fsaverage unit failed: the flag says that thickness gave the score nothing, and the
+    # ledger says why.
     rows_of = vertex_summary.groupby("subject_uid").size()
     frame["flags"] = pd.Series(
         [
@@ -1141,6 +1272,10 @@ def update_native(
     this template and the centroid, or a mesh neighbour of it, is the counterpart of a
     vertex in that render's vertex map. Without a template or a cluster table there is no
     table, and one that an earlier state left is removed. ``clusters.parquet`` is only read.
+
+    A vertex map that cannot be read leaves its subject without rows and is named in a note
+    of the report; it fails no unit, and every later call reads the file again, so a render
+    made anew is picked up.
     """
     started = time.perf_counter()
     tally = _Tally()
@@ -1177,17 +1312,31 @@ def _native_stage(
     rendered = set(usable["subject_uid"])
     adjacency = {hemi: template.adjacency(hemi) for hemi in HEMIS}
     frames = []
+    damaged: list[str] = []
     for uid, rows in clusters.groupby("subject_uid", sort=True):
         path = media_dir(run_dir, str(uid)) / _VERTEX_MAP
         if uid not in rendered or not path.is_file():
             continue
-        frames.append(native_centroids(rows.reset_index(drop=True), read_npz(path), adjacency))
+        try:
+            vertex_map = read_npz(path)
+        except (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile):
+            damaged.append(str(uid))  # its centroids get no row
+            continue
+        frames.append(native_centroids(rows.reset_index(drop=True), vertex_map, adjacency))
     if frames:
         native = pd.concat(frames, ignore_index=True)
     else:
         native = CLUSTERS_NATIVE.empty_table().to_pandas().drop(columns=["template_id"])
     native["template_id"] = pd.Series([template.template_id] * len(native), dtype=object)
     write_table(native_file, native, CLUSTERS_NATIVE, sort_by=KEYS["clusters_native"])
+    if damaged:
+        tally.notes.append(
+            f"media/<subject_uid>/{_VERTEX_MAP} of {len(damaged)} rendered subject(s) cannot be "
+            f"read ({_some(damaged)}): their cluster centroids have no native position. "
+            "Remove the file and run `surfcensus render`, which makes such a render again."
+        )
+        # a signature that no state of the run gives: the next call reads the files again
+        signature = _signature([signature, *(f"damaged\t{uid}" for uid in damaged)])
     public.record_work(
         [
             WorkRow(

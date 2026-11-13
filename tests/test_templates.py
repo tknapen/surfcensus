@@ -1577,3 +1577,30 @@ def test_cached_real_template(cached_subjects: Path, tmp_path: Path) -> None:
 @pytest.mark.network
 def test_real_template(real_template: Path, real_fsaverage5: Path, tmp_path: Path) -> None:
     check_real_template(real_template, real_fsaverage5, tmp_path)
+
+
+@pytest.mark.parametrize("damage", ["npz", "json", "other_id"])
+def test_store_template_writes_a_damaged_cache_again(
+    small4: Template, tmp_path: Path, damage: str
+) -> None:
+    """Worker processes read the template from this directory: one that does not read back
+    as the template must not stay, whatever ``template.json`` says."""
+    directory = templates.store_template(tmp_path, small4)
+    files = {path.name: path.read_bytes() for path in sorted(directory.iterdir())}
+    if damage == "npz":
+        (directory / "template.npz").write_bytes(files["template.npz"][:1000])
+    elif damage == "json":
+        (directory / "template.json").write_text("{")
+    else:
+        text = files["template.json"].decode().replace(small4.template_id, "0" * 12)
+        (directory / "template.json").write_text(text)
+    assert templates.store_template(tmp_path, small4) == directory
+    assert {path.name: path.read_bytes() for path in sorted(directory.iterdir())} == files
+    same_template(templates.read_template(directory), small4)
+
+
+def test_store_template_leaves_a_whole_cache_alone(small4: Template, tmp_path: Path) -> None:
+    directory = templates.store_template(tmp_path, small4)
+    before = {path.name: path.stat().st_mtime_ns for path in directory.iterdir()}
+    assert templates.store_template(tmp_path, small4) == directory
+    assert {path.name: path.stat().st_mtime_ns for path in directory.iterdir()} == before

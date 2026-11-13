@@ -1486,6 +1486,16 @@ class PublicCatalog:
                 ],
             )
 
+    def forget_work(self, phase: str, units: Collection[str]) -> None:
+        """Remove the ledger rows of ``units`` in ``phase``, in one transaction: for a
+        subject that is no longer a unit of the phase, after its outputs were removed. A
+        unit without a row is passed over."""
+        with self._db.write() as conn:
+            conn.executemany(
+                "DELETE FROM work WHERE phase = ? AND unit = ?",
+                [(phase, unit) for unit in sorted(units)],
+            )
+
     def _local(self) -> bool:
         return self._db.mode == "local"
 

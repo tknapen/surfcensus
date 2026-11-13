@@ -507,9 +507,11 @@ def read_template(directory: Path) -> Template:
 
 def store_template(cache_dir: Path | str, template: Template) -> Path:
     """The directory of ``template`` in a cache (``<cache_dir>/<template_id>``), written
-    first if it is not there. Worker processes read the template from it."""
+    first if it is not there or does not read back as this template. Worker processes read
+    the template from it, so a damaged directory must not be left for them: each would fail
+    its subject for a fault of the run."""
     directory = Path(cache_dir) / template.template_id
-    if not (directory / TEMPLATE_JSON).is_file():
+    if _cached(Path(cache_dir), template.template_id) is None:
         write_template(directory, template)
     return directory
 

@@ -51,7 +51,9 @@ other reasons (``missing file``, ``unreadable``) fail the subject, not the hemis
 SCORE_FLAGS: tuple[str, ...] = tuple(sorted((*VERTEX_FLAGS, "no_stats", "partial_score")))
 """What ``scores.flags`` can hold: the union of the hemispheres' flags, ``no_stats`` for a
 subject without stats files, and ``partial_score`` for one scored on fewer components than
-configured."""
+configured. ``no_thickness`` and ``no_stats`` say what the score lacks, not why: a subject
+whose ``fsaverage`` or ``regional`` unit failed on a file that is there gets them too, and
+the ledger has the reason (``status --failures``)."""
 
 
 def join_flags(flags: Iterable[str]) -> str:

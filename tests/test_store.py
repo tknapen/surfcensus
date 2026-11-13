@@ -1966,6 +1966,25 @@ def test_the_work_ledger(local: Catalog) -> None:
     assert count(local, "work") == 4
 
 
+def test_forgetting_ledger_rows_removes_them_for_one_phase_only(local: Catalog) -> None:
+    public = local.public()
+    public.record_work(
+        [
+            WorkRow("regional", "u1", "c1", "s1", "done"),
+            WorkRow("regional", "u2", "c1", "s2", "failed", reason="unreadable"),
+            WorkRow("regional", "u3", "c1", "s3", "done"),
+            WorkRow("fsaverage", "u1", "c1", "s1", "done"),
+        ]
+    )
+    public.forget_work("regional", [])
+    assert count(local, "work") == 4
+    public.forget_work("regional", {"u1", "u2", "u9"})  # u9 has no row
+    assert list(public.work("regional")["unit"]) == ["u3"]
+    assert public.work_done("regional", "u1", "c1", "s1") is None
+    assert public.work_done("fsaverage", "u1", "c1", "s1") is True
+    assert local.failures("regional").empty
+
+
 def test_a_batch_of_ledger_rows_is_recorded_whole_or_not_at_all(local: Catalog) -> None:
     public = local.public()
     public.record_work([WorkRow("regional", "u1", "c1", "s1", "done")])
@@ -2198,6 +2217,7 @@ def test_a_read_only_catalog_reads_and_refuses_to_write(local: Catalog) -> None:
         assert public.subject_uids() == [uid]
         calls = (
             lambda: public.record_work([WorkRow("regional", uid, "c", "s", "done")]),
+            lambda: public.forget_work("regional", [uid]),
             lambda: public.record_renders([RenderRow(uid, "c", "s", False, "done")]),
             lambda: public.set_file_digests(uid, {FileRole.T1: DIGEST}),
             lambda: public.replace_selection(selection_rows([uid], "all"), ["all"]),

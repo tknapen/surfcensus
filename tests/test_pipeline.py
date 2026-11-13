@@ -8,6 +8,7 @@ a run work on a copy of its directory or on a small cohort of their own.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import logging
 import shutil
 from dataclasses import dataclass
@@ -36,6 +37,7 @@ from surfcensus.metrics.pipeline import (
     run_metrics,
     update_native,
 )
+from surfcensus.metrics.regional import occ_ctrl_ratio
 from surfcensus.metrics.scoring import quantile_scores
 from surfcensus.records import ALL_METRIC_STAGES, METRIC_STAGES, PhaseReport
 from surfcensus.reference import load
@@ -604,6 +606,243 @@ def test_a_hemisphere_that_cannot_be_mapped_gets_a_flag_and_the_subject_goes_on(
 
 
 # ---------------------------------------------------------------------------------------
+# what the run holds of a subject whose files went away, and outputs that were damaged
+
+
+def test_a_subject_that_loses_its_stats_or_thickness_loses_its_rows_and_map(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """Without this the scores kept a ratio, or a ceiling fraction, of files that were no
+    longer there."""
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    kept = tmp_path / "kept"
+    kept.mkdir()
+    stats = cohort.subjects[2].path / "stats"
+    thickness = [cohort.subjects[3].path / "surf" / f"{hemi}.thickness" for hemi in HEMIS]
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        assert counts(run.metrics()) == (4 + 4 + 2, 0, 0)
+        uids = labels(run)
+        lost_stats, lost_thickness = uids["sub-002"], uids["sub-003"]
+        was = {name: table(run_dir, name) for name in ("regional", "vertex_summary", "scores")}
+        map_was = map_path(run_dir, lost_thickness).read_bytes()
+
+        # moved, not deleted: brought back below, the files are listed as they were
+        stats.rename(kept / "stats")
+        for path in thickness:
+            path.rename(kept / path.name)
+        assert run.inventory().done == 2
+        # no subject is read: the two lost their rows, and the run-level units follow
+        assert counts(run.metrics()) == (2, 3 + 3, 0)
+        assert lost_stats not in set(table(run_dir, "regional")["subject_uid"])
+        assert lost_thickness not in set(table(run_dir, "vertex_summary")["subject_uid"])
+        assert not map_path(run_dir, lost_thickness).exists()
+        assert lost_stats not in set(run.public().work("regional")["unit"])
+        assert lost_thickness not in set(run.public().work("fsaverage")["unit"])
+        scores = run.scores().set_index("subject_uid")
+        assert scores.loc[lost_stats, "flags"] == "no_stats,partial_score"
+        assert np.isnan(scores.loc[lost_stats, "occ_ctrl_ratio"])
+        assert np.isnan(scores.loc[lost_stats, "occ_thick_mm"])
+        assert scores.loc[lost_thickness, "flags"] == "no_thickness,partial_score"
+        assert np.isnan(scores.loc[lost_thickness, "ceiling_frac"])
+        # the other subject of each stage keeps what it had
+        assert lost_thickness in set(table(run_dir, "regional")["subject_uid"])
+        assert map_path(run_dir, lost_stats).is_file()
+        assert counts(run.metrics()) == (0, 3 + 3 + 2, 0)
+
+        # The files come back with the listing they had. A ledger row left from before
+        # would say that the two are done, with their rows gone.
+        (kept / "stats").rename(stats)
+        for path in thickness:
+            (kept / path.name).rename(path)
+        assert run.inventory().done == 2
+        assert counts(run.metrics()) == (1 + 1 + 2, 3 + 3, 0)
+        for name, frame in was.items():
+            pd.testing.assert_frame_equal(table(run_dir, name), frame)
+        assert map_path(run_dir, lost_thickness).read_bytes() == map_was
+
+
+def test_a_damaged_template_cache_is_written_again_and_fails_no_subject(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """Worker processes read the template from the run directory. A cache that does not
+    read back used to fail every subject they worked on and to remove its earlier map."""
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        template_id = run.public().meta("template_id")
+    assert template_id is not None
+    files = run_files(run_dir)
+    cached = run_dir / "templates" / template_id / "template.npz"
+    cached.write_bytes(cached.read_bytes()[:1000])
+    with Run(run_dir) as run:
+        assert counts(run.metrics(force=True, jobs=2)) == (4 + 4 + 2, 0, 0)
+    assert run_files(run_dir) == files
+
+
+def test_a_damaged_map_stops_the_phase_and_is_made_again(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        uids = labels(run)
+        files = run_files(run_dir)
+        truncated, garbage = map_path(run_dir, uids["sub-001"]), map_path(run_dir, uids["sub-002"])
+        truncated.write_bytes(truncated.read_bytes()[:300])
+        garbage.write_bytes(b"not an archive")
+        # nothing reads a map while nothing is pending
+        assert counts(run.metrics()) == (0, 4 + 4 + 2, 0)
+        with pytest.raises(ConfigError, match="could not be read") as raised:
+            run.metrics(stages=["reference"], force=True)
+        # a fault of the run: one error that names both subjects, and no failed unit
+        assert raised.value.reason == "invalid"
+        assert uids["sub-001"] in str(raised.value) and uids["sub-002"] in str(raised.value)
+        assert "/" not in raised.value.detail.replace("tables/fsavg", "")
+        assert not truncated.exists() and not garbage.exists()
+        assert catalog_failures(run_dir) == []
+        # the same command makes the two maps again, with the bytes they had
+        assert counts(run.metrics()) == (2, 4 + 2 + 2, 0)
+    assert run_files(run_dir) == files
+
+
+# ---------------------------------------------------------------------------------------
+# what a subject needs to be scored, and what its rows trace back to
+
+
+def test_a_subject_with_one_stats_file_gets_its_rows_and_its_ratio(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """``tier_a`` asks for both stats files. The regional stage asks for one."""
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    (cohort.subjects[0].path / "stats" / "rh.aparc.stats").unlink()
+    for name in ("lh.aparc.stats", "rh.aparc.stats"):
+        (cohort.subjects[2].path / "stats" / name).unlink()
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        uids = labels(run)
+        subjects = run.public().subjects().set_index("subject_uid")
+        assert not subjects.loc[uids["sub-000"], "tier_a"]
+        # two subjects have a stats file, all three a thickness file
+        assert counts(run.metrics()) == (2 + 3 + 2, 0, 0)
+        assert counts(run.metrics()) == (0, 2 + 3 + 2, 0)
+        scores = run.scores().set_index("subject_uid")
+    regional = table(run_dir, "regional")
+    assert set(regional["subject_uid"]) == {uids["sub-000"], uids["sub-001"]}
+    one = regional[regional["subject_uid"] == uids["sub-000"]]
+    assert set(one["hemi"]) == {"lh"} and len(one) == 11
+    occipital, control, ratio = occ_ctrl_ratio(one, config.metrics.regions)
+    row = scores.loc[uids["sub-000"]]
+    assert row["occ_ctrl_ratio"] == pytest.approx(ratio, rel=1e-6)
+    assert row["occ_thick_mm"] == pytest.approx(occipital, rel=1e-6)
+    assert row["ctrl_thick_mm"] == pytest.approx(control, rel=1e-6)
+    assert row["flags"] == ""
+    # without any stats file there is nothing to score on, and the row says so
+    assert np.isnan(scores.loc[uids["sub-002"], "occ_ctrl_ratio"])
+    assert scores.loc[uids["sub-002"], "flags"] == "no_stats,partial_score"
+
+
+METRIC_ROLES = tuple(
+    f"{hemi}_{kind}" for hemi in HEMIS for kind in ("stats", "thickness", "annot", "sphere_reg")
+)
+ROLE_FILES = {
+    "stats": "stats/{hemi}.aparc.stats",
+    "thickness": "surf/{hemi}.thickness",
+    "annot": "label/{hemi}.aparc.annot",
+    "sphere_reg": "surf/{hemi}.sphere.reg",
+}
+
+
+def stored_digests(run_dir: Path, uid: str) -> dict[str, str | None]:
+    """Role -> ``files.sha256`` of one subject."""
+    with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+        rows = catalog.query("SELECT role, sha256 FROM files WHERE subject_uid = ?", (uid,))
+    return {row["role"]: row["sha256"] for row in rows}
+
+
+def digest_of(subject: Path, role: str) -> str:
+    hemi, kind = role.split("_", 1)
+    content = (subject / ROLE_FILES[kind].format(hemi=hemi)).read_bytes()
+    return hashlib.sha256(content).hexdigest()
+
+
+def test_the_files_that_the_metrics_read_get_their_digest_in_the_catalog(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    whole, partial = cohort.subjects[1].path, cohort.subjects[0].path
+    # without its thickness the right hemisphere is not looked at: nothing of it is read
+    (partial / "surf" / "rh.thickness").unlink()
+    (partial / "stats" / "rh.aparc.stats").unlink()
+    damaged = cohort.subjects[2].path / "surf" / "lh.sphere.reg"
+    damaged.write_bytes(damaged.read_bytes()[:1000])
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        uids = labels(run)
+        # the inventory reads the stamp and the logs, and nothing that the metrics read
+        assert all(stored_digests(run_dir, uids["sub-001"])[role] is None for role in METRIC_ROLES)
+        report = run.metrics()
+        assert report.failures == ((uids["sub-002"], "fsaverage: unreadable"),)
+
+        stored = stored_digests(run_dir, uids["sub-001"])
+        assert {role: stored[role] for role in METRIC_ROLES} == {
+            role: digest_of(whole, role) for role in METRIC_ROLES
+        }
+        # the metrics read no other file of the subject
+        read_by_inventory = {"build_stamp", "recon_log", "recon_log_lh", "recon_log_rh"}
+        others = set(stored) - set(METRIC_ROLES) - read_by_inventory
+        assert others and all(stored[role] is None for role in others)
+
+        stored = stored_digests(run_dir, uids["sub-000"])
+        left = [role for role in METRIC_ROLES if role.startswith("lh_")]
+        assert {role: stored[role] for role in left} == {
+            role: digest_of(partial, role) for role in left
+        }
+        assert stored["rh_annot"] is None and stored["rh_sphere_reg"] is None
+        assert "rh_thickness" not in stored and "rh_stats" not in stored
+
+        # a subject whose stage failed has no rows from it, and no digest either
+        stored = stored_digests(run_dir, uids["sub-002"])
+        assert stored["lh_stats"] == digest_of(cohort.subjects[2].path, "lh_stats")
+        assert stored["lh_thickness"] is None and stored["rh_sphere_reg"] is None
+
+        # an inventory that finds the same files keeps the digests, and nothing is redone
+        assert counts(run.inventory()) == (0, 3, 0)
+        assert counts(run.metrics()) == (0, 3 + 2 + 2, 1)
+        assert stored_digests(run_dir, uids["sub-001"])["lh_sphere_reg"] == digest_of(
+            whole, "lh_sphere_reg"
+        )
+
+
+def test_without_a_template_the_sphere_is_not_read_and_gets_no_digest(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template, with_template=False)
+    run_dir = tmp_path / "run"
+    with Run(run_dir, local(cohort.root), config=new_local_config(cohort.root)) as run:
+        run.inventory()
+        uids = labels(run)
+        assert counts(run.metrics(jobs=2)) == (3 + 3 + 1, 0, 0)
+    subject = cohort.subjects[0].path
+    stored = stored_digests(run_dir, uids["sub-000"])
+    for role in METRIC_ROLES:
+        expected = None if role.endswith("sphere_reg") else digest_of(subject, role)
+        assert stored[role] == expected, role
+
+
+# ---------------------------------------------------------------------------------------
 # with renders: counterparts, native centroids
 
 
@@ -660,6 +899,33 @@ def test_native_fills_its_table_again_and_leaves_the_clusters(run_copy: Path) ->
     assert native.read_bytes() == was and table_path(run_copy, "clusters").read_bytes() == clusters
 
 
+def test_a_damaged_vertex_map_leaves_its_subject_without_native_rows(run_copy: Path) -> None:
+    native = table(run_copy, "clusters_native")
+    uid = str(native["subject_uid"].iloc[0])
+    others = native[native["subject_uid"] != uid].reset_index(drop=True)
+    assert len(others)
+    vertex_map = run_copy / "media" / uid / "vertex_map.npz"
+    whole = vertex_map.read_bytes()
+    vertex_map.write_bytes(whole[:500])
+    with Run(run_copy) as run:
+        report = run.metrics(stages=["native"], force=True)
+        # no unit fails; a note names the subject and says what to do
+        assert counts(report) == (1, 0, 0)
+        (note,) = report.notes
+        assert uid in note and "surfcensus render" in note and str(run_copy) not in note
+        pd.testing.assert_frame_equal(table(run_copy, "clusters_native"), others)
+        # every later call reads the file again, a render with nothing to render included
+        rendered = run.render()
+        assert counts(rendered) == (0, 3, 0) and rendered.notes == report.notes
+        # what the note says to do: without the file the render is not whole and is made again
+        vertex_map.unlink()
+        repaired = run.render()
+        assert counts(repaired) == (1, 2, 0) and repaired.notes == ()
+        assert vertex_map.read_bytes() == whole
+        pd.testing.assert_frame_equal(table(run_copy, "clusters_native"), native)
+        assert counts(run.metrics(stages=["native"])) == (0, 1, 0)
+
+
 def test_a_template_that_arrives_later_updates_the_vertex_maps_only(
     synth_template: SyntheticTemplate, tmp_path: Path
 ) -> None:
@@ -693,6 +959,33 @@ def test_a_template_that_arrives_later_updates_the_vertex_maps_only(
     assert read_vertex_map(run_dir / "media" / one / "vertex_map.npz")["lh_fsavg6"].min() >= 0
     # the renders came first here, and the call that rendered them placed the centroids
     assert not table(run_dir, "clusters_native").empty
+
+
+def test_a_finished_run_renders_nothing_while_its_data_is_away(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """A render with nothing pending reads no source. It does read the run's template, which
+    the run directory holds; without that too it stops, as the metrics do."""
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, render=RenderConfig(panel_px=64), metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        assert counts(run.render()) == (3, 0, 0)
+        positions = int(run.clusters()["native_vertex"].notna().sum())
+        assert positions > 0
+    cohort.root.rename(tmp_path / "unmounted")
+    with Run(run_dir) as run:
+        assert counts(run.render()) == (0, 3, 0)
+        assert counts(run.metrics()) == (0, 3 + 3 + 2, 0)
+        assert int(run.clusters()["native_vertex"].notna().sum()) == positions
+    shutil.rmtree(run_dir / "templates")
+    with Run(run_dir) as run:
+        with pytest.raises(TemplateError, match="no longer available") as raised:
+            run.render()
+        assert raised.value.reason == "changed"
+        assert set(run.public().renders()["status"]) == {"done"}
 
 
 # ---------------------------------------------------------------------------------------

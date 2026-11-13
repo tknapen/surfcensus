@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ from surfcensus.schemas import SCHEMAS
 from surfcensus.sources.base import HEMIS
 from surfcensus.sources.local import local
 from surfcensus.sources.patterns import resolve_subject_files
-from surfcensus.store import read_table, table_path
+from surfcensus.store import CATALOG_FILE, Catalog, read_table, table_path
 from surfcensus.templates import Template, build_template
 
 pytestmark = pytest.mark.network
@@ -39,6 +40,10 @@ pytestmark = pytest.mark.network
 SURF2SURF = Path(__file__).parent / "data" / "surf2surf_ds000102_sub-01_lh.npy"
 """Thickness of sub-01 ``lh`` on fsaverage6 as ``mri_surf2surf`` gives it. Made once by a
 developer with FreeSurfer (docs/dev/contract.md, 9.3); the comparison is skipped without it."""
+METRIC_ROLES = {
+    f"{hemi}_{kind}" for hemi in HEMIS for kind in ("stats", "thickness", "annot", "sphere_reg")
+}
+"""The file roles that the ``regional`` and ``fsaverage`` stages read."""
 
 
 @pytest.fixture(scope="module")
@@ -227,6 +232,18 @@ def test_a_run_on_both_real_subjects_with_the_template_next_to_them(
             )
             assert all(2.3 < np.nanmean(maps[hemi]) < 2.7 for hemi in HEMIS)
         print(f"\nmetrics of two subjects: {seconds:.1f} s")
+
+        # before any render: the files the metrics read are in the catalog by content
+        with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+            stored = catalog.query(
+                "SELECT subject_uid, role, location, sha256 FROM files WHERE sha256 IS NOT NULL"
+            )
+        paths = {uids["sub-01"]: real_subject, uids["sub-UTS01"]: real_subject_fs7}
+        for uid in paths:
+            assert METRIC_ROLES <= {row["role"] for row in stored if row["subject_uid"] == uid}
+        for row in stored:
+            content = (paths[row["subject_uid"]] / row["location"]).read_bytes()
+            assert row["sha256"] == hashlib.sha256(content).hexdigest(), row["location"]
 
         rendered = run.render()
         assert (rendered.done, rendered.failed) == (2, 0)

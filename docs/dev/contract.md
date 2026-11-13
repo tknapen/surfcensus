@@ -752,6 +752,8 @@ class PublicCatalog:
     def work_done(self, phase: str, unit: str, config_hash: str, input_signature: str) -> bool | None
         # True: done and matching. False: failed and matching. None: no row, or a row that does not match.
     def record_work(self, rows: Sequence[WorkRow]) -> None           # one transaction
+    def forget_work(self, phase: str, units: Collection[str]) -> None   # removes ledger rows; added in the review of
+                                                       # milestone 3, for a subject that is no longer a unit of a stage
     def renders(self) -> pd.DataFrame                  # subject_uid, config_hash, tile_hash, render_key, video, status,
                                                        # reason, media_path, n_frames, template_id; and `detail` in a
                                                        # local run only
@@ -1344,7 +1346,7 @@ def merge_tables(ctx: RunContext) -> PhaseReport                                
 
 | Stage | Unit | Subjects | Leases | Writes |
 |---|---|---|---|---|
-| `regional` (4a) | subject | `tier_a` | `lh_stats`, `rh_stats`, `aseg_stats` | `regional` part |
+| `regional` (4a) | subject | having `lh_stats` or `rh_stats` (not `tier_a`, which asks for both; see `metrics.md`) | `lh_stats`, `rh_stats` | `regional` part |
 | `fsaverage` (4b) | subject | `tier_b`, or having thickness and annotation | `TIER_B` | `fsavg/<uid>.npz`, `vertex_summary` part |
 | `reference` (4c) | `run` | those with a map | none | `reference/<id>/`, `clusters.parquet` |
 | `score` | `run` | all present | none | `scores.parquet` |
@@ -2413,7 +2415,7 @@ From the draft. Contradicted by what was found (the docs need correcting, sectio
 | G4 | `data_sources.md` "(to verify)": how `?h.pial` links appear on S3 | Absent; only `?h.pial.T1` exists | The existing candidate order suffices; `pial_variant` is recorded |
 | G5 | `data_sources.md`: Tier A about 15 kB, Tier B about 12 MB, annot "small" | annot is 1.05 to 1.19 MB per hemisphere; Tier B about 14 MB; Tier A with full logs 0.7 to 1 MB | Numbers and cost estimates updated |
 | G6 | `metrics.md`: the search region is "shipped as a label with the package"; `metrics.md` and `CLAUDE.md`: fsaverage6 "by truncation" | Shipping conflicts with the condition on D14; truncation gives vertices, not faces | Regions computed at run time from the template; faces by `coarsen_faces` |
-| G7 | `phases.md`: phase 4 input is "complete subjects"; `metrics.md`: regional metrics are "available even when surfaces are missing" | The two disagree | `complete` keeps its `phases.md` meaning (renderable). 4a runs on `tier_a`, 4b on `tier_b` |
+| G7 | `phases.md`: phase 4 input is "complete subjects"; `metrics.md`: regional metrics are "available even when surfaces are missing" | The two disagree | `complete` keeps its `phases.md` meaning (renderable). 4a runs on every subject with a stats file, 4b on every subject with a thickness file (as built; D31) |
 | G8 | `rater_app.md`: "the client converts a click to voxel coordinates"; its API posts `(panel, frame, px, py)` | Two contracts; `frame` does not determine the slice without the mode | The client posts panel, slice and pixel; the server converts and is the authority; `slice`, `frame`, `mode` are all stored |
 | G9 | Hard rule: logs use pseudonyms; `architecture.md`: `--dataset ds000102` | A Snakemake wildcard or config entry with an accession would put it in file names | `--dataset` takes accession or pseudonym; nothing with an accession is stored outside the catalog |
 | G10 | `architecture.md`: `fsavg/<uid>.npz` holds "thickness (and z) maps" | z depends on the reference, which changes with the set | Thickness only; z on demand (`Run.zmap`) |
@@ -2637,10 +2639,10 @@ What step 3.0 delivered (2026-11-13), for the packages that follow. Where this d
 
 What step 3.Z delivered (2026-11-13). Where this differs from sections 6 and 9, this is what the code has; the reasons are in decision D31 of `docs/decisions.md`.
 
-- `metrics/pipeline.py`: `run_metrics`, `update_native`, `merge_tables` as in 6.9, plus `metrics_pending` (how many subjects a call would read), `map_path`, `reference_dir`, `frame_of` and the constants `PER_SUBJECT_STAGES`, `RUN_UNIT`, `FSAVG_DIR`, `REFERENCE_DIR`. The `regional` stage leases the two `aparc.stats` files only; holes are the log's. The `fsaverage` stage takes every subject with a thickness file. A failure is reported as `(unit, "<stage>: <reason>")`, with the reasons of `MetricError` and `source changed`, `metric failure`, `reference not current`. The `score` unit's signature is over the content of the three tables it reads.
-- `Run`: `template(*, retemplate=False)`, `metrics(*, datasets, stages=None, jobs, force, retry_failed, retemplate)`, `scores()`, `clusters()`, `zmap(subject_uid, reference_id=None)`. `Run.render()` passes the template and ends with `update_native`.
+- `metrics/pipeline.py`: `run_metrics`, `update_native`, `merge_tables` as in 6.9, plus `metrics_pending` (how many subjects a call would read), `map_path`, `reference_dir`, `frame_of` and the constants `PER_SUBJECT_STAGES`, `RUN_UNIT`, `FSAVG_DIR`, `REFERENCE_DIR`. The `regional` stage leases the two `aparc.stats` files only and takes every subject that has at least one of them; holes are the log's. The `fsaverage` stage takes every subject with a thickness file. Both store the SHA-256 of the files they read through `PublicCatalog.set_file_digests`, before the ledger rows. Both remove the rows, the map and the ledger row (`PublicCatalog.forget_work`) of a present subject that has none of the stage's files any more. The `reference` stage raises `ConfigError("invalid")` for maps it cannot read, after removing them; the `native` stage names a vertex map it cannot read in a note of its report. A failure is reported as `(unit, "<stage>: <reason>")`, with the reasons of `MetricError` and `source changed`, `metric failure`, `reference not current`. The `score` unit's signature is over the content of the three tables it reads.
+- `Run`: `template(*, retemplate=False)`, `metrics(*, datasets, stages=None, jobs, force, retry_failed, retemplate)`, `scores()`, `clusters()`, `zmap(subject_uid, reference_id=None)`. `Run.render()` passes the template and ends with `update_native`, whose notes it adds to its report.
 - `render/batch.py`: `run_render(ctx, *, template=None, ...)` and `render_pending(ctx, *, template=None, ...)`; `render_status` and `render_failures` take the template id from the pin (`meta.template_id`).
-- `templates.py`: `TEMPLATES_DIR`, `store_template(cache_dir, template)`, `load_template(directory)`.
+- `templates.py`: `TEMPLATES_DIR`, `store_template(cache_dir, template)`, which writes the directory when it is absent or does not read back as the template, `load_template(directory)`.
 - CLI: `metrics` as in 6.10; `render-subject --fsaverage DIR | --no-template`; `render --fsaverage DIR`. `--fsaverage` is not stored in `config.yaml`.
 - `tests/conftest.py`: `small_run` (the run directory) and `small_run_cohort` (its three subjects), `run_copy`, `SMALL_RUN_METRICS`; `real_template` and `real_fsaverage5` (network); `real_subject_fs7` now has all of Tier B. `FREESURFER_HOME` is removed from the environment of the tests.
 

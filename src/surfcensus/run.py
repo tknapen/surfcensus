@@ -8,6 +8,7 @@ method imports the phase it calls and hands it the public side of the run
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import sqlite3
@@ -483,11 +484,10 @@ class Run:
         """:meth:`template`, saying that there is none at ``level``: a render mentions it
         only to those who ask for more output, because the metrics say it aloud."""
         from surfcensus.templates import (
-            TEMPLATE_JSON,
             TemplateError,
             TemplateNotFound,
             find_template,
-            write_template,
+            store_template,
         )
 
         if self._template_looked_for and not retemplate:
@@ -519,8 +519,7 @@ class Run:
             get_logger().log(level, self._no_template[0])
             self._template, self._template_looked_for = None, True
             return None
-        if not (cache / found.template_id / TEMPLATE_JSON).is_file():
-            write_template(cache / found.template_id, found)
+        store_template(cache, found)  # written again when it does not read back
         if found.template_id != pinned:
             self._catalog.upsert_template(
                 found.template_id,
@@ -675,8 +674,8 @@ class Run:
             retry_failed=retry_failed,
         )
         # the cluster centroids of the subjects just rendered get their native position
-        update_native(context, template=template)
-        return report
+        native = update_native(context, template=template)
+        return dataclasses.replace(report, notes=(*report.notes, *native.notes))
 
     def _subject_uids(self, names: Sequence[str]) -> list[str]:
         named = [names] if isinstance(names, str) else list(names)
