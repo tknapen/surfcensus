@@ -42,7 +42,12 @@ def review(
     Every option that maps to a stored value is tri-state: None keeps what the run has, and
     the defaults (not blind, marks not required, no video) apply only when the run is
     created. ``rater`` is not stored: it names the rater of this server process.
-    ``serve=False`` stops after the renders. ``force`` is needed to change ``blind`` once a
-    rating exists. Running it again does the same steps with everything unchanged skipped.
+
+    The app opens when the first ``serve_after`` subjects of the queue are rendered, and
+    the others are rendered while it runs, in the order of the queue
+    (``store.queue_order``). None is 1, so the rating screen comes up at the first render
+    (decision D33); 0 renders every subject first. ``serve=False`` renders every subject
+    and stops. ``force`` is needed to change ``blind`` once a rating exists. Running it
+    again does the same steps with everything unchanged skipped.
     """
     raise NotImplementedError(f"review.review: {_OWNER}")
