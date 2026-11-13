@@ -2,7 +2,8 @@
 makes. See docs/rater_app.md.
 
 Interface of milestone 4. The constants and :func:`utc_now` are final; :func:`open_app_db`,
-:func:`get_or_create_rater` and :func:`store_submission` are written by package 4.B.
+:func:`app_db_mode`, :func:`get_or_create_rater` and :func:`store_submission` are written by
+package 4.B.
 """
 
 from __future__ import annotations
@@ -60,6 +61,17 @@ def open_app_db(run_dir: Path | str, *, run_id: str, mode: AppMode) -> Engine:
     (``run_id``) or of the other mode, and for a file that is no database of the app.
     """
     raise NotImplementedError(f"app.db.open_app_db: {_OWNER}")
+
+
+def app_db_mode(run_dir: Path | str) -> AppMode | None:
+    """The mode of the ``app.sqlite`` of a run directory (``app_meta.mode``), or None for a
+    run that has none yet. For what opens the database of a run as it is, without being
+    told a mode: ``surfcensus finalize`` and ``freeze_calibration`` pass it to
+    :func:`open_app_db`. It creates and changes nothing.
+
+    Raises ``ConfigError("invalid", ...)`` for a file that is no database of the app.
+    """
+    raise NotImplementedError(f"app.db.app_db_mode: {_OWNER}")
 
 
 def get_or_create_rater(session: Session, name: str, *, role: RaterRole = "rater") -> Rater:

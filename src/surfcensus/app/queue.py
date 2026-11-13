@@ -28,10 +28,11 @@ class QueuePlan:
 
     mode: AppMode
     order: tuple[str, ...]
-    """The selected subjects in queue order. Local, not blind: the subjects flagged
-    ``partial_score`` by ``subject_uid``, then by ``primary_rank`` ascending, then the
-    subjects without a score by ``subject_uid``. Blind: a seeded shuffle of the sorted
-    uids. Team: sorted uids."""
+    """The selected subjects in queue order. Local: ``store.queue_order``, which is also
+    the order a local run renders in (not blind: the subjects flagged ``partial_score`` by
+    ``subject_uid``, then by ``primary_rank`` ascending, then the subjects without a score
+    by ``subject_uid``; blind: a shuffle of the sorted uids with the seed of the run).
+    Team: sorted uids."""
     render_keys: Mapping[str, str]
     """Subjects whose render is ready -> its ``render_key``."""
     failed: Mapping[str, str]
@@ -67,7 +68,9 @@ def build_plan(
     """The plan of the present state of the run.
 
     The selected subjects are the rows of ``selection``. ``scores`` are the primary rows of
-    ``scores.parquet`` (``store.primary_scores``), or None when the run has none. A render
+    ``scores.parquet`` (``store.primary_scores``), or None when the run has none; the local
+    order is ``store.queue_order(selected, scores, blind=app.blind, seed=app.queue_seed)``,
+    so the queue and the renderer of a local run go through the subjects alike. A render
     is ready when its row is ``done`` and its config hash is ``render_config_hash``, the
     hash of the running version's render config; a ``done`` row of another hash counts as
     outdated.

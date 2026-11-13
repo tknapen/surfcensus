@@ -36,19 +36,27 @@ def launch_options(environ: dict[str, str] | None = None) -> dict[str, str]:
     return {"executable_path": path}
 
 
-@contextmanager
-def open_browser(**launch: Any) -> Iterator[Any]:
-    """A headless browser (``playwright.sync_api.Browser``), closed on exit. Skips the test
-    when no executable is named and Chrome is not installed."""
+def launch_browser(playwright: Any, **launch: Any) -> Any:
+    """A headless browser (``playwright.sync_api.Browser``) started from a running
+    Playwright; the caller closes it. Skips the test when no executable is named and Chrome
+    is not installed."""
     sync_api = import_module("playwright.sync_api")
     options = launch_options()
+    try:
+        return playwright.chromium.launch(**options, **launch)
+    except sync_api.Error as exc:
+        if "channel" in options and "is not found" in str(exc):
+            pytest.skip(f"no browser: set {BROWSER_ENV} to an executable, or install Chrome")
+        raise
+
+
+@contextmanager
+def open_browser(**launch: Any) -> Iterator[Any]:
+    """Playwright and a browser of :func:`launch_browser`, both closed on exit. Playwright's
+    synchronous API runs once per thread, so tests that share a browser share this."""
+    sync_api = import_module("playwright.sync_api")
     with sync_api.sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch(**options, **launch)
-        except sync_api.Error as exc:
-            if "channel" in options and "is not found" in str(exc):
-                pytest.skip(f"no browser: set {BROWSER_ENV} to an executable, or install Chrome")
-            raise
+        browser = launch_browser(playwright, **launch)
         try:
             yield browser
         finally:

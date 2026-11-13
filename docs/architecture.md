@@ -13,6 +13,8 @@ The package serves two audiences with the same code path.
 
    That command inventories the subjects, computes metrics, renders the occipital animations, and opens the rater app in the browser. Ratings are saved in the run directory and exported with `surfcensus export`.
 
+   This quick start is a main target of the package (decision D33): one line installs it, and one command, pointed at a folder that holds the FreeSurfer outputs of an OpenNeuro dataset or of any other study, shows the rating screen without a further step. The browser opens as soon as the first subject of the queue is rendered, and the rest is rendered behind the running app. What of this is built is said under D33.
+
 2. The paper team runs the census over OpenNeuro. The census is the same pipeline with a remote source, plus discovery and enrichment phases that local users never need.
 
 So the pipeline is organized around a `Source` abstraction. Everything downstream of the source (inventory, metrics, scoring, rendering, rating, export) is identical for local and remote subjects.
@@ -162,7 +164,7 @@ surfcensus render-subject SUBJECT_DIR --out DIR [--fsaverage DIR | --no-template
     # one subject, no run directory; the CLI form of sc.render.three_plane
 ```
 
-`review` defaults the run directory to `PATH/../surfcensus-run` if writable, else `./surfcensus-run`. It renders every subject (local sets are small enough), orders the rating queue by composite score descending unless `--blind` is given, and starts the app on `127.0.0.1` with a single local rater.
+`review` defaults the run directory to `PATH/../surfcensus-run` if writable, else `./surfcensus-run`. It orders the rating queue by composite score descending unless `--blind` is given, renders in that order, and starts the app on `127.0.0.1` with a single local rater as soon as the first subject of the queue is rendered; the others are rendered while the app runs, and the app says so when a rater is faster than the renderer (decision D33). `--serve-after N` waits for N renders, and `--serve-after 0` for all of them.
 
 Census (and power users), one subcommand per phase:
 

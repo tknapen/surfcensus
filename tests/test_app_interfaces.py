@@ -32,7 +32,7 @@ from surfcensus.app.marks import MARK_FIELDS, MarkError
 from surfcensus.config import load_config
 from surfcensus.protocol import Protocol, load_protocol
 from surfcensus.records import SUBJECT_UID_PATTERN
-from surfcensus.render.model import RENDER_JSON, read_render
+from surfcensus.render.model import RENDER_JSON, RenderInfo, read_render
 from surfcensus.run import Run
 from surfcensus.store import (
     PublicCatalog,
@@ -102,6 +102,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "app_db_path": ("run_dir",),
         "utc_now": (),
         "open_app_db": ("run_dir", "run_id", "mode"),
+        "app_db_mode": ("run_dir",),
         "get_or_create_rater": ("session", "name", "role"),
         "store_submission": (
             "session",
@@ -676,14 +677,38 @@ def test_the_browser_is_the_one_named_and_else_chrome(tmp_path: Path) -> None:
 # --- the fixtures the app tests share -------------------------------------------------------
 
 
+def test_the_engine_fixture_opens_the_database_of_the_app_run(
+    request: pytest.FixtureRequest, app_run: Path
+) -> None:
+    # until package 4.B has written open_app_db the fixture says who writes it; afterwards
+    # it gives an engine on app.sqlite of the run
+    try:
+        engine = request.getfixturevalue("app_engine")
+    except NotImplementedError as exc:
+        assert "package 4.B" in str(exc) and not (app_run / APP_DB_FILE).exists()
+    else:
+        assert Path(engine.url.database) == app_run / APP_DB_FILE
+        assert (app_run / APP_DB_FILE).is_file()
+
+
 def test_the_fixtures_of_the_app_tests_are_what_they_say(
     app_run: Path,
     small_run: Path,
     small_run_uids: dict[str, str],
+    small_run_renders: dict[str, RenderInfo],
     shipped_protocol: Protocol,
     api_examples: dict[str, object],
 ) -> None:
     assert sorted(small_run_uids) == ["sub-000", "sub-001", "sub-002"]
+    assert sorted(small_run_renders) == sorted(small_run_uids)
+    for label, info in small_run_renders.items():
+        assert info == read_render(media_dir(small_run, small_run_uids[label]))
+        assert {name: len(panel.slices) for name, panel in info.panels.items()} == {
+            "sagittal": 7,
+            "coronal": 6,
+            "axial": 7,
+        }
+        assert info.vertex_map is not None and info.vertex_map.fsaverage == "fsaverage6"
     assert primary_scores(small_run)["subject_uid"][0] == small_run_uids["sub-001"]
     protocol, _ = load_protocol(app_run)
     assert protocol == shipped_protocol

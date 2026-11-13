@@ -15,9 +15,11 @@ that went through inventory, metrics and render (``small_run``, and ``run_copy``
 that writes); and the real template for the network tests (``real_template``).
 
 Milestone 4 adds what the tests of the rater app share: the shipped protocol
-(``shipped_protocol``), the subjects of ``small_run`` by label (``small_run_uids``), a copy
-of that run with its ``protocol.yaml`` (``app_run``), and the example bodies of the API
-(``api_examples``, from ``tests/app_examples.py``).
+(``shipped_protocol``), the subjects of ``small_run`` by label (``small_run_uids``) and their
+renders (``small_run_renders``), a copy of that run with its ``protocol.yaml`` (``app_run``)
+and an engine on its ``app.sqlite`` (``app_engine``), and the example bodies of the API
+(``api_examples``, from ``tests/app_examples.py``). The browser tests get their browser from
+``tests/browser_launch.py``.
 """
 
 from __future__ import annotations
@@ -65,10 +67,10 @@ from surfcensus.protocol import (  # noqa: E402
     parse_protocol,
     shipped_protocol_bytes,
 )
-from surfcensus.render.model import RenderConfig  # noqa: E402
+from surfcensus.render.model import RenderConfig, RenderInfo, read_render  # noqa: E402
 from surfcensus.run import Run  # noqa: E402
 from surfcensus.sources.local import local  # noqa: E402
-from surfcensus.store import PublicCatalog  # noqa: E402
+from surfcensus.store import PublicCatalog, media_dir  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -234,6 +236,18 @@ def small_run_uids(small_run: Path) -> dict[str, str]:
 
 
 @pytest.fixture(scope="session")
+def small_run_renders(small_run: Path, small_run_uids: dict[str, str]) -> dict[str, RenderInfo]:
+    """Label -> the ``render.json`` of each subject of ``small_run``, whole (with ``inputs``
+    and ``template``): panels of 64 px with 7, 6 and 7 slices, a vertex map with fsaverage6
+    counterparts beside it in ``media_dir(small_run, uid)``."""
+    renders = {
+        label: read_render(media_dir(small_run, uid)) for label, uid in small_run_uids.items()
+    }
+    assert all(info is not None for info in renders.values())
+    return {label: info for label, info in renders.items() if info is not None}
+
+
+@pytest.fixture(scope="session")
 def shipped_protocol() -> Protocol:
     """The protocol of ``data/protocol.yaml``, which a new run starts with."""
     return parse_protocol(shipped_protocol_bytes())
@@ -246,6 +260,19 @@ def app_run(run_copy: Path) -> Path:
     not blind, no ``app.sqlite`` yet."""
     install_protocol(run_copy)
     return run_copy
+
+
+@pytest.fixture
+def app_engine(app_run: Path) -> Iterator[Any]:
+    """An engine on a new ``app.sqlite`` of ``app_run``, in local mode, disposed of
+    afterwards. It needs the app extra and ``app.db.open_app_db``."""
+    from surfcensus.app.db import open_app_db
+
+    with PublicCatalog.open(app_run) as public:
+        run_id = public.run_id()
+    engine = open_app_db(app_run, run_id=run_id, mode="local")
+    yield engine
+    engine.dispose()
 
 
 @pytest.fixture(scope="session")
