@@ -955,7 +955,10 @@ class _App:
                     schemas.SavedMark.model_validate(
                         {"client_id": posted.client_id, "mark_id": mark.mark_id, **_vertices(mark)}
                     )
-                    for posted, mark in zip(rating.marks, stored, strict=True)
+                    # the marks of an unratable rating are not stored
+                    for posted, mark in zip(
+                        () if rating.unratable is not None else rating.marks, stored, strict=True
+                    )
                 ),
             )
             following = self.next_out(session, rater, plan, self.advance(session, rater, plan))
@@ -1323,9 +1326,9 @@ class _App:
             message = f"{exc.reason}: {scrub(exc.detail)}" if unblinded else _FAILED
             return _errors(500, [("request", message)])
         except Exception as exc:
-            get_logger().error(
-                "a request failed: %s: %s", type(exc).__name__, scrub(str(exc)), exc_info=True
-            )
+            # the line without a path; the traceback, which has them, only when asked for
+            get_logger().error("a request failed: %s: %s", type(exc).__name__, scrub(str(exc)))
+            get_logger().debug("the traceback of that request", exc_info=True)
             return _errors(500, [("request", _FAILED)])
 
 
