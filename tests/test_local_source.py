@@ -1370,6 +1370,8 @@ def test_a_path_is_held_by_a_place_as_it_is_written_and_as_it_resolves(
     places = source_places(root)
     outside = tmp_path / "alias"
     outside.symlink_to(store / "sub-01" / "surf")
+    (tmp_path / "scratch").mkdir()
+    (root / "notes").symlink_to(tmp_path / "scratch")  # no subject: its target is no place
     inside = [
         root,
         root / "new",
@@ -1380,6 +1382,7 @@ def test_a_path_is_held_by_a_place_as_it_is_written_and_as_it_resolves(
         outside,  # a link from elsewhere into the target
         outside / "tables",
         tmp_path / "x" / ".." / "study" / "out",
+        root / "notes" / "out",  # written in the source, whatever the link leads to
     ]
     for path in inside:
         assert place_holding(path, places) is not None, path
@@ -1388,7 +1391,14 @@ def test_a_path_is_held_by_a_place_as_it_is_written_and_as_it_resolves(
         assert raised.value.reason == "invalid"
     assert place_holding(root / "sub-01", places) == ("the subjects directory", root)
     assert place_holding(store / "sub-01" / "x", places) == places[1]
-    for path in (tmp_path, tmp_path / "out", store, store / "sub-02", tmp_path / "study2"):
+    for path in (
+        tmp_path,
+        tmp_path / "out",
+        store,
+        store / "sub-02",
+        tmp_path / "study2",
+        tmp_path / "scratch" / "out",
+    ):
         assert place_holding(path, places) is None, path
         refuse_in_sources(path, [root], what="run")
     # a relative path is read from the current directory

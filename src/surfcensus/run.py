@@ -16,7 +16,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING
 
 from surfcensus import privacy
 from surfcensus.config import (
@@ -88,8 +88,10 @@ class Run:
     ``relocate`` is the pseudonym of the dataset that moved. A ``config`` given on opening
     replaces the stored one; it must be of the same run (same mode and identity).
 
-    A run directory inside the subjects directory of a local source is refused
-    (``ConfigError("invalid", ...)``): a source is only read.
+    A run directory inside a directory that a local source reads is refused
+    (``ConfigError("invalid", ...)``), before anything is written: its subjects directory,
+    and what a subject or a template in it links to (``sources.local.source_places``). A
+    source is only read.
     """
 
     run_dir: Path
@@ -400,9 +402,7 @@ class Run:
             return
         refuse_in_sources(self.run_dir, [subjects_dir], what="run", also=self._template_places())
 
-    def refuse_output_in_sources(
-        self, out: Path | str, *, what: Literal["run", "output"] = "output"
-    ) -> None:
+    def refuse_output_in_sources(self, out: Path | str) -> None:
         """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory
         that a local source of the run reads: its subjects directory, the directory that a
         subject or a template in it links to (``sources.local.source_places``), or the
@@ -419,7 +419,7 @@ class Run:
             except SourceError:
                 place = None
             places.append(place if isinstance(place, Path) else Path(stored.root))
-        refuse_in_sources(out, places, what=what, also=self._template_places())
+        refuse_in_sources(out, places, what="output", also=self._template_places())
 
     # sources
 
