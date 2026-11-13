@@ -12,6 +12,7 @@ import io
 from collections.abc import Iterator
 from typing import Any
 
+import browser_launch  # pyrefly: ignore[missing-import]
 import pytest
 from browser_launch import open_browser  # pyrefly: ignore[missing-import]
 from PIL import Image
@@ -55,3 +56,19 @@ def test_the_browser_runs_a_module_script_and_gives_a_screenshot(browser: Any, w
     assert shot.size == (width, 600)
     assert shot.convert("RGB").getpixel((100, 100)) == (0xFF, 0xD4, 0x00)
     page.close()
+
+
+def test_without_a_named_browser_and_without_chrome_the_test_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # a channel that is not installed stands in for a machine without Chrome
+    monkeypatch.delenv(browser_launch.BROWSER_ENV, raising=False)
+    monkeypatch.setattr(browser_launch, "CHANNEL", "chrome-canary")
+    with pytest.raises(pytest.skip.Exception, match="SURFCENSUS_BROWSER"), open_browser():
+        pytest.fail("a browser that is not installed started")
+
+
+def test_a_named_browser_that_is_no_file_is_an_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(browser_launch.BROWSER_ENV, "/nonexistent/chromium")
+    with pytest.raises(FileNotFoundError, match="not a file"), open_browser():
+        pytest.fail("a browser that does not exist started")

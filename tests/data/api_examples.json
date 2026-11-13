@@ -95,6 +95,8 @@
   ]
  },
  "events_out": {"stored": 4},
+ "review_query": {"sort": "composite", "order": "desc", "filter": "final_A:2,fs_version:6.0.1",
+                  "offset": 0, "limit": 50},
  "review": {
   "total": 3,
   "columns": ["subject_uid", "subject_label", "dataset", "fs_version", "render_status",

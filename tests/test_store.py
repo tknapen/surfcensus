@@ -7,6 +7,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import sqlite3
 import subprocess
@@ -2677,3 +2678,59 @@ def test_parts_of_the_intensity_table_take_the_schema_of_the_run(tmp_path: Path)
         "template",
         "none",
     ]
+
+
+# --- the order of the rating queue ------------------------------------------------------------
+
+
+def _score_frame(rows: Sequence[tuple[str, int | None, str]]) -> pd.DataFrame:
+    """``(subject_uid, primary_rank, flags)`` as the columns ``queue_order`` reads."""
+    return pd.DataFrame(
+        {
+            "subject_uid": [uid for uid, _, _ in rows],
+            "primary_rank": pd.array([rank for _, rank, _ in rows], dtype="Int32"),
+            "flags": [flags for _, _, flags in rows],
+        }
+    )
+
+
+def test_the_queue_goes_by_primary_rank_with_the_partial_scores_first() -> None:
+    a, b, c, d, e, f = (letter * 16 for letter in "abcdef")
+    scores = _score_frame(
+        [
+            (a, 2, "no_annot"),
+            (c, 3, "no_stats,partial_score"),
+            (d, 1, ""),
+            (e, 4, "partial_score"),
+            (f, None, "partial_score"),  # a row that is not primary says nothing
+            (d, None, ""),
+        ]
+    )
+    order = store.queue_order([f, e, d, c, b, a], scores, blind=False, seed=1)
+    # could not be fully scored (by uid), then worst first, then without a primary row (by uid)
+    assert order == [c, e, d, a, b, f]
+    assert store.queue_order([a, a, d], scores, blind=False, seed=1) == [d, a]  # each once
+    assert store.queue_order([b, a], None, blind=False, seed=1) == [a, b]
+    assert store.queue_order([], scores, blind=False, seed=1) == []
+    # a flag that only starts like the one that counts does not count
+    lookalike = _score_frame([(a, 2, "partial_score_x"), (d, 1, "")])
+    assert store.queue_order([a, d], lookalike, blind=False, seed=1) == [d, a]
+
+
+def test_a_blind_queue_is_a_seeded_shuffle_whatever_the_scores() -> None:
+    uids = [letter * 16 for letter in "abcdefgh"]
+    scores = _score_frame([(uid, rank, "") for rank, uid in enumerate(reversed(uids), start=1)])
+    expected = sorted(uids)
+    random.Random(11).shuffle(expected)
+    assert expected != sorted(uids) and expected != list(reversed(uids))
+    assert store.queue_order(uids[::-1], scores, blind=True, seed=11) == expected
+    assert store.queue_order(uids, None, blind=True, seed=11) == expected
+    assert store.queue_order(uids, None, blind=True, seed=12) != expected
+    assert store.queue_order(uids, scores, blind=False, seed=11) == list(reversed(uids))
+
+
+def test_the_queue_order_of_the_small_run_is_that_of_its_scores(small_run: Path) -> None:
+    scores = store.primary_scores(small_run)
+    uids = sorted(scores["subject_uid"])
+    assert not scores["flags"].str.contains("partial_score").any()
+    assert store.queue_order(uids, scores, blind=False, seed=0) == scores["subject_uid"].tolist()

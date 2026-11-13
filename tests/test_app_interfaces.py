@@ -13,6 +13,8 @@ import inspect
 import pickle
 import re
 import sqlite3
+import subprocess
+import sys
 from importlib import import_module
 from pathlib import Path
 
@@ -22,6 +24,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("sqlmodel")
 
+from browser_launch import BROWSER_ENV, launch_options  # pyrefly: ignore[missing-import]
 from sqlmodel import Session, SQLModel, create_engine, select
 
 from surfcensus.app import APP_DB_FILE, APP_TABLES, RATINGS_FLAT_VIEW, db, models
@@ -29,10 +32,12 @@ from surfcensus.app.marks import MARK_FIELDS, MarkError
 from surfcensus.config import load_config
 from surfcensus.protocol import Protocol, load_protocol
 from surfcensus.records import SUBJECT_UID_PATTERN
+from surfcensus.render.model import RENDER_JSON, read_render
 from surfcensus.run import Run
 from surfcensus.store import (
     PublicCatalog,
     clusters_with_native,
+    media_dir,
     primary_scores,
 )
 
@@ -60,6 +65,28 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "load_calibration": ("run_dir",),
         "write_calibration": ("run_dir", "calibration"),
         "validate_calibration": ("calibration", "protocol", "subjects", "render"),
+    },
+    "surfcensus.app.schemas": {
+        "RenderOut": None,
+        "RENDER_PRIVATE_FIELDS": None,
+        "ROUTES": None,
+        "Route": None,
+        "ReviewQuery": None,
+        "MEDIA_FILE": None,
+        "EVENT_TYPES": None,
+        "render_out": ("info",),
+        "media_base": ("subject_uid", "base_url"),
+        "tile_name": ("pattern", "panel", "index"),
+    },
+    "surfcensus.store": {
+        "primary_scores": ("run_dir",),
+        "clusters_with_native": ("run_dir",),
+        "queue_order": ("uids", "scores", "blind", "seed"),
+        "media_dir": ("run_dir", "subject_uid"),
+    },
+    "surfcensus.render.model": {
+        "RENDER_JSON": None,
+        "read_render": ("out_dir",),
     },
     "surfcensus.app.marks": {
         "MarkError": None,
@@ -595,6 +622,55 @@ def test_a_run_directory_without_tables_has_empty_scores_and_clusters(tmp_path: 
     assert len(scores) == 0 and "primary_rank" in scores.columns
     clusters = clusters_with_native(tmp_path)
     assert len(clusters) == 0 and {"peak_z", "tkr_x"} <= set(clusters.columns)
+
+
+def test_the_render_of_a_subject_is_read_from_its_media_directory(
+    small_run: Path, small_run_uids: dict[str, str], tmp_path: Path
+) -> None:
+    for uid in small_run_uids.values():
+        directory = media_dir(small_run, uid)
+        info = read_render(directory)
+        assert info is not None
+        assert info.to_json() == (directory / RENDER_JSON).read_text()
+        assert info.inputs and info.vertex_map is not None
+        assert (directory / info.vertex_map.file).is_file()
+    # no render, a render that is being written, a damaged file, an earlier schema: None
+    assert read_render(tmp_path) is None
+    assert read_render(tmp_path / "absent") is None
+    text = (media_dir(small_run, uid) / RENDER_JSON).read_text()
+    for damaged in ("", text[: len(text) // 2], "{}", text.replace('"box"', '"bax"', 1)):
+        (tmp_path / RENDER_JSON).write_text(damaged)
+        assert read_render(tmp_path) is None
+    (tmp_path / RENDER_JSON).write_text(text)
+    assert read_render(tmp_path) == info and read_render(str(tmp_path)) == info
+
+
+def test_reading_a_render_does_not_load_the_renderer() -> None:
+    # the server reads render.json for every assignment; it has no use for matplotlib
+    code = (
+        "import sys\n"
+        "from surfcensus.render.model import read_render\n"
+        "import surfcensus.app.schemas, surfcensus.protocol, surfcensus.calibration\n"
+        "print('matplotlib' in sys.modules, 'surfcensus.render.api' in sys.modules)\n"
+    )
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True)
+    assert out.stdout.split() == ["False", "False"]
+
+
+# --- the browser of the browser tests ---------------------------------------------------------
+
+
+def test_the_browser_is_the_one_named_and_else_chrome(tmp_path: Path) -> None:
+    assert BROWSER_ENV == "SURFCENSUS_BROWSER"
+    assert launch_options({}) == {"channel": "chrome"}
+    assert launch_options({BROWSER_ENV: ""}) == {"channel": "chrome"}
+    executable = tmp_path / "chromium"
+    executable.write_bytes(b"")
+    assert launch_options({BROWSER_ENV: str(executable)}) == {"executable_path": str(executable)}
+    # a name that is no file is an error, not a reason to use another browser or to skip
+    for wrong in (tmp_path / "absent", tmp_path):
+        with pytest.raises(FileNotFoundError, match="SURFCENSUS_BROWSER"):
+            launch_options({BROWSER_ENV: str(wrong)})
 
 
 # --- the fixtures the app tests share -------------------------------------------------------

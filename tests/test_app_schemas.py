@@ -32,8 +32,10 @@ from surfcensus.app.schemas import (
     MAX_EVENTS_PER_CALL,
     MAX_MARKS_PER_RATING,
     MAX_NOTE_CHARS,
+    MAX_REVIEW_ROWS,
     MEDIA_FILE,
     RENDER_PRIVATE_FIELDS,
+    ROUTES,
     EventIn,
     EventsIn,
     MarkIn,
@@ -44,6 +46,8 @@ from surfcensus.app.schemas import (
     RatingOut,
     RenderOut,
     ResolvedMark,
+    ReviewQuery,
+    Route,
     SavedMark,
     SavedOut,
     SessionOut,
@@ -53,7 +57,7 @@ from surfcensus.app.schemas import (
     tile_name,
 )
 from surfcensus.protocol import parse_protocol, shipped_protocol_bytes
-from surfcensus.render.model import RenderInfo, TileFiles
+from surfcensus.render.model import RenderInfo, TileFiles, read_render
 from surfcensus.store import PublicCatalog, media_dir
 
 MARK = {"client_id": "m1", "class": "A", "panel": "sagittal", "slice": 3, "px": 30.5, "py": 28.25}
@@ -102,12 +106,93 @@ def test_the_examples_cover_every_route_shape() -> None:
         "RatingOut",
         "EventsIn",
         "EventsOut",
+        "ReviewQuery",
         "ReviewOut",
         "SubjectOut",
         "StatsOut",
         "ErrorsOut",
         "HealthOut",
     }
+
+
+def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
+    # docs/dev/contract.md, section 7.5: the table of routes
+    assert {(route.method, route.path): route for route in ROUTES} == {
+        ("GET", "/"): Route("GET", "/"),
+        ("GET", "/review"): Route("GET", "/review", unblinded=True),
+        ("GET", "/static/{path}"): Route("GET", "/static/{path}"),
+        ("GET", "/media/{subject_uid}/{path}"): Route("GET", "/media/{subject_uid}/{path}"),
+        ("GET", "/healthz"): Route("GET", "/healthz", schemas.HealthOut),
+        ("GET", "/api/session"): Route("GET", "/api/session", SessionOut),
+        ("GET", "/api/next"): Route("GET", "/api/next", NextOut),
+        ("GET", "/api/back"): Route("GET", "/api/back", NextOut),
+        ("POST", "/api/rating"): Route("POST", "/api/rating", RatingOut, RatingIn),
+        ("POST", "/api/events"): Route("POST", "/api/events", schemas.EventsOut, EventsIn),
+        ("GET", "/api/review"): Route(
+            "GET", "/api/review", schemas.ReviewOut, ReviewQuery, unblinded=True
+        ),
+        ("GET", "/api/review/{subject_uid}"): Route(
+            "GET", "/api/review/{subject_uid}", schemas.SubjectOut, unblinded=True
+        ),
+        ("GET", "/api/stats"): Route("GET", "/api/stats", StatsOut, unblinded=True),
+        ("GET", "/api/export"): Route("GET", "/api/export", unblinded=True),
+    }
+    assert len(ROUTES) == 14  # no route twice
+    # what is unblinded is the review page and everything under its API, and nothing a
+    # rating page calls
+    unblinded = {route.path for route in ROUTES if route.unblinded}
+    assert unblinded == {
+        "/review",
+        "/api/review",
+        "/api/review/{subject_uid}",
+        "/api/stats",
+        "/api/export",
+    }
+    for route in ROUTES:
+        if route.request is not None and route.method == "POST":
+            assert route.response is not None
+
+
+def test_every_example_belongs_to_a_route_and_has_one_of_its_shapes() -> None:
+    routes = {f"{route.method} {route.path}": route for route in ROUTES}
+    for key, where in EXAMPLE_ROUTES.items():
+        route = routes[where]
+        shape = EXAMPLE_SHAPES[key]
+        assert shape in (route.response, route.request, schemas.ErrorsOut), key
+    # and every route that answers or takes JSON has an example of each of its shapes
+    for where, route in routes.items():
+        for shape in (route.response, route.request):
+            if shape is not None:
+                assert any(
+                    EXAMPLE_ROUTES[key] == where and EXAMPLE_SHAPES[key] is shape
+                    for key in EXAMPLE_SHAPES
+                ), f"{where}: {shape.__name__}"
+
+
+def test_the_query_of_the_review_table_has_its_defaults_and_limits() -> None:
+    plain = ReviewQuery()
+    assert (plain.sort, plain.order, plain.filter, plain.offset, plain.limit) == (
+        None,
+        "asc",
+        "",
+        0,
+        200,
+    )
+    # as a server reads it from a URL: every value is text
+    asked = ReviewQuery.model_validate(
+        {"sort": "composite", "order": "desc", "offset": "20", "limit": "10"}
+    )
+    assert (asked.sort, asked.order, asked.offset, asked.limit) == ("composite", "desc", 20, 10)
+    assert ReviewQuery(limit=MAX_REVIEW_ROWS).limit == MAX_REVIEW_ROWS == 1000
+    for field, value in (
+        ("order", "up"),
+        ("offset", -1),
+        ("limit", 0),
+        ("limit", MAX_REVIEW_ROWS + 1),
+        ("page", 2),
+    ):
+        with pytest.raises(ValidationError, match=field):
+            ReviewQuery.model_validate({field: value})
 
 
 @pytest.mark.parametrize("key", sorted(EXAMPLE_SHAPES))
@@ -255,8 +340,9 @@ def _small_run_render(small_run: Path) -> RenderInfo:
     with PublicCatalog.open(small_run) as public:
         subjects = public.subjects()
     uid = dict(zip(subjects["subject_label"], subjects["subject_uid"], strict=True))[RECORDED_LABEL]
-    text = (media_dir(small_run, uid) / "render.json").read_text(encoding="utf-8")
-    return RenderInfo.model_validate_json(text)
+    info = read_render(media_dir(small_run, uid))
+    assert info is not None
+    return info
 
 
 def _keys(value: Any) -> set[str]:

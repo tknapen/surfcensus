@@ -12,6 +12,7 @@ import errno
 import hashlib
 import math
 import os
+import random
 import shutil
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from concurrent.futures.process import BrokenProcessPool
@@ -23,6 +24,7 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_tree import write_tree  # pyrefly: ignore[missing-import]
@@ -880,11 +882,14 @@ def score_rows(entries: Sequence[Mapping[str, object]]) -> pd.DataFrame:
 
 
 def write_scores(bench: Bench, ranks: Mapping[str, tuple[int, str]]) -> None:
-    """``uid -> (rank, flags)`` as primary rows, and a second row per subject with the
-    ranks reversed, which the order must not follow."""
+    """``uid -> (primary_rank, flags)`` as primary rows, and a second row per subject. The
+    order must follow ``primary_rank`` alone: ``rank``, which is within a reference, runs
+    the other way in the primary rows, and the second rows have no ``primary_rank``."""
     entries: list[dict[str, object]] = []
     for uid, (rank, flags) in ranks.items():
-        entries.append({"subject_uid": uid, "rank": rank, "flags": flags})
+        entries.append(
+            {"subject_uid": uid, "rank": 10 - rank, "primary_rank": rank, "flags": flags}
+        )
         entries.append(
             {"subject_uid": uid, "reference_id": "other", "primary": False, "rank": 100 - rank}
         )
@@ -915,11 +920,40 @@ def test_selected_subjects_of_a_local_run_with_scores_go_in_queue_order(
     run_render(bench.ctx(), force=True)
     assert bench.leased == [c, e, d, a, b]
 
-    for changes in ({"app": bench.config.app.model_copy(update={"blind": True})}, {}):
+    # a blind run: the seeded shuffle of the rating queue, whatever the scores
+    for seed in (7, 8):
+        shuffled = [a, b, c, d, e]
+        random.Random(seed).shuffle(shuffled)
+        assert shuffled != [a, b, c, d, e]
+        blind = bench.config.app.model_copy(update={"blind": True, "queue_seed": seed})
         del bench.leased[:]
-        run_render(bench.ctx(**changes), force=True, all_subjects=not changes)
-        expected = [a, b, c, d, e] if changes else [a, b, c, d, e, f]
-        assert bench.leased == expected  # a blind run, and a run of all subjects: by subject_uid
+        run_render(bench.ctx(app=blind), force=True)
+        assert bench.leased == shuffled
+
+    del bench.leased[:]
+    run_render(bench.ctx(), force=True, all_subjects=True)
+    assert bench.leased == [a, b, c, d, e, f]  # a run of all subjects: by subject_uid
+
+
+def test_a_scores_table_of_an_earlier_schema_does_not_order_or_stop_a_render(
+    new_bench: Callable[..., Bench],
+) -> None:
+    labels = ["sub-01", "sub-02", "sub-03"]
+    bench = new_bench(labels, cache=CacheConfig(batch_subjects=1))
+    a, b, c = sorted(bench.uid(label) for label in labels)
+    select(bench, [a, b, c])
+    write_scores(bench, {a: (3, ""), b: (2, ""), c: (1, "")})
+    run_render(bench.ctx())
+    assert bench.leased == [c, b, a]
+    # the table as a version without primary_rank wrote it: until metrics writes it again,
+    # the run renders as one without scores
+    path = store.table_path(bench.run_dir, "scores")
+    pq.write_table(pq.read_table(path).drop_columns(["primary_rank"]), path)
+    with pytest.raises(ValueError, match="another schema"):
+        store.primary_scores(bench.run_dir)
+    del bench.leased[:]
+    assert run_render(bench.ctx(), force=True).done == 3
+    assert bench.leased == [a, b, c]
 
 
 def test_a_census_run_with_scores_goes_by_pseudonym_and_subject(

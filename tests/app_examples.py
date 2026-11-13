@@ -42,6 +42,7 @@ EXAMPLE_SHAPES: dict[str, type[BaseModel]] = {
     "rating_out": schemas.RatingOut,
     "events_in": schemas.EventsIn,
     "events_out": schemas.EventsOut,
+    "review_query": schemas.ReviewQuery,
     "review": schemas.ReviewOut,
     "subject": schemas.SubjectOut,
     "stats": schemas.StatsOut,
@@ -62,6 +63,7 @@ EXAMPLE_ROUTES: dict[str, str] = {
     "rating_out": "POST /api/rating",
     "events_in": "POST /api/events",
     "events_out": "POST /api/events",
+    "review_query": "GET /api/review",
     "review": "GET /api/review",
     "subject": "GET /api/review/{subject_uid}",
     "stats": "GET /api/stats",
@@ -69,7 +71,8 @@ EXAMPLE_ROUTES: dict[str, str] = {
     "errors_409": "POST /api/rating",
     "health": "GET /healthz",
 }
-"""Key of ``api_examples.json`` -> the route that receives or answers it."""
+"""Key of ``api_examples.json`` -> the route that receives or answers it, as method and path
+of ``schemas.ROUTES``."""
 
 
 def load_render_small() -> dict[str, Any]:
