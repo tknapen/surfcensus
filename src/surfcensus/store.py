@@ -19,6 +19,7 @@ missing a pandas nullable integer, and a float has NaN.
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import sqlite3
@@ -256,6 +257,9 @@ _NETWORK_FILESYSTEMS = frozenset(
     }
 )
 
+# what SQLite keeps beside a database file while it is written to
+_SIDECARS = ("-journal", "-wal", "-shm")
+
 _UID = re.compile(r"[0-9a-f]{16}")
 _PSEUDONYM = re.compile(r"D-[0-9a-f]{1,64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
@@ -407,6 +411,71 @@ def _in_use(exc: sqlite3.Error, name: str) -> ConfigError | None:
     return None
 
 
+class UnfinishedCatalog(ConfigError):
+    """A catalog file that holds nothing: no table of it has a row.
+
+    That is what a process leaves that was killed while it made a run, on a file system
+    without hard links or with a version before :meth:`Catalog.create` built the catalog
+    under another name. Nothing is lost with such a file; :func:`discard_unfinished` removes
+    it. The reason is ``invalid``.
+    """
+
+
+def _holds_no_row(conn: sqlite3.Connection) -> bool:
+    """Whether no table of the database has a row. Raises ``sqlite3.DatabaseError`` when the
+    file cannot be read as a database."""
+    tables = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    for (name,) in tables:
+        quoted = name.replace('"', '""')
+        if conn.execute(f'SELECT 1 FROM "{quoted}" LIMIT 1').fetchone() is not None:
+            return False
+    return True
+
+
+def discard_unfinished(path: Path | str) -> bool:
+    """Remove the catalog at ``path`` if it is an unfinished one (:class:`UnfinishedCatalog`)
+    and say whether it was removed. The file is looked at here, whatever the caller saw
+    before: a catalog that holds a row is never removed. No file is not an error.
+    """
+    path = Path(path)
+    if not path.is_file():
+        return False
+    try:
+        _Db(path, readonly=False).close()
+    except UnfinishedCatalog:
+        # SQLite has rolled back what the writer left and removed its journal by now; a
+        # journal that stayed would be replayed into the next file of this name
+        for suffix in ("", *_SIDECARS):
+            path.with_name(path.name + suffix).unlink(missing_ok=True)
+        return True
+    return False
+
+
+def _publish(tmp: Path, path: Path) -> bool:
+    """Give the finished file ``tmp`` the name ``path``, unless the name is taken; says
+    whether it was given. ``tmp`` stays, or is gone, for the caller to remove."""
+    try:
+        os.link(tmp, path)  # atomic, and fails when the name is taken
+    except FileExistsError:
+        return False
+    except OSError:
+        # A file system without hard links. The name is claimed with an empty file, which
+        # every reader takes for an unfinished catalog, and the rename then replaces it in
+        # one step.
+        try:
+            path.touch(exist_ok=False)
+        except FileExistsError:
+            return False
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            path.unlink(missing_ok=True)
+            raise
+    return True
+
+
 def filesystem_type(path: Path | str, mounts: str | None = None) -> str | None:
     """The type of the file system that holds ``path``, as Linux names it (``ext4``,
     ``nfs4``), or None when it cannot be told.
@@ -482,6 +551,10 @@ class _Db:
                 f"{name} has schema {version}; this version of surfcensus reads up to "
                 f"{SCHEMA_VERSION}",
             )
+        if expect_run and version == 0:
+            # Catalog.create numbers the schema before a run is in the file, so this one
+            # holds none. It is left as it is: no migration is applied to it.
+            raise self._no_run()
         if version < SCHEMA_VERSION:
             if self.readonly:
                 raise ConfigError(
@@ -494,12 +567,29 @@ class _Db:
             return
         row = self.one("SELECT value FROM meta WHERE key = 'mode'")
         if row is None or row["value"] not in _BUSY_MS:
-            raise ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
+            raise self._no_run()
         self.mode = row["value"]
         busy = _BUSY_MS[self.mode]
         if self.readonly and self.mode == "census":
             busy = _READONLY_CENSUS_BUSY_MS  # in WAL mode a reader does not wait for a writer
         self._conn.execute(f"PRAGMA busy_timeout = {busy}")
+
+    def _no_run(self) -> ConfigError:
+        """The error for a file that holds no run: an unfinished catalog when it holds
+        nothing at all, else a database that something else made."""
+        name = self.path.name
+        try:
+            empty = _holds_no_row(self._conn)
+        except sqlite3.DatabaseError:
+            empty = False
+        if empty:
+            # not "no run": that reads as a foreign file, and the run's configuration is fine
+            return UnfinishedCatalog(
+                "invalid",
+                f"{name} holds nothing: the making of this run was interrupted. A phase "
+                "command or `status` on the run directory makes the catalog again",
+            )
+        return ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
 
     def rows(self, sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -565,45 +655,68 @@ class Catalog:
         self._db = _Db(Path(path), readonly=readonly)
 
     @classmethod
-    def create(cls, path: Path | str, *, mode: Mode, key: HashKey) -> Catalog:
+    def create(
+        cls, path: Path | str, *, mode: Mode, key: HashKey, exist_ok: bool = False
+    ) -> Catalog:
         """A new catalog; also draws the run secret.
 
         ``key`` is the per-run salt of a local run or the dataset key of a census run; its
-        fingerprint is stored, the key is not. An existing file is refused. A census
-        catalog is put in WAL mode, with a warning when the directory is on a network file
-        system (seen on Linux only), where WAL does not work.
+        fingerprint is stored, the key is not. A census catalog is put in WAL mode, with a
+        warning when the directory is on a network file system (seen on Linux only), where
+        WAL does not work.
+
+        The catalog is built under a temporary name in the same directory and given its name
+        when it is whole, so ``path`` holds a run or does not exist, also when this process
+        is killed, and no other process ever opens a half-made catalog. An existing file is
+        refused. With ``exist_ok`` a catalog that another process put there meanwhile is
+        opened in place of the new one when it is of the same mode and key, and refused
+        otherwise.
         """
         path = Path(path)
         if (mode == "local") != (key.kind == "local-salt"):
             raise ConfigError("key", f"a {mode} run is not keyed with a {key.kind}")
         path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
         try:
-            path.touch(exist_ok=False)  # claims the name: two processes cannot both create
-        except FileExistsError:
-            raise ConfigError("invalid", f"{path.parent} already has a {path.name}") from None
-        try:
-            db = _Db(path, readonly=False, expect_run=False)
-            try:
-                if mode == "census":
-                    cls._use_wal(db, path)
-                meta = {
-                    "run_id": uuid.uuid4().hex,
-                    "mode": mode,
-                    "key_kind": key.kind,
-                    "key_fingerprint": key.fingerprint,
-                    "created_at": _now(),
-                    "surfcensus_version": __version__,
-                    "run_secret": secrets.token_bytes(32).hex(),
-                }
-                with db.write() as conn:
-                    conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta.items())
-            finally:
-                db.close()
-        except BaseException:
-            for suffix in ("", "-wal", "-shm", "-journal"):
-                path.with_name(path.name + suffix).unlink(missing_ok=True)
-            raise
-        return cls(path)
+            taken = os.path.lexists(path)
+            if not taken:
+                tmp.touch(exist_ok=False)
+                db = _Db(tmp, readonly=False, expect_run=False)
+                try:
+                    meta = {
+                        "run_id": uuid.uuid4().hex,
+                        "mode": mode,
+                        "key_kind": key.kind,
+                        "key_fingerprint": key.fingerprint,
+                        "created_at": _now(),
+                        "surfcensus_version": __version__,
+                        "run_secret": secrets.token_bytes(32).hex(),
+                    }
+                    with db.write() as conn:
+                        conn.executemany(
+                            "INSERT INTO meta (key, value) VALUES (?, ?)", meta.items()
+                        )
+                    if mode == "census":
+                        # last: every row is in the file itself when the log begins, so
+                        # the file alone is the catalog
+                        cls._use_wal(db, path)
+                finally:
+                    db.close()
+                taken = not _publish(tmp, path)
+        finally:
+            for suffix in ("", *_SIDECARS):
+                tmp.with_name(tmp.name + suffix).unlink(missing_ok=True)
+        if not taken:
+            return cls(path)
+        if not exist_ok:
+            raise ConfigError("invalid", f"{path.parent} already has a {path.name}")
+        existing = cls(path)
+        if (existing.meta("mode"), existing.meta("key_fingerprint")) != (mode, key.fingerprint):
+            existing.close()
+            raise ConfigError(
+                "invalid", f"{path.parent} already has a {path.name}, of another run"
+            )
+        return existing
 
     @staticmethod
     def _use_wal(db: _Db, path: Path) -> None:
