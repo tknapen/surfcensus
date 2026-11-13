@@ -728,12 +728,9 @@ class Run:
         ``subject_uid``. Empty before ``metrics`` has run."""
         import pandas as pd
 
-        from surfcensus.schemas import SCHEMAS
-        from surfcensus.store import read_table, table_path
+        from surfcensus.store import primary_scores
 
-        scores = read_table(table_path(self.run_dir, "scores"), SCHEMAS["scores"])
-        scores = scores[scores["primary"].to_numpy(dtype=bool)]
-        scores = scores.sort_values("primary_rank").reset_index(drop=True)
+        scores = primary_scores(self.run_dir)
         if self.config.mode == "local":
             subjects = self.public().subjects()
             label = dict(zip(subjects["subject_uid"], subjects["subject_label"], strict=True))
@@ -745,12 +742,9 @@ class Run:
         """``clusters.parquet`` left-joined with ``clusters_native.parquet``: every outlier
         cluster that was kept, with the native position of its centroid where a render
         gives one. Empty before ``metrics`` has found a reference."""
-        from surfcensus.schemas import KEYS, SCHEMAS
-        from surfcensus.store import read_table, table_path
+        from surfcensus.store import clusters_with_native
 
-        clusters = read_table(table_path(self.run_dir, "clusters"), SCHEMAS["clusters"])
-        native = read_table(table_path(self.run_dir, "clusters_native"), SCHEMAS["clusters_native"])
-        return clusters.merge(native, how="left", on=list(KEYS["clusters"]))
+        return clusters_with_native(self.run_dir)
 
     def zmap(self, subject_uid: str, reference_id: str | None = None) -> dict[Hemi, np.ndarray]:
         """The subject's z-map per hemisphere on the template mesh, against ``reference_id``

@@ -50,6 +50,9 @@ surfcensus/
     cli.py                 # typer app
     config.py              # RunConfig, the config.yaml of a run; stage identities
     privacy.py             # keyed pseudonyms, subject_uid, render keys, scrubbing; dataset key, reveal mapping
+    protocol.py            # the rating protocol of a run (protocol.yaml): scale, criteria, keys, unratable reasons
+    calibration.py         # the calibration set of a run (calibration.yaml)
+    review.py              # `surfcensus review`: inventory, metrics, selection, render, app (milestone 4)
     store.py               # SQLite catalog (private Catalog, PublicCatalog) + parquet tables; schema migrations
     records.py             # plain records shared between modules (provenance, ledger rows, RunContext)
     schemas.py             # Arrow schemas and keys of the parquet tables
@@ -109,9 +112,14 @@ surfcensus/
       batch.py             # phase 6 for a run: pending subjects, the renders table, the check sample
       freeview.py          # optional backend, wraps the original gist approach
     app/
+      __init__.py          # the name of app.sqlite and of its tables, for code that reads it without the app extra
+      schemas.py           # the shapes of the API (pydantic only); RenderOut, the render a page receives
       server.py            # FastAPI
       models.py            # SQLModel tables
+      db.py                # opening app.sqlite, its schema version, storing a submission
       queue.py
+      events.py            # interaction events
+      finalize.py          # final labels and marks; unratable labels for failed renders; freezing a calibration set
       marks.py             # click -> voxel -> tkr/scanner RAS -> native vertex -> fsaverage6 vertex
       static/              # vanilla JS + CSS, no build step, ships in the wheel
       templates/
@@ -132,7 +140,7 @@ Extras:
 - `app`: `fastapi`, `uvicorn`, `sqlmodel`, `jinja2`.
 - `freeview`: no Python deps; requires a FreeSurfer install and `xvfb-run` at runtime.
 - `analysis`: `marimo`, `statsmodels`, `scikit-learn`, `krippendorff`.
-Dependency group `dev` (uv): `pytest`, `ruff`, `pyrefly`, `beartype`, `hypothesis`.
+Dependency group `dev` (uv): `pytest`, `ruff`, `pyrefly`, `beartype`, `hypothesis`. Dependency group `browser`: `playwright`, for the browser test of the rater app, which drives a browser that is installed already (the executable named by `SURFCENSUS_BROWSER`, else Chrome) and is not part of the default tests or of CI.
 
 S3 access uses plain HTTPS against the public bucket endpoints (ListObjectsV2 with `list-type=2`, GET with `Range`), so `boto3` is not needed. `boto3` with `botocore.UNSIGNED` is an acceptable alternative if listing at scale turns out to need it.
 

@@ -24,6 +24,10 @@ if TYPE_CHECKING:
 
 Status = Literal["done", "failed"]
 
+SUBJECT_UID_PATTERN = r"[0-9a-f]{16}"
+"""What a ``subject_uid`` looks like (``privacy.subject_uid``): the name of a subject in every
+path, table and URL. A ``render_key`` has the same form."""
+
 METRIC_STAGES: tuple[str, ...] = ("regional", "fsaverage", "reference", "score")
 """The stages of phase 4 that ``surfcensus metrics`` runs when none is named, in order."""
 

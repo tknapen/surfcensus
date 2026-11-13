@@ -80,9 +80,72 @@ def test_the_modules_of_this_milestone_are_found() -> None:
         assert expected in names
 
 
+APP_EXTRA = ("fastapi", "uvicorn", "sqlmodel", "sqlalchemy", "jinja2")
+"""What the ``app`` extra installs. Only modules under ``app/`` may need it."""
+CORE_APP_MODULES = ("surfcensus.app", "surfcensus.app.schemas")
+"""The modules under ``app/`` that a core install imports."""
+
+
+def needs_app_extra(module: str) -> bool:
+    return module.startswith("surfcensus.app.") and module not in CORE_APP_MODULES
+
+
 @pytest.mark.parametrize("module", module_names())
 def test_every_module_imports_in_a_fresh_interpreter(module: str) -> None:
+    if needs_app_extra(module):
+        pytest.importorskip("fastapi")
+        pytest.importorskip("sqlmodel")
     run_python(f"import {module}")
+
+
+def test_the_modules_of_milestone_4_are_found() -> None:
+    names = module_names()
+    for expected in (
+        "surfcensus.protocol",
+        "surfcensus.calibration",
+        "surfcensus.review",
+        "surfcensus.app",
+        "surfcensus.app.schemas",
+        "surfcensus.app.models",
+        "surfcensus.app.db",
+        "surfcensus.app.marks",
+        "surfcensus.app.queue",
+        "surfcensus.app.events",
+        "surfcensus.app.finalize",
+        "surfcensus.app.server",
+        "surfcensus.export",
+        "surfcensus.export.tables",
+    ):
+        assert expected in names
+
+
+BLOCK_APP_EXTRA = "import sys\n" + "".join(f"sys.modules[{name!r}] = None\n" for name in APP_EXTRA)
+
+
+@pytest.mark.parametrize("module", [name for name in module_names() if not needs_app_extra(name)])
+def test_only_the_app_needs_the_app_extra(module: str) -> None:
+    # `surfcensus export`, the protocol, the calibration set and the shapes of the API work
+    # on a core install: a None in sys.modules makes the import of that name fail
+    out = run_python(
+        BLOCK_APP_EXTRA + f"import {module}\n"
+        "print(sorted(n for n in sys.modules if n.split('.')[0] in "
+        f"{APP_EXTRA!r} and sys.modules[n] is not None))\n"
+    )
+    assert out.strip() == "[]"
+
+
+def test_the_app_package_names_its_database_without_importing_anything() -> None:
+    assert loaded_beyond("import surfcensus.app", "surfcensus") == []
+    assert loaded_beyond("import surfcensus.export", "surfcensus") == []
+    out = run_python(
+        "import sys, surfcensus.app, surfcensus.export\n"
+        "print(sorted(m for m in sys.modules if m.startswith('surfcensus')))\n"
+        "print(surfcensus.app.APP_DB_FILE, len(surfcensus.app.APP_TABLES))\n"
+    )
+    assert out.splitlines() == [
+        "['surfcensus', 'surfcensus.app', 'surfcensus.export']",
+        "app.sqlite 9",
+    ]
 
 
 def test_import_surfcensus_loads_the_standard_library_only() -> None:
@@ -237,7 +300,7 @@ def test_code_downstream_of_the_inventory_names_nothing_private() -> None:
             checked += 1
             found = private_names(path.read_text(), signatures_too=name in NO_SIGNATURE)
             assert found == [], f"{path.relative_to(PACKAGE_DIR)}: {found}"
-    assert checked >= 9  # the render package, at least
+    assert checked >= 9 + 11  # the render package, and app/, export/ and calibration.py
 
 
 @pytest.mark.parametrize(

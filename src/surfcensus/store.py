@@ -1718,6 +1718,25 @@ def table_path(run_dir: Path | str, table: str) -> Path:
     return Path(run_dir) / "tables" / f"{table}.parquet"
 
 
+def primary_scores(run_dir: Path | str) -> pd.DataFrame:
+    """The primary rows of ``tables/scores.parquet``, one per present subject, sorted by
+    ``primary_rank``: the one order of the subjects of a run (``rank`` is within a
+    reference). Empty before ``metrics`` has run. What ``Run.scores()`` returns, without the
+    labels; the rater app, the export and the queue read the scores through this."""
+    scores = read_table(table_path(run_dir, "scores"), SCHEMAS["scores"])
+    scores = scores[scores["primary"].to_numpy(dtype=bool)]
+    return scores.sort_values("primary_rank").reset_index(drop=True)
+
+
+def clusters_with_native(run_dir: Path | str) -> pd.DataFrame:
+    """``clusters.parquet`` left-joined with ``clusters_native.parquet`` on the key of the
+    cluster table, which holds the reference: a native position of an earlier reference is
+    never attached to a cluster of the present one. What ``Run.clusters()`` returns."""
+    clusters = read_table(table_path(run_dir, "clusters"), SCHEMAS["clusters"])
+    native = read_table(table_path(run_dir, "clusters_native"), SCHEMAS["clusters_native"])
+    return clusters.merge(native, how="left", on=list(KEYS["clusters"]))
+
+
 def part_path(run_dir: Path | str, table: str, dataset: str) -> Path:
     """``tables/_parts/<table>/<pseudonym>.parquet``: the rows of one dataset.
 

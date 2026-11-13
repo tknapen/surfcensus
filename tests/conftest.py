@@ -13,6 +13,11 @@ Milestone 3 adds the template and the cohorts: ``synth_template``, ``synth_cohor
 ``small_cohort``, built from ``tests/synth_template.py`` and ``tests/synth_tierb.py``; a run
 that went through inventory, metrics and render (``small_run``, and ``run_copy`` for a test
 that writes); and the real template for the network tests (``real_template``).
+
+Milestone 4 adds what the tests of the rater app share: the shipped protocol
+(``shipped_protocol``), the subjects of ``small_run`` by label (``small_run_uids``), a copy
+of that run with its ``protocol.yaml`` (``app_run``), and the example bodies of the API
+(``api_examples``, from ``tests/app_examples.py``).
 """
 
 from __future__ import annotations
@@ -23,6 +28,7 @@ import shutil
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 from jaxtyping import install_import_hook
 
@@ -36,6 +42,7 @@ os.environ.pop("FREESURFER_HOME", None)
 
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
+from app_examples import load_api_examples  # noqa: E402  # pyrefly: ignore[missing-import]
 from synth import (  # noqa: E402  # pyrefly: ignore[missing-import]
     SyntheticSubject,
     write_synthetic_subject,
@@ -52,9 +59,16 @@ from synth_tierb import (  # noqa: E402  # pyrefly: ignore[missing-import]
 )
 
 from surfcensus.config import MetricsConfig, new_local_config  # noqa: E402
+from surfcensus.protocol import (  # noqa: E402
+    Protocol,
+    install_protocol,
+    parse_protocol,
+    shipped_protocol_bytes,
+)
 from surfcensus.render.model import RenderConfig  # noqa: E402
 from surfcensus.run import Run  # noqa: E402
 from surfcensus.sources.local import local  # noqa: E402
+from surfcensus.store import PublicCatalog  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -205,6 +219,40 @@ def run_copy(small_run: Path, tmp_path: Path) -> Path:
     """A copy of the run directory of ``small_run`` that a test may write to. Its source is
     still the read-only cohort."""
     return Path(shutil.copytree(small_run, tmp_path / "run"))
+
+
+@pytest.fixture(scope="session")
+def small_run_uids(small_run: Path) -> dict[str, str]:
+    """Label -> ``subject_uid`` of the three subjects of ``small_run`` (``sub-000`` to
+    ``sub-002``; ``sub-001`` carries the patch and has ``primary_rank`` 1). The uids follow
+    the salt of the run, which is drawn anew in every test session. The three subjects have
+    the same T1 and surfaces, so they share one ``render_key``: a test of what is keyed by
+    subject and render must not tell them apart by the key alone."""
+    with PublicCatalog.open(small_run) as public:
+        subjects = public.subjects()
+    return dict(zip(subjects["subject_label"], subjects["subject_uid"], strict=True))
+
+
+@pytest.fixture(scope="session")
+def shipped_protocol() -> Protocol:
+    """The protocol of ``data/protocol.yaml``, which a new run starts with."""
+    return parse_protocol(shipped_protocol_bytes())
+
+
+@pytest.fixture
+def app_run(run_copy: Path) -> Path:
+    """``run_copy`` with the shipped ``protocol.yaml`` installed: a run directory that the
+    rater app can be started on. Three rendered subjects, all selected, marks not required,
+    not blind, no ``app.sqlite`` yet."""
+    install_protocol(run_copy)
+    return run_copy
+
+
+@pytest.fixture(scope="session")
+def api_examples() -> dict[str, Any]:
+    """One example body per shape of ``surfcensus/app/schemas.py``, as JSON data: the keys
+    of ``app_examples.EXAMPLE_SHAPES``. A test that changes one takes a deep copy."""
+    return load_api_examples()
 
 
 @pytest.fixture(autouse=True)

@@ -210,7 +210,7 @@ class AppConfig(_Frozen):
     mark_near_mm: float = Field(default=2.0, ge=0)
     mark_show_mm: float = Field(default=3.0, ge=0)
     require_marks: bool | None = None
-    """None: ``protocol.yaml`` decides."""
+    """None: ``protocol.yaml`` decides (``protocol.marks_required``)."""
     blind: bool = False
     queue_seed: int
     """Drawn once when the run is created."""
@@ -278,19 +278,21 @@ def _queue_seed() -> int:
 
 def _build(defaults: dict[str, object], overrides: Mapping[str, object]) -> RunConfig:
     values = defaults | dict(overrides)
-    app = values["app"]
-    if isinstance(app, Mapping):  # a partial app section keeps the seed drawn here
-        values["app"] = {"queue_seed": _queue_seed()} | dict(app)
+    app, default_app = values["app"], defaults["app"]
+    if isinstance(app, Mapping) and isinstance(default_app, AppConfig):
+        # a partial app section keeps the seed drawn here and the defaults of its mode
+        values["app"] = default_app.model_dump() | dict(app)
     try:
         return RunConfig.model_validate(values)
     except ValidationError as exc:
-        raise ConfigError("invalid", _validation_detail(exc)) from exc
+        raise ConfigError("invalid", validation_detail(exc)) from exc
 
 
 def new_local_config(
     root: Path | str, *, subjects: Sequence[str] = (), **overrides: object
 ) -> RunConfig:
-    """The configuration of a new local run on ``root``: a fresh salt and queue seed, no video.
+    """The configuration of a new local run on ``root``: a fresh salt and queue seed, no
+    video, marks not required.
 
     ``overrides`` are fields of :class:`RunConfig`, as models or as mappings, for example
     ``render=RenderConfig(panel_px=64)``.
@@ -304,7 +306,8 @@ def new_local_config(
             kind="local-salt", local_salt=salt.secret.hex(), key_fingerprint=salt.fingerprint
         ),
         "render_video": False,
-        "app": AppConfig(queue_seed=_queue_seed()),
+        # marks are optional in a local run until --require-marks, whatever protocol.yaml says
+        "app": AppConfig(queue_seed=_queue_seed(), require_marks=False),
     }
     return _build(defaults, overrides)
 
@@ -330,10 +333,11 @@ def with_changes(config: RunConfig, **changes: object) -> RunConfig:
     try:
         return RunConfig.model_validate(config.model_dump() | changes)
     except ValidationError as exc:
-        raise ConfigError("invalid", _validation_detail(exc)) from exc
+        raise ConfigError("invalid", validation_detail(exc)) from exc
 
 
-def _validation_detail(exc: ValidationError) -> str:
+def validation_detail(exc: ValidationError) -> str:
+    """One line that names every entry a model refused, for a ``ConfigError``."""
     problems = []
     for error in exc.errors():
         where = ".".join(str(part) for part in error["loc"])
@@ -373,7 +377,7 @@ def load_config(run_dir: Path | str) -> RunConfig:
     try:
         return RunConfig.model_validate(data)
     except ValidationError as exc:
-        raise ConfigError("invalid", f"{CONFIG_FILE}: {_validation_detail(exc)}") from exc
+        raise ConfigError("invalid", f"{CONFIG_FILE}: {validation_detail(exc)}") from exc
 
 
 def dump_config(config: RunConfig) -> str:

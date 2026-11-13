@@ -1,0 +1,159 @@
+{
+ "_about": "Example bodies of the rater app's API, one per shape of surfcensus/app/schemas.py (tests/app_examples.py names the shape of each key and loads this file). The strings \"@render_small.json\" and \"@protocol.yaml\" stand for the recorded render object beside this file and for the shipped protocol as JSON. Marks and slices fit that render: panels of 64 px, 7, 6 and 7 slices.",
+ "session": {
+  "mode": "local",
+  "rater": {"id": 1, "name": "local", "role": "lead"},
+  "app_version": "0.0.1",
+  "protocol": "@protocol.yaml",
+  "protocol_sha256": "9c1f0d6a4b7e2f3a5c8d1e0f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d3e2f1a0b",
+  "require_marks": false,
+  "settings": {"mark_show_mm": 3.0, "blind": false},
+  "examples": [
+   {"criterion": "A", "value": 2, "panel": "sagittal", "slice": 3,
+    "media_base": "/media/9b2e41c07d2e4b8a/", "render_key": "0a1b2c3d4e5f6a7b",
+    "caption": "The pial surface encloses the superior sagittal sinus.",
+    "tiles": {"gray": "tiles/{panel}_{index:03d}.webp", "contours": "tiles/{panel}_{index:03d}_c.webp"}}
+  ]
+ },
+ "next_assignment": {
+  "status": "assignment",
+  "assignment": {
+   "assignment_id": 12, "kind": "main", "subject_uid": "3f9a1c07d2e4b8a1",
+   "media_base": "/media/3f9a1c07d2e4b8a1/", "render_key": "5d0c1f2a9b7e4c31",
+   "render": "@render_small.json", "has_vertex_map": true, "previous": null
+  },
+  "prefetch": [
+   {"subject_uid": "9b2e41c07d2e4b8a", "media_base": "/media/9b2e41c07d2e4b8a/",
+    "render_key": "0a1b2c3d4e5f6a7b", "n_slices": {"sagittal": 7, "coronal": 6, "axial": 7},
+    "tiles": {"gray": "tiles/{panel}_{index:03d}.webp", "contours": "tiles/{panel}_{index:03d}_c.webp"}}
+  ],
+  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "rendered": 120, "n_subjects": 150}
+ },
+ "next_revision": {
+  "status": "assignment",
+  "assignment": {
+   "assignment_id": 11, "kind": "main", "subject_uid": "9b2e41c07d2e4b8a",
+   "media_base": "/media/9b2e41c07d2e4b8a/", "render_key": "0a1b2c3d4e5f6a7b",
+   "render": "@render_small.json", "has_vertex_map": true,
+   "previous": {
+    "values": {"A": 2, "B": 0, "C": 0}, "unratable": null, "other": false, "note": "",
+    "marks": [
+     {"client_id": "m8", "mark_id": 8, "class": "A", "panel": "sagittal", "slice": 3,
+      "px": 30.5, "py": 28.25, "frame": 3, "mode": "sync", "ts": "2026-11-12T14:03:20.004Z",
+      "hemi": "lh", "pial_vertex": 211, "pial_dist_mm": 0.8, "white_vertex": 211,
+      "white_dist_mm": 2.9, "fsavg6_vertex": 12950, "vertex_surface": "pial", "box_dist_mm": 0.0}
+    ]
+   }
+  },
+  "prefetch": [],
+  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "rendered": 120, "n_subjects": 150}
+ },
+ "next_rendering": {
+  "status": "rendering", "retry_after_s": 2,
+  "progress": {"done_today": 0, "done_total": 0, "remaining": 150, "rendered": 0, "n_subjects": 150}
+ },
+ "next_done": {
+  "status": "done",
+  "progress": {"done_today": 12, "done_total": 150, "remaining": 0, "rendered": 150, "n_subjects": 150}
+ },
+ "rating_in": {
+  "assignment_id": 12, "protocol_version": "0.1-draft",
+  "values": {"A": 2, "B": 0, "C": 0}, "unratable": null, "other": false, "note": "",
+  "marks": [
+   {"client_id": "m1", "class": "A", "panel": "sagittal", "slice": 3, "px": 30.5, "py": 28.25,
+    "frame": 3, "mode": "sync", "ts": "2026-11-12T14:03:20.004Z"}
+  ],
+  "client_ts": "2026-11-12T14:03:22.120Z", "ms_on_subject": 14200
+ },
+ "rating_in_unratable": {
+  "assignment_id": 13, "protocol_version": "0.1-draft",
+  "values": {}, "unratable": "image too poor to judge", "other": false, "note": "",
+  "marks": [], "client_ts": "2026-11-12T14:04:01.500Z", "ms_on_subject": 6100
+ },
+ "rating_out": {
+  "saved": {
+   "assignment_id": 12, "submission_id": 30, "revision": 1,
+   "marks": [
+    {"client_id": "m1", "mark_id": 8, "hemi": "lh", "pial_vertex": 211, "pial_dist_mm": 0.8,
+     "white_vertex": 211, "white_dist_mm": 2.9, "fsavg6_vertex": 12950, "vertex_surface": "pial",
+     "box_dist_mm": 0.0}
+   ]
+  },
+  "next": {
+   "status": "done",
+   "progress": {"done_today": 4, "done_total": 41, "remaining": 0, "rendered": 41, "n_subjects": 41}
+  }
+ },
+ "events_in": {
+  "assignment_id": 12,
+  "events": [
+   {"ts": "2026-11-12T14:03:08.000Z", "type": "load", "payload": {}},
+   {"ts": "2026-11-12T14:03:12.250Z", "type": "pause", "payload": {"frame": 3}},
+   {"ts": "2026-11-12T14:03:20.000Z", "type": "frames",
+    "payload": {"mode": "sync", "visits": [[0, 83], [1, 83], [2, 84], [3, 7750]]}},
+   {"ts": "2026-11-12T14:03:20.004Z", "type": "mark_add", "payload": {"client_id": "m1", "class": "A"}}
+  ]
+ },
+ "events_out": {"stored": 4},
+ "review": {
+  "total": 3,
+  "columns": ["subject_uid", "subject_label", "dataset", "fs_version", "render_status",
+              "render_reason", "primary_rank", "composite", "composite_component", "flags",
+              "final_A", "final_B", "final_C", "final_method", "unratable_reason",
+              "n_ratings", "n_marks"],
+  "rows": [
+   {"subject_uid": "9b2e41c07d2e4b8a", "subject_label": "sub-001", "dataset": "D-0f2d1eaa",
+    "fs_version": "6.0.1", "render_status": "done", "render_reason": null, "primary_rank": 1,
+    "composite": 0.967, "composite_component": "mass_medial", "flags": "",
+    "final_A": 2, "final_B": 0, "final_C": 0, "final_method": "single",
+    "unratable_reason": null, "n_ratings": 1, "n_marks": 1},
+   {"subject_uid": "3f9a1c07d2e4b8a1", "subject_label": "sub-002", "dataset": "D-0f2d1eaa",
+    "fs_version": "6.0.1", "render_status": "done", "render_reason": null, "primary_rank": 2,
+    "composite": 0.0, "composite_component": "occ_ctrl_ratio", "flags": "",
+    "final_A": null, "final_B": null, "final_C": null, "final_method": null,
+    "unratable_reason": null, "n_ratings": 0, "n_marks": 0},
+   {"subject_uid": "c4d5e6f7a8b9c0d1", "subject_label": "sub-007", "dataset": "D-0f2d1eaa",
+    "fs_version": "6.0.1", "render_status": "failed", "render_reason": "missing surface",
+    "primary_rank": 3, "composite": null, "composite_component": null,
+    "flags": "no_thickness,partial_score",
+    "final_A": null, "final_B": null, "final_C": null, "final_method": "single",
+    "unratable_reason": "missing surface", "n_ratings": 0, "n_marks": 0}
+  ]
+ },
+ "subject": {
+  "subject_uid": "9b2e41c07d2e4b8a",
+  "media_base": "/media/9b2e41c07d2e4b8a/", "render_key": "0a1b2c3d4e5f6a7b",
+  "render": "@render_small.json",
+  "scores": {"subject_uid": "9b2e41c07d2e4b8a", "reference_id": "set-cecaad3b4478",
+             "primary_rank": 1, "composite": 0.967, "composite_component": "mass_medial"},
+  "ratings": [
+   {"assignment_id": 11, "rater": "local", "kind": "main", "render_key": "0a1b2c3d4e5f6a7b",
+    "render_current": true, "A": 2, "B": 0, "C": 0, "unratable_reason": null, "other": false,
+    "note": "", "revision": 1, "server_ts": "2026-11-12T14:03:22.300Z", "ms_on_subject": 14200}
+  ],
+  "marks": [
+   {"mark_id": 8, "assignment_id": 11, "rater": "local", "class": "A", "panel": "sagittal",
+    "slice": 3, "px": 30.5, "py": 28.25, "vox": [7.0, 6.9, 9.6], "tkr": [-5.0, -66.0, 11.0],
+    "hemi": "lh", "pial_vertex": 211, "pial_dist_mm": 0.8, "white_vertex": 211,
+    "white_dist_mm": 2.9, "fsavg6_vertex": 12950, "vertex_surface": "pial", "box_dist_mm": 0.0}
+  ],
+  "clusters": [
+   {"reference_id": "set-cecaad3b4478", "hemi": "lh", "region": "medial", "rank": 1,
+    "tkr": [-12.5, -68.0, 9.5], "area_mm2": 412.6, "peak_z": 41.5}
+  ]
+ },
+ "stats": {
+  "raters": [
+   {"rater": "local", "n_completed": 40, "median_s": 14.2,
+    "by_day": [{"day": "2026-11-12", "n": 40}]}
+  ],
+  "agreement": null, "drift": null
+ },
+ "errors_422": {
+  "errors": [{"field": "marks", "message": "criterion A is rated major but has no mark of class A"}]
+ },
+ "errors_409": {
+  "errors": [{"field": "protocol_version", "message": "the protocol changed since the page loaded; reload"}]
+ },
+ "health": {"ok": true, "version": "0.0.1"}
+}

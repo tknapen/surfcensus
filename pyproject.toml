@@ -32,6 +32,9 @@ all = ["surfcensus[app,analysis]"]
 
 [dependency-groups]
 dev = ["pytest", "ruff", "pyrefly", "beartype", "hypothesis"]
+# The browser test of the rater app (tests/test_browser.py, `just test-browser`). It drives a
+# browser that is already installed: the executable named by SURFCENSUS_BROWSER, else Chrome.
+browser = ["playwright"]
 
 [project.scripts]
 surfcensus = "surfcensus.cli:app"
@@ -45,8 +48,11 @@ packages = ["src/surfcensus"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not network'"
-markers = ["network: test needs internet access to public buckets"]
+addopts = "-m 'not network and not browser'"
+markers = [
+  "network: test needs internet access to public buckets",
+  "browser: test drives the rater app in a real browser (needs the browser dependency group)",
+]
 
 [tool.ruff]
 line-length = 100
