@@ -133,8 +133,42 @@ def test_write_npz_refuses_objects_and_leaves_nothing_behind(tmp_path: Path) -> 
 
 def test_read_npz_refuses_a_pickled_entry(tmp_path: Path) -> None:
     np.savez(tmp_path / "pickled.npz", o=np.array([{"a": 1}], dtype=object))
-    with pytest.raises(ValueError, match="allow_pickle"):
+    with pytest.raises(ValueError, match=r"^pickled\.npz cannot be read as an archive") as caught:
         _io.read_npz(tmp_path / "pickled.npz")
+    assert "allow_pickle" in str(caught.value.__cause__)
+
+
+def test_read_npz_turns_whatever_a_damaged_archive_raises_into_a_value_error(
+    tmp_path: Path,
+) -> None:
+    """One changed byte makes numpy and zipfile raise errors of many kinds: an error of
+    Python's tokenizer for the header of an array, NotImplementedError for a zip version.
+    A caller that lists the kinds it catches lets one of them through as a traceback."""
+    path = tmp_path / "maps.npz"
+    # more than zipfile reads at once, so that numpy parses a header before the CRC is checked
+    arrays = {"lh_thickness": np.ones(3000, "<f2"), "rh_thickness": np.ones(3000, "<f2")}
+    _io.write_npz(path, arrays)
+    whole = path.read_bytes()
+    second, directory = whole.index(b"PK\x03\x04", 4), whole.index(b"PK\x01\x02")
+    causes: set[str] = set()
+    for position in (*range(200), *range(second, second + 200), *range(directory, len(whole))):
+        damaged = bytearray(whole)
+        damaged[position] ^= 0x5A
+        (tmp_path / "flip.npz").write_bytes(bytes(damaged))
+        try:
+            _io.read_npz(tmp_path / "flip.npz")
+        except ValueError as exc:
+            assert str(exc) == "flip.npz cannot be read as an archive of arrays", position
+            causes.add(type(exc.__cause__).__name__)
+        except OSError:  # an offset in the directory that cannot be sought
+            causes.add("OSError")
+    # the sweep meets the kinds that are neither a ValueError nor a damaged-archive error
+    assert {"TokenError", "NotImplementedError", "BadZipFile"} <= causes
+    with pytest.raises(FileNotFoundError):
+        _io.read_npz(tmp_path / "absent.npz")
+    np.save(tmp_path / "plain.npy", np.arange(3))
+    with pytest.raises(ValueError, match=r"^plain\.npy cannot be read as an archive of arrays$"):
+        _io.read_npz(tmp_path / "plain.npy")
 
 
 # --- atomic_path ----------------------------------------------------------------------------

@@ -10,6 +10,7 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import hashlib
+import io
 import logging
 import shutil
 import sqlite3
@@ -30,12 +31,26 @@ from synth_tierb import (  # pyrefly: ignore[missing-import]
     synthetic_cohort,
 )
 
-from surfcensus.config import ConfigError, MetricsConfig, RunConfig, new_local_config, with_changes
+from surfcensus.config import (
+    STAGE_SCHEMAS,
+    ConfigError,
+    MetricsConfig,
+    RunConfig,
+    new_local_config,
+    stage_hashes,
+    with_changes,
+)
 from surfcensus.fsio.annot import read_annotation
 from surfcensus.fsio.morph import read_morph
 from surfcensus.fsio.surfaces import read_surface
 from surfcensus.metrics.clusters import find_clusters
-from surfcensus.metrics.fsaverage import MAD_TO_SD, global_median, read_maps, resample_hemi
+from surfcensus.metrics.fsaverage import (
+    MAD_TO_SD,
+    global_median,
+    read_maps,
+    resample_hemi,
+    write_maps,
+)
 from surfcensus.metrics.pipeline import (
     map_path,
     merge_tables,
@@ -45,6 +60,7 @@ from surfcensus.metrics.pipeline import (
 )
 from surfcensus.metrics.regional import occ_ctrl_ratio
 from surfcensus.metrics.scoring import quantile_scores
+from surfcensus.privacy import HashKey, dataset_pseudonym, local_salt_from_hex
 from surfcensus.records import ALL_METRIC_STAGES, METRIC_STAGES, PhaseReport
 from surfcensus.reference import load
 from surfcensus.reference.load import Reference, read_index, read_reference, write_reference
@@ -202,10 +218,22 @@ def test_scores_have_one_primary_row_per_subject(cohort_run: CohortRun) -> None:
     index = read_index(reference_dir(cohort_run.run_dir, reference_id))
     assert index.strata[f"dataset:{dataset}"].n == 31
 
+    # rank is within a reference: the subject without a map is rank 1 among the rows
+    # without one. primary_rank is the one order of the run, and puts it last
+    assert sorted(scores.loc[scores["rank"] == 1, "reference_id"]) == sorted(["none", reference_id])
+    assert sorted(scores["primary_rank"]) == list(range(1, 33))
+    assert scores.loc[unmapped, "primary_rank"].tolist() == [32]
+    assert scored["primary_rank"].tolist() == scored["rank"].tolist()
+
     with Run(cohort_run.run_dir) as run:
         primary = run.scores()
         assert len(primary) == 32 and primary["reference_id"].iloc[-1] == "none"
         assert list(primary["rank"].iloc[:31]) == list(range(1, 32))
+        assert list(primary["primary_rank"]) == list(range(1, 33))
+        # a local run names its subjects
+        assert list(primary.columns[:2]) == ["subject_uid", "subject_label"]
+        assert dict(zip(primary["subject_label"], primary["subject_uid"], strict=True)) == uids
+        assert list(primary.columns.drop("subject_label")) == SCHEMAS["scores"].names
         joined = run.clusters()
         assert len(joined) == len(table(cohort_run.run_dir, "clusters"))
         assert joined["native_vertex"].isna().all()
@@ -285,6 +313,31 @@ def test_a_second_run_does_nothing(cohort_copy: Path) -> None:
     rewritten = {p.name for p in before if after[p] != before[p]}
     assert rewritten <= {CATALOG_FILE, "regional.parquet", "vertex_summary.parquet"}
     assert set(after) == set(before)
+
+
+def test_scores_written_before_primary_rank_are_computed_again(
+    cohort_copy: Path, cohort_run: CohortRun, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The column changed what the score stage writes for equal settings, so the stage got
+    another schema number: a table of the earlier form is not skipped over."""
+    whole = table_path(cohort_copy, "scores").read_bytes()
+    template_id = table(cohort_copy, "scores")["template_id"].dropna().iloc[0]
+    with monkeypatch.context() as earlier:
+        earlier.setitem(STAGE_SCHEMAS, "score", 1)
+        old_hash = stage_hashes(cohort_run.config, template_id=template_id)["score"]
+    assert old_hash != stage_hashes(cohort_run.config, template_id=template_id)["score"]
+    pd.read_parquet(table_path(cohort_copy, "scores")).drop(columns="primary_rank").to_parquet(
+        table_path(cohort_copy, "scores")
+    )
+    with contextlib.closing(sqlite3.connect(cohort_copy / CATALOG_FILE)) as conn, conn:
+        changed = conn.execute(
+            "UPDATE work SET config_hash = ? WHERE phase = 'score'", (old_hash,)
+        ).rowcount
+    assert changed == 1
+    with Run(cohort_copy) as run:
+        assert counts(run.metrics()) == (1, 64, 0)
+        assert list(run.scores()["primary_rank"]) == list(range(1, 33))
+    assert table_path(cohort_copy, "scores").read_bytes() == whole
 
 
 def test_changing_the_cluster_threshold_redoes_the_run_level_stages_only(
@@ -702,22 +755,158 @@ def test_a_damaged_map_stops_the_phase_and_is_made_again(
         run.metrics()
         uids = labels(run)
         files = run_files(run_dir)
-        truncated, garbage = map_path(run_dir, uids["sub-001"]), map_path(run_dir, uids["sub-002"])
+        flipped, truncated, garbage, short = (
+            map_path(run_dir, uids[label]) for label in ("sub-000", "sub-001", "sub-002", "sub-003")
+        )
+        # one changed byte in the header of an array: numpy raises an error of the tokenizer,
+        # which used to pass as a traceback
+        changed = bytearray(flipped.read_bytes())
+        changed[54] ^= 0x5A
+        flipped.write_bytes(bytes(changed))
         truncated.write_bytes(truncated.read_bytes()[:300])
         garbage.write_bytes(b"not an archive")
+        # a whole archive of two maps on another mesh: a copy from another run
+        write_maps(short, {"lh": np.ones(10, np.float32), "rh": np.ones(10, np.float32)})
         # nothing reads a map while nothing is pending
         assert counts(run.metrics()) == (0, 4 + 4 + 2, 0)
         with pytest.raises(ConfigError, match="could not be read") as raised:
             run.metrics(stages=["reference"], force=True)
-        # a fault of the run: one error that names both subjects, and no failed unit
+        # a fault of the run: one error that names the four subjects, and no failed unit
         assert raised.value.reason == "invalid"
-        assert uids["sub-001"] in str(raised.value) and uids["sub-002"] in str(raised.value)
+        assert all(uid in str(raised.value) for uid in uids.values())
         assert "/" not in raised.value.detail.replace("tables/fsavg", "")
-        assert not truncated.exists() and not garbage.exists()
+        assert not any(path.exists() for path in (flipped, truncated, garbage, short))
         assert catalog_failures(run_dir) == []
-        # the same command makes the two maps again, with the bytes they had
-        assert counts(run.metrics()) == (2, 4 + 2 + 2, 0)
+        # the same command makes the four maps again, with the bytes they had
+        assert counts(run.metrics()) == (4, 4 + 0 + 2, 0)
     assert run_files(run_dir) == files
+
+
+def test_a_map_on_another_mesh_is_no_zmap(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(tmp_path / "run", local(cohort.root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        uid = labels(run)["sub-001"]
+        assert set(run.zmap(uid)) == set(HEMIS)
+        path = map_path(run.run_dir, uid)
+        write_maps(path, {"lh": np.ones(10, np.float32), "rh": np.ones(10, np.float32)})
+        with pytest.raises(ValueError, match=r"\.npz: maps of 10 vertices, on a mesh of \d+$"):
+            run.zmap(uid)
+        assert path.exists()  # reading a z-map removes nothing
+
+
+REFERENCE_DAMAGE = {
+    "a stratum cut short": lambda directory: (directory / "stratum_000.npz").write_bytes(
+        (directory / "stratum_000.npz").read_bytes()[:1000]
+    ),
+    "an index that is no JSON": lambda directory: (directory / "index.json").write_text("{"),
+    "no member table": lambda directory: (directory / "members.parquet").unlink(),
+}
+
+
+@pytest.mark.parametrize("damage", sorted(REFERENCE_DAMAGE))
+def test_a_reference_that_does_not_read_back_is_built_again(
+    damage: str, synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """The skip test of the reference stage asked only whether ``index.json`` exists, so a
+    damaged reference stayed done: ``Run.zmap`` raised on it and the score stage ended in a
+    traceback."""
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        uid = labels(run)["sub-001"]
+        files = run_files(run_dir)
+        (reference_id,) = (path.name for path in (run_dir / "tables" / "reference").iterdir())
+        REFERENCE_DAMAGE[damage](reference_dir(run_dir, reference_id))
+        # a fault of the run, said in one line with what to do, and no failed unit
+        for call in (lambda: run.zmap(uid), lambda: run.metrics(stages=["score"], force=True)):
+            with pytest.raises(ConfigError, match="cannot be read; run `surfcensus metrics`") as e:
+                call()
+            assert e.value.reason == "invalid" and reference_id in e.value.detail
+            assert str(tmp_path) not in e.value.detail
+        assert catalog_failures(run_dir) == []
+        # the plain command builds the reference again, with the bytes it had, and nothing else
+        assert counts(run.metrics()) == (1, 4 + 4 + 1, 0)
+        assert run_files(run_dir) == files
+        assert counts(run.metrics()) == (0, 4 + 4 + 2, 0)
+        assert set(run.zmap(uid)) == set(HEMIS)
+
+
+def test_an_fsaverage_that_arrives_after_the_inventory_is_found(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """The directory next to the subjects was looked for only where the inventory had
+    recorded one, so ``metrics`` said "absent" while it was there."""
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template, with_template=False)
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        assert counts(run.metrics()) == (4 + 4 + 1, 0, 0)
+        assert run.public().meta("template_id") is None
+        assert set(run.scores()["score_kind"]) == {"fallback_rank"}
+    (cohort.root / "fsaverage").symlink_to(synth_template.path, target_is_directory=True)
+    with Run(run_dir) as run:  # no second inventory
+        report = run.metrics()
+        template = run.template()
+        assert template is not None and template.origin == "adjacent"
+        assert run.public().meta("template_id") == template.template_id
+        # the maps, the reference and the scores; the parcel rows stay
+        assert counts(report) == (4 + 2, 4, 0) and report.notes == ()
+        assert set(run.scores()["score_kind"]) == {"composite_z"}
+        with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+            (row,) = catalog.query("SELECT origin, dataset_id FROM templates")
+            assert row["origin"] == "adjacent" and row["dataset_id"] is not None
+
+
+def test_the_first_usable_fsaverage_next_to_the_subjects_is_the_template(
+    synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """Of two datasets, the first in pseudonym order has an ``fsaverage`` that lacks files.
+    It used to be the only one looked at, and the run had no template."""
+    roots = [
+        little_cohort(tmp_path / name, 2, synth_template, with_template=False).root
+        for name in ("one", "two")
+    ]
+    config = new_local_config(roots[0])
+    assert config.identity.local_salt is not None
+    salt = local_salt_from_hex(config.identity.local_salt)
+    roots.sort(key=lambda root: dataset_pseudonym(salt, "local", str(root.resolve())))
+    (roots[0] / "fsaverage" / "surf").mkdir(parents=True)
+    (roots[1] / "fsaverage").symlink_to(synth_template.path, target_is_directory=True)
+    run_dir = tmp_path / "run"
+    with Run(run_dir, [local(root) for root in roots], config=config) as run:
+        assert counts(run.inventory()) == (4, 0, 0)
+        template = run.template()
+        assert template is not None and template.origin == "adjacent"
+    with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
+        rows = catalog.query(
+            "SELECT root, template_location FROM datasets ORDER BY pseudonym, source, pipeline"
+        )
+        assert [row["root"] for row in rows] == [str(root.resolve()) for root in roots]
+        assert all(row["template_location"] == "fsaverage" for row in rows)
+        (used,) = catalog.query(
+            "SELECT d.root FROM templates t JOIN datasets d ON d.dataset_id = t.dataset_id"
+        )
+        assert used["root"] == str(roots[1].resolve())
+
+
+def test_a_census_run_scores_without_labels(small_cohort: SyntheticCohort, tmp_path: Path) -> None:
+    key = HashKey(bytes(range(1, 33)), "dataset-key")
+    with Run(tmp_path / "run", local(small_cohort.root), key=key) as run:
+        assert run.config.mode == "census"
+        run.inventory()
+        run.metrics()
+        scores = run.scores()
+    assert list(scores.columns) == SCHEMAS["scores"].names
+    assert list(scores["primary_rank"]) == [1, 2, 3, 4, 5] == list(scores["rank"])
 
 
 # ---------------------------------------------------------------------------------------
@@ -905,14 +1094,38 @@ def test_native_fills_its_table_again_and_leaves_the_clusters(run_copy: Path) ->
     assert native.read_bytes() == was and table_path(run_copy, "clusters").read_bytes() == clusters
 
 
-def test_a_damaged_vertex_map_leaves_its_subject_without_native_rows(run_copy: Path) -> None:
+def _zip_version(whole: bytes) -> bytes:
+    """One changed byte in the zip directory: zipfile raises NotImplementedError."""
+    changed = bytearray(whole)
+    changed[whole.index(b"PK\x01\x02") + 6] ^= 0x5A
+    return bytes(changed)
+
+
+def _other_arrays(whole: bytes) -> bytes:
+    """A whole archive that holds no array of a vertex map."""
+    buffer = io.BytesIO()
+    np.savez(buffer, lh_index=np.arange(3), thickness=np.ones(3))
+    return buffer.getvalue()
+
+
+VERTEX_MAP_DAMAGE = {
+    "cut short": lambda whole: whole[:500],
+    "zip version": _zip_version,
+    "other arrays": _other_arrays,
+}
+
+
+@pytest.mark.parametrize("damage", sorted(VERTEX_MAP_DAMAGE))
+def test_a_damaged_vertex_map_leaves_its_subject_without_native_rows(
+    damage: str, run_copy: Path
+) -> None:
     native = table(run_copy, "clusters_native")
     uid = str(native["subject_uid"].iloc[0])
     others = native[native["subject_uid"] != uid].reset_index(drop=True)
     assert len(others)
     vertex_map = run_copy / "media" / uid / "vertex_map.npz"
     whole = vertex_map.read_bytes()
-    vertex_map.write_bytes(whole[:500])
+    vertex_map.write_bytes(VERTEX_MAP_DAMAGE[damage](whole))
     with Run(run_copy) as run:
         report = run.metrics(stages=["native"], force=True)
         # no unit fails; a note names the subject and says what to do

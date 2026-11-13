@@ -30,6 +30,7 @@ __all__ = [
     "MASS_REGIONS",
     "METRIC_COLUMNS",
     "STD_COLUMNS",
+    "add_primary_rank",
     "add_rank",
     "composite",
     "fallback_rank",
@@ -693,4 +694,33 @@ def add_rank(scores: pd.DataFrame) -> pd.DataFrame:
     rank[order.index.to_numpy()] = order.groupby("reference_id").cumcount().to_numpy() + 1
     out = scores.copy()
     out["rank"] = rank
+    return out
+
+
+def add_primary_rank(scores: pd.DataFrame) -> pd.DataFrame:
+    """``scores`` with ``primary_rank``: the primary rows of the run in one order, numbered
+    1 to their count; missing in every other row.
+
+    ``rank`` is within a ``reference_id``, so among the primary rows it is not unique: a
+    subject without a z-map has a row under the reference ``none`` and is ranked among such
+    rows, where it can be rank 1 beside the rank 1 of the scored subjects. Here the
+    subjects scored against a reference come first, by ``rank``, and those without one
+    after them, by ``rank``; equal ranks (primary rows under two references) go by
+    ``subject_uid``. A consumer that needs one ordering of the subjects, a queue or a
+    sample by decile, takes this column.
+    """
+    _require(scores, "scores", (*_KEY, "primary", "rank"))
+    primary = scores["primary"].to_numpy(dtype=bool)
+    order = pd.DataFrame(
+        {
+            "unreferenced": (scores["reference_id"] == NO_REFERENCE).to_numpy(dtype=bool),
+            "rank": scores["rank"].to_numpy(dtype=np.int64),
+            "subject_uid": scores["subject_uid"].to_numpy(dtype=object),
+        }
+    )[primary].sort_values(["unreferenced", "rank", "subject_uid"])
+    position = np.zeros(len(scores), dtype=np.int64)
+    position[order.index.to_numpy()] = np.arange(1, len(order) + 1)
+    out = scores.copy()
+    out["primary_rank"] = pd.array(position, dtype="Int32")
+    out.loc[~primary, "primary_rank"] = pd.NA
     return out

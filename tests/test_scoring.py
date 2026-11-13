@@ -43,6 +43,7 @@ from surfcensus.metrics.scoring import (
     MASS_REGIONS,
     METRIC_COLUMNS,
     STD_COLUMNS,
+    add_primary_rank,
     add_rank,
     composite,
     fallback_rank,
@@ -394,7 +395,8 @@ def test_the_names_follow_the_scores_schema() -> None:
     ]
     assert STD_COLUMNS == tuple(f"std_{name}" for name in CONFIG.components)
     assert set(FALLBACK_COMPONENTS) <= set(CONFIG.components)
-    later = {"primary", "stratum", "n_reference", "score_config_hash"}  # the pipeline's
+    # the pipeline's
+    later = {"primary", "primary_rank", "stratum", "n_reference", "score_config_hash"}
     ours = {*METRIC_COLUMNS, *STD_COLUMNS, "composite", "composite_component", "n_components"}
     assert set(names) == ours | {"score_kind", "rank"} | later
 
@@ -1158,6 +1160,7 @@ def test_a_run_without_subjects_scores_to_empty_frames() -> None:
         assert len(ranked) == 0
         assert set(schemas.SCORES.names) - set(ranked.columns) == {
             "primary",
+            "primary_rank",
             "stratum",
             "n_reference",
             "score_config_hash",
@@ -1327,6 +1330,41 @@ def test_the_composite_is_compared_as_it_is_stored() -> None:
     assert add_rank(frame)["rank"].tolist() == [2, 1]
     frame["composite"] = np.array([1.0 + 1e-6, 1.0])  # not equal as float32
     assert add_rank(frame)["rank"].tolist() == [1, 2]
+
+
+def test_primary_rank_is_one_order_over_the_primary_rows() -> None:
+    """``rank`` is within a reference, so a subject without a z-map is rank 1 among the
+    rows without a reference, beside the rank 1 of the scored subjects. ``primary_rank``
+    numbers the primary rows once: those with a reference first."""
+    frame = add_rank(
+        rank_frame(
+            [
+                ("a", REF, 0.5, 0.5, 0.1),
+                ("b", REF, 2.0, 2.0, 0.0),
+                ("c", NONE, 3.0, 3.0, None),  # no thickness: scored on what is left
+                ("a", OTHER, 0.1, 0.1, 0.0),
+                ("b", OTHER, -0.3, -0.3, -1.0),
+                ("d", NONE, 1.0, 1.0, None),
+                ("e", OTHER, 0.0, 0.0, 0.0),  # primary under another reference than a and b
+            ]
+        )
+    )
+    frame["primary"] = [True, True, True, False, False, True, True]
+    assert frame["rank"].tolist() == [2, 1, 1, 1, 3, 2, 2]
+    assert frame.loc[frame["primary"], "rank"].tolist().count(1) == 2
+    ranked = add_primary_rank(frame)
+    assert ranked["primary_rank"].dtype == pd.Int32Dtype()
+    # b (1), then a and e (both 2, by subject), then the two without a reference
+    assert ranked["primary_rank"].tolist() == [2, 1, 4, pd.NA, pd.NA, 5, 3]
+    assert ranked.drop(columns="primary_rank").equals(frame)
+    assert "primary_rank" not in frame.columns
+    # the order of the rows does not matter, and an earlier column is replaced
+    again = add_primary_rank(ranked.assign(primary_rank=0).iloc[::-1].reset_index(drop=True))
+    assert again["primary_rank"].tolist() == [2, 1, 4, pd.NA, pd.NA, 5, 3][::-1]
+    empty = add_primary_rank(add_rank(rank_frame([])).assign(primary=True))
+    assert len(empty) == 0 and empty["primary_rank"].dtype == pd.Int32Dtype()
+    with pytest.raises(ValueError, match="scores: no column primary"):
+        add_primary_rank(frame.drop(columns="primary"))
 
 
 # --- cohorts --------------------------------------------------------------------------------
@@ -1544,9 +1582,15 @@ def test_the_three_bad_subjects_of_the_cohort_rank_one_to_three(
     assert scores.loc[no_sphere, "std_ceiling_frac"] == pytest.approx(score(0.5 / 32))
 
     # with the columns the pipeline adds, the frame is a scores table
-    full = scores.reset_index().assign(
-        primary=True, stratum=None, n_reference=31, score_config_hash="0" * 12
+    full = add_primary_rank(scores.reset_index().assign(primary=True)).assign(
+        stratum=None, n_reference=31, score_config_hash="0" * 12
     )
+    # one order over the 32: the 31 with a reference by their rank, then the one without
+    assert sorted(full["primary_rank"]) == list(range(1, 33))
+    by_uid = full.set_index("subject_uid")
+    assert by_uid.loc[no_sphere, "primary_rank"] == 32 and by_uid.loc[no_sphere, "rank"] == 1
+    referenced = by_uid.drop(index=no_sphere)
+    assert referenced["primary_rank"].tolist() == referenced["rank"].tolist()
     path = tmp_path / "scores.parquet"
     store.write_table(path, full, schemas.SCORES, sort_by=schemas.KEYS["scores"])
     back = store.read_table(path, schemas.SCORES).set_index("subject_uid")

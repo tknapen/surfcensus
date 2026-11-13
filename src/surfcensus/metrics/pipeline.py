@@ -17,8 +17,9 @@ catalog, so that a row traces to the bytes it was computed from. For the same re
 remove what they hold of a subject that no longer has their files.
 
 An output of the run that is damaged is not a failure of a subject: a map that cannot be
-read stops the phase and is removed, to be made again; a vertex map that cannot be read is
-named in a note.
+read, or is on another mesh, stops the phase and is removed, to be made again; a reference
+of the run that does not read back is built again; a vertex map that cannot be read, or
+does not hold the arrays of one, is named in a note.
 
 A phase function receives a ``RunContext`` and never the run, so it names subjects by
 ``subject_uid`` and datasets by pseudonym.
@@ -30,12 +31,11 @@ import hashlib
 import math
 import shutil
 import time
-import zipfile
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -77,6 +77,7 @@ from surfcensus.reference.load import (
     ReferenceMaps,
     applicable_stratum,
     read_index,
+    read_reference,
     shipped_reference,
     stratum_size,
     write_reference,
@@ -716,9 +717,10 @@ def run_metrics(
     The report counts the units worked on now (``done``), skipped, and in the failed state
     when the call returns (``failed``; ``failures`` holds ``(unit, "<stage>: <reason>")``).
 
-    Raises ``ConfigError("invalid", ...)`` for a stage that does not exist, and for a map
-    of the run that the ``reference`` stage cannot read: the file is removed and the next
-    call makes it again.
+    Raises ``ConfigError("invalid", ...)`` for a stage that does not exist; for a map of
+    the run that the ``reference`` stage cannot read or that is on another mesh (the file
+    is removed and the next call makes it again); and for a reference of the run that the
+    ``score`` stage cannot read, which the ``reference`` stage builds again when it runs.
     """
     started = time.perf_counter()
     wanted = _checked_stages(stages)
@@ -850,17 +852,39 @@ def _reference_hash(ctx: RunContext, template: Template | None) -> str:
     return stage_hashes(ctx.config, template_id=template_id)["reference"]
 
 
-def _reference_current(ctx: RunContext, template: Template | None, scored: _Scored) -> bool:
+def _reference_state(
+    ctx: RunContext, template: Template | None, scored: _Scored
+) -> Literal["current", "stale", "damaged"]:
+    """Where the output of the ``reference`` unit stands. ``stale``: the ledger has no done
+    row for the present settings and maps, or a file that the row names is gone.
+    ``damaged``: the row is current and the set reference it names does not read back as a
+    reference of that id on the template's mesh. Reads the reference, 1 MB per stratum on
+    fsaverage6."""
     done = ctx.public.work_done(
         "reference", RUN_UNIT, _reference_hash(ctx, template), scored.signature
     )
     if done is not True:
-        return False
+        return "stale"
     _, output = _reference_row(ctx)
     if not isinstance(output, str):
-        return True
+        return "current"
     run_dir = Path(ctx.run_dir)
-    return (run_dir / output).is_file() and table_path(run_dir, "clusters").is_file()
+    if not ((run_dir / output).is_file() and table_path(run_dir, "clusters").is_file()):
+        return "stale"
+    set_id = _set_reference_id(ctx)
+    if set_id is None:
+        return "current"
+    try:
+        reference = read_reference(reference_dir(run_dir, set_id))
+    except (OSError, ValueError):
+        return "damaged"
+    lengths = {len(maps[hemi].median) for maps in reference.strata.values() for hemi in HEMIS}
+    expected = lengths if template is None else {len(template.hemis[HEMIS[0]].cortex)}
+    return "current" if reference.reference_id == set_id and lengths <= expected else "damaged"
+
+
+def _reference_current(ctx: RunContext, template: Template | None, scored: _Scored) -> bool:
+    return _reference_state(ctx, template, scored) == "current"
 
 
 # --- reference and clusters -----------------------------------------------------------------
@@ -980,18 +1004,22 @@ def _merge(ctx: RunContext, table: str) -> Path:
     return merge_parts(ctx.run_dir, table, present=ctx.public.subject_uids())
 
 
-def _read_run_maps(ctx: RunContext, uids: Sequence[str]) -> dict[str, dict[Hemi, np.ndarray]]:
-    """The maps of ``uids``. One that cannot be read is an output of the run that was
-    damaged, not a property of its subject: every such map is removed, so that the
-    ``fsaverage`` stage finds it missing and makes it again, and the phase stops.
+def _read_run_maps(
+    ctx: RunContext, template: Template, uids: Sequence[str]
+) -> dict[str, dict[Hemi, np.ndarray]]:
+    """The maps of ``uids``. One that cannot be read, or is not on the mesh of the template,
+    is an output of the run that was damaged, not a property of its subject: every such map
+    is removed, so that the ``fsaverage`` stage finds it missing and makes it again, and
+    the phase stops.
 
     Raises ``ConfigError("invalid", ...)`` that names the subjects.
     """
     maps: dict[str, dict[Hemi, np.ndarray]] = {}
     damaged: list[str] = []
+    n_vertices = len(template.hemis[HEMIS[0]].cortex)
     for uid in uids:
         try:
-            maps[uid] = read_maps(map_path(ctx.run_dir, uid))
+            maps[uid] = read_maps(map_path(ctx.run_dir, uid), n_vertices)
         except (OSError, ValueError):
             damaged.append(uid)
     if damaged:
@@ -1026,7 +1054,7 @@ def _reference_stage(
             return
 
     uids = [str(uid) for uid in scored.with_map["subject_uid"]]
-    maps = _read_run_maps(ctx, uids)
+    maps = _read_run_maps(ctx, template, uids)
     medians = {
         uid: {hemi: global_median(maps[uid][hemi], template.hemis[hemi]) for hemi in HEMIS}
         for uid in uids
@@ -1177,6 +1205,7 @@ def _score_frame(
         .transform("min")
     )
     frame["primary"] = np.asarray([order.get(r, -1) for _, r in keys]) == first.to_numpy()
+    frame = scoring.add_primary_rank(frame)
     strata_column = [stratum_of.get(key) for key in keys]
     frame["stratum"] = pd.Series(strata_column, index=frame.index, dtype=object)
     frame["n_reference"] = pd.array(
@@ -1234,7 +1263,16 @@ def _score_stage(
             reason, _ = _recorded(ctx, "score").get(RUN_UNIT, (None, None))
             tally.failures[("score", RUN_UNIT)] = reason or METRIC_FAILURE
             return
-    if template is not None and not _reference_current(ctx, template, scored):
+    state = "current" if template is None else _reference_state(ctx, template, scored)
+    if state == "damaged":
+        # an output of the run that does not read back is no property of a subject, and the
+        # reference stage builds it again from the maps
+        raise ConfigError(
+            "invalid",
+            f"the reference {_set_reference_id(ctx)} in {REFERENCE_DIR} cannot be read; "
+            "run `surfcensus metrics`, which builds it again",
+        )
+    if state == "stale":
         # Scores from clusters of another state of the run would look like any others. This
         # says something about the order of the calls, not about the inputs, so no row is
         # recorded: the next call looks again.
@@ -1273,9 +1311,9 @@ def update_native(
     vertex in that render's vertex map. Without a template or a cluster table there is no
     table, and one that an earlier state left is removed. ``clusters.parquet`` is only read.
 
-    A vertex map that cannot be read leaves its subject without rows and is named in a note
-    of the report; it fails no unit, and every later call reads the file again, so a render
-    made anew is picked up.
+    A vertex map that cannot be read, or that lacks the arrays of one, leaves its subject
+    without rows and is named in a note of the report; it fails no unit, and every later
+    call reads the file again, so a render made anew is picked up.
     """
     started = time.perf_counter()
     tally = _Tally()
@@ -1319,10 +1357,12 @@ def _native_stage(
             continue
         try:
             vertex_map = read_npz(path)
-        except (OSError, ValueError, EOFError, KeyError, zipfile.BadZipFile):
+            frame = native_centroids(rows.reset_index(drop=True), vertex_map, adjacency)
+        except (OSError, ValueError, KeyError, IndexError):
+            # not an archive of arrays, or not the arrays of a vertex map
             damaged.append(str(uid))  # its centroids get no row
             continue
-        frames.append(native_centroids(rows.reset_index(drop=True), vertex_map, adjacency))
+        frames.append(frame)
     if frames:
         native = pd.concat(frames, ignore_index=True)
     else:

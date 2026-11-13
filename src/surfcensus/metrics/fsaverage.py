@@ -15,7 +15,6 @@ library or the thread count.
 from __future__ import annotations
 
 import math
-import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -190,18 +189,20 @@ def write_maps(path: Path, maps: Mapping[Hemi, Float[np.ndarray, " v"]]) -> None
     write_npz(path, arrays)
 
 
-def read_maps(path: Path) -> dict[Hemi, Float[np.ndarray, " v"]]:
+def read_maps(path: Path, n_vertices: int | None = None) -> dict[Hemi, Float[np.ndarray, " v"]]:
     """The two maps of a file written by :func:`write_maps`, as float32.
 
     ``FileNotFoundError`` for a file that is not there; ``ValueError``, naming the file and
-    not its path, for one that is not an archive of the two float16 maps.
+    not its path, for one that is not an archive of the two float16 maps. With
+    ``n_vertices``, the vertex count of the mesh the maps should be on, also for maps of
+    another length: a file that was copied from a run on another mesh, or written over.
     """
     path = Path(path)
     try:
         arrays = read_npz(path)
     except FileNotFoundError:
         raise
-    except (ValueError, OSError, EOFError, KeyError, zipfile.BadZipFile) as exc:
+    except (ValueError, OSError) as exc:
         raise ValueError(f"{path.name} cannot be read as an archive of arrays") from exc
     keys = [f"{hemi}_thickness" for hemi in HEMIS]
     if list(arrays) != keys:
@@ -215,6 +216,10 @@ def read_maps(path: Path) -> dict[Hemi, Float[np.ndarray, " v"]]:
     if len(maps["lh"]) != len(maps["rh"]):
         raise ValueError(
             f"{path.name}: the maps have {len(maps['lh'])} and {len(maps['rh'])} vertices"
+        )
+    if n_vertices is not None and len(maps["lh"]) != n_vertices:
+        raise ValueError(
+            f"{path.name}: maps of {len(maps['lh'])} vertices, on a mesh of {n_vertices}"
         )
     return maps
 

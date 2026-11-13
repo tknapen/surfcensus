@@ -27,7 +27,6 @@ from __future__ import annotations
 import json
 import math
 import re
-import zipfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from itertools import pairwise
@@ -513,7 +512,7 @@ def _read_stratum(path: Path) -> dict[str, np.ndarray]:
         raise ValueError(f"{INDEX_JSON} lists {path.name}, which is missing")
     try:
         arrays = read_npz(path)
-    except (ValueError, OSError, EOFError, KeyError, zipfile.BadZipFile) as exc:
+    except (ValueError, OSError) as exc:
         raise ValueError(f"{path.name} cannot be read as an archive of arrays") from exc
     expected = {f"{hemi}_{field}": dtype for hemi in HEMIS for field, dtype in _MAP_DTYPES.items()}
     if set(arrays) != set(expected):

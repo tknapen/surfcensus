@@ -450,12 +450,7 @@ def read_template(directory: Path) -> Template:
         raise ValueError(
             f"{TEMPLATE_JSON}: its content is not that of the template {info.template_id}"
         )
-    try:
-        arrays = read_npz(directory / TEMPLATE_NPZ)
-    except OSError:
-        raise
-    except Exception as exc:  # zipfile and numpy raise several kinds of error
-        raise ValueError(f"{TEMPLATE_NPZ} cannot be read: {exc}") from exc
+    arrays = read_npz(directory / TEMPLATE_NPZ)
 
     n, n_faces = icosahedron_vertices(info.order), 20 * 4**info.order
     layout: dict[str, tuple[str, tuple[int, ...]]] = {}

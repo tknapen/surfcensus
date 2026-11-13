@@ -242,9 +242,8 @@ def test_render_takes_the_template_option_as_well(
 def test_the_template_next_to_the_subjects_is_found_without_an_option(
     three: Path, three_run: Path, synth_template: SyntheticTemplate
 ) -> None:
+    # the directory arrives after the inventory, and is found without a second one
     (three / "fsaverage").symlink_to(synth_template.path, target_is_directory=True)
-    # the inventory records that the directory is there
-    assert cli("inventory", "--run-dir", three_run).exit_code == 0
     result = cli("metrics", "--run-dir", three_run)
     assert result.exit_code == 0 and closing(result, 8, 0, 0) and result.stderr == ""
     shutil.rmtree(three_run / "templates")
@@ -270,6 +269,47 @@ def test_a_damaged_map_of_the_run_is_one_line_and_exit_code_2(run_copy: Path) ->
     again = cli("metrics", "--run-dir", run_copy)
     assert again.exit_code == 0 and closing(again, 1, 7, 0), again.output
     assert maps[0].read_bytes() == whole
+
+
+def test_a_changed_byte_in_a_map_or_a_vertex_map_is_no_traceback(run_copy: Path) -> None:
+    """One changed byte makes numpy or zipfile raise an error that no reader listed: both
+    used to end the command in a traceback with exit code 1."""
+    maps = sorted((run_copy / "tables" / "fsavg").iterdir())
+    changed = bytearray(maps[0].read_bytes())
+    changed[54] ^= 0x5A  # in the header of the first array
+    maps[0].write_bytes(bytes(changed))
+    stopped = cli("metrics", "--run-dir", run_copy, "--stage", "reference", "--force")
+    assert stopped.exit_code == 2 and isinstance(stopped.exception, SystemExit), stopped.output
+    assert stopped.output.startswith("invalid: the fsaverage map of 1 subject(s)")
+    assert closing(cli("metrics", "--run-dir", run_copy), 1, 7, 0)
+
+    vertex_map = sorted((run_copy / "media").glob("*/vertex_map.npz"))[0]
+    whole = vertex_map.read_bytes()
+    changed = bytearray(whole)
+    changed[whole.index(b"PK\x01\x02") + 6] ^= 0x5A  # the zip version of the first entry
+    vertex_map.write_bytes(bytes(changed))
+    noted = cli("metrics", "--run-dir", run_copy, "--stage", "native", "--force")
+    assert noted.exit_code == 0 and closing(noted, 1, 0, 0), noted.output
+    assert f"cannot be read ({vertex_map.parent.name})" in noted.stdout
+
+
+def test_a_damaged_reference_is_one_line_and_the_plain_command_builds_it_again(
+    run_copy: Path,
+) -> None:
+    name = reference_id(run_copy)
+    stratum = run_copy / "tables" / "reference" / name / "stratum_000.npz"
+    whole = stratum.read_bytes()
+    stratum.write_bytes(whole[:1000])
+    stopped = cli("metrics", "--run-dir", run_copy, "--stage", "score", "--force")
+    assert stopped.exit_code == 2 and isinstance(stopped.exception, SystemExit), stopped.output
+    assert stopped.output == (
+        f"invalid: the reference {name} in tables/reference cannot be read; "
+        "run `surfcensus metrics`, which builds it again\n"
+    )
+    again = cli("metrics", "--run-dir", run_copy)
+    assert again.exit_code == 0 and closing(again, 1, 7, 0), again.output
+    assert stratum.read_bytes() == whole
+    assert closing(cli("metrics", "--run-dir", run_copy), 0, 8, 0)
 
 
 def test_a_damaged_vertex_map_is_a_note_and_no_failure(run_copy: Path) -> None:

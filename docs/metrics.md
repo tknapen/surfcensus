@@ -29,7 +29,7 @@ Everything the metrics need on the target mesh is derived at run time from an `f
 
 1. the directory given with `--fsaverage DIR`;
 2. `$FREESURFER_HOME/subjects/fsaverage` if FreeSurfer is installed;
-3. the `fsaverage/` directory next to the subjects (fMRIPrep writes one into `sourcedata/freesurfer/`).
+3. the `fsaverage/` directory next to the subjects (fMRIPrep writes one into `sourcedata/freesurfer/`): of the first dataset, in pseudonym order, that has one with every template file. It is looked for when the template is first needed, where the inventory recorded it and otherwise at its usual place, so a directory that was put there after the inventory is found without a second inventory.
 
 A directory can be used when it holds `surf/?h.sphere.reg`, `surf/?h.white`, `label/?h.cortex.label` and `label/?h.aparc.annot`; `surf/?h.white.avg.area.mgh` is used when both are there. nilearn's `fetch_surf_fsaverage` also returns sphere meshes, but whether its coordinates match FreeSurfer's `sphere.reg` convention is to verify, and it is not used.
 
@@ -76,7 +76,7 @@ How often z exceeds 3 by chance depends on the size of the reference. Simulated 
 
 Circularity: if capture is common at some vertices, it shifts that vertex's median up and inflates its MAD, which hides exactly the errors we look for in exactly the place they occur. The first pass uses all subjects; after rating, the reference is rebuilt from rater-passed subjects only, and all scores are recomputed. The paper reports detection with both references, since the difference measures how much contamination of the reference costs.
 
-A reference built within a run is stored under `tables/reference/<reference_id>/`: `index.json`, one `stratum_<nnn>.npz` per stratum (median, MAD and subject count per vertex, 0.98 MB on fsaverage6) and `members.parquet`. Its id (`set-<12 hex>`) follows from the settings and from the digests of the members' map files, so a reference whose member changed has another id.
+A reference built within a run is stored under `tables/reference/<reference_id>/`: `index.json`, one `stratum_<nnn>.npz` per stratum (median, MAD and subject count per vertex, 0.98 MB on fsaverage6) and `members.parquet`. Its id (`set-<12 hex>`) follows from the settings and from the digests of the members' map files, so a reference whose member changed has another id. Before the `reference` stage is skipped, the reference is read back; one that does not read as a reference of its id on the template's mesh is built again.
 
 ## Subject-level metrics derived from the z-map
 
@@ -123,6 +123,8 @@ Population. Components are standardised over the whole run (`scoring.population 
 Partial scores. A subject that lacks a component (no `sphere.reg`, no stats files, low coverage) has a maximum over fewer scores, which is lower on average. `n_components` says how many it had and the flag `partial_score` marks it. The flags `no_stats` and `no_thickness` say what the score lacks, not why: a subject whose `regional` or `fsaverage` stage failed on a file that is there (a truncated thickness file, say) gets them like a subject without the files, and the reason is in `surfcensus status --failures`. Rank: within one reference, rank 1 is the highest composite; ties go by the mean of the subject's standardised components, then by `subject_uid`; subjects without a composite come last.
 
 `scores.parquet` has one row per present subject and reference. A subject without a z-map has a row with the reference `none`. Exactly one row per subject is primary, and `Run.scores()` returns those.
+
+`rank` orders the rows of one reference, so it is not one order of the subjects: a subject without a z-map is ranked among the rows of `none`, and in a run where the others have z-maps it is rank 1 there, beside the rank 1 of the scored subjects. `primary_rank` is the one order: it numbers the primary rows from 1 to the number of subjects, those scored against a reference first, by rank, then those without one, by rank, and equal ranks under two references by `subject_uid`. It is missing in the rows that are not primary. `Run.scores()` is sorted by it, and the rating queue and the deciles of the selection take it, not `rank`. In a local run `Run.scores()` also names the subjects (`subject_label`); the table itself holds no label.
 
 ## Local users
 

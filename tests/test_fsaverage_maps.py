@@ -694,6 +694,16 @@ def test_reading_a_file_that_is_not_a_map(tmp_path: Path) -> None:
 
     (tmp_path / "garbage.npz").write_bytes(b"not an archive")
     refused("garbage.npz", "cannot be read as an archive")
+    # one changed byte in the header of an array: numpy raises an error of the tokenizer
+    write_maps(tmp_path / "whole.npz", {"lh": np.ones(2562, np.float32)})
+    damaged = bytearray((tmp_path / "whole.npz").read_bytes())
+    damaged[54] ^= 0x5A
+    (tmp_path / "flipped.npz").write_bytes(bytes(damaged))
+    refused("flipped.npz", "cannot be read as an archive")
+    # maps of another mesh than the one asked for
+    assert len(read_maps(tmp_path / "whole.npz", 2562)["rh"]) == 2562
+    with pytest.raises(ValueError, match=r"^whole\.npz: maps of 2562 vertices, on a mesh of 642$"):
+        read_maps(tmp_path / "whole.npz", 642)
     (tmp_path / "empty.npz").write_bytes(b"")
     refused("empty.npz", "cannot be read as an archive")
     lh = np.ones(12, dtype="<f2")

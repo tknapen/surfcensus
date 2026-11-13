@@ -466,7 +466,7 @@ STAGE_SCHEMAS: dict[str, int] = {
     "regional": 1,
     "fsaverage": 1,
     "reference": 1,
-    "score": 1,
+    "score": 2,  # 2: scores.parquet gained primary_rank
     "select": 1,
     "native": 1,
     "intensity": 1,

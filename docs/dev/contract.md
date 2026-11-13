@@ -919,7 +919,7 @@ class Run:
     def render(self, *, jobs: int = 1, datasets: Collection[str] | None = None,
                subjects: Sequence[str] | None = None, all_subjects: bool | None = None, video: bool | None = None,
                force: bool = False, retry_failed: bool = False) -> PhaseReport
-    def scores(self) -> pd.DataFrame            # primary rows of tables/scores.parquet, sorted by rank; local: with subject_label
+    def scores(self) -> pd.DataFrame            # primary rows of tables/scores.parquet, sorted by primary_rank (6.10); local: with subject_label after subject_uid
     def clusters(self) -> pd.DataFrame          # clusters.parquet left-joined with clusters_native.parquet
     def public(self) -> PublicCatalog
     def context(self) -> RunContext
@@ -1128,7 +1128,7 @@ Cache format, `templates/<template_id>/`: `template.npz` with, per hemisphere `h
 3. D14 order: `$FREESURFER_HOME/subjects/fsaverage`, `adjacent`, the bundled copy `surfcensus/data/fsaverage` (absent for now). The first usable one is built.
 4. `TemplateNotFound` with everything looked at.
 
-`Run.template(*, retemplate: bool = False) -> Template | None` (added to `run.py` in this milestone) calls it with `adjacent` from the first dataset, in pseudonym order, that has a `template_location`; writes the cache, the `templates` row and `meta.template_id` on first use. When `meta.template_id` is set and no template with that id can be read from the cache or rebuilt from the candidates, it raises `TemplateError("changed", "the template this run was scored with is no longer available; pass --fsaverage DIR or --retemplate")`: a run that has scores never falls back to D16 silently because a volume was unmounted or `templates/` was deleted. Only a run that never had a template gets None, on `TemplateNotFound`, after logging once, at warning level:
+`Run.template(*, retemplate: bool = False) -> Template | None` (added to `run.py` in this milestone) calls it with `adjacent` from the first local dataset, in pseudonym order, whose `fsaverage` next to the subjects has every template file, at the recorded `template_location` or, where the inventory recorded none, at `<root>/<fs_root>/fsaverage` (a directory put there after the inventory is found without a second inventory); writes the cache, the `templates` row and `meta.template_id` on first use. When `meta.template_id` is set and no template with that id can be read from the cache or rebuilt from the candidates, it raises `TemplateError("changed", "the template this run was scored with is no longer available; pass --fsaverage DIR or --retemplate")`: a run that has scores never falls back to D16 silently because a volume was unmounted or `templates/` was deleted. Only a run that never had a template gets None, on `TemplateNotFound`, after logging once, at warning level:
 
 ```
 No fsaverage template found. Looked in:
@@ -1221,7 +1221,7 @@ def resample_hemi(thickness: Float[np.ndarray, "n"], sphere_reg: Surface, templa
                   annot: Annotation | None, config: MetricsConfig) -> tuple[HemiMap, SphereMap]
 def global_median(thickness_fs: Float[np.ndarray, "v"], template_hemi: TemplateHemi) -> float
 def write_maps(path: Path, maps: Mapping[Hemi, Float[np.ndarray, "v"]]) -> None
-def read_maps(path: Path) -> dict[Hemi, Float[np.ndarray, "v"]]      # float32
+def read_maps(path: Path, n_vertices: int | None = None) -> dict[Hemi, Float[np.ndarray, "v"]]      # float32; ValueError for a file that is no archive of the two maps and, with n_vertices, for maps of another length
 def build_reference(stack: Float[np.ndarray, "s v"], template_hemi: TemplateHemi, adjacency: scipy.sparse.csr_matrix, *,
                     min_vertex_n: int, smooth_iterations: int, mad_floor_mm: float) -> ReferenceMaps
 def zmap(thickness_fs: Float[np.ndarray, "v"], global_median: float, ref: ReferenceMaps) -> Float[np.ndarray, "v"]
@@ -1291,6 +1291,7 @@ def composite(metrics: pd.DataFrame, strata: pd.Series, config: ScoringConfig, *
               norms: Mapping[str, Sequence[float]] | None = None) -> pd.DataFrame
 def fallback_rank(metrics: pd.DataFrame) -> pd.DataFrame
 def add_rank(scores: pd.DataFrame) -> pd.DataFrame
+def add_primary_rank(scores: pd.DataFrame) -> pd.DataFrame   # needs `primary`; the pipeline calls it after setting that column
 ```
 
 - Every component is oriented so that larger is more suspicious.
@@ -1299,6 +1300,7 @@ def add_rank(scores: pd.DataFrame) -> pd.DataFrame
 - `composite` returns, per row: `std_<component>` for each component; `composite` = the maximum over the components that are not NaN; `composite_component` = the name that attained it (first in config order on a tie); `n_components` = how many were not NaN; `score_kind = "composite_z"`. A subject with fewer components than configured (no `sphere.reg`, low coverage, a degenerate sphere) has a maximum over fewer scores, which is lower on average (0.57 against 1.03 for 2 against 4 independent scores), so it gets the flag `partial_score`, and the queue shows such subjects first (7.4) instead of letting them sink.
 - `fallback_rank` (D16): per component (`ceiling_frac`, `occ_ctrl_ratio`), the percentile `(r - 1) / (n - 1)` with `r` the minimum rank among the `n` subjects with a value, 0 when `n = 1`; `composite` = the larger of the two; `score_kind = "fallback_rank"`, `reference_id = "none"`. Minimum-rank ties matter here: with no ceiling vertex anywhere (the common case) every ceiling percentile is 0 and the order follows the ratio.
 - `add_rank`, within one `reference_id`: rank 1 = highest composite; ties by the mean of the non-NaN `std_*` scores descending, then `subject_uid`; subjects without a composite after all others.
+- `add_primary_rank`: `primary_rank` of 6.10, 1 to the number of primary rows, null elsewhere. Rows under a reference first, by `rank`; rows under `none` after them, by `rank`; equal ranks by `subject_uid`.
 
 ```python
 # reference/load.py
@@ -1362,8 +1364,9 @@ def merge_tables(ctx: RunContext) -> PhaseReport                                
 - The `reference` unit's input signature is the SHA-256 over the sorted `(subject_uid, fsaverage input signature, dataset, field_strength, fs_major)` of the subjects with a map; the `score` unit's adds the regional signatures and the reference ids. Adding one subject therefore redoes the set-level stages and nothing per subject. Like every input signature it stays in the ledger.
 - `native` reads `clusters.parquet` and, for each subject with clusters, the vertex map of its current render; its input signature covers the SHA-256 of `clusters.parquet` and the sorted `(subject_uid, render_key, template_id)` of the done renders. It takes milliseconds per subject. `Run.render()` ends with it, and `metrics --stage native` exists for the case that the reference is rebuilt after rendering. `clusters.parquet` itself is written by the `reference` stage only and never rewritten by a later phase.
 - Run-level stages ignore `datasets` (section 4). `Run.metrics()` with no stage filter is the whole of phase 4 for a local run. Snakemake calls the stages separately.
+- Outputs of the run that do not read back are faults of the run, not of a subject (D29). A map in `tables/fsavg/` that is no archive of two maps on the template's mesh stops the `reference` stage with `ConfigError("invalid", ...)` and is removed, and the next call makes it again. The skip test of `reference` reads the set reference that its row names (`read_reference`, 1 MB per stratum): one that does not read back as a reference of that id on the template's mesh is built again, and the `score` stage, named alone on such a run, raises `ConfigError("invalid", ...)` that says to run `surfcensus metrics`. A vertex map that is no archive of arrays, or lacks the arrays of one, leaves its subject without native centroids and is named in a note. `_io.read_npz` raises `ValueError` for whatever numpy and `zipfile` raise on a damaged archive, so no caller lists the kinds.
 
-`Run.zmap(subject_uid, reference_id=None) -> dict[Hemi, np.ndarray]` (added to `run.py` in this milestone) reads the subject's map and the reference (the primary one by default) and returns `zmap(...)` per hemisphere. z-maps are not stored.
+`Run.zmap(subject_uid, reference_id=None) -> dict[Hemi, np.ndarray]` (added to `run.py` in this milestone) reads the subject's map and the reference (the primary one by default) and returns `zmap(...)` per hemisphere. z-maps are not stored. A reference of the run that cannot be read is `ConfigError("invalid", ...)`, a map that cannot be read or is on another mesh a `ValueError` that names the file.
 
 ### 6.10 Tables (`schemas.py`)
 
@@ -1414,7 +1417,8 @@ String columns are Arrow `string`. Floats are `float32` unless noted. Key column
 | `composite` | float32, nullable | |
 | `composite_component` | string, nullable | |
 | `n_components` | int8 | components that were not NaN |
-| `rank` | int32 | 1 = looks worst, within the `reference_id` |
+| `rank` | int32 | 1 = looks worst, within the `reference_id`; not unique among the primary rows, where a subject without a z-map is ranked among the rows of `none` |
+| `primary_rank` | int32, nullable | the primary rows of the run in one order, 1 to their number: the subjects scored against a reference first, by `rank`, then those under `none`, by `rank`, equal ranks by `subject_uid`; null in the other rows. The order of `Run.scores()`, of the queue (7.4) and of the deciles of `select` (8.6) |
 | `mass_kind` | string | `excess` or `sum_z` |
 | `mass_search`, `mass_medial`, `mass_inferior`, `mass_lateral`, `mass_control` | float32, nullable | of the largest cluster, larger hemisphere |
 | `area_search_mm2`, `peak_z_search` | float32, nullable | |
@@ -1647,7 +1651,7 @@ def has_work_left(session: Session, rater: Rater, plan: QueuePlan) -> bool      
 ```
 
 - A render is ready when its row is `done` and its `config_hash` equals `render_config_hash`, the hash of the running version's config (which includes the schema number). A `done` row with another hash counts as `outdated`.
-- Selected subjects are the rows of `selection` (a local run: every present subject, reason `all`). Local order without `blind`: first the subjects flagged `partial_score` (they could not be fully scored and would otherwise sink, 6.8), by `subject_uid`; then by `scores.rank` of the primary rows ascending (worst first); then subjects without a score, by `subject_uid`. With `blind`: `random.Random(seed).shuffle` of the sorted uids. Team: sorted uids (the order is not used).
+- Selected subjects are the rows of `selection` (a local run: every present subject, reason `all`). Local order without `blind`: first the subjects flagged `partial_score` (they could not be fully scored and would otherwise sink, 6.8), by `subject_uid`; then by `scores.primary_rank` ascending (worst first; `rank` is within a reference and occurs twice among the primary rows, 6.10); then subjects without a score, by `subject_uid`. With `blind`: `random.Random(seed).shuffle` of the sorted uids. Team: sorted uids (the order is not used).
 - `next_assignment` is idempotent: an open assignment is returned again, so a reload never skips a subject.
 - Local: walk `order`. A subject is done for a rater when the rater has a completed `main` assignment whose `render_key` equals the subject's current one. The first subject that is not done and is ready gets an assignment. Nothing ready and `pending + outdated > 0`: `rendering`. Nothing left: `done`. Subjects whose render failed are never offered; they have an unratable final label (7.2) and appear in review and export with their reason. Several local raters each walk the same order on their own.
 - Repeats, in both modes, when `repeat_rate > 0`: with that probability the next assignment is a subject this rater completed at least `repeat_gap` assignments ago and has not yet repeated. It is stored with kind `repeat`.
@@ -2051,7 +2055,7 @@ def detectability_sample(scores: pd.DataFrame, n: int, *, config: SelectConfig, 
 def run_select(ctx: RunContext, *, n_prevalence: int, n_detectability: int, seed: int) -> PhaseReport
 ```
 
-Both return `subject_uid`, `reason`, `stratum`, `inclusion_prob`, `seed`. Sampling is without replacement within strata, on subjects sorted by `subject_uid`, with `numpy.random.default_rng([seed, zlib.crc32(stratum.encode())])`, so adding a dataset later does not change the draws in the others. The prevalence sample never reads `scores`. The detectability sample is stratified by decile of `rank` among the primary score rows (not of the composite value, which has ties), samples the top decile at `top_decile_factor` times the base rate, and takes every subject above the `extreme_quantile` of rank with reason `extreme`. A subject drawn by both keeps both rows, each with its own probability. A sample size larger than its population selects everything with reason `all`. The `select` unit's input signature is the SHA-256 of `scores.parquet` and of the sorted present uids, so a rerun with the same sizes and seed on unchanged scores does nothing. `architecture.md` has a single `--n`; the two samples have different sizes and designs, so there are two options.
+Both return `subject_uid`, `reason`, `stratum`, `inclusion_prob`, `seed`. Sampling is without replacement within strata, on subjects sorted by `subject_uid`, with `numpy.random.default_rng([seed, zlib.crc32(stratum.encode())])`, so adding a dataset later does not change the draws in the others. The prevalence sample never reads `scores`. The detectability sample is stratified by decile of `primary_rank` (the one order of the primary score rows, 6.10; not `rank`, which is within a reference, and not the composite value, which has ties), samples the top decile at `top_decile_factor` times the base rate, and takes every subject above the `extreme_quantile` of `primary_rank` with reason `extreme`. A subject drawn by both keeps both rows, each with its own probability. A sample size larger than its population selects everything with reason `all`. The `select` unit's input signature is the SHA-256 of `scores.parquet` and of the sorted present uids, so a rerun with the same sizes and seed on unchanged scores does nothing. `architecture.md` has a single `--n`; the two samples have different sizes and designs, so there are two options.
 
 ### 8.7 Team mode, calibration, adjudication, dashboard
 

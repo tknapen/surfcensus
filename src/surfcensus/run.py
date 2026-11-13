@@ -15,7 +15,7 @@ import sqlite3
 from collections.abc import Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
 
 from surfcensus import privacy
@@ -464,10 +464,11 @@ class Run:
 
         Looked for, in this order: the directory of ``metrics.fsaverage_dir`` when it is set,
         ``$FREESURFER_HOME/subjects/fsaverage``, the ``fsaverage`` next to the subjects of
-        the first dataset, in pseudonym order, that has one. The first use stores the
-        template under ``templates/<template_id>/``, records it in the catalog and pins the
-        run to it (``meta.template_id``); from then on the run keeps that template whatever
-        the environment looks like. ``retemplate`` looks again and pins what it finds.
+        the first dataset, in pseudonym order, that has one, whether or not the inventory
+        has seen it. The first use stores the template under ``templates/<template_id>/``,
+        records it in the catalog and pins the run to it (``meta.template_id``); from then
+        on the run keeps that template whatever the environment looks like. ``retemplate``
+        looks again and pins what it finds.
 
         A run that never had a template gets None, after one warning that says where a
         template was looked for and how to give one. A run that is pinned never does:
@@ -536,16 +537,35 @@ class Run:
         return found
 
     def _adjacent_template(self) -> tuple[Path | None, int | None]:
-        """The ``fsaverage`` next to the subjects of the first dataset, in pseudonym order,
-        that the inventory found one for, and that dataset's row."""
+        """The ``fsaverage`` next to the subjects of the first local dataset, in pseudonym
+        order, that has one with every template file, and that dataset's row.
+
+        The directory is looked for where the inventory recorded it and, for a dataset
+        without such a record, at its usual place next to the subjects: an ``fsaverage``
+        that was put there after the inventory is found without a second inventory. When
+        no dataset has a usable one, the first directory that was recorded or exists is
+        returned, so that the lookup can say what it lacks.
+        """
+        from surfcensus.sources.local import TEMPLATE_NAME, template_files_missing
+
         rows = self._catalog.query(
-            "SELECT dataset_id, source, root, template_location FROM datasets "
-            "WHERE template_location IS NOT NULL ORDER BY pseudonym, source, pipeline"
+            "SELECT dataset_id, root, fs_root, template_location FROM datasets "
+            "WHERE source = 'local' AND root IS NOT NULL ORDER BY pseudonym, source, pipeline"
         )
+        incomplete: tuple[Path | None, int | None] = (None, None)
         for row in rows:
-            if row["source"] == "local" and row["root"] is not None:
-                return Path(row["root"]) / row["template_location"], row["dataset_id"]
-        return None, None
+            recorded = row["template_location"]
+            location = recorded or (PurePosixPath(row["fs_root"]) / TEMPLATE_NAME).as_posix()
+            directory = Path(row["root"]) / location
+            try:
+                missing = template_files_missing(directory)
+            except OSError:
+                missing = ("unreadable",)
+            if missing == ():
+                return directory, row["dataset_id"]
+            if incomplete[0] is None and (recorded is not None or missing is not None):
+                incomplete = (directory, row["dataset_id"])
+        return incomplete
 
     def _no_template_message(self, exc: TemplateNotFound) -> str:
         names = {
@@ -702,17 +722,24 @@ class Run:
         return resolved
 
     def scores(self) -> pd.DataFrame:
-        """The primary rows of ``tables/scores.parquet``, one per present subject: first the
-        subjects scored against a reference, by rank, then those without one, by rank.
-        Empty before ``metrics`` has run."""
-        from surfcensus.schemas import NO_REFERENCE, SCHEMAS
+        """The primary rows of ``tables/scores.parquet``, one per present subject, by
+        ``primary_rank``: first the subjects scored against a reference, by rank, then those
+        without one, by rank. In a local run the frame also has ``subject_label``, after
+        ``subject_uid``. Empty before ``metrics`` has run."""
+        import pandas as pd
+
+        from surfcensus.schemas import SCHEMAS
         from surfcensus.store import read_table, table_path
 
         scores = read_table(table_path(self.run_dir, "scores"), SCHEMAS["scores"])
         scores = scores[scores["primary"].to_numpy(dtype=bool)]
-        order = scores.assign(unreferenced=scores["reference_id"] == NO_REFERENCE)
-        order = order.sort_values(["unreferenced", "rank", "subject_uid"])
-        return order.drop(columns="unreferenced").reset_index(drop=True)
+        scores = scores.sort_values("primary_rank").reset_index(drop=True)
+        if self.config.mode == "local":
+            subjects = self.public().subjects()
+            label = dict(zip(subjects["subject_uid"], subjects["subject_label"], strict=True))
+            labels = pd.Series([label.get(uid) for uid in scores["subject_uid"]], dtype=object)
+            scores.insert(1, "subject_label", labels)
+        return scores
 
     def clusters(self) -> pd.DataFrame:
         """``clusters.parquet`` left-joined with ``clusters_native.parquet``: every outlier
@@ -731,11 +758,14 @@ class Run:
         reads the subject's thickness map and the reference and computes
         ``metrics.fsaverage.zmap``.
 
-        Raises ``KeyError`` for a subject that has no score against that reference, and
-        ``ConfigError("missing", ...)`` when the map or the reference is not on disk.
+        Raises ``KeyError`` for a subject that has no score against that reference,
+        ``ConfigError("missing", ...)`` when the map or the reference is not on disk,
+        ``ConfigError("invalid", ...)`` for a reference of the run that cannot be read (the
+        next ``metrics`` builds it again), and ``ValueError``, naming the file, for a map
+        that cannot be read or is not on the mesh of the template.
         """
         from surfcensus.metrics.fsaverage import global_median, read_maps, zmap
-        from surfcensus.metrics.pipeline import map_path, reference_dir
+        from surfcensus.metrics.pipeline import REFERENCE_DIR, map_path, reference_dir
         from surfcensus.reference.load import read_reference, shipped_reference
         from surfcensus.reference.strata import SHIPPED_PREFIX
         from surfcensus.schemas import NO_REFERENCE, SCHEMAS
@@ -752,18 +782,29 @@ class Run:
             raise KeyError(f"{subject_uid} has no z-map against {against}")
         reference_id, stratum = rows["reference_id"].iloc[0], rows["stratum"].iloc[0]
         template = self.template()
+        if template is None:
+            raise ConfigError("missing", "the run has no template")
         try:
             if reference_id.startswith(SHIPPED_PREFIX):
                 reference = shipped_reference()
             else:
-                reference = read_reference(reference_dir(self.run_dir, reference_id))
-            maps = read_maps(map_path(self.run_dir, subject_uid))
+                try:
+                    reference = read_reference(reference_dir(self.run_dir, reference_id))
+                except ValueError as exc:
+                    raise ConfigError(
+                        "invalid",
+                        f"the reference {reference_id} in {REFERENCE_DIR} cannot be read; "
+                        "run `surfcensus metrics`, which builds it again",
+                    ) from exc
+            maps = read_maps(
+                map_path(self.run_dir, subject_uid), len(template.hemis[HEMIS[0]].cortex)
+            )
         except FileNotFoundError as exc:
             raise ConfigError(
                 "missing", f"the map or the reference of {subject_uid} is not in the run"
             ) from exc
-        if template is None or reference is None:
-            raise ConfigError("missing", f"the run has no template or no reference {reference_id}")
+        if reference is None:
+            raise ConfigError("missing", f"the run has no reference {reference_id}")
         return {
             hemi: zmap(
                 maps[hemi],

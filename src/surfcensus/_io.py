@@ -53,9 +53,23 @@ def write_npz(path: Path | str, arrays: Mapping[str, np.ndarray]) -> None:
 
 
 def read_npz(path: Path | str) -> dict[str, np.ndarray]:
-    """Every array of an ``.npz``, in the order of the archive. Pickled entries are refused."""
-    with np.load(path, allow_pickle=False) as archive:
-        return {key: archive[key] for key in archive.files}
+    """Every array of an ``.npz``, in the order of the archive. Pickled entries are refused.
+
+    A file that cannot be opened is the ``OSError`` of the system (``FileNotFoundError`` for
+    one that is not there). One that is opened and is not such an archive is a
+    ``ValueError`` that names the file and not its path, whatever numpy and ``zipfile``
+    raise for it: a damaged archive gives ``BadZipFile``, ``EOFError`` or ``KeyError``, a
+    damaged array header an error of Python's tokenizer, a damaged zip header
+    ``NotImplementedError``.
+    """
+    try:
+        with np.load(path, allow_pickle=False) as archive:
+            return {key: archive[key] for key in archive.files}
+    except OSError:
+        raise
+    except Exception as exc:
+        name = Path(path).name
+        raise ValueError(f"{name} cannot be read as an archive of arrays") from exc
 
 
 def sha256_file(path: Path | str) -> str:

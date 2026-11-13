@@ -148,6 +148,7 @@ def test_scores_columns() -> None:
     assert schema.field("primary").type == pa.bool_()
     assert schema.field("n_components").type == pa.int8()
     assert schema.field("rank").type == pa.int32()
+    assert schema.field("primary_rank").type == pa.int32()
     assert set(schema.names) - nullable("scores") == {
         "subject_uid",
         "reference_id",
@@ -174,6 +175,7 @@ def test_scores_columns() -> None:
         "composite_component",
         "n_components",
         "rank",
+        "primary_rank",
         "mass_kind",
         "mass_search",
         "mass_medial",

@@ -144,6 +144,7 @@ SCORES = _schema(
     _nullable(_STRING, "composite_component"),
     _required(_INT8, "n_components"),
     _required(_INT32, "rank"),
+    _nullable(_INT32, "primary_rank"),
     _required(_STRING, "mass_kind"),
     _nullable(
         _FLOAT32, "mass_search", "mass_medial", "mass_inferior", "mass_lateral", "mass_control"
@@ -166,7 +167,12 @@ SCORES = _schema(
     _nullable(_FLOAT32, "trunc_frac"),
     _required(_STRING, "flags", "score_config_hash"),
 )
-"""One row per present subject and reference; ``dataset`` is the pseudonym."""
+"""One row per present subject and reference; ``dataset`` is the pseudonym.
+
+``rank`` orders the rows of one ``reference_id``, so a rank occurs once per reference.
+``primary_rank`` orders the primary rows of the whole run, 1 to the number of subjects, and
+is missing in the other rows: the one ordering for a queue or a sample (see
+``metrics.scoring.add_primary_rank``)."""
 
 
 DEFAULT_INTENSITY_DEPTHS = 4

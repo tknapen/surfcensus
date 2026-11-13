@@ -48,7 +48,7 @@ run.inventory()
 run.metrics(jobs=4)
 run.render(jobs=4)
 run.public().subjects()  # a pandas DataFrame: one row per subject
-run.scores()  # one row per subject, by rank
+run.scores()  # one row per subject, by primary_rank
 run.clusters()  # the clusters of thick cortex, with their position where rendered
 ```
 
