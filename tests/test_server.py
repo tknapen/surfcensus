@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import hashlib
+import http.client
 import io
 import itertools
 import json
@@ -68,9 +69,18 @@ from surfcensus.render import geometry
 from surfcensus.render.model import PANEL_ORDER, RENDER_JSON, RenderInfo, read_render
 from surfcensus.render.vertexmap import read_vertex_map
 from surfcensus.run import Run
-from surfcensus.schemas import SCHEMAS, SCORE_FLAGS
+from surfcensus.schemas import KEYS, SCHEMAS, SCORE_FLAGS
 from surfcensus.sources.local import local
-from surfcensus.store import CATALOG_FILE, PublicCatalog, media_dir, primary_scores
+from surfcensus.store import (
+    CATALOG_FILE,
+    PublicCatalog,
+    clusters_with_native,
+    media_dir,
+    primary_scores,
+    read_table,
+    table_path,
+    write_table,
+)
 
 BASE = "http://127.0.0.1"
 NONE = {"A": 0, "B": 0, "C": 0}
@@ -248,13 +258,28 @@ def asgi_get(
         "client": ("127.0.0.1", 50000),
     }
 
-    async def receive() -> dict[str, Any]:
-        return {"type": "http.request", "body": b"", "more_body": False}
+    async def call() -> None:
+        asked = False
+        answered = asyncio.Event()
 
-    async def send(message: dict[str, Any]) -> None:
-        sent.append(message)
+        async def receive() -> dict[str, Any]:
+            # the request once; then nothing until the answer is out, as a connection that
+            # stays open (a response that sends a file listens for the client leaving)
+            nonlocal asked
+            if not asked:
+                asked = True
+                return {"type": "http.request", "body": b"", "more_body": False}
+            await answered.wait()
+            return {"type": "http.disconnect"}
 
-    asyncio.run(app(scope, receive, send))
+        async def send(message: dict[str, Any]) -> None:
+            sent.append(message)
+            if message["type"] == "http.response.body" and not message.get("more_body"):
+                answered.set()
+
+        await app(scope, receive, send)
+
+    asyncio.run(call())
     status = next(m["status"] for m in sent if m["type"] == "http.response.start")
     body = b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body")
     return status, body
@@ -644,12 +669,15 @@ def test_marks_are_stored_as_points_when_the_vertex_map_cannot_be_read(
     # a render whose vertex map is gone says so, and its marks are points as well
     second = body["next"]["assignment"]
     assert second["has_vertex_map"] is True
+    posted, expected = mark_on_surface(app_run, second["subject_uid"])
     (media_dir(app_run, second["subject_uid"]) / "vertex_map.npz").unlink()
     second = shown(client)
     assert second["has_vertex_map"] is False
-    posted, _expected = mark_on_surface(app_run, first["subject_uid"])
     (saved,) = rate(client, second, marks=[posted | {"class": "X"}])["saved"]["marks"]
-    assert saved["hemi"] is None and saved["box_dist_mm"] >= 0
+    assert saved["hemi"] is None and saved["pial_vertex"] is None
+    assert rows(app_run, "SELECT tkr_x, tkr_y, tkr_z FROM marks WHERE class = 'X'")[
+        0
+    ] == pytest.approx(expected["tkr"], abs=1e-9)
 
 
 @pytest.mark.parametrize(
@@ -699,6 +727,36 @@ def test_a_rating_that_breaks_a_rule_names_the_field_and_stores_nothing(
     assert stored(app_run) == before
     assert rows(app_run, "SELECT completed_at FROM assignments") == [(None,)]
     assert shown(client) == first
+
+
+@pytest.mark.parametrize("number", [2**63, 2**70, -(2**63) - 1])
+def test_a_number_that_no_column_can_hold_is_refused_and_no_error(
+    client: TestClient, app_run: Path, number: int
+) -> None:
+    # JSON has no largest integer; SQLite has
+    first = shown(client)
+    before = stored(app_run)
+    events = {"assignment_id": number, "events": [{"ts": "t", "type": "play"}]}
+    for path, body, where in (
+        ("/api/rating", rating(number), "assignment_id"),
+        ("/api/rating", rating(first, ms_on_subject=number), "ms_on_subject"),
+        ("/api/rating", rating(first, marks=[mark(frame=number)]), "marks.0.frame"),
+        ("/api/rating", rating(first, marks=[mark(slice=number)]), "marks.0.slice"),
+        ("/api/rating", rating(first, values=NONE | {"B": number}), "values.B"),
+        ("/api/skip", skip_body(number), "assignment_id"),
+        ("/api/skip", skip_body(first, ms=number), "ms_on_subject"),
+        ("/api/events", events, "assignment_id"),
+    ):
+        assert fields(client.post(path, json=body), 422) == [where], (path, where)
+    assert stored(app_run) == before
+    assert rows(app_run, "SELECT completed_at, skip_count FROM assignments") == [(None, 0)]
+    # the largest that fits names no assignment; a payload is text, whatever it holds
+    assert fields(client.post("/api/skip", json=skip_body(2**63 - 1)), 404) == ["assignment_id"]
+    kept = {"assignment_id": 1, "events": [{"ts": "t", "type": "zoom", "payload": {"n": number}}]}
+    assert client.post("/api/events", json=kept).json() == {"stored": 1}
+    assert rows(app_run, "SELECT payload_json FROM events WHERE type = 'zoom'") == [
+        (f'{{"n":{number}}}',)
+    ]
 
 
 def test_marks_are_required_for_a_positive_value_when_the_run_says_so(app_run: Path) -> None:
@@ -768,10 +826,13 @@ def test_a_rating_or_a_skip_on_tiles_that_were_rendered_again_is_refused(
     again = shown(client)
     assert again["subject_uid"] == first["subject_uid"] and again["assignment_id"] == 2
     assert again["render_key"] == "f" * 16
-    rate(client, again)
+    following = rate(client, again)["next"]["assignment"]
+    assert following["assignment_id"] == 3 and following["subject_uid"] != first["subject_uid"]
+    # the assignment of the earlier tiles stays as it was left: open, and never offered
     assert rows(app_run, "SELECT assignment_id, completed_at IS NULL FROM assignments") == [
         (1, 1),
         (2, 0),
+        (3, 1),
     ]
 
 
@@ -847,10 +908,16 @@ def test_back_shows_the_rating_and_a_second_submission_is_a_revision(
     assert rows(app_run, "SELECT submission_id, deleted_ts IS NOT NULL FROM marks") == [(1, 1)]
     assert rows(app_run, "SELECT value FROM final_labels WHERE criterion = 'A'") == [(1,)]
     assert n_rows(app_run, "final_marks") == 0
-    assert shaped(client.get("/api/back"), schemas.NextOut)["assignment"]["previous"]["note"] == (
-        "second"
-    )
+    # what comes back for the next revision is the current submission, not the one before
+    previous = shaped(client.get("/api/back"), schemas.NextOut)["assignment"]["previous"]
+    assert (previous["values"], previous["note"]) == ({"A": 1, "B": 0, "C": 0}, "second")
+    assert previous["marks"] == []
     assert revised["next"]["progress"]["done_total"] == 1
+    third = rate(client, again, values={"A": 2, "B": 0, "C": 0}, marks=[posted])
+    (new_mark,) = third["saved"]["marks"]
+    previous = shaped(client.get("/api/back"), schemas.NextOut)["assignment"]["previous"]
+    assert [found["mark_id"] for found in previous["marks"]] == [new_mark["mark_id"]]
+    assert new_mark["mark_id"] != saved["mark_id"]
 
 
 def test_only_the_subject_left_last_can_be_rated_again(client: TestClient, app_run: Path) -> None:
@@ -1013,8 +1080,8 @@ def test_skipping_goes_round_the_skipped_subjects_and_the_last_one_stays(
     again = skip(client, only)
     assert again["assignment"] == only and again["progress"]["skipped"] == 0
     assert n_rows(app_run, "assignments") == 3 and n_rows(app_run, "submissions") == 2
-    # a skipped subject keeps the unblinded pages closed where they are closed at all
-    assert rows(app_run, "SELECT sum(skip_count) FROM assignments") == [(6,)]
+    # the first was skipped three times, the two others once each
+    assert rows(app_run, "SELECT skip_count FROM assignments ORDER BY seq") == [(3,), (1,), (1,)]
 
 
 # --- events -------------------------------------------------------------------------------------
@@ -1188,7 +1255,6 @@ def test_media_are_the_tiles_and_the_poster_of_a_ready_render(
         "tiles/sagittal_\u0660\u0660\u0660.webp",
         "tiles/SAGITTAL_000.webp",
         "tiles/oblique_000.webp",
-        "tiles/../poster.webp",
         "tiles/%2e%2e/render.json",
         "..%2f..%2fcatalog.sqlite",
         "../../catalog.sqlite",
@@ -1202,6 +1268,18 @@ def test_media_serve_no_other_name(client: TestClient, app_run: Path, name: str)
     assert client.get(f"/media/{uid}/{name}").status_code == 404
     status, body = asgi_get(client.app, f"/media/{uid}/{name}")
     assert status == 404 and b"errors" in body
+
+
+def test_a_name_with_dot_segments_is_no_name_of_a_render(client: TestClient) -> None:
+    # as a server hands the path over when a client did not resolve the dots; the test
+    # client would, and ask for the poster
+    uid = shown(client)["subject_uid"]
+    assert asgi_get(client.app, f"/media/{uid}/poster.webp")[0] == 200
+    for name in ("tiles/../poster.webp", "./poster.webp", "tiles/./sagittal_000.webp"):
+        status, body = asgi_get(client.app, f"/media/{uid}/{name}")
+        assert status == 404 and b"errors" in body, name
+    assert asgi_get(client.app, f"/media/{uid}/../{uid}/poster.webp")[0] == 404
+    assert asgi_get(client.app, f"/media/./{uid}/poster.webp")[0] == 404
 
 
 def test_media_of_no_subject_or_of_a_render_that_is_not_ready_are_not_served(
@@ -1346,6 +1424,60 @@ def test_the_files_of_the_run_directory_are_not_served(client: TestClient, path:
     assert status == 404
 
 
+def raw_status(port: int, path: str, headers: dict[str, str] | None = None) -> int:
+    """The status of a GET whose path and headers go over the socket as they are given."""
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        connection.putrequest("GET", path, skip_host=True, skip_accept_encoding=True)
+        sent = {"Host": f"127.0.0.1:{port}"} if headers is None else headers
+        for name, value in sent.items():
+            connection.putheader(name, value)
+        connection.endheaders()
+        response = connection.getresponse()
+        response.read()
+        return response.status
+    finally:
+        connection.close()
+
+
+def test_a_path_that_climbs_is_a_404_however_it_is_written_on_the_socket(app_run: Path) -> None:
+    # the HTTP server decodes %2e and %2f before the app sees the path, which neither the
+    # test client nor a raw ASGI call shows
+    uid = queue(app_run)[0]
+    directory = media_dir(app_run, uid)
+    climbing = {
+        f"/media/{uid}/tiles/../{RENDER_JSON}": directory / RENDER_JSON,
+        f"/media/{uid}/tiles/%2e%2e/{RENDER_JSON}": directory / RENDER_JSON,
+        f"/media/{uid}/tiles/..%2f{RENDER_JSON}": directory / RENDER_JSON,
+        f"/media/{uid}/tiles/%2e%2e/poster.webp": directory / "poster.webp",
+        f"/media/{uid}/../../{CATALOG_FILE}": app_run / CATALOG_FILE,
+        f"/media/{uid}/%2e%2e/%2e%2e/{CATALOG_FILE}": app_run / CATALOG_FILE,
+        f"/media/{uid}/..%2f..%2fconfig.yaml": app_run / "config.yaml",
+        f"/media/%2e%2e/{CATALOG_FILE}": app_run / CATALOG_FILE,
+        "/static/../server.py": server.STATIC_DIR.parent / "server.py",
+        "/static/%2e%2e/server.py": server.STATIC_DIR.parent / "server.py",
+        "/static/..%2fserver.py": server.STATIC_DIR.parent / "server.py",
+        "/static/js/%2e%2e/%2e%2e/templates/rate.html": server.TEMPLATES_DIR / "rate.html",
+    }
+    handle = start_server(app_run, port=0)
+    try:
+        assert raw_status(handle.port, f"/media/{uid}/poster.webp") == 200
+        assert raw_status(handle.port, "/static/js/rate.js") == 200
+        for path, target in climbing.items():
+            # each names a file that is there: the 404 is the server's doing
+            assert target.is_file(), path
+            assert raw_status(handle.port, path) == 404, path
+        for path in ("//etc/passwd", "/static//etc/passwd", "/static/%2fetc%2fpasswd", "/media/"):
+            assert raw_status(handle.port, path) == 404, path
+        # a request without a Host header is no HTTP/1.1 request: it does not reach the app,
+        # which would refuse it as well (the raw ASGI call in the test of the hosts)
+        assert raw_status(handle.port, "/healthz", {}) == 400
+        assert raw_status(handle.port, "/healthz", {"Host": "evil.example"}) == 403
+        assert raw_status(handle.port, "/healthz") == 200
+    finally:
+        handle.stop()
+
+
 # --- who may ask --------------------------------------------------------------------------------
 
 
@@ -1470,6 +1602,21 @@ def test_a_post_is_json_of_a_bounded_size(client: TestClient, app_run: Path) -> 
         "/api/events", content=large, headers={"Content-Type": "application/json"}
     )
     assert fields(response, 413) == ["request"]
+
+    def unannounced() -> Iterator[bytes]:
+        yield b'{"assignment_id": 1, "events": [], "pad": "'
+        for _ in range(server.MAX_BODY_BYTES // 65_536 + 1):
+            yield b"x" * 65_536
+        yield b'"}'
+
+    # a body that does not say how long it is is counted as it arrives
+    before = n_rows(app_run, "events")
+    response = client.post(
+        "/api/events", content=unannounced(), headers={"Content-Type": "application/json"}
+    )
+    assert "content-length" not in response.request.headers
+    assert fields(response, 413) == ["request"]
+    assert n_rows(app_run, "events") == before
     for wrong in ("", "{", "[]", '"text"', "null"):
         response = client.post(
             "/api/rating", content=wrong, headers={"Content-Type": "application/json"}
@@ -1562,6 +1709,29 @@ def test_a_blind_run_opens_the_unblinded_routes_only_when_nothing_is_left(app_ru
         assert client.get("/").status_code == 200
 
 
+def test_a_browser_that_opens_a_closed_review_gets_a_page_that_says_why(app_run: Path) -> None:
+    """The refusal of ``/review`` is the ``ErrorsOut`` of every route; a request that asks
+    for a page, as a browser's address bar does, gets the same words as a page."""
+    set_app(app_run, blind=True)
+    with serving(app_run) as client:
+        page = client.get("/review", headers={"Accept": "text/html,application/xhtml+xml"})
+        assert page.status_code == 403
+        assert page.headers["content-type"].startswith("text/html")
+        assert page.headers["cache-control"] == "no-store"
+        assert "you still have subjects to rate; the review opens when none is left" in page.text
+        assert '<a href="/">Back to the rating screen</a>' in page.text
+        # the page of the review itself, its scripts and anything of a subject are not in it
+        assert "<script" not in page.text and "review.js" not in page.text
+        for uid in queue(app_run):
+            assert uid not in page.text
+        # the routes of the API answer a browser as they answer a script
+        api = client.get("/api/review", headers={"Accept": "text/html"})
+        assert fields(api, 403) == ["request"]
+        rate_all(client)
+        opened = client.get("/review", headers={"Accept": "text/html"})
+        assert opened.status_code == 200 and "review.js" in opened.text
+
+
 def test_a_blind_run_stays_closed_while_a_render_is_awaited(app_run: Path) -> None:
     set_app(app_run, blind=True)
     last = queue(app_run)[-1]
@@ -1638,6 +1808,24 @@ def test_the_review_table_has_a_row_per_subject_in_the_order_of_the_queue(
     assert (first["final_method"], first["n_ratings"], first["n_marks"]) == ("single", 1, 0)
     assert body["rows"][1]["final_A"] is None and body["rows"][1]["n_ratings"] == 0
     assert isinstance(first["composite"], float) and first["primary"] is True
+
+
+def test_the_review_table_follows_the_ranks_not_the_uids(app_run: Path) -> None:
+    # the uids of the fixture follow from a random salt: in one session of six their order
+    # is that of the ranks. Here the ranks run against the uids, so the two always differ.
+    path = table_path(app_run, "scores")
+    scores = read_table(path, SCHEMAS["scores"])
+    against = sorted(scores["subject_uid"], reverse=True)
+    assert scores["primary"].all() and len(against) == 3
+    scores["primary_rank"] = [against.index(uid) + 1 for uid in scores["subject_uid"]]
+    write_table(path, scores, SCHEMAS["scores"], sort_by=KEYS["scores"])
+    with serving(app_run) as client:
+        body = shaped(client.get("/api/review"), schemas.ReviewOut)
+        assert [row["subject_uid"] for row in body["rows"]] == against
+        tied = shaped(client.get("/api/review", params={"sort": "fs_version"}), schemas.ReviewOut)
+        assert [row["subject_uid"] for row in tied["rows"]] == against
+        # the queue is in the same order
+        assert shown(client)["subject_uid"] == against[0]
 
 
 def test_the_review_table_sorts_filters_and_pages(client: TestClient, app_run: Path) -> None:
@@ -1723,11 +1911,18 @@ def test_a_subject_of_the_review_has_its_render_scores_ratings_marks_and_cluster
         "local",
     )
     assert seen["tkr"] == pytest.approx(expected["tkr"], abs=1e-9)
-    # sub-001 carries the patch: its clusters with a native position are listed
-    assert uid == small_run_uids["sub-001"] and body["clusters"]
-    for cluster in body["clusters"]:
-        assert cluster["hemi"] in ("lh", "rh") and cluster["peak_z"] > 3
-        assert all(isinstance(value, float) for value in cluster["tkr"])
+    # sub-001 carries the patch: its clusters with a native position are listed, no other
+    clusters = clusters_with_native(app_run)
+    own = clusters[(clusters["subject_uid"] == uid) & clusters["tkr_x"].notna()]
+    assert uid == small_run_uids["sub-001"] and 0 < len(own) < int(clusters["tkr_x"].notna().sum())
+    assert len(own) < int((clusters["subject_uid"] == uid).sum())
+    assert [
+        (found["reference_id"], found["hemi"], found["region"], found["rank"])
+        for found in body["clusters"]
+    ] == list(zip(own["reference_id"], own["hemi"], own["region"], own["rank"], strict=True))
+    for cluster, tkr_x, peak_z in zip(body["clusters"], own["tkr_x"], own["peak_z"], strict=True):
+        assert cluster["tkr"][0] == pytest.approx(tkr_x) and cluster["peak_z"] > 3
+        assert cluster["peak_z"] == pytest.approx(peak_z)
     # a subject nobody rated; a subject without a ready render; no subject
     other = shaped(client.get(f"/api/review/{small_run_uids['sub-000']}"), schemas.SubjectOut)
     assert other["ratings"] == [] and other["marks"] == [] and other["render"] is not None
@@ -1840,7 +2035,7 @@ def test_nothing_a_rating_page_receives_names_a_dataset_a_label_or_a_score(
     subject_columns = set(subjects.columns) - {"subject_uid"}
     assert keys & score_columns == set()
     assert keys & subject_columns == set()
-    assert keys & {"inputs", "template", "scores", "rater_id", "seq", "detail", "sha256"} == set()
+    assert keys & {"inputs", "template", "scores", "rater_id", "detail", "sha256"} == set()
     text = "\n".join(strings)
     for label in small_run_uids:
         assert label not in text
@@ -1856,6 +2051,50 @@ def test_nothing_a_rating_page_receives_names_a_dataset_a_label_or_a_score(
     # no digest of a source file: nothing of 64 hex digits but the protocol's own
     digests = {word for word in text.replace('"', " ").split() if len(word) == 64}
     assert digests <= {hashlib.sha256((app_run / PROTOCOL_FILE).read_bytes()).hexdigest()}
+
+
+def test_a_second_rater_is_shown_nothing_of_what_the_first_one_rated(app_run: Path) -> None:
+    with serving(app_run, rater="Ottoline") as first_rater:
+        first = shown(first_rater)
+        posted, _expected = mark_on_surface(app_run, first["subject_uid"])
+        rate(
+            first_rater,
+            first,
+            values={"A": 2, "B": 1, "C": 0},
+            marks=[posted],
+            note="nota bene qzx",
+        )
+        assert rate_all(first_rater) == 2
+    with serving(app_run, rater="Grace") as grace:
+        answers: list[Any] = [shaped(grace.get("/api/session"), schemas.SessionOut)]
+        # nobody's rating is hers to go back to
+        assert fields(grace.get("/api/back"), 404) == ["request"]
+        body = get_next(grace)
+        answers.append(body)
+        # the same subject, under an assignment of her own and as a new one
+        assert body["assignment"]["subject_uid"] == first["subject_uid"]
+        assert body["assignment"]["assignment_id"] != first["assignment_id"]
+        assert body["assignment"]["previous"] is None
+        assert body["progress"] | {"done_total": 0, "remaining": 3} == body["progress"]
+        stored_body = rate(grace, body["assignment"])
+        answers.append(stored_body)
+        assert stored_body["saved"]["revision"] == 1 and stored_body["saved"]["marks"] == []
+        back = shaped(grace.get("/api/back"), schemas.NextOut)
+        answers.append(back)
+        assert back["assignment"]["previous"] == {
+            "values": NONE,
+            "unratable": None,
+            "other": False,
+            "note": "",
+            "marks": [],
+        }
+        answers.append(skip(grace, shown(grace)))
+    text = json.dumps(answers)
+    assert "Ottoline" not in text and "qzx" not in text
+    # and what the first rater stored is as she left it
+    assert rows(app_run, "SELECT note FROM submissions WHERE note != '' AND current") == [
+        ("nota bene qzx",)
+    ]
 
 
 def masked(body: dict[str, Any]) -> dict[str, Any]:
@@ -2235,7 +2474,7 @@ def test_a_started_server_answers_on_the_port_it_says_and_stops(app_run: Path) -
         handle.stop()
     assert not handle.running and not accepts(handle.port)
     handle.stop()  # a second call does nothing
-    # the database is free again: the app of another process, or of the next start, opens it
+    # and the run can be served again
     with serving(app_run) as client:
         assert shown(client)["assignment_id"] == 1
 
@@ -2292,7 +2531,14 @@ def test_no_free_port_and_no_local_host_are_config_errors(
         assert client.get("/healthz").status_code == 200
 
 
-def test_serve_refuses_a_run_whose_renders_are_out_of_date(app_run: Path) -> None:
+def test_serve_refuses_a_run_whose_renders_are_out_of_date(
+    app_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def started(*_args: object, **_kw: object) -> None:
+        # serve would then wait for a signal: fail here, not by a test that never ends
+        raise AssertionError("the server was started")
+
+    monkeypatch.setattr(server, "start_server", started)
     order = queue(app_run)
     said = ["1 render is out of date", "2 renders are out of date"]
     for uid, expected in zip(order[:2], said, strict=True):
@@ -2306,9 +2552,34 @@ def test_serve_refuses_a_run_whose_renders_are_out_of_date(app_run: Path) -> Non
     assert not (app_run / "app.sqlite").exists()
 
 
-def test_serve_listens_on_this_machine_only(app_run: Path) -> None:
+def test_serve_listens_on_this_machine_only(app_run: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    def listened(*_args: object, **_kw: object) -> None:
+        raise AssertionError("the server went on to listen")
+
+    monkeypatch.setattr(server, "_listen", listened)
     with pytest.raises(ConfigError, match="local server"):
         serve(app_run, host="0.0.0.0", port=0, open_browser=False)
+
+
+@contextmanager
+def interrupted_if_it_waits_on(seconds: float = 20.0) -> Iterator[list[bool]]:
+    """Around a call of ``serve`` that is meant to return. When it has not after
+    ``seconds``, an interrupt ends it and the list says so: the test fails and does not
+    hang."""
+    waited_on: list[bool] = []
+
+    def interrupt() -> None:
+        waited_on.append(True)
+        os.kill(os.getpid(), signal.SIGINT)
+
+    earlier = signal.signal(signal.SIGINT, signal.default_int_handler)
+    timer = threading.Timer(seconds, interrupt)
+    timer.start()
+    try:
+        yield waited_on
+    finally:
+        timer.cancel()
+        signal.signal(signal.SIGINT, earlier)
 
 
 def test_serve_prints_the_url_opens_the_browser_and_stops_at_sigterm(
@@ -2329,9 +2600,9 @@ def test_serve_prints_the_url_opens_the_browser_and_stops_at_sigterm(
 
     monkeypatch.setattr(server.webbrowser, "open", browser)
     earlier = signal.getsignal(signal.SIGTERM)
-    started = time.monotonic()
-    serve(app_run, port=0)  # returns because of the signal
-    assert time.monotonic() - started < 30
+    with interrupted_if_it_waits_on() as waited_on:
+        serve(app_run, port=0)  # returns because of the signal
+    assert not waited_on
     assert signal.getsignal(signal.SIGTERM) is earlier
     (url,) = opened
     assert answers == [(200, {"ok": True, "version": surfcensus.__version__})]
@@ -2349,9 +2620,33 @@ def test_serve_prints_the_url_opens_the_browser_and_stops_at_sigterm(
 
     stopper = threading.Thread(target=stop_when_it_listens)
     stopper.start()
-    serve(app_run, port=0, open_browser=False)
+    with interrupted_if_it_waits_on() as waited_on:
+        serve(app_run, port=0, open_browser=False)
     stopper.join()
+    assert not waited_on
     assert opened == [] and signal.getsignal(signal.SIGTERM) is earlier
+
+
+def test_serve_stops_at_ctrl_c(app_run: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    ports: list[int] = []
+
+    def browser(url: str) -> bool:
+        # called once the server listens and serve waits: the interrupt arrives in there
+        ports.append(int(url.rsplit(":", 1)[1].strip("/")))
+        assert accepts(ports[0])
+        threading.Thread(target=os.kill, args=(os.getpid(), signal.SIGINT)).start()
+        return True
+
+    monkeypatch.setattr(server.webbrowser, "open", browser)
+    # Python's own handler, whatever the process was started with
+    earlier = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        serve(app_run, port=0)
+    except KeyboardInterrupt:
+        pytest.fail("serve let the interrupt through")
+    finally:
+        signal.signal(signal.SIGINT, earlier)
+    assert len(ports) == 1 and not accepts(ports[0])
 
 
 # --- on the real subject ------------------------------------------------------------------------

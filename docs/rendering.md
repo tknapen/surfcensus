@@ -41,7 +41,7 @@ Display orientation (decision D13), recorded per panel in `render.json` as the a
 - coronal: horizontal is x, vertical is z, superior up; radiological by default (`radiological`), so the subject's right is at the left of the panel;
 - axial: horizontal is x, vertical is y, anterior up; radiological by default.
 
-Pixel convention: panel pixel coordinates `(px, py)` are continuous, with the origin at the top-left corner of the tile, `px` to the right and `py` down, in units of tile pixels. The pixel in column `c` and row `r` covers `[c, c + 1) × [r, r + 1)` and is sampled at its centre `(c + 0.5, r + 0.5)`. A browser click at offset `(ox, oy)` on a tile displayed at width `w` maps to `px = ox × width / w`.
+Pixel convention: panel pixel coordinates `(px, py)` are continuous, with the origin at the top-left corner of the tile, `px` to the right and `py` down, in units of tile pixels. The pixel in column `c` and row `r` covers `[c, c + 1) × [r, r + 1)` and is sampled at its centre `(c + 0.5, r + 0.5)`. A browser click at offset `(ox, oy)` on a tile displayed at width `w` maps to `px = ox × width / w`. The offset is that of the pointer: a browser reports a click by the upper left corner of its screen pixel, and the page takes the middle of that pixel (`rater_app.md`, Marking errors by clicking).
 
 The box is a reasonable default for adult brains. Pilot renders on infant, elderly or atypical brains decide whether the box needs to scale with brain size (for example by the distance between the occipital and frontal poles).
 

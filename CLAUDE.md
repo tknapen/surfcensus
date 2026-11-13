@@ -22,7 +22,7 @@ Everything in the package serves one of these two numbers.
 
 ## Status
 
-Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestone 2 (local source, config, catalog, inventory, `Run`) is built: `surfcensus inventory`, `surfcensus render` and `surfcensus status` work on a local directory and are resumable, and `sc.Run(...)` and `sc.sources.local(...)` are the Python API behind them. It is tested on synthetic directory trees and, end to end, on two real subjects linked into an fMRIPrep layout (`ds000102` sub-01, FreeSurfer 6.0.1; `ds003020` sub-UTS01, FreeSurfer 7.3.2). A census run can be created and opened from Python, with local sources only; no command creates one yet. Milestone 3 (template, registration, fsaverage maps, reference, clusters, ceiling and regional metrics, scoring, render schema 3) is built: `surfcensus metrics` computes phase 4 for a local run and is resumable, `sc.Run.metrics()`, `.scores()`, `.clusters()`, `.zmap()` and `.template()` are the Python API behind it, and renders carry fsaverage6 counterparts and the fsaverage pole when the run has a template. The template is built at run time from an `fsaverage` directory (a FreeSurfer install, the one next to the subjects, or `--fsaverage DIR`); nothing fsaverage-derived ships. Without a template, and for fewer than 30 subjects with a map, subjects are ranked as decision D16 says. It is tested on synthetic cohorts with planted thick patches and, end to end, on the two real subjects with a real `fsaverage` next to them and on Tier A and B of 34 real, unrated subjects (all of `ds000102` and `ds003020`). Not built or not done: the shipped reference (empty), the intensity metric (milestone 5), the comparison with `mri_surf2surf` (needs FreeSurfer), and any look at a scored subject by eye. Milestone 4 (rater app, `review`, `export`) has its first step only: the protocol and the calibration set (`protocol.py`, `calibration.py`), the shapes and the list of routes of the app's API and the tables of `app.sqlite` are written and tested, the order of the local rating queue is one function that the renderer follows too (`store.queue_order`), and every other module of the milestone exists as signatures that raise `NotImplementedError` (decision D32). There is no rater app yet, so `surfcensus review` does not exist. Milestones 5 and 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
+Milestone 1 (`fsio` and `render`) is built and tested on synthetic subjects and on `ds000102` sub-01; `surfcensus render-subject SUBJECT_DIR --out DIR` works. Its exit check, the by-eye comparison with Freeview, is still to be done by Tomas. Milestone 2 (local source, config, catalog, inventory, `Run`) is built: `surfcensus inventory`, `surfcensus render` and `surfcensus status` work on a local directory and are resumable, and `sc.Run(...)` and `sc.sources.local(...)` are the Python API behind them. It is tested on synthetic directory trees and, end to end, on two real subjects linked into an fMRIPrep layout (`ds000102` sub-01, FreeSurfer 6.0.1; `ds003020` sub-UTS01, FreeSurfer 7.3.2). A census run can be created and opened from Python, with local sources only; no command creates one yet. Milestone 3 (template, registration, fsaverage maps, reference, clusters, ceiling and regional metrics, scoring, render schema 3) is built: `surfcensus metrics` computes phase 4 for a local run and is resumable, `sc.Run.metrics()`, `.scores()`, `.clusters()`, `.zmap()` and `.template()` are the Python API behind it, and renders carry fsaverage6 counterparts and the fsaverage pole when the run has a template. The template is built at run time from an `fsaverage` directory (a FreeSurfer install, the one next to the subjects, or `--fsaverage DIR`); nothing fsaverage-derived ships. Without a template, and for fewer than 30 subjects with a map, subjects are ranked as decision D16 says. It is tested on synthetic cohorts with planted thick patches and, end to end, on the two real subjects with a real `fsaverage` next to them and on Tier A and B of 34 real, unrated subjects (all of `ds000102` and `ds003020`). Not built or not done: the shipped reference (empty), the intensity metric (milestone 5), the comparison with `mri_surf2surf` (needs FreeSurfer), and any look at a scored subject by eye. Milestone 4 (rater app, `review`, `export`) is built for local runs: `surfcensus review PATH` inventories, scores, selects and renders the subjects of a directory and opens the rating app at the first render, with the others rendered behind it (decision D33); `surfcensus serve`, `finalize`, `calibration freeze` and `export` work, and `surfcensus.review.review(...)` is the Python API. The app has the rating screen (three panels from tiles, both playback modes, marks by click, the keyboard map, a skip key, a tour for first-time raters, a visible refusal of an incomplete rating), a review screen, a local queue by `primary_rank` or blind, final labels for one rater and, through `finalize`, for several, and an export of ten tables. It is tested on synthetic runs through the server and in a browser, and was driven end to end in Chromium on the two real subjects, where every stored mark equals a computation from the surface files (decisions D26, D28, D34). No human has rated anything with it: the time a rating takes and how raters use it are unknown until phase 0. Not built: team mode (tokens, several raters at once, the calibration queue, adjudication, the dashboard, the error map), which is milestone 5, and the pieces of D33 that follow milestone 4 (BIDS dataset roots, DataLad placeholders, the app's packages in the core, the install test). Milestones 5 and 6 are not started. The docs below are the specification. When the docs and the code disagree, the docs win until a decision in `docs/decisions.md` changes them; update the docs in the same change as the code.
 
 ## Build order
 
@@ -113,6 +113,15 @@ Measured 2026-11-12 on a full render of `ds000102` sub-01: 9 s on one core; 10.9
 
 Measured 2026-11-12 on a local run over the two real subjects (one machine, files on a local disk): `surfcensus inventory` under 0.1 s for the phase, with the logs read whole; `surfcensus render --jobs 2` 9.0 s without video; `surfcensus render --video` 17.5 s in one process; a second call of either does nothing in under 0.1 s; `catalog.sqlite` 64 kB; the source files unchanged in size and modification time. The media of `ds000102` sub-01 rendered through a run with video are byte-identical, file for file, to the render that `render-subject` made of it at the end of milestone 1 (same machine).
 
+Measured 2026-11-13 with the rater app of milestone 4 (one machine, 4 processors, local disk, Chromium 153 headless on the same machine; details in `docs/rater_app.md`). No human rated anything: every rating was made by a script that drives the browser.
+
+- A local fMRIPrep tree of `ds000102` sub-01 and `ds003020` sub-UTS01 with the real `fsaverage` next to them: `surfcensus review PATH --no-browser` reaches the running app in 11.0, 11.2 and 11.8 s (three new run directories; the first render is about 7 s of it), and in 0.8 s when the run is finished. One real subject through `review(..., serve=False)`: 9.7 s, then 0.1 s.
+- The browser loads 352 tiles per subject in 352 requests, 4.06 MB (sub-01) and 3.77 MB (sub-UTS01), plus one answer of about 10 kB with the geometry; the page itself is 12 requests and 138 kB. First subject with every tile loaded 3.2 s after opening the page; next subject 0.13 s after `Enter` (it is fetched ahead). No request to another host, no cookie.
+- Nine marks placed by clicks on drawn pial and white contours in all three panels (1400 by 900 px, 2x zoom, and 900 by 700 px at a device pixel ratio of 2) equal a computation from the T1 header, the surface files and the `sphere.reg` files with nibabel and numpy alone: tkr and scanner RAS within 1e-9 mm, hemisphere, pial and white vertex with distances, fsaverage6 vertex. The stored points lie 0.00 to 0.18 mm from the clicked surface. A browser reports a click by the corner of its screen pixel; taking the middle removed a shift of half a screen pixel up and to the left (0.05 to 0.65 tile pixels on four marks before the change).
+- Package 4.A, same day, `ds000102` sub-01 at 320 px in both display orientations: for a click at the centre of every opaque pial contour pixel (231,079 and 231,036 pixels) the resolved hemisphere, vertices, distances and fsaverage6 vertex equal those from the full surfaces; 0.305% of those clicks resolve to a vertex that is not `visible`.
+- `ms_on_subject` of three submissions and one skip equals the time the subject was on screen in that visit within 12 ms; the time the tour was open is not in it.
+- `review` on the 26 subjects of `ds000102` with Tier A and B only: 35 s, every subject `missing surface`, exit code 1. On a synthetic set of 32 the queue is the partial-score block, then `primary_rank`; blind, the seeded shuffle.
+
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 
 ## Hard rules
@@ -142,24 +151,29 @@ Built:
 just setup            # uv sync with dev extras
 just test             # pytest, no network
 just test-network     # pytest -m network
-just test-browser     # pytest -m browser: a real browser (so far only that it starts; the app has no page yet)
+just test-browser     # pytest -m browser: the pages in a real browser (SURFCENSUS_BROWSER, else Chrome); not in CI
 just lint             # ruff check + ruff format --check + pyrefly
 surfcensus render-subject SUBJECT_DIR --out DIR   # one subject, no run directory
 surfcensus inventory --run-dir DIR [--source PATH]   # phase 2; --source creates a local run
 surfcensus metrics --run-dir DIR [--jobs J] [--fsaverage DIR]   # phase 4
 surfcensus render --run-dir DIR [--jobs J]           # phase 6
 surfcensus status --run-dir DIR [--failures]         # where a run stands
+surfcensus review PATH [--run-dir DIR] [--rater NAME] [--blind] [--no-browser] [--no-serve] [--serve-after N]
+                                                     # local data: inventory, metrics, render, rater app
+surfcensus serve --run-dir DIR [--rater NAME]        # the rater app on a rendered run (local mode)
+surfcensus finalize --run-dir DIR                    # final labels from the ratings of several local raters
+surfcensus calibration freeze --run-dir DIR          # calibration.yaml from the final labels
+surfcensus export --run-dir DIR [--format csv|parquet]   # phase 8, tables for analysis
 ```
 
 Planned:
 
 ```
-surfcensus review PATH   # local data: inventory, metrics, render, open rater app
 surfcensus discover   # phase 1
 surfcensus enrich     # phase 3
 surfcensus select     # phase 5
-surfcensus serve      # phase 7, rater web app
-surfcensus export     # phase 8, tables for analysis
+surfcensus serve --mode team   # phase 7 for a census: tokens, several raters, adjudication
+surfcensus export --release | --reveal   # what a census publishes; the pseudonym mapping
 ```
 
 ## Detailed specs

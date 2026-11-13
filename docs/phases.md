@@ -1,6 +1,6 @@
 # Phases of the search
 
-The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`; until `review` exists (milestone 4) they run phases 2, 4 and 6 with `surfcensus inventory`, `surfcensus metrics` and `surfcensus render`.
+The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`, which also selects every subject; `surfcensus inventory`, `surfcensus metrics` and `surfcensus render` run the phases one at a time.
 
 Cheap phases run on everything; expensive phases run on what the cheap phases select. The guiding cost asymmetry is that downloading and computing are cheap compared with rater time, so the pipeline spends compute freely to make every rated minute informative.
 
@@ -100,13 +100,19 @@ Input: media, selection. Output: `app.sqlite`.
 - Raters click-mark every error they rate minor or major; the server resolves marks to native and fsaverage6 vertices on submission.
 - Disagreements beyond one scale step go to adjudication, where the final mark set is also fixed.
 
+- A rater can skip a subject; it comes back after the others and stays with that rater, so no queue ends with a subject unrated and no subject changes hands by being skipped. Every skip is recorded.
+- A selected subject whose render failed gets an unratable final label with the reason of the failure and is not offered.
+
 Exit check: inter-rater agreement on the main criteria above the threshold fixed in the pilot; all sampled subjects have final labels.
+
+Built (milestone 4) for local runs: `surfcensus review PATH` (phases 2, 4, 6 and 7 in one command), `surfcensus serve`, and `surfcensus finalize`, which writes the final labels of two or more local raters by the one-step rule and lists the subjects that need a decision. The team queue (calibration, k raters per subject, repeats), tokens, adjudication and the dashboard are milestone 5.
 
 ## Phase 8: export and analysis
 
 Input: everything. Output: analysis tables, figures, a public gallery, the normative reference, a released ratings dataset.
 
-- `surfcensus export` joins ratings, scores and provenance into one table per analysis unit.
+- `surfcensus export` joins ratings, scores and provenance into one table per analysis unit: `subjects`, `scores`, `selection`, `ratings`, `marks`, `final_marks`, `clusters`, `datasets`, `behaviour` and `skips`, as CSV or parquet, with a `manifest.json` that holds the run id, the stage hashes, the template and reference ids, the protocol and calibration versions and hashes, and the row count and SHA-256 of every file. It works on a run without ratings. An export into a directory that holds an earlier one replaces it. CSV has no types, so identifiers are read as text. Built (milestone 4).
+- Two profiles. `analysis`: every subject, pseudonymous, for the team's notebooks; the only profile of a local run. `release` (a census run): selected subjects only in every table; no age, sex, manufacturer, pipeline version or notes; field strength binned to 1.5, 3 and 7 T; the subject count of a dataset binned (1 to 9, 10 to 29, 30 to 99, 100 or more); the sampling probability to two significant digits. Raters are `R-01`, `R-02`, ... in every export of a census run.
 - `surfcensus reference build` rebuilds the per-vertex fsaverage reference from rater-passed subjects, rescoring every subject against it (second pass), and writes it into the package data for the next release.
 - Census error maps: per-vertex frequency of final marks on fsaverage, by class.
 - Analyses as in `analysis_plan.md`.

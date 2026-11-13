@@ -67,6 +67,7 @@ EXPORT_TABLES: tuple[str, ...] = (
     "clusters",
     "datasets",
     "behaviour",
+    "skips",
 )
 """Each is written as ``<name>.csv`` or ``<name>.parquet``."""
 MANIFEST = "manifest.json"
@@ -120,8 +121,31 @@ BEHAVIOUR_COLUMNS: tuple[str, ...] = (
     "n_pauses",
     "n_mode_switches",
     "n_back",
+    "n_skips",
+    "ms_skipped_visits",
 )
-"""``behaviour``: one row per completed assignment, summed over its events."""
+"""``behaviour``: one row per completed assignment, summed over its events. ``ms_on_subject``
+is the time of the visit that ended with the submission; ``n_skips`` is how often the
+assignment was skipped before and ``ms_skipped_visits`` the time of those visits together
+(missing where a skip event holds none)."""
+
+SKIPS_COLUMNS: tuple[str, ...] = (
+    "assignment_id",
+    "n",
+    "subject_uid",
+    "rater",
+    "kind",
+    "render_key",
+    "client_ts",
+    "server_ts",
+    "ms_on_subject",
+    "rated",
+)
+"""``skips``: one row per skip a rater made, from the ``skip`` events that the server
+writes. ``n`` numbers the skips of an assignment from 1, ``ms_on_subject`` is the time of
+the visit that ended with the skip, and ``rated`` says whether the assignment has a
+submission now. An assignment that was skipped and not rated yet has rows here and none in
+``ratings``."""
 
 MARKS_COLUMNS: tuple[str, ...] = (
     "subject_uid",
@@ -231,7 +255,9 @@ _SORT_KEYS: dict[str, tuple[str, ...]] = {
     "clusters": KEYS["clusters"],
     "datasets": ("dataset", "source", "pipeline"),
     "behaviour": ("assignment_id",),
+    "skips": ("assignment_id", "n"),
 }
+_SKIP_EVENT = "skip"  # app.schemas.SKIP_EVENT, which is not imported: this module needs no extra
 _COUNTED_EVENTS = {
     "play": "n_plays",
     "pause": "n_pauses",
@@ -283,6 +309,18 @@ _FINAL_MARK_KINDS: dict[str, _Kind] = {
     "pial_vertex": "int",
     "fsavg6_vertex": "int",
     "source_mark_ids": "str",
+}
+_SKIP_KINDS: dict[str, _Kind] = {
+    "assignment_id": "int",
+    "n": "int",
+    "subject_uid": "str",
+    "rater": "str",
+    "kind": "str",
+    "render_key": "str",
+    "client_ts": "str",
+    "server_ts": "str",
+    "ms_on_subject": "int",
+    "rated": "bool",
 }
 _SUBJECT_RATING_KINDS: dict[str, _Kind] = {
     "final_A": "int",
@@ -691,7 +729,88 @@ def _behaviour(src: _Sources, ratings: pd.DataFrame) -> pd.DataFrame:
         frame[name] = _column(
             [counts.get((assignment, kind), 0) for assignment in assignments], "int"
         )
+    skipped = {
+        int(assignment): int(count)
+        for assignment, count in src.query("SELECT assignment_id, skip_count FROM assignments")
+    }
+    frame["n_skips"] = _column([skipped.get(assignment, 0) for assignment in assignments], "int")
+    spent: dict[int, list[int | None]] = {}
+    for assignment, _, ms, _ in _skip_events(src):
+        spent.setdefault(assignment, []).append(ms)
+    frame["ms_skipped_visits"] = _column(
+        [_sum_or_none(spent.get(assignment, [])) for assignment in assignments], "int"
+    )
     return frame[list(BEHAVIOUR_COLUMNS)]
+
+
+def _sum_or_none(values: Sequence[int | None]) -> int | None:
+    """The sum, or None when a value is not known; 0 for none."""
+    known = [value for value in values if value is not None]
+    return sum(known) if len(known) == len(values) else None
+
+
+def _whole(value: object) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def _skip_events(src: _Sources) -> list[tuple[int, str | None, int | None, dict[str, Any]]]:
+    """``(assignment_id, client time, ms on the subject, payload)`` of every ``skip`` event,
+    in the order they were written. A payload that is not of the form the server writes
+    gives an empty one."""
+    events = []
+    for assignment, ts, text in src.query(
+        "SELECT assignment_id, ts, payload_json FROM events "
+        f"WHERE assignment_id IS NOT NULL AND type = '{_SKIP_EVENT}' ORDER BY event_id"
+    ):
+        try:
+            payload = json.loads(text) if isinstance(text, str) else None
+        except ValueError:
+            payload = None
+        payload = payload if isinstance(payload, dict) else {}
+        events.append(
+            (
+                int(assignment),
+                ts if isinstance(ts, str) else None,
+                _whole(payload.get("ms_on_subject")),
+                payload,
+            )
+        )
+    return events
+
+
+def _skips(src: _Sources) -> pd.DataFrame:
+    assignments = {
+        int(assignment): (str(uid), int(rater_id), str(kind), key, completed is not None)
+        for assignment, uid, rater_id, kind, key, completed in src.query(
+            "SELECT assignment_id, subject_uid, rater_id, kind, render_key, completed_at "
+            "FROM assignments"
+        )
+    }
+    names = _rater_names(src)
+    rows = []
+    position: dict[int, int] = {}
+    for assignment, client_ts, ms, payload in _skip_events(src):
+        if assignment not in assignments:
+            continue
+        uid, rater_id, kind, key, rated = assignments[assignment]
+        position[assignment] = position.get(assignment, 0) + 1
+        number = _whole(payload.get("n"))
+        server_ts = payload.get("server_ts")
+        rows.append(
+            (
+                assignment,
+                position[assignment] if number is None else number,
+                uid,
+                names.get(rater_id),
+                kind,
+                key,
+                client_ts,
+                server_ts if isinstance(server_ts, str) else None,
+                ms,
+                rated,
+            )
+        )
+    return _frame(_spec(SKIPS_COLUMNS, _SKIP_KINDS), rows)
 
 
 def _unratable_reasons(src: _Sources, labels: Sequence[tuple[Any, ...]]) -> dict[str, str]:
@@ -900,6 +1019,7 @@ def _tables(src: _Sources, profile: Profile, scores: pd.DataFrame) -> dict[str, 
         "clusters": _clusters(src),
         "datasets": _datasets(src, release=release),
         "behaviour": _behaviour(src, ratings),
+        "skips": _skips(src),
     }
     if release:
         tables = _released(tables, set(src.public.selection()["subject_uid"]))

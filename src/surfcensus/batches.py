@@ -294,6 +294,7 @@ def run_batches(
     batch_subjects: int,
     jobs: int,
     progress: str | None = None,
+    stop: Callable[[], bool] | None = None,
 ) -> None:
     """Per batch of ``units`` (pending ``subject_uid``s, in order): lease every subject, run
     ``work`` on each, call ``commit`` once in the parent, release the leases.
@@ -321,6 +322,10 @@ def run_batches(
 
     ``progress`` is the description of a progress bar on stderr that counts subjects; None
     shows none, and none is drawn when stderr is not a terminal.
+
+    ``stop`` is asked before each batch is leased: once it answers true, no further batch is
+    started and the call returns. The batches before it are committed, so this is how a
+    caller in another thread ends the work between two batches without losing any.
     """
     if batch_subjects < 1:
         raise ValueError(f"batch_subjects must be at least 1, not {batch_subjects}")
@@ -341,6 +346,8 @@ def run_batches(
         if workers is not None:
             cleanup.callback(workers.stop)
         for start in range(0, len(units), batch_subjects):
+            if stop is not None and stop():
+                break
             batch = units[start : start + batch_subjects]
             with ExitStack() as leases:
                 outcomes: dict[int, R | Exception] = {}

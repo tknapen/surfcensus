@@ -157,14 +157,31 @@ The real `pyproject.toml` is in the repository root and is the source of truth: 
 Local users:
 
 ```
-surfcensus review PATH [--run-dir DIR] [--subjects GLOB] [--rater NAME] [--no-browser]
+surfcensus review PATH [--run-dir DIR] [--subjects GLOB]... [--rater NAME] [--blind / --no-blind]
+                       [--require-marks / --no-require-marks] [--field-strength T] [--jobs J]
+                       [--fsaverage DIR] [--video / --no-video] [--port N] [--no-browser]
+                       [--no-serve] [--serve-after N] [--relocate] [--force]
     # inventory + metrics + scoring + render + serve, in one go
-surfcensus export --run-dir DIR [--format csv|parquet]
+surfcensus serve    --run-dir DIR [--host H] [--port N] [--mode local|team] [--rater NAME] [--no-browser]
+surfcensus finalize --run-dir DIR
+surfcensus calibration freeze --run-dir DIR [--subject UID]... [--version V]
+surfcensus export --run-dir DIR [--out DIR] [--format csv|parquet] [--release]
 surfcensus render-subject SUBJECT_DIR --out DIR [--fsaverage DIR | --no-template]
     # one subject, no run directory; the CLI form of sc.render.three_plane
 ```
 
-`review` defaults the run directory to `PATH/../surfcensus-run` if writable, else `./surfcensus-run`. It orders the rating queue by composite score descending unless `--blind` is given, renders in that order, and starts the app on `127.0.0.1` with a single local rater as soon as the first subject of the queue is rendered; the others are rendered while the app runs, and the app says so when a rater is faster than the renderer (decision D33). `--serve-after N` waits for N renders, and `--serve-after 0` for all of them.
+`review` defaults the run directory to `PATH/../surfcensus-run` when a run is there already or that place can be written to, else `./surfcensus-run`; for one subject directory as `PATH`, to `surfcensus-run` beside the subjects directory, since a run may not lie inside it. It orders the rating queue by composite score descending unless `--blind` is given, renders in that order, and starts the app on `127.0.0.1` with a single local rater as soon as the first subject of the queue is rendered; the others are rendered while the app runs, and the app says so when a rater is faster than the renderer (decision D33). `--serve-after N` waits for N renders, and `--serve-after 0` for all of them.
+
+`review`, `serve`, `finalize`, `calibration freeze` and `export` are built (milestone 4), for local runs:
+
+- `review` does the steps of the phase commands in one process and says on stderr, one block per step, which run directory it uses and whether it is new, how many subjects it found in which layout and FreeSurfer version and which cannot be rendered for lack of which file, what the subjects were scored against, how many are rendered, and the address of the app with the time from the start of the command. Every present subject is selected (reason `all`, probability 1, the seed of the queue); a subject that lacks a file a render needs is in the selection, gets its `missing surface` render row and an unratable final label, and is never offered.
+- The first `--serve-after` subjects of the queue (1 unless given) are rendered before the app starts, one in the process itself. Then a second `Run` in a thread renders the rest in queue order, a batch of `--jobs` subjects at a time (default: the processors, at most 8), so that each is offered soon after it is made; the app answers `rendering` when nothing is ready. A failure of the run or the machine ends that renderer with one line, and the app goes on with what is rendered.
+- Ctrl-C or SIGTERM stops the server, then the renderer, which finishes the batch it is on and records it; the rest stays pending for the next call. The command then prints how many subjects the rater has rated and how many are left, and the export command. A second SIGTERM while it stops changes nothing.
+- Options that are stored (`--subjects`, `--field-strength`, `--blind`, `--require-marks`, `--video`) hold until they are given again; the defaults (not blind, marks not required, no video) apply only when the run is created. `--rater` is not stored. `--blind` cannot change once the run has a submission, unless `--force`; the change is then written into the events of the app. One subject directory as `PATH` names its own subject set: on a run of the same subjects directory it replaces the stored one.
+- The same command again does the same steps with everything unchanged skipped: on two real subjects it is back at the app in 0.8 s (`rater_app.md`, what was measured). `--relocate` is for data that moved, as for `inventory`.
+- `--no-serve` renders every subject and stops; it needs no package of the app. `review` ends with exit code 1 only when no subject of the run can be rendered, with 2 for what stops a phase command, and with 0 otherwise, also when some subjects failed: those are named and are unratable.
+- `review` is for a local run with one source. A census run is refused; `serve` is the command for it (team mode, milestone 5).
+- `serve` starts the app on a run that is rendered and renders nothing; `finalize`, `calibration freeze` and `export` are described in `rater_app.md` and `phases.md`. A core install without the app's packages gets one line that names `pip install "surfcensus[app]"`.
 
 Census (and power users), one subcommand per phase:
 
@@ -217,7 +234,15 @@ scores = run.scores()  # pandas DataFrame, one row per subject, by primary_rank
 clusters = run.clusters()  # outlier clusters, with native positions where a render gives them
 z = run.zmap(scores["subject_uid"][0])  # {"lh": ..., "rh": ...} on the template mesh
 sc.render.three_plane(subject_dir, out="sub-01.mp4")  # single subject, no run dir
+
+from surfcensus.review import review
+from surfcensus.export.tables import export_run
+
+run = review("/data/SUBJECTS_DIR", serve=False)  # every step, every render, no app
+export_run(run.run_dir)  # the tables of phase 8
 ```
+
+`review(path, ...)` is the command as a function and returns the run; with the app it returns after Ctrl-C. `review.open_review(...)` returns the run and the running app with the renderer behind it (`ReviewApp`: `url`, `rendering`, `wait_rendered()`, `stop()`), for a caller that wants to do something while it runs. `Run.render(stop=...)` takes a function that is asked before each batch and ends the call between two batches; `native=False` leaves the closing `native` stage to a later call.
 
 `Run(run_dir, source)` creates a run in a new or empty directory; `Run(run_dir)` opens one, without a key also for a census run (only `inventory` and, later, `discover` need the key). Each phase method returns a `PhaseReport` with the counts of units done, skipped and failed. `run.template()` returns the fsaverage template of the run, or None for a run that never had one; it stores the template in the run directory and pins the run to it on first use, and raises when a pinned template can neither be read nor built again. `run.zmap(subject_uid)` computes a subject's z-map from its stored thickness map and the reference; z-maps are not stored.
 
@@ -253,6 +278,10 @@ run/
     render.json          # geometry, per-panel pixel-to-voxel affines, frame tables, config hash
     vertex_map.npz       # native vertices the tiles show, plus a margin, and their fsaverage6 counterparts
   app.sqlite             # rater app state, separate from the catalog
+  protocol.yaml          # the rating protocol of the run; the shipped one is installed when the app first starts
+  calibration.yaml       # the calibration set, once `surfcensus calibration freeze` has written it
+  export/                # surfcensus export: ten tables as CSV or parquet and manifest.json (analysis profile)
+  release/               # surfcensus export --release, a census run only
 ```
 
 Datasets appear everywhere outside `catalog.sqlite` by keyed pseudonym (`D-3f9a1c07`), never by accession; see decisions D10 and D20 in `decisions.md`. `privacy.py` owns every keyed identifier (the pseudonym, `subject_uid`, `render_key`, the names of cached files), the scrubbing of text that comes from exceptions and, from milestone 5, key loading and the reveal path. Nothing else in the package computes one of these or prints an accession for display. `config.yaml` records the key fingerprint.
@@ -293,3 +322,5 @@ An input signature is 16 hex characters of the SHA-256 over role, location, size
 - Resampling tests: resampling fsaverage onto itself is the identity; a smooth field on a synthetic sphere survives resampling within tolerance; agreement with `mri_surf2surf` on the network fixture within a stated tolerance (run once by a developer with FreeSurfer, stored as a reference array; not made yet, and the test is skipped until it is).
 - Metric fixtures: a synthetic fsaverage directory of the real size (163,842 vertices, coarsened to fsaverage6 by the code under test) with Desikan parcels laid out by rule, and synthetic subjects whose `sphere.reg` is a known warp and whose thickness is a known function of the template position, with a 5 mm patch planted in some. A cohort of 32 crosses the 30-subject rule; one of 5 does not. `small_run` is a run of three such subjects that went through inventory, metrics and render. `planted_run` is a run of three with values that the cohorts lack planted in single hemispheres (vertices at the ceiling in the control region, near the ceiling, at 0 and above the maximum, a sphere with folded faces and one wound inward), for the tests of what the stages copy into their tables.
 - Click round-trip tests: random voxels to panel pixels and back for every panel and slice in `render.json`; marks resolve to the expected vertex on a synthetic mesh.
+- Rater app: the queue, the database, final labels, the export and the server each have tests on copies of `small_run` (three synthetic subjects, rendered); the server is tested through Starlette's test client and over a socket. `tests/test_review.py` and `tests/test_cli_review.py` run `review` on synthetic directories, with the app in a thread and, for Ctrl-C and SIGTERM, as a process.
+- Frontend: `tests/test_frontend.py` reads the JavaScript and the templates (every route and field against `app/schemas.py`, no other host) and runs the modules without a page under Node, where there is one. `tests/test_frontend_browser.py` (marked `browser`) drives the pages in a browser against the mock server of `tests/frontend_mock.py`; `SURFCENSUS_FRONTEND_MEDIA` points it at other renders. `tests/test_browser.py` (marked `browser`) drives the real pages on the real server, on a run that `review` made of two synthetic 1 mm subjects, at two window widths: what a rater does with keys and mouse, the stored mark against the surface file, and a first-time rater who learns from the screen alone how to get to the next subject. Browser tests need a browser that is installed (`SURFCENSUS_BROWSER`, else Chrome) and are not part of the default run or of CI.

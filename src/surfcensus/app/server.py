@@ -18,7 +18,9 @@ What a server on localhost has to hold against, and how:
   and ``/media`` the tiles, the poster and the video of a ready render, under the names a
   render writes; a name that leads anywhere else, directly or through a link, is a 404.
   ``render.json``, ``vertex_map.npz``, the catalog, the configuration and the database are
-  never served.
+  never served. A path is a route or it is not: no answer redirects to another one.
+- A body that is not what a page sends: a shape of ``app.schemas`` refuses it with 422, as
+  does a number that no column of the database can hold; nothing of it is stored.
 - Blindness: the rating routes answer with the shapes of ``app.schemas`` that hold nothing
   of a dataset, a label, a score or another rating, and an error of those routes says
   nothing that an exception said.
@@ -30,6 +32,7 @@ committed last, or not at all.
 from __future__ import annotations
 
 import errno
+import html
 import os
 import re
 import signal
@@ -101,7 +104,7 @@ from surfcensus.store import (
     PublicCatalog,
     clusters_with_native,
     media_dir,
-    primary_scores,
+    queue_scores,
 )
 
 DEFAULT_PORT = 8765
@@ -143,6 +146,16 @@ _SAME_ORIGIN = frozenset({"same-origin", "none"})
 _BUSY = "the database of the app is in use or cannot be written; try again"
 _FAILED = "the server failed on this request; its log says why"
 _SETTINGS = ("blind", "require_marks", "mark_max_dist_mm")
+# no template: the pages are the two of PAGES, and this is the refusal of one of them
+_CLOSED_PAGE = (
+    '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
+    '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+    "<title>surfcensus: review</title>\n"
+    '<link rel="icon" href="data:,">\n<link rel="stylesheet" href="{static}/app.css">\n'
+    '</head>\n<body>\n<main class="review">\n<p class="message" role="status">{message}</p>\n'
+    '<p><a href="/">Back to the rating screen</a></p>\n</main>\n</body>\n</html>\n'
+)
+_INT64 = 2**63
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -192,11 +205,33 @@ def _invalid(exc: ValidationError) -> _Refused:
     )
 
 
-def _parse(shape: type[_Model], body: bytes) -> _Model:
+def _beyond_a_column(value: object, where: str, found: list[tuple[str, str]]) -> None:
+    if isinstance(value, bool):
+        return
+    if isinstance(value, int):
+        if not -_INT64 <= value < _INT64:
+            found.append((where or "request", "the number is too large to be stored"))
+    elif isinstance(value, Mapping):
+        for key, inner in value.items():
+            _beyond_a_column(inner, f"{where}.{key}" if where else str(key), found)
+    elif isinstance(value, list | tuple):
+        for number, inner in enumerate(value):
+            _beyond_a_column(inner, f"{where}.{number}" if where else str(number), found)
+
+
+def _parse(shape: type[_Model], body: bytes, *, as_text: Collection[str] = ()) -> _Model:
+    """The body of a POST in its shape: 422 with the fields the shape refuses, and for an
+    integer that no column of the database can hold (JSON has no largest number, SQLite
+    has). The fields named in ``as_text`` are stored as text and are not looked at."""
     try:
-        return shape.model_validate_json(body)
+        parsed = shape.model_validate_json(body)
     except ValidationError as exc:
         raise _invalid(exc) from None
+    found: list[tuple[str, str]] = []
+    _beyond_a_column(parsed.model_dump(by_alias=True, exclude=set(as_text)), "", found)
+    if found:
+        raise _Refused.of(422, found)
+    return parsed
 
 
 async def _body(request: Request) -> bytes:
@@ -512,10 +547,7 @@ class _App:
         cached = self._scores
         if cached is not None and cached[0] == stamp:
             return cached[1]
-        try:
-            scores: pd.DataFrame | None = primary_scores(self.run_dir)
-        except (ValueError, OSError):
-            scores = None
+        scores = queue_scores(self.run_dir)
         self._scores = (stamp, scores)
         return scores
 
@@ -1097,7 +1129,8 @@ class _App:
         return _json(out)
 
     def post_events(self, body: bytes) -> Response:
-        batch = _parse(schemas.EventsIn, body)
+        # a payload is stored as the JSON it came as, whatever numbers it holds
+        batch = _parse(schemas.EventsIn, body, as_text=("events",))
         with self.session() as (session, _rater):
             assignment = self._owned(session, batch.assignment_id)
             stored = store_events(session, assignment, batch.events)
@@ -1106,9 +1139,21 @@ class _App:
 
     # --- pages and files ------------------------------------------------------------------------
 
-    def page(self, route: str) -> Response:
+    def page(self, route: str, to_a_reader: bool = False) -> Response:
+        """A page. A review that is closed is refused like every unblinded route; a browser
+        that asked for the page itself (``to_a_reader``) gets the reason as a page with a
+        way back, not as JSON."""
         if route == "/review":
-            self.gate()
+            try:
+                self.gate()
+            except _Refused as refused:
+                if not to_a_reader:
+                    raise
+                said = " ".join(message for _, message in refused.problems)
+                text = _CLOSED_PAGE.format(static=STATIC_URL, message=html.escape(said))
+                return HTMLResponse(
+                    text, status_code=refused.status, headers={"Cache-Control": NO_STORE}
+                )
         template = self.pages.get_template(PAGES[route])
         text = template.render(static=STATIC_URL, version=self.version, mode=self.mode)
         return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
@@ -1441,7 +1486,14 @@ def create_app(
         finally:
             state.close()
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
+    app = FastAPI(
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        lifespan=lifespan,
+        # a path is a route or it is not: no answer sends a browser to another one
+        redirect_slashes=False,
+    )
     app.state.close = state.close
     app.add_middleware(
         _Guard,
@@ -1474,8 +1526,9 @@ def create_app(
         return state.answer(state.page, "/")
 
     @app.get("/review")
-    def review_page() -> Response:
-        return state.answer(state.page, "/review", unblinded=True)
+    def review_page(request: Request) -> Response:
+        reader = "text/html" in request.headers.get("accept", "")
+        return state.answer(state.page, "/review", reader, unblinded=True)
 
     @app.get(STATIC_URL + "/{path:path}")
     def static(path: str) -> Response:
@@ -1625,7 +1678,19 @@ def start_server(
         app.state.close()
         raise
     bound = int(sock.getsockname()[1])
-    config = uvicorn.Config(app, log_level="warning", access_log=False, lifespan="on")
+    config = uvicorn.Config(
+        app,
+        log_level="warning",
+        access_log=False,
+        lifespan="on",
+        # what uvicorn itself depends on, so that a server is the same one whether or not
+        # httptools and uvloop happen to be installed beside it
+        http="h11",
+        loop="asyncio",
+        # no proxy stands before a local server: what a request says of one is not believed
+        proxy_headers=False,
+        server_header=False,
+    )
     server = uvicorn.Server(config)
     thread = threading.Thread(
         target=server.run, kwargs={"sockets": [sock]}, name="surfcensus-app", daemon=True
@@ -1665,18 +1730,27 @@ def serve(
     run_dir = Path(run_dir)
     config = load_config(run_dir)
     with PublicCatalog.open(run_dir) as public:
-        try:
-            scores: pd.DataFrame | None = primary_scores(run_dir)
-        except (ValueError, OSError):
-            scores = None
         plan = build_plan(
-            public, scores, config.app, "local", render_config_hash=config.render.config_hash()
+            public,
+            queue_scores(run_dir),
+            config.app,
+            "local",
+            render_config_hash=config.render.config_hash(),
         )
     if plan.outdated > 0:
         renders = "render is" if plan.outdated == 1 else "renders are"
         raise ConfigError(
             "invalid",
             f"{plan.outdated} {renders} out of date; run surfcensus render --run-dir {run_dir}",
+        )
+    if plan.pending > 0:
+        # nothing renders behind this server: the queue would wait for them for good
+        subjects = "subject is" if plan.pending == 1 else "subjects are"
+        print(
+            f"{plan.pending} selected {subjects} not rendered yet and will not be offered; "
+            f"run surfcensus render --run-dir {run_dir}",
+            file=sys.stderr,
+            flush=True,
         )
     handle = start_server(run_dir, host=host, port=port, mode=mode, rater=rater)
     stop = threading.Event()

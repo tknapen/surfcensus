@@ -1729,6 +1729,17 @@ def primary_scores(run_dir: Path | str) -> pd.DataFrame:
     return scores.sort_values("primary_rank").reset_index(drop=True)
 
 
+def queue_scores(run_dir: Path | str) -> pd.DataFrame | None:
+    """:func:`primary_scores` as the rating queue takes them: None when the run has no
+    scores table that this version reads (one of an earlier schema, until ``metrics`` has
+    written it again, or a file that cannot be read). The queue then goes by
+    ``subject_uid`` and is not stopped."""
+    try:
+        return primary_scores(run_dir)
+    except (ValueError, OSError):
+        return None
+
+
 def queue_order(
     uids: Collection[str], scores: pd.DataFrame | None, *, blind: bool, seed: int
 ) -> list[str]:

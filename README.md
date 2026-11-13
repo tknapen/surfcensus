@@ -2,25 +2,56 @@
 
 Look at your FreeSurfer surfaces where they most often go wrong.
 
-Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the superior sagittal sinus, the transverse sinus or the cerebellar tentorium, and these errors are rarely edited. `surfcensus` is being built to score reconstructions with per-vertex cortical-thickness outlier metrics in fsaverage space, to render animated sagittal, coronal and axial views around the occipital pole with white and pial contours, and to serve those views in a keyboard-driven rating app in which raters click on errors to mark where they are.
+Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the superior sagittal sinus, the transverse sinus or the cerebellar tentorium, and these errors are rarely edited. `surfcensus` scores reconstructions with per-vertex cortical-thickness outlier metrics in fsaverage space, renders sagittal, coronal and axial views that sweep through a box around the occipital pole with white and pial contours, and serves those views in a keyboard-driven rating app in which raters click on errors to mark where they are.
 
 ## Status
 
-Milestones 1 to 3 of 6 are built: rendering one subject; inventorying and rendering a directory of subjects into a run directory; and scoring them. Everything else is planned and does not exist yet, including `surfcensus review`, `surfcensus export` and the rating app. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
+Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
 
 ## What works today
 
 Install from a clone with [uv](https://docs.astral.sh/uv/):
 
 ```
-uv sync
+uv sync --extra app
 ```
 
-No FreeSurfer installation or licence is needed. Your data is only read: nothing is written into a subject directory or into the directory that holds your subjects.
+(`uv sync` alone installs everything but the rating app.) No FreeSurfer installation or licence is needed. Your data is only read: nothing is written into a subject directory or into the directory that holds your subjects.
 
-### A directory of subjects
+### Look at your subjects and rate them
 
-Point `inventory` at a FreeSurfer `SUBJECTS_DIR`, an fMRIPrep output folder, a BIDS derivatives folder with `freesurfer/`, or one subject directory, and give it a run directory outside your subjects directory to write to:
+```
+uv run surfcensus review /path/to/SUBJECTS_DIR
+```
+
+`PATH` is a FreeSurfer `SUBJECTS_DIR`, an fMRIPrep output folder, a BIDS derivatives folder with `freesurfer/`, or one subject directory. The command lists the subjects, scores them, renders the first one and opens the rating app in your browser at `http://127.0.0.1:8765/`; the other subjects are rendered while you rate. It keeps its work in a run directory, `surfcensus-run` next to `PATH` (or `--run-dir DIR`), and says on the terminal what it found, which subjects cannot be rendered and why, and how long it took to get to the app (about 11 s for two real subjects on a 4-core machine, under 1 s when you come back). Ctrl-C stops it; the same command again continues where you were.
+
+- The rating screen shows three views that sweep through the back of the brain. A first visit starts with a short tour. You give each of three questions (sagittal sinus and falx, tentorium and transverse sinus, white surface) a value with the number keys, click on an error to mark where it is, and press Enter for the next subject. `k` skips a subject, which then comes back after the others; `Backspace` goes back; `?` shows the definitions and every key.
+- Subjects come worst-scoring first. `--blind` offers them in a random order and keeps the review screen closed until all are rated. `--rater NAME` says who is rating; two people can rate the same run one after the other, and `surfcensus finalize --run-dir DIR` then writes the labels they agree on and lists the subjects they do not.
+- The review screen (`/review`) lists every subject with its scores and labels and shows a rated subject with its marks.
+- `--no-browser` does not open a browser, `--no-serve` prepares everything and stops, `--serve-after 0` renders every subject before the app opens, `--fsaverage DIR` names the template (see `metrics` below).
+
+```
+uv run surfcensus export --run-dir /path/to/surfcensus-run
+```
+
+writes `export/` in the run directory: `subjects`, `scores`, `selection`, `ratings`, `marks`, `final_marks`, `clusters`, `datasets`, `behaviour` and `skips` as CSV (`--format parquet` for parquet), and a `manifest.json` with the checksum of each. CSV has no types: read identifiers such as `subject_uid` as text (`pd.read_csv(path, dtype={"subject_uid": str})`), or use parquet.
+
+The same from Python:
+
+```python
+from surfcensus.review import review
+from surfcensus.export.tables import export_run
+
+run = review("/path/to/SUBJECTS_DIR", serve=False)  # every step, every render, no app
+export_run(run.run_dir)
+```
+
+The app listens on your own machine only and loads nothing from the internet.
+
+### A directory of subjects, step by step
+
+`review` runs these commands for you. To run them one at a time, point `inventory` at the same kinds of folder and give it a run directory outside your subjects directory to write to:
 
 ```
 uv run surfcensus inventory --run-dir runs/mystudy --source /path/to/SUBJECTS_DIR
@@ -33,7 +64,7 @@ uv run surfcensus status --run-dir runs/mystudy
 - `metrics` scores the subjects. It resamples each subject's cortical thickness to fsaverage6 through its `sphere.reg`, compares it per location with the other subjects of the run, finds clusters of unusually thick cortex around the occipital pole, counts vertices at FreeSurfer's 5 mm thickness maximum, and reads regional thickness from the stats files. The tables are in `tables/` of the run directory; `scores.parquet` has one row per subject with a rank. Two things decide what it can do:
   - It needs an `fsaverage` directory. It finds the one of a FreeSurfer installation (`$FREESURFER_HOME`) or one next to your subjects, as fMRIPrep writes it; otherwise pass `--fsaverage /path/to/fsaverage`. The run then keeps that template.
   - Comparing per location needs at least 30 subjects with a `sphere.reg`. With fewer, or without an fsaverage directory, subjects are ranked on two raw numbers only: the share of occipital vertices at the thickness maximum, and occipital thickness relative to frontal thickness. The command says which of the two it did.
-- `render` writes `media/<id>/` for every subject that has a T1 and white and pial surfaces of both hemispheres: the tiles, `poster.webp`, `render.json` and `vertex_map.npz` described below, and `anim.mp4` with `--video`. Subjects get an identifier that does not show their name, because the rating app will keep raters blind.
+- `render` writes `media/<id>/` for every subject that has a T1 and white and pial surfaces of both hemispheres: the tiles, `poster.webp`, `render.json` and `vertex_map.npz` described below, and `anim.mp4` with `--video`. Subjects get an identifier that does not show their name, because the rating app keeps raters blind.
 - `status` says how many subjects are inventoried, scored and rendered, failed or pending; `status --failures` lists each failure with its reason.
 
 All four can be run again at any time. A second call does only what is new: a subject whose files changed is read, scored and rendered again, the others are skipped, and a subject that failed is tried again when its files change or with `--retry-failed`. If the data moves, `inventory --source /new/place --relocate` keeps the run. The exit code is 0 when nothing is in the failed state, 1 when a subject is, and 2 for a wrong call or for what lies in the machine (a full or read-only disk, a video encoder that does not work, an fsaverage directory that cannot be used): that is held against no subject, and the same command does the work once it is put right.
@@ -80,7 +111,8 @@ The renderer's frames have not yet been compared by eye with Freeview. Details a
 
 ## Planned
 
-- The rating app: `surfcensus review /path/to/SUBJECTS_DIR` will inventory, score and render the subjects and open the rating app in the browser, worst-scoring subjects first. `surfcensus export` will write the ratings.
+- The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.
+- A one-line install without a clone, and `review` on a downloaded OpenNeuro dataset without naming its subfolder.
 - A normative reference to score small sets against, built from rated census subjects.
 - The OpenNeuro census: the same pipeline over FreeSurfer outputs in public OpenNeuro derivatives, to measure how common these errors are and how often quantitative checks miss them. See `docs/phases.md`.
 

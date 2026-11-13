@@ -17,6 +17,7 @@ import subprocess
 import sys
 from importlib import import_module
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import pytest
@@ -95,6 +96,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "MarkError": None,
         "VertexIndex": None,
         "validate_mark": ("info", "mark"),
+        "check_snap_radius": ("max_dist_mm", "vertex_map_margin_mm"),
         "resolve_mark": ("info", "index", "mark", "max_dist_mm"),
         "marked_vertices": ("index", "points", "tolerance_mm", "surface"),
     },
@@ -149,6 +151,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
     "surfcensus.app.events": {
         "store_events": ("session", "assignment", "events"),
         "record_run_event": ("session", "type", "payload", "now"),
+        "record_setting": ("session", "setting", "value", "now"),
     },
     "surfcensus.app.server": {
         "ServerHandle": None,
@@ -169,11 +172,21 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "RATINGS_COLUMNS": None,
         "SUBJECT_RATING_COLUMNS": None,
         "BEHAVIOUR_COLUMNS": None,
+        "SKIPS_COLUMNS": None,
+        "MARKS_COLUMNS": None,
+        "FINAL_MARKS_COLUMNS": None,
+        "DATASETS_COLUMNS": None,
         "ratings_frame": ("run_dir",),
+        "marks_frame": ("run_dir",),
         "subjects_frame": ("run_dir",),
+        "frame_csv": ("frame",),
         "export_run": ("run_dir", "out_dir", "fmt", "profile"),
     },
     "surfcensus.review": {
+        "DEFAULT_RUN_DIR": None,
+        "ReviewApp": None,
+        "default_run_dir": ("path",),
+        "rateable": ("run",),
         "review": (
             "path",
             "run_dir",
@@ -187,6 +200,23 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "video",
             "port",
             "open_browser",
+            "serve",
+            "serve_after",
+            "relocate",
+            "force",
+        ),
+        "open_review": (
+            "path",
+            "run_dir",
+            "subjects",
+            "rater",
+            "blind",
+            "require_marks",
+            "field_strength",
+            "jobs",
+            "fsaverage",
+            "video",
+            "port",
             "serve",
             "serve_after",
             "relocate",
@@ -689,17 +719,10 @@ def test_the_browser_is_the_one_named_and_else_chrome(tmp_path: Path) -> None:
 
 
 def test_the_engine_fixture_opens_the_database_of_the_app_run(
-    request: pytest.FixtureRequest, app_run: Path
+    app_run: Path, app_engine: Any
 ) -> None:
-    # until package 4.B has written open_app_db the fixture says who writes it; afterwards
-    # it gives an engine on app.sqlite of the run
-    try:
-        engine = request.getfixturevalue("app_engine")
-    except NotImplementedError as exc:
-        assert "package 4.B" in str(exc) and not (app_run / APP_DB_FILE).exists()
-    else:
-        assert Path(engine.url.database) == app_run / APP_DB_FILE
-        assert (app_run / APP_DB_FILE).is_file()
+    assert Path(app_engine.url.database) == app_run / APP_DB_FILE
+    assert (app_run / APP_DB_FILE).is_file()
 
 
 def test_the_fixtures_of_the_app_tests_are_what_they_say(

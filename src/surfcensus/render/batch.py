@@ -23,7 +23,7 @@ import math
 import os
 import tempfile
 import time
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -225,6 +225,7 @@ def run_render(
     video: bool | None = None,
     force: bool = False,
     retry_failed: bool = False,
+    stop: Callable[[], bool] | None = None,
 ) -> PhaseReport:
     """Render the pending subjects and record every outcome in the ``renders`` table.
 
@@ -268,6 +269,10 @@ def run_render(
     before anything is recorded; the last two end the call at the batch in which they occur,
     and nothing of that batch is recorded. ``KeyboardInterrupt`` ends the call as well; the
     batches before it are recorded.
+
+    ``stop`` is asked before each batch (``batches.run_batches``): once it answers true the
+    call returns with what the batches before it rendered, and the rest stays pending. It
+    is how ``surfcensus review`` ends the renderer that works behind the running app.
     """
     started = time.perf_counter()
     public, config = ctx.public, ctx.config
@@ -389,6 +394,7 @@ def run_render(
         batch_subjects=config.cache.batch_subjects,
         jobs=jobs,
         progress=PHASE if pending else None,
+        stop=stop,
     )
     return PhaseReport(
         phase=PHASE,

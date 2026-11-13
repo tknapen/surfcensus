@@ -580,3 +580,343 @@ def status(
                 unit = uid if name == uid else f"{uid} ({name})"
                 text = f": {detail}" if isinstance(detail, str) else ""
                 typer.echo(f"{phase} {unit}: {reason}{text}")
+
+
+# --- the rater app (milestone 4) ------------------------------------------------------------------
+
+_RATER = typer.Option(
+    None,
+    "--rater",
+    metavar="NAME",
+    help="Who rates in this session. Not stored: without it the rater is app.rater_name of "
+    "the run (local).",
+)
+calibration_app = typer.Typer(no_args_is_help=True, help="The calibration set of a run.")
+app.add_typer(calibration_app, name="calibration")
+
+
+@contextmanager
+def _app_stops_with_exit_2() -> Iterator[None]:
+    """:func:`_stops_with_exit_2` for the commands of the rater app: also for a core
+    install without the app's packages and for a database of the app that stays locked."""
+    from surfcensus.config import ConfigError
+
+    with _stops_with_exit_2():
+        try:
+            yield
+        except ModuleNotFoundError as exc:
+            if exc.name is None or exc.name.split(".")[0] not in _APP_PACKAGES:
+                raise
+            raise ConfigError(
+                "missing",
+                f"the rater app needs the package {exc.name}; install it with "
+                'pip install "surfcensus[app]"',
+            ) from exc
+        except Exception as exc:
+            # sqlalchemy is imported by the app only, so its error is named by its module
+            if type(exc).__module__.split(".")[0] != "sqlalchemy":
+                raise
+            text = " ".join(str(getattr(exc, "orig", exc)).split())
+            raise ConfigError("invalid", f"app.sqlite cannot be used: {text}") from exc
+
+
+_APP_PACKAGES = ("fastapi", "uvicorn", "sqlmodel", "sqlalchemy", "jinja2", "starlette")
+
+
+def _checked_rater(name: str | None) -> str | None:
+    if name is not None and (not name or name != name.strip()):
+        raise typer.BadParameter(
+            "a rater's name is not empty and has no space at its ends", param_hint="--rater"
+        )
+    return name
+
+
+@app.command("review")
+def review_command(
+    path: Path = typer.Argument(
+        ...,
+        metavar="PATH",
+        help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder or one subject "
+        "directory. It is read and never changed.",
+    ),
+    run_dir: Path | None = typer.Option(
+        None,
+        "--run-dir",
+        metavar="DIR",
+        help="The run directory. Default: surfcensus-run next to PATH, else in the current "
+        "directory.",
+    ),
+    subjects: list[str] | None = typer.Option(
+        None,
+        "--subjects",
+        metavar="GLOB",
+        help="Only the subject directories that match. Repeatable; kept for later calls.",
+    ),
+    rater: str | None = _RATER,
+    blind: bool | None = typer.Option(
+        None,
+        "--blind/--no-blind",
+        help="Offer the subjects in a seeded random order and keep the review screen closed "
+        "until all are rated; otherwise by score, worst first. Kept for later calls.",
+    ),
+    require_marks: bool | None = typer.Option(
+        None,
+        "--require-marks/--no-require-marks",
+        help="A minor or major rating needs a click mark of its class. Kept for later calls.",
+    ),
+    field_strength: float | None = typer.Option(
+        None,
+        "--field-strength",
+        metavar="T",
+        help="Field strength of the subjects in tesla; kept for later calls.",
+    ),
+    jobs: int | None = typer.Option(
+        None,
+        "--jobs",
+        min=1,
+        metavar="J",
+        help="Worker processes for metrics and renders. Default: the processors, at most 8.",
+    ),
+    fsaverage: Path | None = _FSAVERAGE,
+    video: bool | None = typer.Option(
+        None, "--video/--no-video", help="Write anim.mp4 as well; kept for later calls."
+    ),
+    port: int = typer.Option(
+        8765, "--port", min=0, max=65535, metavar="N", help="The port of the app; 0: any free one."
+    ),
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser."),
+    no_serve: bool = typer.Option(
+        False, "--no-serve", help="Prepare everything, render every subject, and stop."
+    ),
+    serve_after: int | None = typer.Option(
+        None,
+        "--serve-after",
+        min=0,
+        metavar="N",
+        help="Open the app when N subjects are rendered and render the others while it runs. "
+        "Default 1; 0 renders every subject first.",
+    ),
+    relocate: bool = typer.Option(
+        False,
+        "--relocate",
+        help="The data moved to PATH: keep the run, its subjects and their ratings.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", help="Change --blind although the run has ratings; it is recorded."
+    ),
+) -> None:
+    """Score, render and rate the FreeSurfer subjects under PATH: inventory, metrics,
+    render and the rating app in the browser, in one go. Run it again to continue."""
+    from surfcensus import review as reviewing
+
+    rater = _checked_rater(rater)
+    with _app_stops_with_exit_2():
+        if not no_serve:
+            import surfcensus.app.server  # noqa: F401  (before the work, not after it)
+        with _interrupted_is_exit_130(), _terminated_like_interrupted():
+            run = reviewing.review(
+                path,
+                run_dir=run_dir,
+                subjects=subjects,
+                rater=rater,
+                blind=blind,
+                require_marks=require_marks,
+                field_strength=field_strength,
+                jobs=jobs,
+                fsaverage=fsaverage,
+                video=video,
+                port=port,
+                open_browser=not no_browser,
+                serve=not no_serve,
+                serve_after=serve_after,
+                relocate=relocate,
+                force=force,
+            )
+        with run:
+            nothing = reviewing.rateable(run) == 0
+            if no_serve and not nothing:
+                typer.echo(f"Run directory: {run.run_dir}")
+    raise typer.Exit(1 if nothing else 0)
+
+
+@app.command("serve")
+def serve_command(
+    run_dir: Path = _RUN_DIR,
+    host: str = typer.Option("127.0.0.1", "--host", metavar="H", help="The address to bind to."),
+    port: int = typer.Option(
+        8765, "--port", min=0, max=65535, metavar="N", help="The port; 0: any free one."
+    ),
+    mode: str | None = typer.Option(
+        None,
+        "--mode",
+        metavar="local|team",
+        help="Default: local for a local run, team for a census run.",
+    ),
+    rater: str | None = _RATER,
+    no_browser: bool = typer.Option(False, "--no-browser", help="Do not open the browser."),
+) -> None:
+    """Open the rating app on a run that is rendered (phase 7). Renders nothing."""
+    from surfcensus.config import load_config
+
+    if mode not in (None, "local", "team"):
+        raise typer.BadParameter("is local or team", param_hint="--mode")
+    rater = _checked_rater(rater)
+    with _app_stops_with_exit_2():
+        from surfcensus.app.server import serve
+
+        if mode is None:
+            mode = "local" if load_config(run_dir).mode == "local" else "team"
+        serve(
+            run_dir,
+            host=host,
+            port=port,
+            mode="local" if mode == "local" else "team",
+            rater=rater,
+            open_browser=not no_browser,
+        )
+
+
+@app.command("finalize")
+def finalize_command(run_dir: Path = _RUN_DIR) -> None:
+    """Write the final labels and marks from the ratings of all raters: one rating as it
+    is, raters within one scale step as their consensus, and a list of the subjects that
+    need a decision."""
+    with _app_stops_with_exit_2():
+        from sqlmodel import Session, select
+
+        from surfcensus.app.db import app_db_mode, open_app_db
+        from surfcensus.app.finalize import finalize
+        from surfcensus.app.models import Rater
+        from surfcensus.app.queue import build_plan, subjects_left, subjects_skipped
+        from surfcensus.config import ConfigError, load_config
+        from surfcensus.export.tables import ratings_frame
+        from surfcensus.protocol import load_protocol
+        from surfcensus.store import PublicCatalog, queue_scores
+
+        config = load_config(run_dir)
+        with PublicCatalog.open(run_dir) as public:
+            mode = app_db_mode(run_dir)
+            if mode is None:
+                raise ConfigError(
+                    "missing", f"{run_dir} has no ratings yet: there is no app.sqlite to read"
+                )
+            protocol, _ = load_protocol(run_dir)
+            plan = build_plan(
+                public,
+                queue_scores(run_dir),
+                config.app,
+                mode,
+                render_config_hash=config.render.config_hash(),
+            )
+            subjects = public.subjects()
+            engine = open_app_db(run_dir, run_id=public.run_id(), mode=mode)
+            try:
+                with Session(engine) as session:
+                    report = finalize(session, plan, protocol)
+                    waiting = []
+                    if mode == "local":
+                        for rater in session.exec(select(Rater).order_by(Rater.name)).all():
+                            left = subjects_left(session, rater, plan)
+                            if left:
+                                skipped = subjects_skipped(session, rater, plan, None)
+                                waiting.append((rater.name, left, skipped))
+                    session.commit()
+            finally:
+                engine.dispose()
+        typer.echo(
+            f"final labels: {report.consensus} by consensus, {report.single} from one rating, "
+            f"{report.unratable} unratable (render failed), {len(report.open)} open"
+        )
+        for name, left, skipped in waiting:
+            noun = "subject" if left == 1 else "subjects"
+            held = f" ({skipped} skipped)" if skipped else ""
+            typer.echo(
+                f"  {name} still has {left} {noun} to rate{held}; labels of those are from "
+                "the other ratings only"
+            )
+        if report.open:
+            typer.echo(
+                "open (raters two or more steps apart, or unratable for one of them): "
+                "decide together, then rate again or adjudicate"
+            )
+            ratings = ratings_frame(run_dir)
+            ratings = ratings[ratings["kind"] == "main"]
+            local = config.mode == "local"
+            # by label where the run has labels: the order two raters look for
+            named = sorted((_names(subjects, [uid]) if local else uid, uid) for uid in report.open)
+            for name, uid in named:
+                typer.echo(f"  {name}")
+                of_subject = ratings[ratings["subject_uid"] == uid]
+                latest = of_subject.sort_values("assignment_id").groupby("rater").tail(1)
+                for row in latest.sort_values("rater").itertuples(index=False):
+                    if isinstance(row.unratable_reason, str):
+                        said = f"unratable ({row.unratable_reason})"
+                    else:
+                        values = {"A": row.A, "B": row.B, "C": row.C}
+                        said = ", ".join(
+                            f"{criterion} {int(value)}"
+                            for criterion, value in values.items()
+                            if not _is_missing(value)
+                        )
+                    typer.echo(f"    {row.rater}: {said}")
+
+
+def _is_missing(value: object) -> bool:
+    import pandas as pd
+
+    return bool(pd.isna(value))  # pyrefly: ignore[no-matching-overload]
+
+
+@calibration_app.command("freeze")
+def calibration_freeze(
+    run_dir: Path = _RUN_DIR,
+    subject: list[str] | None = typer.Option(
+        None,
+        "--subject",
+        metavar="UID",
+        help="Only this subject, by subject_uid. Repeatable. Without it: every subject "
+        "with a final label.",
+    ),
+    version: str = typer.Option("1", "--version", metavar="V", help="The version of the set."),
+) -> None:
+    """Write calibration.yaml from the final labels and marks of a run. The file is never
+    overwritten; justifications and reference examples are then written into it by hand."""
+    with _app_stops_with_exit_2():
+        from surfcensus.app.finalize import freeze_calibration
+
+        path = freeze_calibration(run_dir, subjects=subject or None, version=version)
+        typer.echo(str(path))
+
+
+@app.command("export")
+def export_command(
+    run_dir: Path = _RUN_DIR,
+    out: Path | None = typer.Option(
+        None,
+        "--out",
+        metavar="DIR",
+        help="Where to write. Default: export/ (release/ with --release) in the run "
+        "directory. An earlier export there is replaced, also its files of the other format.",
+    ),
+    fmt: str = typer.Option(
+        "csv", "--format", metavar="csv|parquet", help="CSV has no types: see the README."
+    ),
+    release: bool = typer.Option(
+        False, "--release", help="The coarser tables a census publishes. Not for a local run."
+    ),
+) -> None:
+    """Write the tables for analysis (phase 8): subjects, scores, selection, ratings,
+    marks, final marks, clusters, datasets, behaviour, skips and a manifest."""
+    if fmt not in ("csv", "parquet"):
+        raise typer.BadParameter("is csv or parquet", param_hint="--format")
+    with _stops_with_exit_2():
+        from surfcensus.export.tables import export_run
+
+        paths = export_run(
+            run_dir,
+            out,
+            fmt="csv" if fmt == "csv" else "parquet",
+            profile="release" if release else "analysis",
+        )
+        for path in paths:
+            typer.echo(str(path))

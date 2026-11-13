@@ -709,6 +709,35 @@ def test_no_units_leases_and_commits_nothing(tmp_path: Path) -> None:
     assert commits.batches == []
 
 
+@pytest.mark.parametrize("jobs", [1, 2])
+def test_stop_is_asked_before_each_batch_and_ends_the_run_between_two(
+    tmp_path: Path, jobs: int
+) -> None:
+    units = ["a", "b", "c", "d", "e"]
+    leases = Leases(tmp_path)
+    commits = Commits(leases)
+    asked: list[int] = []
+
+    def stop() -> bool:
+        asked.append(len(commits.batches))
+        return len(commits.batches) == 2
+
+    run_batches(units, leases, describe, commits, batch_subjects=2, jobs=jobs, stop=stop)
+
+    # asked with 0, 1 and 2 batches committed; the third batch is never leased
+    assert asked == [0, 1, 2]
+    assert [[unit for unit, _ in batch] for batch in commits.batches] == [["a", "b"], ["c", "d"]]
+    assert leases.leased() == ["a", "b", "c", "d"]
+    assert commits.flat() == [(unit, expected(leases, unit)) for unit in units[:4]]
+
+
+def test_a_stop_that_is_true_at_once_leases_nothing(tmp_path: Path) -> None:
+    leases = Leases(tmp_path)
+    commits = Commits()
+    run_batches(["a"], leases, describe, commits, batch_subjects=1, jobs=1, stop=lambda: True)
+    assert leases.events == [] and commits.batches == []
+
+
 def test_units_may_be_any_sequence(tmp_path: Path) -> None:
     leases = Leases(tmp_path)
     commits = Commits()

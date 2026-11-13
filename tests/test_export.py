@@ -30,9 +30,22 @@ from synth_tree import write_tier_a, write_tree  # pyrefly: ignore[missing-impor
 
 from surfcensus import __version__
 from surfcensus.app import APP_DB_FILE
-from surfcensus.app.db import APP_SCHEMA_VERSION, get_or_create_rater, open_app_db, store_submission
+from surfcensus.app.db import (
+    APP_SCHEMA_VERSION,
+    get_or_create_rater,
+    open_app_db,
+    record_skip,
+    store_submission,
+)
 from surfcensus.app.models import Assignment, Event, FinalLabel, FinalMark, Mark
-from surfcensus.app.schemas import EVENT_TYPES, FINAL_METHODS, RatingIn, ResolvedMark
+from surfcensus.app.schemas import (
+    EVENT_TYPES,
+    FINAL_METHODS,
+    SKIP_EVENT,
+    RatingIn,
+    ResolvedMark,
+    SkipIn,
+)
 from surfcensus.calibration import CalibrationSet, CalibrationSubject, write_calibration
 from surfcensus.config import CONFIG_FILE, ConfigError
 from surfcensus.export import tables
@@ -46,6 +59,7 @@ from surfcensus.export.tables import (
     MARKS_COLUMNS,
     RATINGS_COLUMNS,
     RELEASE_LEFT_OUT,
+    SKIPS_COLUMNS,
     SUBJECT_RATING_COLUMNS,
     Format,
     Profile,
@@ -289,6 +303,7 @@ def test_every_table_has_the_documented_columns(run: Path, engine: Engine, uids:
     assert columns["clusters"] == [*SCHEMAS["clusters"].names, *native]
     assert columns["datasets"] == list(DATASETS_COLUMNS)
     assert columns["behaviour"] == list(BEHAVIOUR_COLUMNS)
+    assert columns["skips"] == list(SKIPS_COLUMNS)
 
 
 def test_the_mark_tables_follow_the_tables_of_the_app() -> None:
@@ -763,6 +778,7 @@ def test_a_run_without_a_ratings_database_exports_with_empty_rating_columns(
         "clusters": len(clusters_with_native(run_copy)),
         "datasets": 1,
         "behaviour": 0,
+        "skips": 0,
     }
     assert rows["clusters"] > 0
     manifest = manifest_of(run_copy / "export")
@@ -987,6 +1003,8 @@ def test_behaviour_sums_the_events_of_each_completed_assignment(
             "n_pauses": "2",
             "n_mode_switches": "2",
             "n_back": "1",
+            "n_skips": "0",
+            "ms_skipped_visits": "0",
         },
         {
             "assignment_id": str(quiet),
@@ -998,8 +1016,138 @@ def test_behaviour_sums_the_events_of_each_completed_assignment(
             "n_pauses": "0",
             "n_mode_switches": "0",
             "n_back": "0",
+            "n_skips": "0",
+            "ms_skipped_visits": "0",
         },
     ]
+
+
+def skip(engine: Engine, assignment_id: int, *, ms: int, client_ts: str, now: str) -> bool:
+    """Record a skip of an open assignment as the server does."""
+    with Session(engine) as session:
+        assignment = session.get(Assignment, assignment_id)
+        assert assignment is not None
+        body = SkipIn(assignment_id=assignment_id, client_ts=client_ts, ms_on_subject=ms)
+        recorded = record_skip(session, assignment, body, now=now)
+        session.commit()
+        return recorded
+
+
+def test_every_skip_is_a_row_and_the_skipped_visits_are_counted_with_the_rating(
+    run: Path, engine: Engine, uids: list[str]
+) -> None:
+    """A rater skips one subject twice and rates it, skips a second and leaves it, and
+    rates a third at once. The skips table has the three skips, whoever was rated in the
+    end; the behaviour table says what came before each rating."""
+    twice = assign(engine, run, uids[0])
+    assert skip(engine, twice, ms=4000, client_ts="2026-11-13T09:00:01.000Z", now=T1)
+    assert skip(engine, twice, ms=2500, client_ts="2026-11-13T09:00:09.000Z", now=T2)
+    # the request of the second skip arrives again: it is one skip
+    assert not skip(engine, twice, ms=2500, client_ts="2026-11-13T09:00:09.000Z", now=T3)
+    left = assign(engine, run, uids[1], rater="second")
+    assert skip(engine, left, ms=300, client_ts="2026-11-13T09:01:00.000Z", now=T2)
+    submit(engine, twice, ms=7000, now=T3)
+    at_once = rate(engine, run, uids[2], ms=1200, now=T3)
+    # a skip event of a form the server does not write: counted, its time unknown
+    spoiled = assign(engine, run, uids[1])
+    log(engine, spoiled, ("skip", "not json"))
+    submit(engine, spoiled, ms=10, now=T3)
+
+    key = {uid: render_key(run, uid) for uid in uids}
+    export_run(run)
+    skips = read_csv(run / "export" / "skips.csv").to_dict("records")
+    assert skips == [
+        {
+            "assignment_id": str(twice),
+            "n": "1",
+            "subject_uid": uids[0],
+            "rater": "local",
+            "kind": "main",
+            "render_key": key[uids[0]],
+            "client_ts": "2026-11-13T09:00:01.000Z",
+            "server_ts": T1,
+            "ms_on_subject": "4000",
+            "rated": "True",
+        },
+        {
+            "assignment_id": str(twice),
+            "n": "2",
+            "subject_uid": uids[0],
+            "rater": "local",
+            "kind": "main",
+            "render_key": key[uids[0]],
+            "client_ts": "2026-11-13T09:00:09.000Z",
+            "server_ts": T2,
+            "ms_on_subject": "2500",
+            "rated": "True",
+        },
+        {
+            "assignment_id": str(left),
+            "n": "1",
+            "subject_uid": uids[1],
+            "rater": "second",
+            "kind": "main",
+            "render_key": key[uids[1]],
+            "client_ts": "2026-11-13T09:01:00.000Z",
+            "server_ts": T2,
+            "ms_on_subject": "300",
+            "rated": "False",
+        },
+        {
+            "assignment_id": str(spoiled),
+            "n": "1",
+            "subject_uid": uids[1],
+            "rater": "local",
+            "kind": "main",
+            "render_key": key[uids[1]],
+            "client_ts": T1,
+            "server_ts": "",
+            "ms_on_subject": "",
+            "rated": "True",
+        },
+    ]
+    behaviour = by_assignment(read_csv(run / "export" / "behaviour.csv"))
+    assert list(behaviour.index) == [str(twice), str(at_once), str(spoiled)]
+    # the time of a rating is that of its last visit; the earlier visits are beside it
+    assert behaviour.loc[
+        str(twice), ["ms_on_subject", "n_skips", "ms_skipped_visits"]
+    ].tolist() == [
+        "7000",
+        "2",
+        "6500",
+    ]
+    assert behaviour.loc[str(at_once), ["n_skips", "ms_skipped_visits"]].tolist() == ["0", "0"]
+    # the count is the assignment's own; the time of a visit nobody recorded is not a 0
+    assert behaviour.loc[str(spoiled), ["n_skips", "ms_skipped_visits"]].tolist() == ["0", ""]
+    # a skip is no rating: the subject that was only skipped has none from that rater
+    ratings = read_csv(run / "export" / "ratings.csv")
+    assert str(left) not in set(ratings["assignment_id"])
+
+    export_run(run, fmt="parquet")
+    typed = pd.read_parquet(run / "export" / "skips.parquet")
+    assert typed["n"].tolist() == [1, 2, 1, 1] and typed["rated"].tolist() == [
+        True,
+        True,
+        False,
+        True,
+    ]
+    assert typed["ms_on_subject"].tolist()[:3] == [4000, 2500, 300] and pd.isna(
+        typed["ms_on_subject"].iloc[3]
+    )
+
+
+def by_assignment(frame: pd.DataFrame) -> pd.DataFrame:
+    return frame.set_index("assignment_id")
+
+
+def test_the_export_reads_the_skip_events_the_server_writes() -> None:
+    assert tables._SKIP_EVENT == SKIP_EVENT
+
+
+def test_a_run_without_ratings_has_an_empty_skips_table(run: Path) -> None:
+    export_run(run)
+    assert read_csv(run / "export" / "skips.csv").to_dict("records") == []
+    assert list(read_csv(run / "export" / "skips.csv").columns) == list(SKIPS_COLUMNS)
 
 
 # --- the two formats ------------------------------------------------------------------------------
@@ -1040,14 +1188,16 @@ def assert_formats_agree(csv_dir: Path, parquet_dir: Path) -> int:
 
 
 def fill(run: Path, engine: Engine, uids: list[str]) -> None:
-    """Ratings of two raters with marks, a revision, an unratable rating, events, final
-    labels and final marks: a row in every table."""
+    """Ratings of two raters with marks, a revision, an unratable rating, a skipped
+    subject, events, final labels and final marks: a row in every table."""
     first = rate(engine, run, uids[0], marks=[click("m1"), click("m2", "C")], note='a, "b"\nc')
     submit(engine, first, marks=[click("m3", px=1 / 3)], found=[resolved(pial_dist_mm=0.1 + 0.2)])
     second = rate(engine, run, uids[0], rater="second", values=NONE, other=True, note="x", now=T2)
     rate(engine, run, uids[1], unratable="image too poor to judge", now=T3)
     log(engine, first, ("play", {}), ("frames", {"mode": "sync", "visits": [[0, 5], [1, 5]]}))
     log(engine, second, ("back", {}))
+    waiting = assign(engine, run, uids[2], rater="second")
+    skip(engine, waiting, ms=800, client_ts="2026-11-13T09:30:00.000Z", now=T2)
     label(engine, uids[0], "consensus", A=0, B=0, C=1)
     label(engine, uids[1], unratable=3)
     with Session(engine) as session:
@@ -1268,7 +1418,8 @@ def test_a_manifest_that_lists_other_names_takes_no_file_with_it(run: Path, tmp_
     for text in ("{", "[]", '{"files": 3}', '{"files": [1, 2]}', ""):
         (out / MANIFEST).write_text(text)
         export_run(run, out)
-        assert (out / "keep.csv").exists() and len(manifest_of(out)["files"]) == 9
+        assert (out / "keep.csv").exists()
+        assert len(manifest_of(out)["files"]) == len(EXPORT_TABLES) == 10
 
 
 def test_an_export_that_is_interrupted_leaves_no_manifest(
@@ -1356,7 +1507,7 @@ def test_the_export_works_without_the_app_extra(
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.splitlines() == ["10 3 3", "[] []"]
+    assert result.stdout.splitlines() == ["11 3 3", "[] []"]
     assert listing(tmp_path / "there") == listing(tmp_path / "here")
 
 
@@ -1367,7 +1518,7 @@ def test_the_module_imports_with_sqlmodel_blocked() -> None:
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "9"
+    assert result.stdout.strip() == "10"
 
 
 # --- a database that is not this run's ratings ---------------------------------------------------
@@ -1437,7 +1588,7 @@ def test_a_database_whose_making_was_interrupted_counts_as_none(run_copy: Path) 
     (run_copy / APP_DB_FILE).write_bytes(b"")
     assert ratings_frame(run_copy).empty
     assert subjects_frame(run_copy)[list(SUBJECT_RATING_COLUMNS)].isna().all().all()
-    assert len(export_run(run_copy)) == 10
+    assert len(export_run(run_copy)) == len(EXPORT_TABLES) + 1
     assert (run_copy / APP_DB_FILE).read_bytes() == b""
 
 
@@ -1472,7 +1623,7 @@ def test_an_export_reads_what_is_committed_while_the_app_is_writing(
         store_submission(session, assignment, rating, [], protocol_sha256="9c1f", app_version="0")
         session.flush()
         assert list(ratings_frame(run)["assignment_id"]) == [done]
-        assert len(export_run(run)) == 10
+        assert len(export_run(run)) == len(EXPORT_TABLES) + 1
         session.commit()
     assert list(ratings_frame(run)["assignment_id"]) == [done, pending]
 

@@ -12,7 +12,7 @@ import dataclasses
 import logging
 import os
 import sqlite3
-from collections.abc import Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
@@ -651,6 +651,8 @@ class Run:
         video: bool | None = None,
         force: bool = False,
         retry_failed: bool = False,
+        native: bool = True,
+        stop: Callable[[], bool] | None = None,
     ) -> PhaseReport:
         """Render the pending subjects into ``media/<subject_uid>/`` (phase 6); see
         ``render.batch.run_render``.
@@ -665,6 +667,12 @@ class Run:
         its label. Raises ``SourceError`` when there is something to render and a source
         cannot be built, before anything is recorded against a subject. A call that finds
         every render recorded needs no source.
+
+        ``native=False`` leaves the ``native`` stage out, for a caller that renders a run
+        in several calls and ends with one that has it. ``stop`` is asked before each batch
+        of renders; once it answers true the call returns with what was rendered, the rest
+        stays pending and the ``native`` stage is left out as well (``surfcensus review``
+        ends its renderer this way).
         """
         from surfcensus.metrics.pipeline import update_native
         from surfcensus.render.batch import render_pending, run_render
@@ -695,10 +703,13 @@ class Run:
             video=video,
             force=force,
             retry_failed=retry_failed,
+            stop=stop,
         )
+        if not native or (stop is not None and stop()):
+            return report
         # the cluster centroids of the subjects just rendered get their native position
-        native = update_native(context, template=template)
-        return dataclasses.replace(report, notes=(*report.notes, *native.notes))
+        located = update_native(context, template=template)
+        return dataclasses.replace(report, notes=(*report.notes, *located.notes))
 
     def _subject_uids(self, names: Sequence[str]) -> list[str]:
         named = [names] if isinstance(names, str) else list(names)

@@ -51,6 +51,15 @@ export function subjectTiles(tiles, nSlices, mediaBase, renderKey, first = null)
   return out;
 }
 
+// Where the pointer of a mouse event is along one axis. A browser names the screen pixel
+// under the pointer by its low edge, in whole CSS pixels, while the pointer is somewhere
+// inside that pixel: its middle is the place without a bias (taking the edge puts every
+// mark half a screen pixel up and to the left on average). A coordinate that already has a
+// fraction is the pointer's own and is taken as it is.
+export function pointerAt(coordinate) {
+  return Number.isInteger(coordinate) ? coordinate + 0.5 : coordinate;
+}
+
 export function sliceCounts(render) {
   const counts = {};
   for (const name of PANEL_ORDER) counts[name] = render.panels[name].slices.length;
@@ -519,8 +528,8 @@ export class Viewer {
     const box = this.panels[name].zoomable.getBoundingClientRect();
     const [px, py] = clickToPixel(
       panel,
-      event.clientX - box.left,
-      event.clientY - box.top,
+      pointerAt(event.clientX) - box.left,
+      pointerAt(event.clientY) - box.top,
       box.width,
       box.height,
     );

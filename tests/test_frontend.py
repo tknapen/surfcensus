@@ -946,6 +946,29 @@ def test_a_subject_has_every_tile_once_and_the_first_frame_in_front(js_copy: Pat
 
 
 @needs_node
+def test_a_click_is_taken_at_the_middle_of_its_screen_pixel(js_copy: Path) -> None:
+    """A browser names the screen pixel under the pointer by its corner, in whole pixels;
+    the middle is the place without a bias. A coordinate with a fraction is the pointer's
+    own. Through ``clickToPixel``, a click on screen pixel 100 of a 320 px tile shown 454 px
+    wide is tile pixel 100.5 * 320 / 454."""
+    out = run_js(
+        js_copy,
+        """
+        import { pointerAt } from "./js/viewer.js";
+        import { clickToPixel } from "./js/coords.js";
+        const panel = { width: 320, height: 320 };
+        output({
+          at: [0, 100, 453, 100.25, 0.5, -3].map(pointerAt),
+          px: clickToPixel(panel, pointerAt(111) - 11, pointerAt(40.75) - 11, 454, 454),
+        });
+        """,
+        {},
+    )
+    assert out["at"] == [0.5, 100.5, 453.5, 100.25, 0.5, -2.5]
+    assert out["px"] == pytest.approx([100.5 * 320 / 454, 29.75 * 320 / 454])
+
+
+@needs_node
 @pytest.mark.parametrize("case", ["conformed", "hires_flipped"])
 def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(
     js_copy: Path, case: str
