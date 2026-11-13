@@ -18,12 +18,13 @@ from synth_tree import (  # pyrefly: ignore[missing-import]
     FS_ROOT,
     write_light_subject,
     write_light_template,
+    write_linked_tree,
     write_tree,
 )
 
 import surfcensus
 import surfcensus.sources.local as local_module
-from surfcensus.config import SourceConfig, new_local_config
+from surfcensus.config import ConfigError, SourceConfig, new_local_config
 from surfcensus.privacy import new_local_salt, subject_uid
 from surfcensus.render import RenderConfig, render_subject
 from surfcensus.run import from_config
@@ -43,7 +44,13 @@ from surfcensus.sources.local import (
     LocalSource,
     detect_layout,
     find_adjacent_template,
+    freesurfer_template_places,
     local,
+    place_holding,
+    refuse_in_sources,
+    refuse_run_in_sources,
+    source_places,
+    stored_subjects_dirs,
     template_files_missing,
 )
 from surfcensus.sources.patterns import ROLE_CANDIDATES
@@ -1328,6 +1335,121 @@ def _check_real_subject(root: Path) -> None:
     assert source.read_bytes(subject, FileRole.T1, byte_range=(0, 1)) == b"\x1f\x8b"
     assert source.read_bytes(subject, FileRole.LH_PIAL, byte_range=(0, 2)) == b"\xff\xff\xfe"
     assert snapshot_tree(root) == before
+
+
+# --- what a source reads, and that nothing is written there --------------------------------------
+
+
+def test_the_places_of_a_source_are_its_directory_and_what_its_links_lead_to(
+    tmp_path: Path,
+) -> None:
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "study", store, ["sub-01", "sub-02"], with_template=True)
+    write_light_subject(root / "sub-03")  # a plain directory is inside the subjects directory
+    (root / "notes").symlink_to(tmp_path)  # a link to a directory that is no subject
+    (root / "gone").symlink_to(tmp_path / "nowhere")
+    (root / "round").symlink_to(root / "round")
+    (root / "file").symlink_to(store / "sub-01" / "mri" / "T1.mgz")
+    assert source_places(root) == [
+        ("the subjects directory", root),
+        ("the template directory that fsaverage links to,", store / "fsaverage"),
+        ("the subject directory that sub-01 links to,", store / "sub-01"),
+        ("the subject directory that sub-02 links to,", store / "sub-02"),
+    ]
+    # the subject globs of a run do not decide what is a source
+    assert len(source_places(local(root, subjects=["sub-01"]).subjects_dir)) == 4
+    # a directory that is not there (the data is not mounted) is all that is known
+    assert source_places(tmp_path / "absent") == [("the subjects directory", tmp_path / "absent")]
+
+
+def test_a_path_is_held_by_a_place_as_it_is_written_and_as_it_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "study", store, ["sub-01"])
+    places = source_places(root)
+    outside = tmp_path / "alias"
+    outside.symlink_to(store / "sub-01" / "surf")
+    inside = [
+        root,
+        root / "new",
+        root / "sub-01",  # written inside the subjects directory, resolves outside it
+        root / "sub-01" / "tables",
+        store / "sub-01",  # the target itself
+        store / "sub-01" / "mri" / "out",
+        outside,  # a link from elsewhere into the target
+        outside / "tables",
+        tmp_path / "x" / ".." / "study" / "out",
+    ]
+    for path in inside:
+        assert place_holding(path, places) is not None, path
+        with pytest.raises(ConfigError, match="which is only read") as raised:
+            refuse_in_sources(path, [root], what="output")
+        assert raised.value.reason == "invalid"
+    assert place_holding(root / "sub-01", places) == ("the subjects directory", root)
+    assert place_holding(store / "sub-01" / "x", places) == places[1]
+    for path in (tmp_path, tmp_path / "out", store, store / "sub-02", tmp_path / "study2"):
+        assert place_holding(path, places) is None, path
+        refuse_in_sources(path, [root], what="run")
+    # a relative path is read from the current directory
+    monkeypatch.chdir(root)
+    assert place_holding("out", places) is not None
+    assert place_holding("../out", places) is None
+
+
+def test_the_refusal_names_the_directory_and_what_holds_it(tmp_path: Path) -> None:
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "study", store, ["sub-01"], with_template=True)
+    with pytest.raises(ConfigError) as raised:
+        refuse_in_sources(root / "run", [root], what="run")
+    assert str(raised.value.detail) == (
+        f"the run directory {root / 'run'} lies inside the subjects directory {root}, which "
+        "is only read; choose a run directory outside it"
+    )
+    with pytest.raises(ConfigError) as raised:
+        refuse_in_sources(store / "sub-01" / "out", [root], what="output")
+    assert str(raised.value.detail) == (
+        f"the output directory {store / 'sub-01' / 'out'} lies inside the subject directory "
+        f"that sub-01 links to, {store / 'sub-01'}, which is only read; choose an output "
+        "directory outside it"
+    )
+    with pytest.raises(ConfigError, match="the template directory that fsaverage links to"):
+        refuse_in_sources(store / "fsaverage", [root], what="output")
+    # a directory named beside the sources of the run: the template of a FreeSurfer install
+    home = tmp_path / "freesurfer"
+    also = freesurfer_template_places({"FREESURFER_HOME": str(home)})
+    assert also == [("the fsaverage directory", home / "subjects" / "fsaverage")]
+    assert (
+        freesurfer_template_places({}) == [] == freesurfer_template_places({"FREESURFER_HOME": ""})
+    )
+    with pytest.raises(ConfigError, match="lies inside the fsaverage directory"):
+        refuse_in_sources(home / "subjects" / "fsaverage" / "run", [], what="run", also=also)
+    refuse_in_sources(home / "subjects" / "run", [], what="run", also=also)
+
+
+def test_the_subjects_directories_of_a_stored_run(tmp_path: Path) -> None:
+    study = write_tree(tmp_path / "study", "fmriprep", ["sub-01"])
+    plain = write_tree(tmp_path / "plain", "subjects_dir", ["sub-01"])
+    config = new_local_config(study).model_copy(
+        update={
+            "sources": (
+                SourceConfig(kind="local", root=str(study)),
+                SourceConfig(kind="local", root=str(plain)),
+                SourceConfig(kind="local", root=str(tmp_path / "unmounted")),
+            )
+        }
+    )
+    assert stored_subjects_dirs(config) == [
+        study / FS_ROOT["fmriprep"],
+        plain,
+        tmp_path / "unmounted",
+    ]
+    refuse_run_in_sources(study / "run", config)  # beside the subjects directory
+    for run_dir in (plain / "run", study / FS_ROOT["fmriprep"] / "sub-01" / "run"):
+        with pytest.raises(ConfigError, match="lies inside the subjects directory"):
+            refuse_run_in_sources(run_dir, config)
+    with pytest.raises(ConfigError, match="lies inside the subjects directory"):
+        refuse_run_in_sources(tmp_path / "unmounted" / "run", config)
 
 
 def test_the_cached_real_subject_is_listed_as_the_bucket_lists_it(cached_subjects: Path) -> None:

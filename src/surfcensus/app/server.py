@@ -99,6 +99,7 @@ from surfcensus.records import SUBJECT_UID_PATTERN
 from surfcensus.render.model import RenderInfo, read_render
 from surfcensus.render.vertexmap import read_vertex_map
 from surfcensus.schemas import SCHEMAS
+from surfcensus.sources.local import refuse_run_in_sources
 from surfcensus.store import (
     MEDIA_DIR,
     PublicCatalog,
@@ -466,6 +467,8 @@ class _App:
         self.run_dir = Path(run_dir).absolute()
         self.mode: AppMode = mode
         self.config = load_config(self.run_dir)
+        # before anything is written: a run that was moved into its source stays as it is
+        refuse_run_in_sources(self.run_dir, self.config)
         app = self.config.app
         try:
             check_snap_radius(app.mark_max_dist_mm, self.config.render.vertex_map_margin_mm)
@@ -1013,7 +1016,10 @@ class _App:
     ) -> tuple[Submission, list[Mark]] | None:
         """The stored submission when ``rating`` is one press of ``Enter`` that arrives a
         second time: the page sends a rating again until it has an answer, and one press is
-        one submission. A rating is known again by the client's time of the press."""
+        one submission. A rating is known again by the client's time of the press and by
+        its content: the values, the note, the flags, the time on the subject and, of each
+        mark, its class, panel, slice, pixel, frame, mode and its time when one was sent.
+        A body that differs in any of them is a revision."""
         if rating.client_ts is None or assignment.completed_at is None:
             return None
         current = _current_submission(session, assignment)
@@ -1038,11 +1044,22 @@ class _App:
             current.unratable_reason == rating.unratable
             and current.note == rating.note
             and bool(current.other) == rating.other
+            and current.ms_on_subject == rating.ms_on_subject
             and values == ({} if rating.unratable is not None else rating.values)
             and len(marks) == len(posted)
             and all(
-                (mark.mark_class, mark.panel, mark.slice, mark.px, mark.py)
-                == (sent.mark_class, sent.panel, sent.slice, sent.px, sent.py)
+                (mark.mark_class, mark.panel, mark.slice, mark.px, mark.py, mark.frame, mark.mode)
+                == (
+                    sent.mark_class,
+                    sent.panel,
+                    sent.slice,
+                    sent.px,
+                    sent.py,
+                    sent.frame,
+                    sent.mode,
+                )
+                # a mark without a time of its own was stored with the server's
+                and (sent.ts is None or mark.created_ts == sent.ts)
                 for mark, sent in zip(marks, posted, strict=True)
             )
         )

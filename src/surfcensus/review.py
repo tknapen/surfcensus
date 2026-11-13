@@ -41,7 +41,7 @@ from surfcensus.config import (
 from surfcensus.log import get_logger
 from surfcensus.run import Run
 from surfcensus.sources.base import RENDER_ROLES, SourceError
-from surfcensus.sources.local import LocalSource, detect_layout
+from surfcensus.sources.local import LocalSource, detect_layout, refuse_in_sources
 from surfcensus.sources.patterns import ROLE_CANDIDATES
 from surfcensus.store import queue_order, queue_scores
 
@@ -94,14 +94,20 @@ def default_run_dir(path: Path | str) -> Path:
 
     A run directory may not lie inside the directory the subjects are read from. When
     ``path`` is one subject directory, its parent is that directory, and the run goes
-    beside it: ``<subjects directory>/../surfcensus-run``. Raises ``SourceError`` as
+    beside it: ``<subjects directory>/../surfcensus-run``, also when the subject directory
+    is a link to another place. Raises ``SourceError`` as
     :func:`surfcensus.sources.local.detect_layout` does.
     """
-    record, _ = detect_layout(path)
-    subjects_dir = (Path(record.root) / record.fs_root).resolve()
-    beside = Path(path).resolve().parent
-    if beside == subjects_dir or subjects_dir in beside.parents:
+    record, implied = detect_layout(path)
+    subjects_dir = Path(record.root) / record.fs_root
+    if implied:
+        # one subject directory, which may be a link: the run goes beside the directory that
+        # lists it, which is the root the run stores, not beside what the link leads to
         beside = subjects_dir.parent
+    else:
+        beside, inside = Path(path).resolve().parent, subjects_dir.resolve()
+        if beside == inside or inside in beside.parents:
+            beside = inside.parent
     candidate = beside / DEFAULT_RUN_DIR
     if (candidate / "config.yaml").is_file() or os.access(beside, os.W_OK | os.X_OK):
         return candidate
@@ -243,10 +249,16 @@ def _record_blind(run: Run, blind: bool) -> None:
         engine.dispose()
 
 
+def _refuse_in_fsaverage(run_dir: Path, fsaverage: Path | str) -> None:
+    refuse_in_sources(run_dir, [], what="run", also=[("the fsaverage directory", Path(fsaverage))])
+
+
 def _with_fsaverage(run: Run, fsaverage: Path | str | None) -> None:
-    """The template of this call; not stored, since the run keeps the template itself."""
+    """The template of this call; not stored, since the run keeps the template itself. A
+    run directory inside the directory given is refused: the template is only read."""
     if fsaverage is None:
         return
+    _refuse_in_fsaverage(run.run_dir, fsaverage)
     metrics = run.config.metrics.model_dump() | {"fsaverage_dir": str(Path(fsaverage).resolve())}
     run.config = with_changes(run.config, metrics=metrics)
 
@@ -541,6 +553,8 @@ def open_review(
     path = Path(path)
     jobs = default_jobs() if jobs is None else jobs
     run_dir = default_run_dir(path) if run_dir is None else Path(run_dir)
+    if fsaverage is not None:
+        _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
     run, new = _open_run(
         path,
         run_dir,

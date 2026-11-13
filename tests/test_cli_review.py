@@ -25,7 +25,11 @@ import pandas as pd
 import pytest
 import yaml
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
-from synth_tree import write_tree  # pyrefly: ignore[missing-import]
+from synth_tree import (  # pyrefly: ignore[missing-import]
+    write_light_template,
+    write_linked_tree,
+    write_tree,
+)
 from typer.testing import CliRunner, Result
 
 pytest.importorskip("fastapi")
@@ -572,6 +576,129 @@ def test_export_refuses_an_output_in_the_subjects_directory(
     assert (study / "tables" / MANIFEST).is_file()
 
 
+@pytest.fixture
+def linked(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A subjects directory whose two subjects and whose template are links into a store,
+    and the run that ``review`` makes of it: ``(subjects directory, store, run)``."""
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "linked" / "study", store, ["sub-01", "sub-02"])
+    result = cli("review", root, "--no-serve", "--jobs", 1)
+    assert result.exit_code == 0, result.output
+    # the template comes after the review: a light one has too few vertices to score with
+    write_light_template(store / "fsaverage")
+    (root / "fsaverage").symlink_to(store / "fsaverage", target_is_directory=True)
+    return root, store, tmp_path / "linked" / DEFAULT_RUN_DIR
+
+
+@pytest.mark.parametrize(
+    "where", ["link", "below the link", "target", "below the target", "template", "alias"]
+)
+def test_export_refuses_an_output_in_what_a_subject_links_to(
+    linked: tuple[Path, Path, Path], tmp_path: Path, where: str
+) -> None:
+    """A subject directory that is a link resolves outside the subjects directory. What it
+    leads to is read as a source all the same, and so is what the template link leads to."""
+    root, store, run_dir = linked
+    out = {
+        "link": root / "sub-02",
+        "below the link": root / "sub-01" / "exp",
+        "target": store / "sub-02",
+        "below the target": store / "sub-01" / "exp",
+        "template": store / "fsaverage",
+        "alias": tmp_path / "alias",
+    }[where]
+    if where == "alias":
+        out.symlink_to(store / "sub-01" / "surf")
+    before = snapshot_tree(store), snapshot_tree(root)
+    result = cli("export", "--run-dir", run_dir, "--out", out)
+    assert result.exit_code == 2, result.output
+    assert result.stdout == "" and len(result.stderr.splitlines()) == 1
+    assert result.stderr.startswith("invalid: the output directory ")
+    assert "which is only read" in result.stderr
+    with pytest.raises(ConfigError, match="which is only read") as raised:
+        export_run(run_dir, out)
+    assert raised.value.reason == "invalid"
+    assert (snapshot_tree(store), snapshot_tree(root)) == before
+    # beside what the links lead to is a place like any other
+    beside = cli("export", "--run-dir", run_dir, "--out", store / "tables")
+    assert beside.exit_code == 0, beside.output
+
+
+def test_a_run_directory_in_what_a_subject_links_to_is_refused_before_it_is_made(
+    linked: tuple[Path, Path, Path], tmp_path: Path
+) -> None:
+    root, store, _run_dir = linked
+    before = snapshot_tree(store), snapshot_tree(root)
+    for place in (store / "sub-01" / "run", root / "sub-02" / "run", store / "fsaverage" / "r"):
+        for command in (
+            ("review", root, "--run-dir", place, "--no-serve", "--jobs", 1),
+            ("inventory", "--run-dir", place, "--source", root),
+        ):
+            result = cli(*command)
+            assert result.exit_code == 2, result.output
+            assert result.stderr.splitlines()[-1].startswith("invalid: the run directory ")
+            assert "which is only read" in result.stderr
+    # a run directory in the fsaverage directory that the call names
+    given = tmp_path / "templates" / "fsaverage"
+    result = cli("review", root, "--run-dir", given / "run", "--fsaverage", given, "--no-serve")
+    assert result.exit_code == 2 and "lies inside the fsaverage directory" in result.stderr
+    assert not given.exists()
+    assert (snapshot_tree(store), snapshot_tree(root)) == before
+
+
+def test_a_run_that_was_moved_into_its_source_is_not_written_to(run_dir: Path, study: Path) -> None:
+    """``export`` without ``--out``, ``serve``, ``finalize`` and ``calibration freeze`` open a
+    run without building its sources. Nothing the package writes goes into a source."""
+    rate_all(run_dir, "ada", {"sub-01": dict(A=0, B=0, C=0), "sub-02": dict(A=1, B=0, C=0)})
+    moved = study / "sourcedata" / "freesurfer" / "run-moved"
+    run_dir.rename(moved)
+    before = snapshot_tree(study)
+    for command in (
+        ("export", "--run-dir", moved),
+        ("export", "--run-dir", moved, "--format", "parquet"),
+        ("serve", "--run-dir", moved, "--no-browser", "--port", 0),
+        ("finalize", "--run-dir", moved),
+        ("calibration", "freeze", "--run-dir", moved),
+        ("review", study, "--run-dir", moved, "--no-serve"),
+    ):
+        result = cli(*command)
+        assert result.exit_code == 2, (command, result.output)
+        assert result.stdout == "" and len(result.stderr.splitlines()) == 1, command
+        assert "lies inside the subjects directory" in result.stderr, command
+    with pytest.raises(ConfigError, match="lies inside the subjects directory"):
+        create_app(moved)
+    with pytest.raises(ConfigError, match="lies inside the subjects directory"):
+        export_run(moved)
+    assert snapshot_tree(study) == before
+    assert cli("status", "--run-dir", moved).exit_code == 0  # reading is no writing
+
+
+@pytest.mark.parametrize("fmt", ["csv", "parquet"])
+def test_export_refuses_an_output_among_the_files_of_the_run(
+    run_dir: Path, study: Path, fmt: str
+) -> None:
+    """``clusters.parquet`` and ``scores.parquet`` are names of the run's own tables and of
+    an export: an export into ``tables/`` used to leave a run that no phase could read."""
+    before = snapshot_tree(run_dir)
+    for out in (run_dir / "tables", run_dir, run_dir / "media" / "x", run_dir / "mine"):
+        result = cli("export", "--run-dir", run_dir, "--format", fmt, "--out", out)
+        assert result.exit_code == 2, result.output
+        assert result.stdout == "" and len(result.stderr.splitlines()) == 1
+        assert "lies inside the run directory" in result.stderr
+        assert "export/ or release/" in result.stderr
+        with pytest.raises(ConfigError, match="lies inside the run directory"):
+            export_run(run_dir, out, fmt="csv" if fmt == "csv" else "parquet")
+    assert snapshot_tree(run_dir) == before
+    # the two directories of an export, also when they are named, and places below them
+    for out in (run_dir / "export", run_dir / "release", run_dir / "export" / "second"):
+        result = cli("export", "--run-dir", run_dir, "--format", fmt, "--out", out)
+        assert result.exit_code == 0, result.output
+        assert (out / MANIFEST).is_file()
+    # the run is as usable as before
+    again = cli("review", study, "--no-serve", "--jobs", 1)
+    assert again.exit_code == 0, again.output
+
+
 def test_export_refuses_an_output_where_the_subjects_were(
     run_dir: Path, study: Path, tmp_path: Path
 ) -> None:
@@ -597,6 +724,18 @@ def test_export_of_a_census_run_refuses_an_output_in_a_local_source(
     assert snapshot_tree(study) == before
     elsewhere = cli("export", "--run-dir", run_dir, "--out", tmp_path / "out")
     assert elsewhere.exit_code == 0, elsewhere.output
+    # the run itself moved into the source: its own export/ is an output there
+    moved = study / "sourcedata" / "freesurfer" / "census"
+    run_dir.rename(moved)
+    before = snapshot_tree(study)
+    result = cli("export", "--run-dir", moved)
+    assert result.exit_code == 2, result.output
+    assert "lies inside the subjects directory" in result.stderr
+    # the roots of a census run are read from its catalog, whose write-ahead log is opened
+    assert not (moved / "export").exists()
+    assert {name: at for name, at in snapshot_tree(study).items() if "/census" not in name} == {
+        name: at for name, at in before.items() if "/census" not in name
+    }
 
 
 def test_the_commands_are_listed_in_the_help() -> None:

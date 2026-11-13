@@ -41,8 +41,11 @@ from surfcensus.log import get_logger
 from surfcensus.protocol import CRITERION_IDS, PROTOCOL_FILE, load_protocol
 from surfcensus.reference.strata import field_bin
 from surfcensus.schemas import KEYS, NO_REFERENCE, SCHEMAS
-from surfcensus.sources.base import SourceError
-from surfcensus.sources.local import detect_layout
+from surfcensus.sources.local import (
+    freesurfer_template_places,
+    refuse_in_sources,
+    stored_subjects_dirs,
+)
 from surfcensus.store import (
     PublicCatalog,
     clusters_with_native,
@@ -1201,27 +1204,37 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
 
 
 def _refuse_in_sources(run_dir: Path, target: Path) -> None:
-    """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, the subjects
-    directory of a source of a local run, compared after links are resolved: sources are
-    only read. The roots are those of ``config.yaml``; where a root holds no subjects now
-    (the data is not mounted), ``target`` is compared with the root itself. A census run
-    keeps its roots in the private catalog, out of reach of this module; the command checks
-    it through ``Run.refuse_output_in_sources``."""
-    resolved = target.resolve()
-    for stored in load_config(run_dir).sources:
-        if stored.kind != "local" or stored.root is None:
-            continue
-        try:
-            record, _ = detect_layout(stored.root)
-            place = Path(record.root) / record.fs_root
-        except SourceError:
-            place = Path(stored.root)
-        if resolved.is_relative_to(place.resolve()):
-            raise ConfigError(
-                "invalid",
-                f"{target} lies inside the subjects directory {place}, which is only read; "
-                "choose an output directory outside it",
-            )
+    """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, a directory
+    that a source of a local run reads (``sources.local.refuse_in_sources``): its subjects
+    directory, what a subject or a template in it links to, and the fsaverage directory of
+    a FreeSurfer install. Sources are only read. The roots are those of ``config.yaml``;
+    where a root holds no subjects now (the data is not mounted), ``target`` is compared
+    with the root itself. A census run keeps its roots in the private catalog, out of reach
+    of this module; the command checks it through ``Run.refuse_output_in_sources``."""
+    refuse_in_sources(
+        target,
+        stored_subjects_dirs(load_config(run_dir)),
+        what="output",
+        also=freesurfer_template_places(),
+    )
+
+
+def _refuse_in_run(run_dir: Path, target: Path) -> None:
+    """Raise ``ConfigError("invalid", ...)`` when ``target`` is the run directory or lies
+    inside it, other than in its ``export/`` or ``release/``: the tables of an export have
+    names that the run's own tables have (``tables/clusters.parquet``), and an export over
+    them leaves a run that no phase can read."""
+    run, resolved = run_dir.resolve(), target.resolve()
+    if not resolved.is_relative_to(run):
+        return
+    if any(resolved.is_relative_to(run / name) for name in EXPORT_DIRS.values()):
+        return
+    places = " or ".join(f"{name}/" for name in EXPORT_DIRS.values())
+    raise ConfigError(
+        "invalid",
+        f"the output directory {target} lies inside the run directory {run_dir}, where "
+        f"the run keeps its own files; choose its {places}, or a directory outside the run",
+    )
 
 
 def _forget_earlier(target: Path, writing: Collection[str]) -> None:
@@ -1279,22 +1292,25 @@ def export_run(
     or 7), ``datasets.n_subjects`` one of :data:`SUBJECT_COUNT_BINS` and
     ``selection.inclusion_prob`` rounded to two significant digits.
 
-    An ``out_dir`` that is, or lies inside, the subjects directory of a local run is
-    refused before anything is read or written: a source is only read.
+    Refused before anything is read or written: a target (``out_dir`` or the default) that
+    is, or lies inside, a directory that a source of a local run reads, since a source is
+    only read (:func:`_refuse_in_sources`); and an ``out_dir`` in the run directory that is
+    not in its ``export/`` or ``release/``, where an export would replace files of the run.
 
     Raises ``ConfigError("invalid", ...)`` for the release profile of a local run, for such
-    an ``out_dir`` and for
-    what :func:`subjects_frame` raises it for, ``ConfigError("missing", ...)`` for a
-    directory without a run, ``ValueError`` for a format or profile there is none of, and
-    ``OSError`` for a place that cannot be written.
+    a target and for what :func:`subjects_frame` raises it for, ``ConfigError("missing",
+    ...)`` for a directory without a run, ``ValueError`` for a format or profile there is
+    none of, and ``OSError`` for a place that cannot be written.
     """
     if fmt not in _WRITERS:
         raise ValueError(f"an export is csv or parquet, not {fmt!r}")
     if profile not in EXPORT_DIRS:
         raise ValueError(f"the export profiles are analysis and release, not {profile!r}")
     run_dir = Path(run_dir)
-    if out_dir is not None:
-        _refuse_in_sources(run_dir, Path(out_dir))
+    target = run_dir / EXPORT_DIRS[profile] if out_dir is None else Path(out_dir)
+    # also the default: a run directory that was moved into its source gets no export
+    _refuse_in_sources(run_dir, target)
+    _refuse_in_run(run_dir, target)
     with _sources(run_dir) as src:
         if profile == "release" and src.local:
             raise ConfigError(
@@ -1305,7 +1321,6 @@ def export_run(
         scores = _scores(src)
         tables = _tables(src, profile, scores)
         manifest = _manifest(src, profile, fmt, scores)
-    target = run_dir / EXPORT_DIRS[profile] if out_dir is None else Path(out_dir)
     target.mkdir(parents=True, exist_ok=True)
     names = {name: f"{name}.{fmt}" for name in EXPORT_TABLES}
     _forget_earlier(target, set(names.values()))

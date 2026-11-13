@@ -181,3 +181,20 @@ def write_tree(
                 json.dumps(description, indent=2) + "\n"
             )
     return root
+
+
+def write_linked_tree(
+    root: Path, store: Path, labels: Sequence[str], *, with_template: bool = False
+) -> Path:
+    """A subjects directory ``root`` whose subjects are links to light subjects in ``store``,
+    as a study that takes its subjects from a shared place; with ``with_template`` also
+    ``root/fsaverage`` as a link to ``store/fsaverage``. Returns ``root``."""
+    root, store = Path(root), Path(store)
+    root.mkdir(parents=True, exist_ok=True)
+    for label in labels:
+        write_light_subject(store / label)
+        (root / label).symlink_to(store / label, target_is_directory=True)
+    if with_template:
+        write_light_template(store / "fsaverage")
+        (root / "fsaverage").symlink_to(store / "fsaverage", target_is_directory=True)
+    return root

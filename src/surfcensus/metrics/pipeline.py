@@ -1135,6 +1135,21 @@ def _too_few_note(ctx: RunContext, template: Template | None, scored: _Scored) -
     )
 
 
+def _read_clusters(run_dir: Path) -> pd.DataFrame:
+    """``tables/clusters.parquet``. A file that is no parquet table, or a table of another
+    schema (one written over it), is a fault of the run and of no subject:
+    ``ConfigError("invalid", ...)`` that names the command which writes the table again."""
+    try:
+        return read_table(table_path(run_dir, "clusters"), CLUSTERS)
+    except (ValueError, OSError) as exc:
+        raise ConfigError(
+            "invalid",
+            "tables/clusters.parquet cannot be read as the cluster table of this run "
+            f"({' '.join(str(exc).split())}); run `surfcensus metrics --stage reference "
+            "--force`, which writes it again",
+        ) from exc
+
+
 def _score_frame(
     ctx: RunContext,
     template: Template | None,
@@ -1147,7 +1162,7 @@ def _score_frame(
     run_dir = Path(ctx.run_dir)
     vertex_summary = read_table(table_path(run_dir, "vertex_summary"), SCHEMAS["vertex_summary"])
     regional = read_table(table_path(run_dir, "regional"), SCHEMAS["regional"])
-    clusters = read_table(table_path(run_dir, "clusters"), CLUSTERS) if applied else None
+    clusters = _read_clusters(run_dir) if applied else None
     metrics = scoring.subject_metrics(
         vertex_summary,
         clusters,
@@ -1346,7 +1361,7 @@ def _native_stage(
         tally.skipped += 1
         return
 
-    clusters = read_table(clusters_file, CLUSTERS)
+    clusters = _read_clusters(run_dir)
     rendered = set(usable["subject_uid"])
     adjacency = {hemi: template.adjacency(hemi) for hemi in HEMIS}
     frames = []

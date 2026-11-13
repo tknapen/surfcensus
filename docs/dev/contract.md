@@ -1814,7 +1814,7 @@ Every option of `review` that maps to a stored value is tri-state (5.4): `None`,
 
 What `review` does, and what it prints (stderr, one block per step):
 
-1. Run directory: `--run-dir`, else `PATH/../surfcensus-run` if its parent is writable, else `./surfcensus-run`. If that default lies inside the subjects directory (a single subject as `PATH`), `<subjects directory>/../surfcensus-run`. `Run directory: /data/surfcensus-run (new)`.
+1. Run directory: `--run-dir`, else `PATH/../surfcensus-run` if its parent is writable, else `./surfcensus-run`. If that default lies inside the subjects directory (a single subject as `PATH`), `<subjects directory>/../surfcensus-run`, where the subjects directory is the one that lists the subject, also when the subject directory is a link. `Run directory: /data/surfcensus-run (new)`.
 2. Inventory. `Found 48 subjects (fMRIPrep layout, FreeSurfer 7.3.2). 2 cannot be rendered: sub-07 (no surf/lh.pial), sub-31 (no mri/T1.mgz).`
 3. Metrics, all stages, with a progress bar; then one line naming the reference used, or the D16 or template message.
 4. Selection: every present subject, reason `all`, `inclusion_prob` 1, seed `queue_seed`. Incomplete subjects are in it; they get their `missing surface` render row in the next step and an unratable final label, and are never offered for rating.
@@ -1880,7 +1880,7 @@ surfcensus export --run-dir DIR [--out DIR] [--format csv|parquet] [--release]
 surfcensus export --run-dir DIR --reveal --reveal-out DIR        (milestone 5, 8.1)
 ```
 
-Reads `PublicCatalog`, the tables and `app.sqlite` (standard-library `sqlite3`); writes into `run_dir/export/` (`run_dir/release/` with `--release`; or `--out`), atomically, sorted, and prints the paths. An output that is, or lies inside, the subjects directory of a local source is refused (`ConfigError("invalid")`, exit 2): `export_run` checks the roots of a local run's `config.yaml`, and the command checks a census run through `Run.refuse_output_in_sources`, since its roots are in the private catalog. It works on a run without ratings and on one without `app.sqlite` (the rating columns are then empty). `export_run` has no reveal argument and cannot reach an accession; `--reveal` is handled in `cli.py` (8.1).
+Reads `PublicCatalog`, the tables and `app.sqlite` (standard-library `sqlite3`); writes into `run_dir/export/` (`run_dir/release/` with `--release`; or `--out`), atomically, sorted, and prints the paths. An output that is, or lies inside, a directory that a local source reads is refused (`ConfigError("invalid")`, exit 2): the subjects directory, what a linked subject or template in it leads to (`sources.local.source_places`), and the `fsaverage` of a FreeSurfer install. The default target counts as well. `export_run` checks the roots of a local run's `config.yaml`, and the command checks a census run through `Run.refuse_output_in_sources`, since its roots are in the private catalog. An `out_dir` inside the run directory is refused unless it is in `export/` or `release/`. It works on a run without ratings and on one without `app.sqlite` (the rating columns are then empty). `export_run` has no reveal argument and cannot reach an accession; `--reveal` is handled in `cli.py` (8.1).
 
 | File | One row per | Columns |
 |---|---|---|

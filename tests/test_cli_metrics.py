@@ -312,6 +312,40 @@ def test_a_damaged_reference_is_one_line_and_the_plain_command_builds_it_again(
     assert closing(cli("metrics", "--run-dir", run_copy), 0, 8, 0)
 
 
+@pytest.mark.parametrize("damage", ["another schema", "no parquet"])
+def test_a_cluster_table_that_is_not_one_is_one_line_and_exit_code_2(
+    run_copy: Path, damage: str
+) -> None:
+    """A table of another schema under the name ``clusters.parquet`` (an export once wrote
+    one there) ended ``render``, ``review`` and ``metrics`` in a traceback with exit code 1."""
+    table = run_copy / "tables" / "clusters.parquet"
+    whole = table.read_bytes()
+    if damage == "another schema":
+        shutil.copy(run_copy / "tables" / "scores.parquet", table)
+    else:
+        table.write_bytes(b"subject_uid,rank\n")
+    for command in (("render",), ("metrics", "--stage", "native"), ("metrics",)):
+        stopped = cli(command[0], "--run-dir", run_copy, *command[1:])
+        assert stopped.exit_code == 2, (command, stopped.output)
+        assert isinstance(stopped.exception, SystemExit)
+        assert len(stopped.output.splitlines()) == 1, stopped.output
+        assert stopped.output.startswith(
+            "invalid: tables/clusters.parquet cannot be read as the cluster table of this run ("
+        )
+        assert stopped.output.endswith(
+            "; run `surfcensus metrics --stage reference --force`, which writes it again\n"
+        )
+    # a fault of the run: no unit of any stage is in the failed state
+    status = cli("status", "--run-dir", run_copy).stdout.splitlines()[1:]
+    assert status and all(", 0 failed" in line for line in status), status
+    # the command that the line names writes the table again, with the bytes it had
+    again = cli("metrics", "--run-dir", run_copy, "--stage", "reference", "--force")
+    assert again.exit_code == 0 and closing(again, 1, 0, 0), again.output
+    assert table.read_bytes() == whole
+    assert closing(cli("metrics", "--run-dir", run_copy), 0, 8, 0)
+    assert cli("render", "--run-dir", run_copy).exit_code == 0
+
+
 def test_a_damaged_vertex_map_is_a_note_and_no_failure(run_copy: Path) -> None:
     """It used to be a traceback at the end of ``render`` and of ``metrics --stage native``."""
     with Run(run_copy) as run:

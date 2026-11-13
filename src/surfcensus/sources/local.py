@@ -15,13 +15,14 @@ import os
 import re
 import sys
 import types
-from collections.abc import Collection, Iterator, Mapping, Sequence
+from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
 from stat import S_ISDIR
+from typing import Literal
 
-from surfcensus.config import SourceConfig
+from surfcensus.config import ConfigError, RunConfig, SourceConfig
 from surfcensus.inventory.provenance import parse_dataset_description
 from surfcensus.log import get_logger
 from surfcensus.sources.base import (
@@ -39,6 +40,7 @@ from surfcensus.sources.patterns import (
     TEMPLATE_FILES,
     is_file,
     is_subject_candidate,
+    is_template_name,
     resolve_subject_files,
     variant_name,
 )
@@ -138,6 +140,119 @@ def find_adjacent_template(subjects_dir: Path | str) -> Path | None:
     except OSError:
         return None
     return directory if missing == () else None
+
+
+def source_places(subjects_dir: Path | str) -> list[tuple[str, Path]]:
+    """The directories that a local source on ``subjects_dir`` reads, as ``(what, directory)``
+    pairs: the subjects directory, and the directory behind every entry of it that is a link
+    to a subject directory or to a template (``fsaverage*``).
+
+    The subjects of a study are often links into another place, and that place is read as
+    much as the directory that lists them. Only links are followed, and they are found in
+    one listing, so a directory of plain subject directories costs no ``stat`` per subject.
+    Every subject directory counts, also one that the subject globs of a run leave out. A
+    subjects directory that cannot be listed (the data is not mounted) gives itself alone.
+    Not followed: a file that is a link inside a subject directory; the renderer refuses an
+    output beside such a file's target when it reads the file (``render.api``).
+    """
+    place = Path(subjects_dir)
+    places = [("the subjects directory", place)]
+    try:
+        with os.scandir(place) as entries:
+            links = sorted(entry.name for entry in entries if entry.is_symlink())
+    except OSError:
+        return places
+    for name in links:
+        entry = place / name
+        try:
+            target = entry.resolve()
+            template = is_template_name(name) or is_template_name(target.name)
+            if not (_is_dir(entry) if template else is_subject_candidate(entry)):
+                continue
+        except (OSError, RuntimeError):  # a link that leads nowhere, or in a circle
+            continue
+        what = "the template directory" if template else "the subject directory"
+        places.append((f"{what} that {name} links to,", target))
+    return places
+
+
+def freesurfer_template_places(env: Mapping[str, str] = os.environ) -> list[tuple[str, Path]]:
+    """``$FREESURFER_HOME/subjects/fsaverage`` as a place of :func:`place_holding`, when the
+    variable is set: the template of a run may have been read from there."""
+    home = env.get("FREESURFER_HOME")
+    if not home:
+        return []
+    return [("the fsaverage directory", Path(home) / "subjects" / TEMPLATE_NAME)]
+
+
+def place_holding(
+    target: Path | str, places: Iterable[tuple[str, Path]]
+) -> tuple[str, Path] | None:
+    """The first of ``places`` that ``target`` is, or lies inside, or None.
+
+    ``target`` is compared twice: as it is written (made absolute, ``..`` taken out, no link
+    followed) and with every link resolved. So a path named through a link in the subjects
+    directory is inside the source, and so is a path that names the link's target.
+    """
+    written = Path(os.path.abspath(target))
+    resolved = Path(target).resolve()
+    for what, place in places:
+        named, real = Path(os.path.abspath(place)), place.resolve()
+        if (
+            written.is_relative_to(named)
+            or written.is_relative_to(real)
+            or resolved.is_relative_to(real)
+        ):
+            return what, place
+    return None
+
+
+def refuse_in_sources(
+    target: Path | str,
+    subjects_dirs: Iterable[Path | str],
+    *,
+    what: Literal["run", "output"],
+    also: Iterable[tuple[str, Path]] = (),
+) -> None:
+    """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, a directory
+    that a local source reads (:func:`source_places` of each of ``subjects_dirs``) or one
+    of ``also``: sources are only read, so nothing the package writes goes there. ``what``
+    says which directory ``target`` is, for the message."""
+    places = [place for directory in subjects_dirs for place in source_places(directory)]
+    found = place_holding(target, [*places, *also])
+    if found is None:
+        return
+    raise ConfigError(
+        "invalid",
+        f"the {what} directory {target} lies inside {found[0]} {found[1]}, which is only "
+        f"read; choose {'an' if what == 'output' else 'a'} {what} directory outside it",
+    )
+
+
+def stored_subjects_dirs(config: RunConfig) -> list[Path]:
+    """The subjects directories of the local sources of a local run, from the roots in its
+    ``config.yaml``; where a root holds no subjects now (the data is not mounted), the root
+    itself. A census run keeps its roots in the private catalog and gives none here."""
+    places = []
+    for stored in config.sources:
+        if stored.kind != "local" or stored.root is None:
+            continue
+        try:
+            record, _ = detect_layout(stored.root)
+            places.append(Path(record.root) / record.fs_root)
+        except SourceError:
+            places.append(Path(stored.root))
+    return places
+
+
+def refuse_run_in_sources(run_dir: Path | str, config: RunConfig) -> None:
+    """Raise ``ConfigError("invalid", ...)`` when the run directory of a local run is, or
+    lies inside, a directory that one of its sources reads: a run that was moved into its
+    own data is not written to. For the commands that open a run without building its
+    sources (the rater app, ``finalize``, ``calibration freeze``)."""
+    refuse_in_sources(
+        run_dir, stored_subjects_dirs(config), what="run", also=freesurfer_template_places()
+    )
 
 
 def _pipeline_version(directory: Path) -> str | None:

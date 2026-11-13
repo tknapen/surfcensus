@@ -378,7 +378,10 @@ def _with_fsaverage(run: Run, fsaverage: Path | None) -> None:
     if fsaverage is None:
         return
     from surfcensus.config import with_changes
+    from surfcensus.sources.local import refuse_in_sources
 
+    # the template is only read: no run lies in the directory it is taken from
+    refuse_in_sources(run.run_dir, [], what="run", also=[("the fsaverage directory", fsaverage)])
     metrics = run.config.metrics.model_dump() | {"fsaverage_dir": str(fsaverage.resolve())}
     run.config = with_changes(run.config, metrics=metrics)
 
@@ -797,9 +800,11 @@ def finalize_command(run_dir: Path = _RUN_DIR) -> None:
         from surfcensus.config import ConfigError, load_config
         from surfcensus.export.tables import ratings_frame
         from surfcensus.protocol import load_protocol
+        from surfcensus.sources.local import refuse_run_in_sources
         from surfcensus.store import PublicCatalog, queue_scores
 
         config = load_config(run_dir)
+        refuse_run_in_sources(run_dir, config)  # a source is only read
         with PublicCatalog.open(run_dir) as public:
             mode = app_db_mode(run_dir)
             if mode is None:
@@ -891,7 +896,10 @@ def calibration_freeze(
     overwritten; justifications and reference examples are then written into it by hand."""
     with _app_stops_with_exit_2():
         from surfcensus.app.finalize import freeze_calibration
+        from surfcensus.config import load_config
+        from surfcensus.sources.local import refuse_run_in_sources
 
+        refuse_run_in_sources(run_dir, load_config(run_dir))  # a source is only read
         path = freeze_calibration(run_dir, subjects=subject or None, version=version)
         typer.echo(str(path))
 
@@ -918,18 +926,17 @@ def export_command(
     if fmt not in ("csv", "parquet"):
         raise typer.BadParameter("is csv or parquet", param_hint="--format")
     with _stops_with_exit_2():
-        from surfcensus.export.tables import export_run
+        from surfcensus.config import load_config
+        from surfcensus.export.tables import EXPORT_DIRS, export_run
 
-        if out is not None:
-            from surfcensus.config import load_config
+        # a source is only read. The export itself refuses an output in a source of a
+        # local run; the roots of a census run are in the catalog, which the run opens
+        if load_config(run_dir).mode == "census":
+            from surfcensus.run import Run
 
-            # a source is only read. The export itself refuses an output in a source of a
-            # local run; the roots of a census run are in the catalog, which the run opens
-            if load_config(run_dir).mode == "census":
-                from surfcensus.run import Run
-
-                with Run(run_dir) as run:
-                    run.refuse_output_in_sources(out)
+            target = run_dir / EXPORT_DIRS["release" if release else "analysis"]
+            with Run(run_dir) as run:
+                run.refuse_output_in_sources(target if out is None else out)
         paths = export_run(
             run_dir,
             out,

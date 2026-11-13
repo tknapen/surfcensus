@@ -902,6 +902,11 @@ UNRATABLE: dict[str, Any] = {"unratable": "image too poor to judge", "note": "n"
         (RATED, True, {"marks": "slice"}),
         (RATED, True, {"marks": "px"}),
         (RATED, True, {"marks": "py"}),
+        (RATED, True, {"marks": "frame"}),
+        (RATED, True, {"marks": "mode"}),
+        (RATED, True, {"marks": "ts"}),
+        (RATED, True, {"ms_on_subject": 99_999}),
+        (UNRATABLE, False, {"ms_on_subject": 99_999}),
     ],
     ids=[
         "other",
@@ -915,6 +920,11 @@ UNRATABLE: dict[str, Any] = {"unratable": "image too poor to judge", "note": "n"
         "mark_slice",
         "mark_px",
         "mark_py",
+        "mark_frame",
+        "mark_mode",
+        "mark_ts",
+        "ms_on_subject",
+        "ms_on_subject_unratable",
     ],
 )
 def test_a_resent_time_with_another_body_is_a_revision(
@@ -941,6 +951,10 @@ def test_a_resent_time_with_another_body_is_a_revision(
             "slice": posted["slice"] + (1 if posted["slice"] == 0 else -1),
             "px": posted["px"] + 0.25,
             "py": posted["py"] + 0.25,
+            # the playback context of the click and its time, which the first body left out
+            "frame": 3,
+            "mode": "seq",
+            "ts": "t-click",
         }
         change = {"marks": [posted | {part: moved[part]}]}
     two = shaped(client.post("/api/rating", json=sent | change), schemas.RatingOut)
@@ -949,6 +963,34 @@ def test_a_resent_time_with_another_body_is_a_revision(
         (1, 0),
         (2, 1),
     ]
+    # what the second body said is what is stored
+    if "ms_on_subject" in change:
+        assert rows(app_run, "SELECT ms_on_subject FROM submissions WHERE current") == [(99_999,)]
+
+
+def test_a_rating_with_the_context_of_its_marks_that_arrives_twice_is_one_submission(
+    client: TestClient, app_run: Path
+) -> None:
+    """The frame, the mode and the time of a mark are part of what is compared, and a body
+    that carries them and arrives twice is still one press of ``Enter``."""
+    first = shown(client)
+    posted, _expected = mark_on_surface(app_run, first["subject_uid"])
+    tile = first["render"]["modes"]["sync"]["frames"]
+    position = PANEL_ORDER.index(posted["panel"])
+    frame = next(n for n, slices in enumerate(tile) if slices[position] == posted["slice"])
+    marked = posted | {"frame": frame, "mode": "sync", "ts": "t-click"}
+    sent = rating(first, values={"A": 1, "B": 0, "C": 0}, marks=[marked])
+    one = shaped(client.post("/api/rating", json=sent), schemas.RatingOut)
+    two = shaped(client.post("/api/rating", json=sent), schemas.RatingOut)
+    assert one["saved"] == two["saved"] and one["saved"]["revision"] == 1
+    assert rows(app_run, "SELECT frame, mode, created_ts FROM marks") == [
+        (frame, "sync", "t-click")
+    ]
+    # the same mark at another time of clicking is another body
+    other = sent | {"marks": [marked | {"ts": "t-later"}]}
+    assert (
+        shaped(client.post("/api/rating", json=other), schemas.RatingOut)["saved"]["revision"] == 2
+    )
 
 
 # --- back, and a revision -----------------------------------------------------------------------

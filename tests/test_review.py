@@ -23,7 +23,7 @@ import pandas as pd
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_tierb import SyntheticCohort  # pyrefly: ignore[missing-import]
-from synth_tree import write_tree  # pyrefly: ignore[missing-import]
+from synth_tree import write_linked_tree, write_tree  # pyrefly: ignore[missing-import]
 
 pytest.importorskip("fastapi")
 pytest.importorskip("sqlmodel")
@@ -567,6 +567,39 @@ def test_the_default_run_directory_is_beside_the_data(
     (tmp_path / "a" / DEFAULT_RUN_DIR).mkdir()
     (tmp_path / "a" / DEFAULT_RUN_DIR / CONFIG_FILE).write_text("")
     assert default_run_dir(plain) == tmp_path / "a" / DEFAULT_RUN_DIR
+
+
+def test_the_default_run_directory_does_not_follow_a_subject_link(tmp_path: Path) -> None:
+    """One subject directory that is a link, as path: the run goes beside the subjects
+    directory that lists the link, which is the root the run stores, and not beside what
+    the link leads to, which may be a store of other data."""
+    store = tmp_path / "shared" / "store"
+    root = write_linked_tree(tmp_path / "mine" / "study", store, ["sub-01", "sub-02"])
+    assert default_run_dir(root / "sub-01") == tmp_path / "mine" / DEFAULT_RUN_DIR
+    assert default_run_dir(root) == tmp_path / "mine" / DEFAULT_RUN_DIR
+    before = snapshot_tree(tmp_path / "shared")
+    with review(root / "sub-01", serve=False, jobs=1) as run:
+        assert run.run_dir == tmp_path / "mine" / DEFAULT_RUN_DIR
+        assert run.config.sources[0].root == str(root)
+        assert render_counts(run) == (1, 0, 0)
+    assert snapshot_tree(tmp_path / "shared") == before
+    assert sorted(path.name for path in (tmp_path / "shared").iterdir()) == ["store"]
+
+
+def test_a_review_with_its_run_in_a_linked_subject_leaves_nothing(tmp_path: Path) -> None:
+    """The run directory is refused before the run is made, not at the first render."""
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "study", store, ["sub-01", "sub-02"])
+    before = snapshot_tree(tmp_path)
+    for run_dir in (store / "sub-02" / "run", root / "sub-02" / "run"):
+        with pytest.raises(ConfigError, match="lies inside") as raised:
+            review(root, run_dir=run_dir, serve=False, jobs=1)
+        assert raised.value.reason == "invalid"
+    # the fsaverage directory of the call is read as well
+    fsaverage = tmp_path / "templates" / "fsaverage"
+    with pytest.raises(ConfigError, match="lies inside the fsaverage directory"):
+        review(root, run_dir=fsaverage / "run", fsaverage=fsaverage, serve=False, jobs=1)
+    assert snapshot_tree(tmp_path) == before
 
 
 def test_one_subject_directory_as_path(tmp_path: Path) -> None:

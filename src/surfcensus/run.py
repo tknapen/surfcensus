@@ -16,7 +16,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from contextlib import AbstractContextManager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from surfcensus import privacy
 from surfcensus.config import (
@@ -168,6 +168,7 @@ class Run:
             base = config if config is not None else new_local_config(given[0].config().root or ".")
             hash_key = run_key(base)
         stored = []
+        self.config = base  # what the refusal below reads; the sources follow
         for source in given:
             self._refuse_inside(source)
             described = source.config()
@@ -378,36 +379,47 @@ class Run:
             )
         return locals_[0]
 
+    def _template_places(self) -> list[tuple[str, Path]]:
+        """The fsaverage directories outside the subjects directories that this call may
+        read a template from: the one given for the call and that of a FreeSurfer install.
+        The directory a pinned template was once built from is not stored (the run keeps
+        the template by content), so it is known only to the call that names it."""
+        from surfcensus.sources.local import freesurfer_template_places
+
+        places = freesurfer_template_places()
+        if self.config.metrics.fsaverage_dir is not None:
+            places.append(("the fsaverage directory", Path(self.config.metrics.fsaverage_dir)))
+        return places
+
     def _refuse_inside(self, source: Source) -> None:
+        """Refuse a run directory that is, or lies inside, what ``source`` reads."""
+        from surfcensus.sources.local import refuse_in_sources
+
         subjects_dir = getattr(source, "subjects_dir", None)
         if not isinstance(subjects_dir, Path):
             return
-        if self.run_dir.resolve().is_relative_to(subjects_dir.resolve()):
-            raise ConfigError(
-                "invalid",
-                f"the run directory {self.run_dir} lies inside the subjects directory "
-                f"{subjects_dir}, which is only read; choose a run directory outside it",
-            )
+        refuse_in_sources(self.run_dir, [subjects_dir], what="run", also=self._template_places())
 
-    def refuse_output_in_sources(self, out: Path | str) -> None:
-        """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, the
-        subjects directory of a local source of the run, compared after links are
-        resolved: sources are only read. Where the source cannot be built now (the data
-        is not mounted), ``out`` is compared with its stored root."""
-        target = Path(out).resolve()
+    def refuse_output_in_sources(
+        self, out: Path | str, *, what: Literal["run", "output"] = "output"
+    ) -> None:
+        """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory
+        that a local source of the run reads: its subjects directory, the directory that a
+        subject or a template in it links to (``sources.local.source_places``), or the
+        fsaverage directory of this call or of a FreeSurfer install. ``out`` is compared as
+        it is written and with links resolved: sources are only read. Where the source
+        cannot be built now (the data is not mounted), ``out`` is compared with its stored
+        root."""
+        from surfcensus.sources.local import refuse_in_sources
+
+        places = []
         for stored in self._stored_locals():
             try:
                 place = getattr(self._source(stored.index), "subjects_dir", None)
             except SourceError:
                 place = None
-            if not isinstance(place, Path):
-                place = Path(stored.root)
-            if target.is_relative_to(place.resolve()):
-                raise ConfigError(
-                    "invalid",
-                    f"{out} lies inside the subjects directory {place}, which is only "
-                    "read; choose an output directory outside it",
-                )
+            places.append(place if isinstance(place, Path) else Path(stored.root))
+        refuse_in_sources(out, places, what=what, also=self._template_places())
 
     # sources
 

@@ -17,7 +17,11 @@ from pathlib import Path
 
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
-from synth_tree import write_tier_a, write_tree  # pyrefly: ignore[missing-import]
+from synth_tree import (  # pyrefly: ignore[missing-import]
+    write_linked_tree,
+    write_tier_a,
+    write_tree,
+)
 
 import surfcensus as sc
 from surfcensus import privacy, store
@@ -237,6 +241,69 @@ def test_an_output_in_the_subjects_directory_is_refused(
         with pytest.raises(ConfigError, match="lies inside the subjects directory"):
             run.refuse_output_in_sources(study / "tables")
         run.refuse_output_in_sources(tmp_path / "out")
+
+
+def test_a_run_directory_in_what_a_subject_links_to_is_refused(tmp_path: Path) -> None:
+    """A subject directory that is a link leads to a directory that is read as much as the
+    subjects directory is. The refusal comes before ``config.yaml``: nothing is left."""
+    store = tmp_path / "store"
+    root = write_linked_tree(tmp_path / "study", store, ["sub-01", "sub-02"], with_template=True)
+    before = snapshot_tree(tmp_path)
+    for place in (
+        store / "sub-01" / "run",  # named at the target
+        root / "sub-02" / "run",  # named through the link
+        store / "fsaverage" / "run",  # the template next to the subjects is read too
+    ):
+        with pytest.raises(ConfigError, match="which is only read") as raised:
+            Run(place, local(root))
+        assert raised.value.reason == "invalid"
+        with pytest.raises(ConfigError, match="which is only read"):
+            Run(place, local(root / "sub-01"))  # one subject directory as the source
+    assert snapshot_tree(tmp_path) == before
+    # beside what the links lead to is a place like any other
+    with Run(store / "run", local(root)) as run:
+        assert run.inventory().done == 2
+        for out in (
+            store / "sub-01",
+            store / "sub-02" / "surf" / "tables",
+            root / "sub-01" / "tables",
+            store / "fsaverage",
+        ):
+            with pytest.raises(ConfigError, match="which is only read"):
+                run.refuse_output_in_sources(out)
+        run.refuse_output_in_sources(store / "tables")
+        run.refuse_output_in_sources(tmp_path / "out")
+    # a run that was moved into such a directory is refused when its source is next built
+    shutil.move(store / "run", store / "sub-01" / "run")
+    with Run(store / "sub-01" / "run") as run:
+        with pytest.raises(ConfigError, match=r"the run directory .* lies inside the subject"):
+            run.inventory()
+
+
+def test_an_output_in_an_fsaverage_directory_of_the_call_is_refused(
+    study: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The template a run was scored with is kept by content, not by path. What a call can
+    know is the directory it was given and that of a FreeSurfer install."""
+    home = tmp_path / "freesurfer"
+    given = tmp_path / "templates" / "fsaverage"
+    with Run(tmp_path / "run", local(study)) as run:
+        for out in (given, given / "tables", home / "subjects" / "fsaverage" / "x"):
+            run.refuse_output_in_sources(out)
+        monkeypatch.setenv("FREESURFER_HOME", str(home))
+        with pytest.raises(ConfigError, match="lies inside the fsaverage directory"):
+            run.refuse_output_in_sources(home / "subjects" / "fsaverage" / "x")
+        run.refuse_output_in_sources(home / "subjects" / "x")
+        metrics = run.config.metrics.model_dump() | {"fsaverage_dir": str(given)}
+        run.config = with_changes(run.config, metrics=metrics)
+        for out in (given, given / "tables"):
+            with pytest.raises(ConfigError, match="lies inside the fsaverage directory"):
+                run.refuse_output_in_sources(out)
+        run.refuse_output_in_sources(given.parent)
+    # a new run in the install's template is refused before it exists
+    with pytest.raises(ConfigError, match="lies inside the fsaverage directory"):
+        Run(home / "subjects" / "fsaverage" / "run", local(study))
+    assert not home.exists()
 
 
 def test_one_subject_directory_is_a_run_of_that_subject(tmp_path: Path) -> None:
