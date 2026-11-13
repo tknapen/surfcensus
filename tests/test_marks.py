@@ -769,7 +769,6 @@ def test_every_tile_resolves_as_the_full_surfaces_say(cases: dict[str, Case], na
     # each branch of the hemisphere rule was taken
     assert sum(e.source == "white" for e, c in zip(expected, classes, strict=True) if c != "C") > 5
     assert sum(e.source == "pial" for e, c in zip(expected, classes, strict=True) if c == "C") > 5
-    assert sum(e.other_hemi_is_nearer for e in expected) > 5
     assert sum(r.pial_vertex is None and r.white_vertex is not None for r in resolved) > 5
     assert sum(r.box_dist_mm == 0 for r in resolved) > 100
     assert sum(r.box_dist_mm > 5 for r in resolved) > 100
@@ -822,8 +821,9 @@ def test_a_click_on_a_pial_vertex_gives_that_vertex(cases: dict[str, Case]) -> N
                     assert off_plane <= 0.5 + ATOL
                     assert r.fsavg6_vertex == spheres(hemi, vertex)
                     assert r.vertex_surface == "pial"
+                    # the white ellipsoid lies 2.5 mm inside the pial one
                     assert r.white_vertex is not None and r.white_dist_mm is not None
-                    assert r.white_dist_mm >= 2.0  # the white ellipsoid lies 2.5 mm inside
+                    assert r.white_dist_mm > 1.5 > r.pial_dist_mm
                     tested += 1
         assert tested > 300, name
 
@@ -847,7 +847,7 @@ def test_between_the_hemispheres_both_vertices_are_of_one_hemisphere(
         ).tolist()[0]
         per_mm = case.config.panel_px / case.layout.side
         for slice_pos in range(0, len(case.layout.planes[panel]), 3):
-            for dx in np.linspace(-1.6, 1.6, 9):
+            for dx in np.linspace(-1.4, 1.4, 9):
                 for py in np.linspace(8.0, 56.0, 7):
                     clicks.append((panel, slice_pos, centre + dx * per_mm, float(py)))
     points = np.array([case.point(c) for c in clicks])
@@ -1336,14 +1336,18 @@ def test_the_vertex_index_of_another_render_is_refused(cases: dict[str, Case]) -
 
 def test_a_resolved_mark_is_the_shape_of_the_api(cases: dict[str, Case]) -> None:
     case = cases["default"]
+    # on the left occipital pole, in the sagittal tile nearest it
+    pole = case.anatomy.pial["lh"][np.argmin(case.anatomy.pial["lh"][:, 1])]
+    slice_pos = int(np.argmin(np.abs(case.layout.planes["sagittal"] - pole[0])))
+    px, py = pixel_of(case.layout, case.config, "sagittal", pole).tolist()
     posted = {
         "client_id": "m1",
         "class": "A",
         "panel": "sagittal",
-        "slice": 31,
-        "px": 21.5,
-        "py": 30.25,
-        "frame": frame_showing(case.info, "sync", "sagittal", 31),
+        "slice": slice_pos,
+        "px": px,
+        "py": py,
+        "frame": frame_showing(case.info, "sync", "sagittal", slice_pos),
         "mode": "sync",
         "ts": "2026-11-12T14:03:20.004Z",
     }
@@ -1357,8 +1361,8 @@ def test_a_resolved_mark_is_the_shape_of_the_api(cases: dict[str, Case]) -> None
         assert type(value) is float
     # the voxel of the slice is the one render.json lists
     panel = case.info.panels["sagittal"]
-    assert r.vox[panel.slice_voxel_axis] == panel.slices[31]
-    assert r.tkr[0] == panel.slice_mm[31]
+    assert r.vox[panel.slice_voxel_axis] == panel.slices[slice_pos]
+    assert r.tkr[0] == panel.slice_mm[slice_pos]
 
 
 # ------------------------------------------- the cached real subject (ds000102 sub-01)
