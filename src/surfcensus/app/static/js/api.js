@@ -102,7 +102,9 @@ export async function settle(next, { onRendering = null, sleep = pause } = {}) {
   for (;;) {
     if (next && next.status !== "rendering") return next;
     if (next && onRendering) onRendering(next);
-    await sleep((next ? next.retry_after_s : 2) * 1000);
+    // never a busy loop, whatever the answer says
+    const seconds = next && next.retry_after_s > 0 ? next.retry_after_s : 2;
+    await sleep(Math.max(0.25, seconds) * 1000);
     try {
       next = await getNext();
     } catch (failure) {

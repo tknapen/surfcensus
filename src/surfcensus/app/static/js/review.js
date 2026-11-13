@@ -12,8 +12,10 @@ import { Viewer, nearestFrame } from "./viewer.js";
 const SVG = "http://www.w3.org/2000/svg";
 const PAGE_ROWS = 200;
 // What the tables of one subject show: fields of ReviewRating, ReviewMark and ClusterOut.
-const RATING_COLUMNS = ["rater", "kind", "A", "B", "C", "unratable_reason", "other", "note", "revision", "server_ts", "ms_on_subject", "render_current"];
-const MARK_COLUMNS = ["rater", "class", "panel", "slice", "hemi", "pial_vertex", "pial_dist_mm", "fsavg6_vertex", "box_dist_mm"];
+const RATING_COLUMNS = ["rater", "kind", "A", "B", "C", "unratable_reason", "other", "note",
+  "revision", "server_ts", "ms_on_subject", "render_current"];
+const MARK_COLUMNS = ["rater", "class", "panel", "slice", "hemi", "pial_vertex", "pial_dist_mm",
+  "fsavg6_vertex", "box_dist_mm"];
 const CLUSTER_COLUMNS = ["reference_id", "hemi", "region", "rank", "area_mm2", "peak_z"];
 const byId = (id) => document.getElementById(id);
 
@@ -42,7 +44,9 @@ export function cellText(value) {
 // of the analysis plan), "unratable", or "not rated".
 export function finalLevel(row) {
   if (row.unratable_reason) return "unratable";
-  const values = [row.final_A, row.final_B].filter((value) => value !== null && value !== undefined);
+  const values = [row.final_A, row.final_B].filter(
+    (value) => value !== null && value !== undefined,
+  );
   return values.length ? Math.max(...values) : "not rated";
 }
 
@@ -221,16 +225,24 @@ class ReviewPage {
     const x = (value) => left + ((value - low) / span) * (width - left - right);
     const y = (position) => height - bottom - (position + 0.5) * band;
     const parts = [];
+    const label = (at, baseline, anchor, text) =>
+      svg("text", { class: "scatter-label", x: at, y: baseline, "text-anchor": anchor }, text);
     levels.forEach((level, position) => {
       parts.push(
-        svg("line", { class: "scatter-grid", x1: left, x2: width - right, y1: y(position), y2: y(position) }),
-        svg("text", { class: "scatter-label", x: left - 8, y: y(position) + 4, "text-anchor": "end" }, names[position]),
+        svg("line", {
+          class: "scatter-grid",
+          x1: left,
+          x2: width - right,
+          y1: y(position),
+          y2: y(position),
+        }),
+        label(left - 8, y(position) + 4, "end", names[position]),
       );
     });
     parts.push(
-      svg("text", { class: "scatter-label", x: left, y: height - 18, "text-anchor": "start" }, cellText(low)),
-      svg("text", { class: "scatter-label", x: width - right, y: height - 18, "text-anchor": "end" }, cellText(high)),
-      svg("text", { class: "scatter-label", x: (left + width - right) / 2, y: height - 4, "text-anchor": "middle" }, "composite score"),
+      label(left, height - 18, "start", cellText(low)),
+      label(width - right, height - 18, "end", cellText(high)),
+      label((left + width - right) / 2, height - 4, "middle", "composite score"),
     );
     rows.forEach((row, position) => {
       const level = levels.indexOf(finalLevel(row));
@@ -249,7 +261,8 @@ class ReviewPage {
     });
     figure.replaceChildren(...parts);
     byId("scatter-caption").textContent = rows.length
-      ? `Composite score against the final label (the worse of A and B) of the ${rows.length} subjects of this page that have a score. A dot opens its subject.`
+      ? "Composite score against the final label (the worse of A and B) of the " +
+        `${rows.length} subjects of this page that have a score. A dot opens its subject.`
       : "No subject of this page has a composite score.";
   }
 
@@ -264,7 +277,10 @@ class ReviewPage {
       subject = await api.getSubject(row.subject_uid);
     } catch (failure) {
       if (failure instanceof api.ApiError && failure.status === 403) this.refused(failure);
-      else byId("subject-message").textContent = `The subject could not be loaded: ${failure.message}`;
+      else {
+        byId("subject-message").textContent =
+          `The subject could not be loaded: ${failure.message}`;
+      }
       return;
     }
     this.subject = subject;
@@ -292,7 +308,9 @@ class ReviewPage {
       if (subject.marks.length) {
         this.goTo(subject.marks[0].vox, [subject.marks[0].panel, subject.marks[0].slice]);
       }
-      else if (subject.clusters.length) this.goTo(tkrToVoxel(subject.render, subject.clusters[0].tkr));
+      else if (subject.clusters.length) {
+        this.goTo(tkrToVoxel(subject.render, subject.clusters[0].tkr));
+      }
     } else {
       byId("subject-message").textContent = row.render_reason
         ? `No render: ${row.render_reason}.`
@@ -337,10 +355,13 @@ class ReviewPage {
       parts.push(wrap);
     };
     list("Ratings", RATING_COLUMNS, subject.ratings);
-    list("Marks", MARK_COLUMNS, subject.marks, (mark) => this.goTo(mark.vox, [mark.panel, mark.slice]));
-    list("Outlier clusters with a native position", CLUSTER_COLUMNS, subject.clusters, (cluster) => {
+    list("Marks", MARK_COLUMNS, subject.marks, (mark) =>
+      this.goTo(mark.vox, [mark.panel, mark.slice]),
+    );
+    const toCluster = (cluster) => {
       if (subject.render) this.goTo(tkrToVoxel(subject.render, cluster.tkr));
-    });
+    };
+    list("Outlier clusters with a native position", CLUSTER_COLUMNS, subject.clusters, toCluster);
     if (subject.scores) {
       parts.push(html("h3", "", "Scores"));
       const scores = html("dl", "scores");

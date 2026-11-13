@@ -69,9 +69,9 @@ def subject_from_media(media_dir: Path, position: int) -> MockSubject:
     if info is None:
         raise ValueError(f"{media_dir} holds no render of this version")
     return MockSubject(
-        subject_uid=f"{position + 1:02x}" + "9b2e41c07d2e4b"[: 14],
+        subject_uid=f"{position + 1:02x}" + "9b2e41c07d2e4b"[:14],
         media_dir=Path(media_dir),
-        render_key=f"{position + 1:02x}" + "0a1b2c3d4e5f6a"[: 14],
+        render_key=f"{position + 1:02x}" + "0a1b2c3d4e5f6a"[:14],
         info=info,
     )
 
@@ -276,7 +276,9 @@ class _Mock:
         saved = []
         for number, mark in enumerate(rating.marks):
             try:
-                geometry.pixel_to_voxel(subject.info.panels[mark.panel], mark.slice, mark.px, mark.py)
+                geometry.pixel_to_voxel(
+                    subject.info.panels[mark.panel], mark.slice, mark.px, mark.py
+                )
             except IndexError:
                 return _errors(422, f"marks.{number}.slice", "the panel has no such slice")
             vertices = state.resolve(subject, mark) if state.resolve else {"box_dist_mm": 0.0}
@@ -552,7 +554,9 @@ def create_mock_app(state: MockState) -> FastAPI:
     @app.get("/api/export")
     def export() -> Response:
         lines = ["assignment_id,subject_uid,rater"]
-        lines += [f"{done.assignment_id},{done.subject.subject_uid},local" for done in state.completed]
+        lines += [
+            f"{done.assignment_id},{done.subject.subject_uid},local" for done in state.completed
+        ]
         return closed() or Response("\n".join(lines) + "\n", media_type="text/csv")
 
     return app

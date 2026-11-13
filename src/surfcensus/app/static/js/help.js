@@ -44,7 +44,9 @@ export function keyboardRows(protocol) {
     [["click"], "place a mark of the active class (pauses playback); click a mark to select it"],
     [
       [...protocol.criteria.map((criterion) => criterion.mark_key), protocol.other_mark_key],
-      `active mark class: ${protocol.criteria.map((criterion) => criterion.id).join(", ")}, X other`,
+      `active mark class: ${protocol.criteria
+        .map((criterion) => criterion.id)
+        .join(", ")}, X other`,
     ],
     [["Delete"], "remove the selected mark"],
     [["Ctrl/Cmd + Z"], "undo the last mark"],
@@ -83,7 +85,8 @@ export class Help {
       html(
         "p",
         "dialog-lead",
-        "Judge the surfaces, not the image. When uncertain between two levels, choose the lower one and add a note.",
+        "Judge the surfaces, not the image. When uncertain between two levels, choose the " +
+          "lower one and add a note.",
       ),
     );
     const scale = html("table", "help-table");

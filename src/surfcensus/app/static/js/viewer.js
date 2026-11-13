@@ -183,7 +183,17 @@ export class Viewer {
       stage.addEventListener("click", (event) => this.clicked(name, event));
       figure.append(stage, html("figcaption", "", name));
       panels.append(figure);
-      this.panels[name] = { figure, stage, zoomable, slots, overlay, vertical, horizontal, marks, edges };
+      this.panels[name] = {
+        figure,
+        stage,
+        zoomable,
+        slots,
+        overlay,
+        vertical,
+        horizontal,
+        marks,
+        edges,
+      };
     }
 
     const transport = html("div", "transport");

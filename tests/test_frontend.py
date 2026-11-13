@@ -246,8 +246,9 @@ def follow(annotation: Any) -> type[BaseModel] | Each | None:
 
 
 _CHAIN = re.compile(
-    r"(?<![\w$.])(?:this\.)?(%s)\b((?:\s*\??\.\s*[A-Za-z_$][\w$]*|\[[^\[\]]*\])*)"
-    % "|".join(sorted(NAMES))
+    r"(?<![\w$.])(?:this\.)?("
+    + "|".join(sorted(NAMES))
+    + r")\b((?:\s*\??\.\s*[A-Za-z_$][\w$]*|\[[^\[\]]*\])*)"
 )
 _STEP = re.compile(r"\s*\??\.\s*([A-Za-z_$][\w$]*)|(\[[^\[\]]*\])")
 
@@ -255,6 +256,7 @@ _STEP = re.compile(r"\s*\??\.\s*([A-Za-z_$][\w$]*)|(\[[^\[\]]*\])")
 def field_problems(code: str, where: str, seen: dict[str, set[str]] | None = None) -> list[str]:
     """Every access in blanked code that names something no shape has."""
     problems = []
+    code = code.replace("...", "   ")  # a spread is no access: `{ ...previous.values }`
     for match in _CHAIN.finditer(code):
         start: Any = NAMES[match.group(1)]
         chain = match.group(1)
@@ -359,7 +361,11 @@ def js_sources() -> dict[str, str]:
 def test_the_frontend_files_are_those_of_the_contract() -> None:
     assert set(js_sources()) == set(JS_FILES)
     assert (STATIC_DIR / "app.css").is_file()
-    assert {path.name for path in TEMPLATES_DIR.iterdir()} == {"base.html", "rate.html", "review.html"}
+    assert {path.name for path in TEMPLATES_DIR.iterdir()} == {
+        "base.html",
+        "rate.html",
+        "review.html",
+    }
     # nothing to build and nothing else to ship: scripts, one stylesheet, three pages
     others = [
         str(path.relative_to(STATIC_DIR))
@@ -378,6 +384,29 @@ def test_modules_import_each_other_by_relative_path_and_nothing_else() -> None:
             assert (JS_DIR / target[2:]).is_file(), f"{name} imports {target}, which does not exist"
         assert "import(" not in blank_js(source), f"{name} imports at run time"
         assert "require(" not in blank_js(source)
+
+
+def test_every_name_a_module_imports_is_exported_by_the_module_it_names() -> None:
+    sources = js_sources()
+    exported = {
+        name: set(
+            re.findall(r"^export\s+(?:async\s+)?(?:function|const|class|let)\s+(\w+)", text, re.M)
+        )
+        for name, text in sources.items()
+    }
+    checked = 0
+    for name, source in sources.items():
+        for names, target in re.findall(r"import\s*\{([^}]*)\}\s*from\s*\"\./([\w.]+)\"", source):
+            for wanted in filter(None, (part.strip() for part in names.split(","))):
+                assert wanted in exported[target], f"{name} imports {wanted} from {target}"
+                checked += 1
+        for alias, target in re.findall(
+            r"import\s*\*\s*as\s+(\w+)\s+from\s*\"\./([\w.]+)\"", source
+        ):
+            for wanted in set(re.findall(rf"\b{alias}\.(\w+)", blank_js(source))):
+                assert wanted in exported[target], f"{name} uses {alias}.{wanted}"
+                checked += 1
+    assert checked > 40
 
 
 # --- routes ----------------------------------------------------------------------------------
@@ -408,7 +437,13 @@ def test_requests_are_made_in_api_js_only_and_by_the_names_of_its_table() -> Non
     routes = js_routes()
     for name, source in js_sources().items():
         code = blank_js(source)
-        for call in (r"(?<![\w.$])fetch\(", r"\bsendBeacon\(", "XMLHttpRequest", "WebSocket", "EventSource"):
+        for call in (
+            r"(?<![\w.$])fetch\(",
+            r"\bsendBeacon\(",
+            "XMLHttpRequest",
+            "WebSocket",
+            "EventSource",
+        ):
             found = len(re.findall(call, code))
             if name == "api.js" and call.endswith("\\("):
                 assert found == 1, f"api.js calls {call} in {found} places"
@@ -448,7 +483,9 @@ def test_nothing_is_fetched_from_another_host() -> None:
 def test_the_url_check_finds_a_cdn_and_a_protocol_relative_url() -> None:
     assert _URL.findall('<script src="https://cdn.example.org/x.js">')
     assert _URL.findall("@import url(//fonts.example.com/css)")
-    assert not (set(_URL.findall('createElementNS("http://www.w3.org/2000/svg", "g")')) - _NAMESPACES)
+    assert not (
+        set(_URL.findall('createElementNS("http://www.w3.org/2000/svg", "g")')) - _NAMESPACES
+    )
     assert not _URL.findall("const a = b // c.length is odd")
 
 
@@ -466,6 +503,7 @@ def test_every_field_the_javascript_reads_exists_in_its_shape() -> None:
         "SessionOut": {"protocol", "settings", "require_marks", "examples", "protocol_sha256"},
         "NextOut": {"status", "assignment", "prefetch", "progress", "retry_after_s"},
         "AssignmentOut": {"assignment_id", "previous"},
+        "PreviousOut": {"values", "unratable", "other", "note", "marks"},
         "PrefetchOut": {"tiles", "n_slices", "media_base", "render_key"},
         "ProgressOut": {"done_today", "done_total", "remaining", "rendered", "n_subjects"},
         "RenderOut": {"panels", "modes", "tiles", "config", "volume"},
@@ -492,7 +530,9 @@ def test_every_field_the_javascript_reads_exists_in_its_shape() -> None:
     }
     for owner, fields in expected.items():
         assert fields <= seen.get(owner, set()), f"{owner}: {fields - seen.get(owner, set())}"
-    assert {"client_id", "class", "panel", "slice", "px", "py"} <= seen["PreviousMark or ReviewMark"]
+    assert {"client_id", "class", "panel", "slice", "px", "py"} <= seen[
+        "PreviousMark or ReviewMark"
+    ]
     # the viewer is given an assignment on the rating page and a subject on the review page,
     # under the name `subject`: what it reads of it is in both shapes
     shown = {"render", "media_base", "render_key"}
@@ -510,6 +550,7 @@ def test_every_field_the_javascript_reads_exists_in_its_shape() -> None:
         ("render.template", "RenderOut has no field 'template'"),
         ("for (const m of assignment.previous.marks) m; mark.vertex", "no field 'vertex'"),
         ("row.accession", "a row of the review has no field 'accession'"),
+        ("const all = { ...previous.values, ...assignment.scores };", "no field 'scores'"),
         ("`${progress.done} of ${progress.n_subjects}`", "ProgressOut has no field 'done'"),
     ],
 )
@@ -541,7 +582,10 @@ def test_every_body_the_javascript_builds_has_the_fields_of_its_shape() -> None:
 
 
 def test_the_body_check_finds_a_stray_and_a_missing_key() -> None:
-    stray = "const body = /* shape: RatingIn */ { assignment_id: 1, protocol_version, ms_on_subject, score: 2 };"
+    stray = (
+        "const body = /* shape: RatingIn */ "
+        "{ assignment_id: 1, protocol_version, ms_on_subject, score: 2 };"
+    )
     assert shape_problems(stray, "snippet") == ["snippet:1: RatingIn has no field 'score'"]
     missing = "post(/* shape: MarkIn */ { client_id, class: c, panel, slice: f(a, b), px });"
     assert shape_problems(missing, "snippet") == ["snippet:1: MarkIn needs 'py'"]
@@ -571,7 +615,8 @@ def test_the_events_the_page_logs_are_the_event_types_of_the_schemas() -> None:
 @pytest.fixture(scope="module")
 def pages() -> dict[str, str]:
     jinja2 = pytest.importorskip("jinja2")
-    from surfcensus.app.server import PAGES, STATIC_URL, TEMPLATES_DIR as served
+    from surfcensus.app.server import PAGES, STATIC_URL
+    from surfcensus.app.server import TEMPLATES_DIR as served
 
     assert served == TEMPLATES_DIR
     environment = jinja2.Environment(
@@ -581,7 +626,9 @@ def pages() -> dict[str, str]:
     )
     # the three variables the server gives a page, and nothing else
     return {
-        route: environment.get_template(name).render(static=STATIC_URL, version="1.2.3", mode="local")
+        route: environment.get_template(name).render(
+            static=STATIC_URL, version="1.2.3", mode="local"
+        )
         for route, name in PAGES.items()
     }
 
@@ -624,7 +671,9 @@ def test_every_element_a_page_script_looks_up_is_in_its_page(
     assert wanted <= present, wanted - present
 
 
-def test_the_keys_named_on_the_rating_page_are_keys_of_the_keyboard_map(pages: dict[str, str]) -> None:
+def test_the_keys_named_on_the_rating_page_are_keys_of_the_keyboard_map(
+    pages: dict[str, str],
+) -> None:
     named = set(re.findall(r"<kbd>([^<]+)</kbd>", pages["/"]))
     aliases = {"Esc": "Escape", "Ctrl": None, "Z": None}
     fixed = set(protocol_module.FIXED_KEYS) | {"Escape"}
@@ -655,7 +704,8 @@ def run_js(js_copy: Path, script: str, data: Any = None) -> Any:
     (js_copy / "input.json").write_text(json.dumps(data), encoding="utf-8")
     main = (
         'import { readFileSync } from "node:fs";\n'
-        'const input = JSON.parse(readFileSync(new URL("./input.json", import.meta.url), "utf8"));\n'
+        'const text = readFileSync(new URL("./input.json", import.meta.url), "utf8");\n'
+        "const input = JSON.parse(text);\n"
         "const output = (value) => console.log(JSON.stringify(value));\n" + script
     )
     (js_copy / "main.mjs").write_text(main, encoding="utf-8")
@@ -664,6 +714,16 @@ def run_js(js_copy: Path, script: str, data: Any = None) -> Any:
     )
     assert done.returncode == 0, done.stderr
     return json.loads(done.stdout)
+
+
+@needs_node
+@pytest.mark.parametrize("name", JS_FILES)
+def test_every_module_parses(js_copy: Path, name: str) -> None:
+    assert NODE is not None
+    done = subprocess.run(
+        [NODE, "--check", f"js/{name}"], cwd=js_copy, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
 
 
 def affine(rows: list[list[float]]) -> np.ndarray:
@@ -692,8 +752,16 @@ def geometry_case(name: str) -> tuple[dict[str, PanelInfo], dict[str, Any], np.n
     centre = (0.3, -95.2, -10.6) if name != "ras_anisotropic" else (0.3, -40.1, -20.3)
     box = BoxInfo(
         centre=centre,
-        low=(centre[0] + config.box_x_mm[0], centre[1] + config.box_y_mm[0], centre[2] + config.box_z_mm[0]),
-        high=(centre[0] + config.box_x_mm[1], centre[1] + config.box_y_mm[1], centre[2] + config.box_z_mm[1]),
+        low=(
+            centre[0] + config.box_x_mm[0],
+            centre[1] + config.box_y_mm[0],
+            centre[2] + config.box_z_mm[0],
+        ),
+        high=(
+            centre[0] + config.box_x_mm[1],
+            centre[1] + config.box_y_mm[1],
+            centre[2] + config.box_z_mm[1],
+        ),
     )
     panels = geometry.build_panels(box, geometry.axis_map(vox2ras_tkr, shape), config)
     modes = geometry.frame_tables(panels)
@@ -806,7 +874,8 @@ def test_tile_names_are_those_of_the_schemas_and_of_the_media_route(js_copy: Pat
         """
         import { tileName, tileUrl } from "./js/coords.js";
         output(input.map(([pattern, panel, index]) =>
-          [tileName(pattern, panel, index), tileUrl("/media/0123456789abcdef/", pattern, panel, index, "5d0c")]));
+          [tileName(pattern, panel, index),
+           tileUrl("/media/0123456789abcdef/", pattern, panel, index, "5d0c")]));
         """,
         wanted,
     )
@@ -829,10 +898,12 @@ def test_a_subject_has_every_tile_once_and_the_first_frame_in_front(js_copy: Pat
         const first = render.modes.sync.frames[5];
         output({
           counts,
-          tiles: subjectTiles(render.tiles, counts, "/media/a/", "k", first).map((tile) => tile.url),
+          tiles: subjectTiles(render.tiles, counts, "/media/a/", "k", first)
+            .map((tile) => tile.url),
           plain: subjectTiles(render.tiles, counts, "/media/a/", "k").length,
-          nearest: render.modes.seq.frames.map((frame) => nearestFrame(render.modes.sync.frames, frame)),
-          wrapped: [wrapFrame(-1, 120), wrapFrame(120, 120), wrapFrame(131, 120), wrapFrame(-11, 120)],
+          nearest: render.modes.seq.frames
+            .map((frame) => nearestFrame(render.modes.sync.frames, frame)),
+          wrapped: [-1, 120, 131, -11].map((frame) => wrapFrame(frame, 120)),
         });
         """,
         render,
@@ -856,7 +927,9 @@ def test_a_subject_has_every_tile_once_and_the_first_frame_in_front(js_copy: Pat
 
 @needs_node
 @pytest.mark.parametrize("case", ["conformed", "hires_flipped"])
-def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(js_copy: Path, case: str) -> None:
+def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(
+    js_copy: Path, case: str
+) -> None:
     panels, render, vox2ras_tkr = geometry_case(case)
     side = panels["sagittal"].width
     marks = [
@@ -865,8 +938,12 @@ def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(js_copy: Path
         {"panel": "coronal", "slice": 3, "px": 0.6 * side, "py": 0.4 * side},
         {"panel": "axial", "slice": 40, "px": 0.38 * side, "py": 0.55 * side},
         # in the margin of a tile, beyond the slices of the coronal panel
-        {"panel": "sagittal", "slice": 5, "px": 0.99 * side if case == "conformed" else 0.01 * side,
-         "py": 0.5 * side},
+        {
+            "panel": "sagittal",
+            "slice": 5,
+            "px": 0.99 * side if case == "conformed" else 0.01 * side,
+            "py": 0.5 * side,
+        },
     ]
     out = run_js(
         js_copy,
@@ -876,7 +953,8 @@ def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(js_copy: Path
         const shown = input.marks.map((mark) => {
           const panels = {};
           for (const name of Object.keys(render.panels)) {
-            panels[name] = render.panels[name].slices.map((_, slice) => markInPanel(render, mark, name, slice, 3));
+            panels[name] = render.panels[name].slices
+              .map((_, slice) => markInPanel(render, mark, name, slice, 3));
           }
           return panels;
         });
@@ -901,7 +979,9 @@ def test_a_mark_shows_in_every_panel_within_the_distance_and_fades(js_copy: Path
                     assert got is None, (name, position)
                     continue
                 n_shown += 1
-                assert got["px"] == pytest.approx(float(px)) and got["py"] == pytest.approx(float(py))
+                assert got["px"] == pytest.approx(float(px)) and got["py"] == pytest.approx(
+                    float(py)
+                )
                 assert got["distance"] == pytest.approx(distance, abs=1e-9)
                 assert got["opacity"] == pytest.approx(1 - (1 - low) * distance / 3.0)
             # one slice every millimetre: a point inside the sweep is near six or seven
@@ -922,7 +1002,8 @@ def test_the_marks_of_a_subject_add_undo_delete_and_post(js_copy: Path) -> None:
         """
         import { MarkStore } from "./js/marks.js";
         const store = new MarkStore();
-        const click = (panel, slice) => ({ panel, slice, px: 10.5, py: 20.25, frame: 3, mode: "sync", target: null });
+        const click = (panel, slice) =>
+          ({ panel, slice, px: 10.5, py: 20.25, frame: 3, mode: "sync", target: null });
         store.reset(input.previous);
         const first = store.add("A", click("sagittal", 3), "2026-11-13T10:00:00.000Z");
         const second = store.add("X", click("axial", 1), "2026-11-13T10:00:01.000Z");
@@ -989,7 +1070,11 @@ def test_the_keyboard_map_has_every_fixed_key_and_the_keys_of_the_protocol(
     assert len(actions) == len(out["map"])
     for criterion in shipped_protocol.criteria:
         for key, level in zip(criterion.keys, shipped_protocol.scale, strict=True):
-            assert actions[key] == {"type": "value", "criterion": criterion.id, "value": level.value}
+            assert actions[key] == {
+                "type": "value",
+                "criterion": criterion.id,
+                "value": level.value,
+            }
         assert actions[criterion.mark_key] == {"type": "class", "class": criterion.id}
     assert actions[shipped_protocol.other_mark_key] == {"type": "class", "class": "X"}
     assert actions[" "] == {"type": "toggle_play"} and actions["Enter"] == {"type": "submit"}
@@ -1077,7 +1162,12 @@ RATING_CASES: list[tuple[dict[str, Any], dict[str, int], bool, list[str]]] = [
     ({"values": {"A": 2, "B": 1, "C": 0}}, {"A": 1, "B": 2}, True, []),
     ({"values": {}, "unratable": "missing surface"}, {}, True, []),
     ({"values": {"A": 2}, "unratable": "missing surface"}, {}, True, []),
-    ({"values": {"A": 0, "B": 0, "C": 0}, "other": True, "note": "  "}, {}, False, ["needs a note"]),
+    (
+        {"values": {"A": 0, "B": 0, "C": 0}, "other": True, "note": "  "},
+        {},
+        False,
+        ["needs a note"],
+    ),
     ({"values": {}, "unratable": "render failure", "other": True}, {}, False, ["needs a note"]),
     ({"values": {"A": 0, "B": 0, "C": 0}, "other": True, "note": "skull"}, {}, False, []),
 ]
@@ -1096,15 +1186,19 @@ def test_enter_is_held_back_by_the_rules_of_a_submission(
         """
         import { blockers, emptyRating, isPositive, ratingFromPrevious } from "./js/rating.js";
         output({
-          blockers: input.cases.map(([rating, counts, required]) => blockers(input.protocol, rating, counts, required)),
+          blockers: input.cases.map(([rating, counts, required]) =>
+            blockers(input.protocol, rating, counts, required)),
           empty: emptyRating(),
           positive: [0, 1, 2].map((value) => isPositive(input.protocol, value)),
-          previous: ratingFromPrevious({ values: { A: 1 }, unratable: null, other: true, note: "x", marks: [] }),
+          previous: ratingFromPrevious(
+            { values: { A: 1 }, unratable: null, other: true, note: "x", marks: [] }),
         });
         """,
         {"protocol": shipped_protocol.model_dump(mode="json"), "cases": cases},
     )
-    for (rating, counts, required, fragments), got in zip(RATING_CASES, out["blockers"], strict=True):
+    for (rating, counts, required, fragments), got in zip(
+        RATING_CASES, out["blockers"], strict=True
+    ):
         assert len(got) == len(fragments), (rating, counts, required, got)
         for fragment, sentence in zip(fragments, got, strict=True):
             assert fragment in sentence
@@ -1131,11 +1225,14 @@ def test_the_body_of_a_rating_is_a_rating_in(js_copy: Path, shipped_protocol: Pr
         """
         import { ratingBody } from "./js/rating.js";
         const assignment = { assignment_id: 12 };
-        const rated = { values: { A: 2, B: 0, C: 0 }, unratable: null, other: true, note: "  dura  " };
-        const unratable = { values: { A: 2 }, unratable: "missing surface", other: false, note: "" };
+        const rated =
+          { values: { A: 2, B: 0, C: 0 }, unratable: null, other: true, note: "  dura  " };
+        const unratable =
+          { values: { A: 2 }, unratable: "missing surface", other: false, note: "" };
+        const at = "2026-11-12T14:03:22.120Z";
         output([
-          ratingBody(assignment, input.protocol, rated, [input.mark], 14200.6, "2026-11-12T14:03:22.120Z"),
-          ratingBody(assignment, input.protocol, unratable, [input.mark], -5, "2026-11-12T14:03:22.120Z"),
+          ratingBody(assignment, input.protocol, rated, [input.mark], 14200.6, at),
+          ratingBody(assignment, input.protocol, unratable, [input.mark], -5, at),
         ]);
         """,
         {"protocol": shipped_protocol.model_dump(mode="json"), "mark": mark},
@@ -1287,7 +1384,8 @@ globalThis.fetch = async (path, options) => {
   calls.push([options.method, path, options.body ?? null]);
   const answer = answers.shift();
   if (answer === "down") throw new TypeError("fetch failed");
-  return { ok: answer.status < 400, status: answer.status, text: async () => JSON.stringify(answer.body) };
+  const text = async () => JSON.stringify(answer.body);
+  return { ok: answer.status < 400, status: answer.status, text };
 };
 const store = new Map();
 globalThis.sessionStorage = {
@@ -1308,21 +1406,25 @@ def test_a_rating_is_sent_again_until_the_server_answers_and_kept_meanwhile(js_c
         + """
         import * as api from "./js/api.js";
         const body = { assignment_id: 12, protocol_version: "v", ms_on_subject: 1 };
-        answers = ["down", { status: 503, body: { errors: [{ field: "request", message: "busy" }] } },
-                   { status: 200, body: { saved: 1 } }];
+        const busy = { errors: [{ field: "request", message: "busy" }] };
+        answers = ["down", { status: 503, body: busy }, { status: 200, body: { saved: 1 } }];
         const kept = [];
         const retries = [];
         const stored = await api.submitRating(body, {
           sleep: async (ms) => { sleeps.push(ms); kept.push(api.unsentRating()); },
-          onRetry: (attempt, failure) => retries.push([attempt, failure.name, failure.status ?? null]),
+          onRetry: (attempt, failure) =>
+            retries.push([attempt, failure.name, failure.status ?? null]),
         });
         const afterStored = api.unsentRating();
-        answers = [{ status: 422, body: { errors: [{ field: "marks", message: "no mark of class A" }] } }];
+        const noMark = { errors: [{ field: "marks", message: "no mark of class A" }] };
+        answers = [{ status: 422, body: noMark }];
         let refused = null;
         try { await api.submitRating(body, { sleep }); } catch (failure) {
-          refused = { name: failure.name, status: failure.status, errors: failure.errors, message: failure.message };
+          const { name, status, errors, message } = failure;
+          refused = { name, status, errors, message };
         }
-        output({ stored, calls, kept, retries, sleeps, afterStored, refused, afterRefused: api.unsentRating() });
+        const afterRefused = api.unsentRating();
+        output({ stored, calls, kept, retries, sleeps, afterStored, refused, afterRefused });
         """,
     )
     assert out["stored"] == {"saved": 1}
@@ -1353,12 +1455,16 @@ def test_next_is_asked_again_while_nothing_is_rendered(js_copy: Path) -> None:
         import * as api from "./js/api.js";
         answers = [{ status: 200, body: input }, "down", { status: 200, body: { status: "done" } }];
         const waits = [];
-        const next = await api.settle(input, { sleep, onRendering: (answer) => waits.push(answer.status) });
+        const onRendering = (answer) => waits.push(answer.status);
+        const next = await api.settle(input, { sleep, onRendering });
         answers = [{ status: 500, body: null }];
         let failed = null;
-        try { await api.getSession(); } catch (failure) { failed = [failure.name, failure.status, failure.message]; }
+        try { await api.getSession(); } catch (failure) {
+          failed = [failure.name, failure.status, failure.message];
+        }
         answers = [{ status: 200, body: { total: 0 } }, { status: 200, body: {} }];
-        await api.getReview({ sort: null, order: "asc", filter: "final_A:2,fs_version:7.3.2", offset: 0, limit: 200 });
+        const filter = "final_A:2,fs_version:7.3.2";
+        await api.getReview({ sort: null, order: "asc", filter, offset: 0, limit: 200 });
         await api.getSubject("0123456789abcdef");
         output({ next, waits, sleeps, calls, failed });
         """,
@@ -1373,7 +1479,9 @@ def test_next_is_asked_again_while_nothing_is_rendered(js_copy: Path) -> None:
         "/api/review?order=asc&filter=final_A%3A2%2Cfs_version%3A7.3.2&offset=0&limit=200"
     )
     assert out["calls"][5][:2] == ["GET", "/api/review/0123456789abcdef"]
-    query = schemas.ReviewQuery(order="asc", filter="final_A:2,fs_version:7.3.2", offset=0, limit=200)
+    query = schemas.ReviewQuery(
+        order="asc", filter="final_A:2,fs_version:7.3.2", offset=0, limit=200
+    )
     assert query.sort is None
 
 

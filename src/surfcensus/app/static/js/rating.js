@@ -133,7 +133,8 @@ export class RatingBar {
     other.dataset.criterion = "X";
     const label = html("span", "criterion-label");
     label.append(html("b", "", "X"), " Anything else worth a mark");
-    other.append(label, html("span", "levels"), this.classControl("X", protocol.other_mark_key, onClass));
+    const control = this.classControl("X", protocol.other_mark_key, onClass);
+    other.append(label, html("span", "levels"), control);
     root.append(other);
   }
 

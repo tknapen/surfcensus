@@ -7,7 +7,15 @@ import { EventLog } from "./events.js";
 import { Help } from "./help.js";
 import { buildKeyMap, installKeys } from "./keys.js";
 import { MarkLayer, MarkStore } from "./marks.js";
-import { RatingBar, ReasonPicker, blockers, emptyRating, isPositive, ratingBody, ratingFromPrevious } from "./rating.js";
+import {
+  RatingBar,
+  ReasonPicker,
+  blockers,
+  emptyRating,
+  isPositive,
+  ratingBody,
+  ratingFromPrevious,
+} from "./rating.js";
 import { Viewer } from "./viewer.js";
 
 const DRAFT_KEY = "surfcensus.draft";
@@ -357,7 +365,8 @@ class RatePage {
         ...this.session.protocol.criteria.map((criterion) => criterion.mark_key),
         this.session.protocol.other_mark_key,
       ];
-      this.notice = `Choose what to mark first: ${keys.join(", ")}, or rate a criterion above none.`;
+      this.notice =
+        `Choose what to mark first: ${keys.join(", ")}, ` + "or rate a criterion above none.";
       this.refresh();
       return;
     }
@@ -573,7 +582,8 @@ class RatePage {
     this.events.add("back", {});
     this.notice = "";
     await this.take(next);
-    this.notice = "This subject was rated before: change what is wrong, then Enter stores it again.";
+    this.notice =
+      "This subject was rated before: change what is wrong, then Enter stores it again.";
     this.refresh();
   }
 }

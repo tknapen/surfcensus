@@ -2,7 +2,14 @@
 // them. A mark is a point on one tile (the fields of MarkIn); as a 3D point it shows in
 // every panel whose current slice passes within `mark_show_mm` of it, fainter with distance.
 
-import { PANEL_ORDER, pixelToVoxel, sliceDistanceMm, tkrToVoxel, voxelToPixel, voxelToTkr } from "./coords.js";
+import {
+  PANEL_ORDER,
+  pixelToVoxel,
+  sliceDistanceMm,
+  tkrToVoxel,
+  voxelToPixel,
+  voxelToTkr,
+} from "./coords.js";
 
 const SVG = "http://www.w3.org/2000/svg";
 export const MIN_OPACITY = 0.2;

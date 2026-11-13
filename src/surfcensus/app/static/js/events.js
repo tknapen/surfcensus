@@ -84,7 +84,12 @@ export function eventBatches(queue) {
 export class EventLog {
   // send(body) posts a batch and resolves when it is stored; it rejects with an error that
   // has a `status` when the server refused it. beacon(body) hands a batch to the browser.
-  constructor({ send, beacon, now = () => performance.now(), wall = () => new Date().toISOString() }) {
+  constructor({
+    send,
+    beacon,
+    now = () => performance.now(),
+    wall = () => new Date().toISOString(),
+  }) {
     this.send = send;
     this.beacon = beacon;
     this.now = now;
