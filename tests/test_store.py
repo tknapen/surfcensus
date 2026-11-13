@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import subprocess
@@ -324,6 +325,350 @@ def test_a_failed_create_leaves_no_file(tmp_path: Path, monkeypatch: pytest.Monk
     assert list(tmp_path.iterdir()) == []
 
 
+# --- a catalog holds a run or does not exist ----------------------------------------------
+
+META_KEYS = {
+    "run_id",
+    "mode",
+    "key_kind",
+    "key_fingerprint",
+    "created_at",
+    "surfcensus_version",
+    "run_secret",
+}
+KEY_OF = {"local": SALT, "census": KEY}
+JOURNAL_OF = {"local": "delete", "census": "wal"}
+
+
+def _looked_at(path: Path) -> dict[str, object]:
+    """What a database file holds, read through a connection of its own."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    try:
+        return {
+            "version": conn.execute("PRAGMA user_version").fetchone()[0],
+            "journal": conn.execute("PRAGMA journal_mode").fetchone()[0],
+            "meta": dict(conn.execute("SELECT key, value FROM meta").fetchall()),
+        }
+    finally:
+        conn.close()
+
+
+def _tables_without_a_run(path: Path) -> None:
+    """What a version before the catalog was built under another name left when it was
+    killed between the schema and the identity of the run."""
+    conn = sqlite3.connect(path, isolation_level=None)
+    store._migrate(conn)
+    conn.close()
+
+
+UNFINISHED = {"an empty file": Path.touch, "tables without a row": _tables_without_a_run}
+
+
+@pytest.mark.parametrize("mode", ["local", "census"])
+def test_a_catalog_gets_its_name_when_it_is_whole(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process that opens the run, or a kill, must never find a ``catalog.sqlite``
+    without a run in it."""
+    path = tmp_path / CATALOG_FILE
+    seen: list[dict[str, object]] = []
+    link = os.link
+
+    def linking(src: Path, dst: Path) -> None:
+        assert Path(dst) == path and not path.exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == [Path(src).name]  # no journal, no log
+        assert re.fullmatch(r"\.catalog\.sqlite\.[0-9a-f]{16}\.tmp", Path(src).name)
+        seen.append(_looked_at(Path(src)))
+        link(src, dst)
+
+    monkeypatch.setattr(os, "link", linking)
+    with Catalog.create(path, mode=mode, key=KEY_OF[mode]) as catalog:
+        (whole,) = seen
+        assert whole["version"] == store.SCHEMA_VERSION and whole["journal"] == JOURNAL_OF[mode]
+        assert set(whole["meta"]) == META_KEYS and whole["meta"]["mode"] == mode
+        assert catalog.run_secret().hex() == whole["meta"]["run_secret"]
+        assert catalog.meta("run_id") == whole["meta"]["run_id"]
+    assert [p.name for p in tmp_path.iterdir()] == [CATALOG_FILE]
+
+
+def test_a_create_that_is_stopped_before_the_name_is_given_leaves_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def interrupted(src: object, dst: object) -> None:
+        raise KeyboardInterrupt
+
+    with monkeypatch.context() as patched:
+        patched.setattr(os, "link", interrupted)
+        with pytest.raises(KeyboardInterrupt):
+            Catalog.create(tmp_path / CATALOG_FILE, mode="census", key=KEY)
+    assert list(tmp_path.iterdir()) == []
+    Catalog.create(tmp_path / CATALOG_FILE, mode="census", key=KEY).close()
+
+
+KILLED = """
+import os, signal, sys
+from surfcensus import store
+from surfcensus.privacy import HashKey
+
+where, mode, kind = sys.argv[1:4]
+
+
+def killed(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def no_hard_links(src, dst):
+    raise PermissionError(1, "Operation not permitted")
+
+
+if where == "before the name":
+    store._publish = killed
+else:  # in the transaction that makes the run in the file itself
+    os.link = no_hard_links
+    fill = store._fill
+
+    def fill_in_place(path, **kwargs):
+        if path.name == store.CATALOG_FILE:
+            store._now = killed
+        fill(path, **kwargs)
+
+    store._fill = fill_in_place
+key = HashKey(bytes.fromhex(sys.argv[5]), kind)
+store.Catalog.create(sys.argv[4], mode=mode, key=key)
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs SIGKILL")
+@pytest.mark.parametrize("mode", ["local", "census"])
+@pytest.mark.parametrize("where", ["before the name", "in the file itself"])
+def test_a_create_that_is_killed_leaves_no_catalog_or_one_that_the_next_finishes(
+    where: str, mode: str, tmp_path: Path
+) -> None:
+    path, key = tmp_path / CATALOG_FILE, KEY_OF[mode]
+    child = subprocess.run(
+        [sys.executable, "-c", KILLED, where, mode, key.kind, str(path), key.secret.hex()],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == -9, child.stderr
+    if where == "before the name":
+        assert not path.exists()
+        with pytest.raises(ConfigError) as caught:
+            Catalog(path)
+        assert caught.value.reason == "missing"
+    else:
+        assert path.stat().st_size == 0
+        with pytest.raises(store.UnfinishedCatalog):
+            Catalog(path)
+    with Catalog.create(path, mode=mode, key=key, exist_ok=True) as catalog:
+        assert catalog.meta("mode") == mode and len(catalog.run_secret()) == 32
+        assert catalog.query("PRAGMA journal_mode")[0][0] == JOURNAL_OF[mode]
+        assert catalog.query("PRAGMA integrity_check")[0][0] == "ok"
+        assert count(catalog, "meta") == 7
+
+
+@pytest.mark.parametrize("mode", ["local", "census"])
+@pytest.mark.parametrize("state", list(UNFINISHED))
+def test_an_unfinished_catalog_is_left_alone_by_opening_and_finished_by_create(
+    state: str, mode: str, tmp_path: Path
+) -> None:
+    path, key = tmp_path / CATALOG_FILE, KEY_OF[mode]
+    UNFINISHED[state](path)
+    before = path.read_bytes()
+    openers = (
+        lambda: Catalog(path),
+        lambda: Catalog(path, readonly=True),
+        lambda: PublicCatalog.open(tmp_path),
+    )
+    for opener in openers:
+        with pytest.raises(store.UnfinishedCatalog, match="holds no run yet") as caught:
+            opener()
+        assert caught.value.reason == "invalid"
+        assert "not made by surfcensus" not in str(caught.value)  # that would say: delete it
+    with pytest.raises(ConfigError, match=r"already has a catalog\.sqlite"):
+        Catalog.create(path, mode=mode, key=key)
+    # nothing was migrated, nothing written: the file is as the killed process left it
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == [CATALOG_FILE]
+
+    with Catalog.create(path, mode=mode, key=key, exist_ok=True) as catalog:
+        meta = {r["key"]: r["value"] for r in catalog.query("SELECT key, value FROM meta")}
+        assert set(meta) == META_KEYS
+        assert (meta["mode"], meta["key_fingerprint"]) == (mode, key.fingerprint)
+        assert catalog.query("PRAGMA user_version")[0][0] == store.SCHEMA_VERSION
+        assert catalog.query("PRAGMA journal_mode")[0][0] == JOURNAL_OF[mode]
+        names = {r[0] for r in catalog.query("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert names == TABLES
+    with Catalog.create(path, mode=mode, key=key, exist_ok=True) as again:  # now it is whole
+        assert again.meta("run_id") == meta["run_id"]
+        assert again.run_secret().hex() == meta["run_secret"]
+
+
+def test_an_existing_catalog_of_another_run_is_refused_also_with_exist_ok(tmp_path: Path) -> None:
+    path = tmp_path / CATALOG_FILE
+    Catalog.create(path, mode="local", key=SALT).close()
+    before = path.read_bytes()
+    other = HashKey(bytes(range(2, 34)), "local-salt")
+    with pytest.raises(ConfigError, match="of another run") as caught:
+        Catalog.create(path, mode="local", key=other, exist_ok=True)
+    assert caught.value.reason == "invalid"
+    assert path.read_bytes() == before
+
+
+def _a_table_with_a_row(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE notes (text)")
+    conn.execute("INSERT INTO notes VALUES ('mine')")
+
+
+def _an_empty_table(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE notes (text)")
+
+
+def _a_numbered_schema_of_its_own(conn: sqlite3.Connection) -> None:
+    conn.execute("CREATE TABLE notes (text)")
+    conn.execute("PRAGMA user_version = 1")
+
+
+def _a_row_in_the_tables_of_a_catalog(conn: sqlite3.Connection) -> None:
+    store._migrate(conn)
+    conn.execute("INSERT INTO meta (key, value) VALUES ('template_id', 'abc')")
+
+
+@pytest.mark.parametrize(
+    "fill",
+    [
+        _a_table_with_a_row,
+        _an_empty_table,
+        _a_numbered_schema_of_its_own,
+        _a_row_in_the_tables_of_a_catalog,
+    ],
+)
+def test_a_database_that_something_else_made_is_never_taken_for_unfinished(
+    fill, tmp_path: Path
+) -> None:
+    """Only a file that holds nothing may be filled: here a run would be made in someone
+    else's database, or over the rows of a catalog that lost its identity."""
+    path = tmp_path / CATALOG_FILE
+    conn = sqlite3.connect(path, isolation_level=None)
+    fill(conn)
+    conn.close()
+    before = path.read_bytes()
+    attempts = (
+        lambda: Catalog(path),
+        lambda: PublicCatalog.open(tmp_path),
+        lambda: Catalog.create(path, mode="local", key=SALT, exist_ok=True),
+    )
+    for attempt in attempts:
+        with pytest.raises(ConfigError, match="it was not made by surfcensus") as caught:
+            attempt()
+        assert not isinstance(caught.value, store.UnfinishedCatalog)
+    store._fill(path, mode="local", key=SALT)  # looks again under the lock, and writes nothing
+    assert path.read_bytes() == before
+    assert [p.name for p in tmp_path.iterdir()] == [CATALOG_FILE]
+
+
+@pytest.mark.parametrize("mode", ["local", "census"])
+def test_without_hard_links_the_run_is_made_in_the_file_itself(
+    mode: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_hard_links(src: object, dst: object) -> None:
+        raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(os, "link", no_hard_links)
+    path, key = tmp_path / CATALOG_FILE, KEY_OF[mode]
+    with Catalog.create(path, mode=mode, key=key) as catalog:
+        assert catalog.meta("mode") == mode and count(catalog, "meta") == 7
+        assert catalog.query("PRAGMA journal_mode")[0][0] == JOURNAL_OF[mode]
+        run_id = catalog.meta("run_id")
+    assert [p.name for p in tmp_path.iterdir()] == [CATALOG_FILE]
+    before = path.read_bytes()
+    with pytest.raises(ConfigError, match=r"already has a catalog\.sqlite"):
+        Catalog.create(path, mode=mode, key=key)
+    assert path.read_bytes() == before
+    with Catalog.create(path, mode=mode, key=key, exist_ok=True) as again:
+        assert again.meta("run_id") == run_id
+
+    # the name was taken between the look and the claim: nothing of the other is replaced
+    other = tmp_path / "other" / CATALOG_FILE
+    lexists = os.path.lexists
+
+    def taken_meanwhile(candidate: object) -> bool:
+        if Path(str(candidate)) == other and not lexists(other):
+            other.write_bytes(before)
+            return False
+        return lexists(candidate)
+
+    monkeypatch.setattr(os.path, "lexists", taken_meanwhile)
+    with Catalog.create(other, mode=mode, key=key, exist_ok=True) as adopted:
+        assert adopted.meta("run_id") == run_id
+    assert [p.name for p in other.parent.iterdir()] == [CATALOG_FILE]
+
+
+CREATOR = """
+import os, sys, time
+from pathlib import Path
+from surfcensus import store
+from surfcensus.privacy import HashKey
+
+path, tag, mode, kind = Path(sys.argv[1]), sys.argv[2], sys.argv[3], sys.argv[4]
+if sys.argv[6] == "no hard links":
+    def no_hard_links(src, dst):
+        raise PermissionError(1, "Operation not permitted")
+    os.link = no_hard_links
+key = HashKey(bytes.fromhex(sys.argv[5]), kind)
+(path.parent / f"ready-{tag}").touch()
+while not (path.parent / "go").exists():
+    time.sleep(0.001)
+with store.Catalog.create(path, mode=mode, key=key, exist_ok=True) as catalog:
+    catalog.set_meta(f"seen-{tag}", catalog.meta("run_id"))
+    print(catalog.meta("run_id"), catalog.run_secret().hex())
+"""
+
+
+@pytest.mark.parametrize("mode", ["local", "census"])
+@pytest.mark.parametrize("start", ["no file", "an empty file", "no hard links"])
+def test_processes_that_make_one_catalog_at_once_all_get_the_same_run(
+    start: str, mode: str, tmp_path: Path
+) -> None:
+    """A run is opened while its catalog is being made, or several commands find a run whose
+    making was killed. Each makes the catalog; one of them wins and the others take its."""
+    path, key = tmp_path / CATALOG_FILE, KEY_OF[mode]
+    if start == "an empty file":
+        path.touch()
+    tags = ("a", "b", "c", "d")
+    makers = [
+        subprocess.Popen(
+            [sys.executable, "-c", CREATOR, path, tag, mode, key.kind, key.secret.hex(), start],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for tag in tags
+    ]
+    try:
+        deadline = time.monotonic() + 120
+        while not all((tmp_path / f"ready-{tag}").exists() for tag in tags):
+            assert all(maker.poll() is None for maker in makers), "a maker ended early"
+            assert time.monotonic() < deadline, "the makers did not start"
+            time.sleep(0.02)
+        (tmp_path / "go").touch()
+        results = [maker.communicate(timeout=300) for maker in makers]
+    finally:
+        for maker in makers:
+            maker.kill()
+    assert [maker.returncode for maker in makers] == [0, 0, 0, 0], [err for _, err in results]
+    assert len({out for out, _ in results}) == 1, results  # one run id, one run secret
+    with Catalog(path) as catalog:
+        run_id = catalog.meta("run_id")
+        assert results[0][0].split() == [run_id, catalog.run_secret().hex()]
+        # every process wrote to the catalog that has the name, none to a file it lost
+        assert [catalog.meta(f"seen-{tag}") for tag in tags] == [run_id] * 4
+        assert catalog.query("PRAGMA integrity_check")[0][0] == "ok"
+    left = {p.name for p in tmp_path.iterdir()} - {"go", *(f"ready-{tag}" for tag in tags)}
+    assert left - {f"{CATALOG_FILE}-wal", f"{CATALOG_FILE}-shm"} == {CATALOG_FILE}
+
+
 def test_opening_what_is_not_a_catalog(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=f"has no {CATALOG_FILE}") as caught:
         Catalog(tmp_path / CATALOG_FILE)
@@ -417,6 +762,34 @@ def test_a_census_run_on_a_network_file_system_gets_a_warning(
     assert caplog.records == []
 
 
+def test_a_census_catalog_that_could_not_be_switched_is_switched_by_a_later_opening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The switch to the write-ahead log needs the file to itself, and where a run is made
+    in the catalog file itself another process may have it open by then."""
+    path = tmp_path / CATALOG_FILE
+    with monkeypatch.context() as refused, caplog.at_level(logging.WARNING, logger="surfcensus"):
+        refused.setattr(store, "_use_wal", lambda conn: False)
+        with Catalog.create(path, mode="census", key=KEY) as catalog:
+            assert catalog.query("PRAGMA journal_mode")[0][0] == "delete"
+            catalog.set_meta("template_id", "abc")  # it works, with a rollback journal
+    (warning,) = [r.getMessage() for r in caplog.records]
+    assert "could not be put in write-ahead mode (it is in delete mode)" in warning
+
+    with Catalog(path, readonly=True) as reader:  # a reader changes nothing
+        assert reader.query("PRAGMA journal_mode")[0][0] == "delete"
+    writer = sqlite3.connect(path, isolation_level=None)
+    writer.execute("BEGIN IMMEDIATE")
+    with Catalog(path) as meanwhile:  # the switch is refused: the opening goes on without
+        assert meanwhile.query("PRAGMA journal_mode")[0][0] == "delete"
+        assert meanwhile.meta("template_id") == "abc"
+    writer.execute("ROLLBACK")
+    writer.close()
+    with Catalog(path) as alone:
+        assert alone.query("PRAGMA journal_mode")[0][0] == "wal"
+        assert alone.meta("template_id") == "abc"
+
+
 def test_filesystem_type_reads_the_mount_that_holds_the_path(tmp_path: Path) -> None:
     inside = tmp_path / "data" / "my run" / "deeper"
     inside.mkdir(parents=True)
@@ -455,8 +828,8 @@ def test_migrations_are_applied_to_an_empty_file(tmp_path: Path) -> None:
     assert names == TABLES
     store._migrate(conn)  # nothing pending: nothing done, no error
     conn.close()
-    # the tables are there, but no run was created in the file
-    with pytest.raises(ConfigError, match="holds no run") as caught:
+    # the tables are there, but no run was made in the file
+    with pytest.raises(store.UnfinishedCatalog, match="holds no run yet") as caught:
         Catalog(path)
     assert caught.value.reason == "invalid"
 

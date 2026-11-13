@@ -542,6 +542,36 @@ def test_a_name_that_is_not_utf8_is_skipped_with_a_warning(
     assert raised.value.reason == "not found"
 
 
+@pytest.mark.skipif(sys.platform != "linux", reason="needs file names of any bytes")
+@pytest.mark.parametrize("layout", ["subjects_dir", "fmriprep"])
+def test_a_root_that_is_not_utf8_is_refused(layout: str, tmp_path: Path) -> None:
+    """A run stores the root in ``config.yaml`` and in its catalog and hashes it into the
+    pseudonym and every ``subject_uid``, all as text. Such a root used to pass and then
+    stop the inventory with a ``UnicodeEncodeError`` from SQLite."""
+    tree = write_tree(tmp_path / "study", layout, ["sub-01", "sub-02"])
+    odd = Path(os.fsdecode(os.fsencode(tmp_path) + b"/stud\xffy"))
+    os.rename(tree, odd)
+    (tmp_path / "link").symlink_to(odd)
+    subject = odd / "sub-01" if layout == "subjects_dir" else odd / "sourcedata/freesurfer/sub-01"
+    for path in (odd, tmp_path / "link", subject):  # the root is where a link leads
+        with pytest.raises(SourceError, match="not valid UTF-8") as raised:
+            LocalSource(path)
+        assert raised.value.reason == "invalid"
+        assert "stud\\udcffy" in str(raised.value)
+        str(raised.value).encode("utf-8")  # the message can be printed and logged
+
+    # a link to one subject keeps its own name, and its root is the directory of the link
+    (tmp_path / "linked" / "sub-09").parent.mkdir()
+    (tmp_path / "linked" / "sub-09").symlink_to(subject)
+    assert _labels(LocalSource(tmp_path / "linked" / "sub-09")) == ["sub-09"]
+
+    os.rename(odd, tree)
+    with pytest.raises(SourceError, match=r"subject glob .* is not valid UTF-8") as raised:
+        LocalSource(tree, subjects=["sub-0[!\udcff]"])
+    assert raised.value.reason == "invalid"
+    assert _labels(LocalSource(tree, subjects=["sub-0[!é]"])) == ["sub-01", "sub-02"]
+
+
 def test_two_names_for_one_directory_are_listed_once_under_the_first(
     tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:

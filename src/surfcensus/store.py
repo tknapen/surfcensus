@@ -373,6 +373,15 @@ def _statements(script: str) -> Iterator[str]:
         yield statement.strip()  # unterminated; SQLite says what is wrong with it
 
 
+def _apply_migrations(conn: sqlite3.Connection) -> None:
+    """Apply the migrations the file lacks, inside the transaction that is open."""
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    for number in range(version, SCHEMA_VERSION):
+        for statement in _statements(MIGRATIONS[number]):
+            conn.execute(statement)
+        conn.execute(f"PRAGMA user_version = {number + 1}")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     """Apply the migrations the file lacks, all in one transaction.
 
@@ -381,11 +390,7 @@ def _migrate(conn: sqlite3.Connection) -> None:
     """
     conn.execute("BEGIN IMMEDIATE")
     try:
-        version = conn.execute("PRAGMA user_version").fetchone()[0]
-        for number in range(version, SCHEMA_VERSION):
-            for statement in _statements(MIGRATIONS[number]):
-                conn.execute(statement)
-            conn.execute(f"PRAGMA user_version = {number + 1}")
+        _apply_migrations(conn)
         conn.execute("COMMIT")
     except BaseException:
         _roll_back(conn)
@@ -412,67 +417,118 @@ def _in_use(exc: sqlite3.Error, name: str) -> ConfigError | None:
 
 
 class UnfinishedCatalog(ConfigError):
-    """A catalog file that holds nothing: no table of it has a row.
+    """A catalog file in which no run was made yet: an empty file, or the tables of this
+    package without a row.
 
-    That is what a process leaves that was killed while it made a run, on a file system
-    without hard links or with a version before :meth:`Catalog.create` built the catalog
-    under another name. Nothing is lost with such a file; :func:`discard_unfinished` removes
-    it. The reason is ``invalid``.
+    A process that makes a run on a file system without hard links leaves the first while it
+    works, and for good when it is killed; a version before :meth:`Catalog.create` built
+    the catalog under another name left either. Nothing is lost with such a file:
+    :meth:`Catalog.create` with ``exist_ok`` makes the run in it. The reason is ``invalid``.
     """
 
 
-def _holds_no_row(conn: sqlite3.Connection) -> bool:
-    """Whether no table of the database has a row. Raises ``sqlite3.DatabaseError`` when the
-    file cannot be read as a database."""
-    tables = conn.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
-    ).fetchall()
-    for (name,) in tables:
+def _unfinished(conn: sqlite3.Connection) -> bool:
+    """Whether the database is an unfinished catalog (:class:`UnfinishedCatalog`).
+
+    Something else made a file that has tables and no schema number, or a schema number
+    and no ``meta`` table, or a row in any table. Raises ``sqlite3.DatabaseError`` when the
+    file cannot be read as a database.
+    """
+    version = conn.execute("PRAGMA user_version").fetchone()[0]
+    tables = [
+        name
+        for (name,) in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        )
+    ]
+    if version > SCHEMA_VERSION or (version == 0) != (not tables):
+        return False
+    if tables and "meta" not in tables:
+        return False
+    for name in tables:
         quoted = name.replace('"', '""')
         if conn.execute(f'SELECT 1 FROM "{quoted}" LIMIT 1').fetchone() is not None:
             return False
     return True
 
 
-def discard_unfinished(path: Path | str) -> bool:
-    """Remove the catalog at ``path`` if it is an unfinished one (:class:`UnfinishedCatalog`)
-    and say whether it was removed. The file is looked at here, whatever the caller saw
-    before: a catalog that holds a row is never removed. No file is not an error.
+def _use_wal(conn: sqlite3.Connection) -> bool:
+    """Put the database in WAL mode, which stays with the file; says whether it is in it.
+
+    The change needs the file to itself for a moment. It is refused while another connection
+    reads or writes, which can happen where a run was made in the catalog file itself
+    (``_fill``), so every opening of a census catalog for writing asks again.
     """
-    path = Path(path)
-    if not path.is_file():
-        return False
     try:
-        _Db(path, readonly=False).close()
-    except UnfinishedCatalog:
-        # SQLite has rolled back what the writer left and removed its journal by now; a
-        # journal that stayed would be replayed into the next file of this name
-        for suffix in ("", *_SIDECARS):
-            path.with_name(path.name + suffix).unlink(missing_ok=True)
-        return True
-    return False
+        journal = conn.execute("PRAGMA journal_mode = WAL").fetchone()
+    except sqlite3.OperationalError:  # locked
+        return False
+    return journal is not None and str(journal[0]).lower() == "wal"
+
+
+def _fill(path: Path, *, mode: Mode, key: HashKey) -> None:
+    """Make a run in the unfinished catalog at ``path``: the schema, the identity of the
+    run and its run secret, in one transaction.
+
+    So the file holds a run or is unfinished, whenever the process ends. The file is looked
+    at again under the write lock: when another process made the run meanwhile, or the
+    file is not an unfinished catalog, nothing is written. A census catalog is put in WAL
+    mode after the transaction, since the journal mode cannot change inside one.
+    """
+    conn = sqlite3.connect(path, timeout=_BUSY_MS["census"] / 1000, isolation_level=None)
+    try:
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except sqlite3.OperationalError as exc:
+            busy = _in_use(exc, path.name)
+            if busy is None:
+                raise
+            raise busy from exc
+        try:
+            if not _unfinished(conn):
+                conn.execute("ROLLBACK")
+                return
+            _apply_migrations(conn)
+            meta = {
+                "run_id": uuid.uuid4().hex,
+                "mode": mode,
+                "key_kind": key.kind,
+                "key_fingerprint": key.fingerprint,
+                "created_at": _now(),
+                "surfcensus_version": __version__,
+                "run_secret": secrets.token_bytes(32).hex(),
+            }
+            conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)", meta.items())
+            conn.execute("COMMIT")
+        except BaseException:
+            _roll_back(conn)
+            raise
+        if mode == "census":
+            # every row is in the file itself when the log begins, so a file that is given
+            # another name after this is the whole catalog
+            _use_wal(conn)
+    finally:
+        conn.close()
 
 
 def _publish(tmp: Path, path: Path) -> bool:
-    """Give the finished file ``tmp`` the name ``path``, unless the name is taken; says
-    whether it was given. ``tmp`` stays, or is gone, for the caller to remove."""
+    """Give the catalog ``tmp`` the name ``path``, unless the name is taken; says whether
+    the name was free. ``tmp`` is left for the caller to remove.
+
+    On a file system without hard links ``tmp`` cannot be given the name: a rename would
+    replace a catalog that another process put there meanwhile. The name is then taken with
+    an empty file, which every reader takes for an unfinished catalog, for the caller to
+    make the run in.
+    """
     try:
         os.link(tmp, path)  # atomic, and fails when the name is taken
     except FileExistsError:
         return False
     except OSError:
-        # A file system without hard links. The name is claimed with an empty file, which
-        # every reader takes for an unfinished catalog, and the rename then replaces it in
-        # one step.
         try:
-            path.touch(exist_ok=False)
+            path.open("x").close()
         except FileExistsError:
             return False
-        try:
-            os.replace(tmp, path)
-        except OSError:
-            path.unlink(missing_ok=True)
-            raise
     return True
 
 
@@ -512,7 +568,7 @@ class _Db:
     thread pool); one write transaction is open at a time.
     """
 
-    def __init__(self, path: Path, *, readonly: bool, expect_run: bool = True) -> None:
+    def __init__(self, path: Path, *, readonly: bool) -> None:
         if not path.is_file():
             raise ConfigError("missing", f"{path.parent} has no {path.name}")
         self.path = path
@@ -529,16 +585,16 @@ class _Db:
         )
         self._conn.row_factory = sqlite3.Row
         try:
-            self._prepare(expect_run)
+            self._prepare()
         except BaseException:
             self._conn.close()
             raise
 
-    def _prepare(self, expect_run: bool) -> None:
+    def _prepare(self) -> None:
         name = self.path.name
         try:
             self._conn.execute("PRAGMA foreign_keys = ON")
-            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            version, mode, unfinished = self._look()
         except sqlite3.DatabaseError as exc:
             # a locked file is whole: saying otherwise invites deleting the catalog
             raise (
@@ -551,10 +607,18 @@ class _Db:
                 f"{name} has schema {version}; this version of surfcensus reads up to "
                 f"{SCHEMA_VERSION}",
             )
-        if expect_run and version == 0:
-            # Catalog.create numbers the schema before a run is in the file, so this one
-            # holds none. It is left as it is: no migration is applied to it.
-            raise self._no_run()
+        if unfinished:
+            # not "it was not made by surfcensus": that reads as a foreign file to delete
+            raise UnfinishedCatalog(
+                "invalid",
+                f"{name} holds no run yet: the run is being made by another process, or "
+                "its making was interrupted. `surfcensus status` on the run directory "
+                "finishes it",
+            )
+        if mode not in _BUSY_MS:
+            # also a file without a schema number: a catalog gets its number in the
+            # transaction that makes the run, so no migration is applied to such a file
+            raise ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
         if version < SCHEMA_VERSION:
             if self.readonly:
                 raise ConfigError(
@@ -563,33 +627,34 @@ class _Db:
                     "command once",
                 )
             _migrate(self._conn)
-        if not expect_run:
-            return
-        row = self.one("SELECT value FROM meta WHERE key = 'mode'")
-        if row is None or row["value"] not in _BUSY_MS:
-            raise self._no_run()
-        self.mode = row["value"]
+        self.mode = mode
         busy = _BUSY_MS[self.mode]
         if self.readonly and self.mode == "census":
             busy = _READONLY_CENSUS_BUSY_MS  # in WAL mode a reader does not wait for a writer
+        elif self.mode == "census":
+            _use_wal(self._conn)  # nothing to do, but for a catalog that could not be switched
         self._conn.execute(f"PRAGMA busy_timeout = {busy}")
 
-    def _no_run(self) -> ConfigError:
-        """The error for a file that holds no run: an unfinished catalog when it holds
-        nothing at all, else a database that something else made."""
-        name = self.path.name
+    def _look(self) -> tuple[int, Mode | None, bool]:
+        """The schema number, the mode of the run, and whether the file is an unfinished
+        catalog, all read from one state of the file: another process may be making the
+        run in it right now."""
+        self._conn.execute("BEGIN")
         try:
-            empty = _holds_no_row(self._conn)
-        except sqlite3.DatabaseError:
-            empty = False
-        if empty:
-            # not "no run": that reads as a foreign file, and the run's configuration is fine
-            return UnfinishedCatalog(
-                "invalid",
-                f"{name} holds nothing: the making of this run was interrupted. A phase "
-                "command or `status` on the run directory makes the catalog again",
-            )
-        return ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
+            version = self._conn.execute("PRAGMA user_version").fetchone()[0]
+            mode = None
+            if 0 < version <= SCHEMA_VERSION:
+                try:
+                    row = self._conn.execute("SELECT value FROM meta WHERE key = 'mode'").fetchone()
+                except sqlite3.OperationalError as exc:
+                    if _in_use(exc, self.path.name) is not None:
+                        raise
+                    row = None  # no such table
+                mode = row[0] if row is not None else None
+            unfinished = mode is None and _unfinished(self._conn)
+        finally:
+            _roll_back(self._conn)
+        return version, mode, unfinished
 
     def rows(self, sql: str, params: Sequence[object] = ()) -> list[sqlite3.Row]:
         with self._lock:
@@ -650,7 +715,9 @@ class Catalog:
 
         Raises :class:`ConfigError`: ``missing`` when there is no file, ``newer schema``
         for one written by a later version, ``invalid`` for a file that is no catalog, and
-        for an older one when ``readonly`` (nothing can then be migrated).
+        for an older one when ``readonly`` (nothing can then be migrated). A catalog in
+        which no run was made yet raises :class:`UnfinishedCatalog` and is left as it is;
+        :meth:`create` with ``exist_ok`` finishes it.
         """
         self._db = _Db(Path(path), readonly=readonly)
 
@@ -666,68 +733,62 @@ class Catalog:
         WAL does not work.
 
         The catalog is built under a temporary name in the same directory and given its name
-        when it is whole, so ``path`` holds a run or does not exist, also when this process
-        is killed, and no other process ever opens a half-made catalog. An existing file is
-        refused. With ``exist_ok`` a catalog that another process put there meanwhile is
-        opened in place of the new one when it is of the same mode and key, and refused
-        otherwise.
+        when it is whole. So ``path`` holds a run or does not exist, also when this process
+        is killed, and no other process opens a half-made catalog. On a file system without
+        hard links the name is taken with an empty file and the run is made in it in one
+        transaction; a process killed then leaves an unfinished catalog
+        (:class:`UnfinishedCatalog`).
+
+        An existing file is refused. With ``exist_ok`` it is opened in place of a new one
+        when it is a catalog of the same mode and key, which another process made
+        meanwhile, and an unfinished catalog is finished in place; a catalog of another
+        run is refused.
         """
         path = Path(path)
         if (mode == "local") != (key.kind == "local-salt"):
             raise ConfigError("key", f"a {mode} run is not keyed with a {key.kind}")
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
-        try:
-            taken = os.path.lexists(path)
-            if not taken:
-                tmp.touch(exist_ok=False)
-                db = _Db(tmp, readonly=False, expect_run=False)
-                try:
-                    meta = {
-                        "run_id": uuid.uuid4().hex,
-                        "mode": mode,
-                        "key_kind": key.kind,
-                        "key_fingerprint": key.fingerprint,
-                        "created_at": _now(),
-                        "surfcensus_version": __version__,
-                        "run_secret": secrets.token_bytes(32).hex(),
-                    }
-                    with db.write() as conn:
-                        conn.executemany(
-                            "INSERT INTO meta (key, value) VALUES (?, ?)", meta.items()
-                        )
-                    if mode == "census":
-                        # last: every row is in the file itself when the log begins, so
-                        # the file alone is the catalog
-                        cls._use_wal(db, path)
-                finally:
-                    db.close()
-                taken = not _publish(tmp, path)
-        finally:
-            for suffix in ("", *_SIDECARS):
-                tmp.with_name(tmp.name + suffix).unlink(missing_ok=True)
-        if not taken:
-            return cls(path)
-        if not exist_ok:
-            raise ConfigError("invalid", f"{path.parent} already has a {path.name}")
-        existing = cls(path)
-        if (existing.meta("mode"), existing.meta("key_fingerprint")) != (mode, key.fingerprint):
-            existing.close()
-            raise ConfigError(
-                "invalid", f"{path.parent} already has a {path.name}, of another run"
-            )
-        return existing
+        catalog = cls._create(path, mode, key, exist_ok)
+        if mode == "census":
+            catalog._warn_about_wal()
+        return catalog
 
-    @staticmethod
-    def _use_wal(db: _Db, path: Path) -> None:
-        kind = filesystem_type(path.parent)
+    @classmethod
+    def _create(cls, path: Path, mode: Mode, key: HashKey, exist_ok: bool) -> Catalog:
+        free = False
+        if not os.path.lexists(path):
+            tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+            try:
+                tmp.touch(exist_ok=False)
+                _fill(tmp, mode=mode, key=key)
+                free = _publish(tmp, path)
+            finally:
+                for suffix in ("", *_SIDECARS):
+                    tmp.with_name(tmp.name + suffix).unlink(missing_ok=True)
+        if not free and not exist_ok:
+            raise ConfigError("invalid", f"{path.parent} already has a {path.name}")
+        try:
+            catalog = cls(path)
+        except UnfinishedCatalog:
+            # The name was taken with an empty file, here or by a process that was killed.
+            # A failure leaves the file: another process may have opened it by now.
+            _fill(path, mode=mode, key=key)
+            catalog = cls(path)
+        # another process may have made the run, in a file that was unfinished or free
+        if (catalog.meta("mode"), catalog.meta("key_fingerprint")) != (mode, key.fingerprint):
+            catalog.close()
+            raise ConfigError("invalid", f"{path.parent} already has a {path.name}, of another run")
+        return catalog
+
+    def _warn_about_wal(self) -> None:
+        kind = filesystem_type(self._db.path.parent)
         if kind in _NETWORK_FILESYSTEMS:
             get_logger().warning(
                 "the run directory is on a network file system (%s); the catalog of a census "
                 "run uses SQLite's write-ahead log, which needs a local disk",
                 kind,
             )
-        journal = db.one("PRAGMA journal_mode = WAL")
+        journal = self._db.one("PRAGMA journal_mode")
         if journal is None or str(journal[0]).lower() != "wal":
             get_logger().warning(
                 "the catalog could not be put in write-ahead mode (it is in %s mode); "

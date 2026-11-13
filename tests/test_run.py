@@ -10,6 +10,7 @@ import os
 import pickle
 import shutil
 import sqlite3
+import subprocess
 import sys
 from collections.abc import Callable, Iterator
 from pathlib import Path
@@ -19,7 +20,7 @@ from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_tree import write_tier_a, write_tree  # pyrefly: ignore[missing-import]
 
 import surfcensus as sc
-from surfcensus import privacy
+from surfcensus import privacy, store
 from surfcensus.config import (
     CONFIG_FILE,
     CacheConfig,
@@ -251,6 +252,176 @@ def test_a_catalog_that_was_never_made_is_made_on_opening(
     (run.run_dir / CATALOG_FILE).unlink()  # as after a crash between the two files
     with Run(run.run_dir) as again:
         assert again.inventory().done == 3
+
+
+def _tables_without_a_run(path: Path) -> None:
+    conn = sqlite3.connect(path, isolation_level=None)
+    store._migrate(conn)
+    conn.close()
+
+
+UNFINISHED = {"an empty file": Path.touch, "tables without a row": _tables_without_a_run}
+
+
+@pytest.mark.parametrize("left", list(UNFINISHED))
+def test_a_run_whose_creation_was_killed_in_its_catalog_opens(
+    left: str, study: Path, new_run: Callable[..., Run]
+) -> None:
+    """A catalog in which no run was made yet: what a kill leaves on a file system without
+    hard links, and what it left before the catalog was built under another name. Every
+    command then ended with "it was not made by surfcensus", for good."""
+    run = new_run(study)
+    run.close()
+    stored = (run.run_dir / CONFIG_FILE).read_bytes()
+    path = run.run_dir / CATALOG_FILE
+    path.unlink()
+    UNFINISHED[left](path)
+    with Run(run.run_dir) as again:
+        with Catalog(path, readonly=True) as catalog:
+            assert catalog.meta("key_fingerprint") == again.config.identity.key_fingerprint
+            assert len(catalog.run_secret()) == 32
+        assert again.inventory().done == 3
+    assert (run.run_dir / CONFIG_FILE).read_bytes() == stored
+    assert {p.name for p in run.run_dir.iterdir()} == {CONFIG_FILE, CATALOG_FILE}
+    with Run(run.run_dir) as third:
+        assert third.inventory().skipped == 3
+
+
+@pytest.mark.parametrize("left", ["no file", *UNFINISHED])
+def test_the_unfinished_catalog_of_a_census_run_is_made_with_the_key_only(
+    left: str, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "census"
+    Run(run_dir, key=DATASET_KEY).close()
+    path = run_dir / CATALOG_FILE
+    path.unlink()
+    if left != "no file":
+        UNFINISHED[left](path)
+    before = path.read_bytes() if path.exists() else None
+    with pytest.raises(ConfigError, match="making it needs the key") as raised:
+        Run(run_dir)
+    assert raised.value.reason == "key"
+    with pytest.raises(ConfigError) as raised:
+        Run(run_dir, key=HashKey(bytes(range(2, 34)), "dataset-key"))
+    assert raised.value.reason == "key"
+    assert (path.read_bytes() if path.exists() else None) == before
+    with Run(run_dir, key=DATASET_KEY) as run:
+        assert run.config.mode == "census"
+    with Run(run_dir) as run, Catalog(path, readonly=True) as catalog:  # whole: no key needed
+        assert catalog.meta("key_fingerprint") == DATASET_KEY.fingerprint
+        assert catalog.query("PRAGMA journal_mode")[0][0] == "wal"
+
+
+def test_a_database_of_something_else_beside_config_yaml_is_not_filled(
+    study: Path, new_run: Callable[..., Run]
+) -> None:
+    run = new_run(study)
+    run.close()
+    path = run.run_dir / CATALOG_FILE
+    path.unlink()
+    conn = sqlite3.connect(path, isolation_level=None)
+    conn.execute("CREATE TABLE notes (text)")
+    conn.execute("INSERT INTO notes VALUES ('mine')")
+    conn.close()
+    before = path.read_bytes()
+    with pytest.raises(ConfigError, match="it was not made by surfcensus"):
+        Run(run.run_dir)
+    assert path.read_bytes() == before
+
+
+KILLED_RUN = """
+import os, signal, sys
+from surfcensus import store
+from surfcensus.run import Run
+from surfcensus.sources.local import LocalSource
+
+
+def killed(*args, **kwargs):
+    os.kill(os.getpid(), signal.SIGKILL)
+
+
+def no_hard_links(src, dst):
+    raise PermissionError(1, "Operation not permitted")
+
+
+if sys.argv[3] == "before the catalog has its name":
+    store._publish = killed
+else:  # while the run is made in the file itself, where there are no hard links
+    link, fill = os.link, store._fill
+
+    def linking(src, dst):
+        if os.path.basename(dst) == store.CATALOG_FILE:
+            no_hard_links(src, dst)
+        link(src, dst)
+
+    def fill_in_place(path, **kwargs):
+        if path.name == store.CATALOG_FILE:
+            store._now = killed
+        fill(path, **kwargs)
+
+    os.link, store._fill = linking, fill_in_place
+Run(sys.argv[2], LocalSource(sys.argv[1]))
+"""
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="needs SIGKILL")
+@pytest.mark.parametrize(
+    "where", ["before the catalog has its name", "in the transaction that makes the run"]
+)
+def test_a_process_killed_while_it_creates_a_run_leaves_one_that_opens(
+    where: str, study: Path, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "run"
+    child = subprocess.run(
+        [sys.executable, "-c", KILLED_RUN, str(study), str(run_dir), where],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert child.returncode == -9, child.stderr
+    left = {p.name for p in run_dir.iterdir() if not p.name.startswith(".")}
+    if where == "before the catalog has its name":
+        assert left == {CONFIG_FILE}
+    else:
+        assert left - {f"{CATALOG_FILE}-journal"} == {CONFIG_FILE, CATALOG_FILE}
+        assert (run_dir / CATALOG_FILE).stat().st_size == 0
+    stored = (run_dir / CONFIG_FILE).read_bytes()
+    with Run(run_dir) as run:
+        assert run.config.sources[0].root == str(study.resolve())
+        assert run.inventory().done == 3
+    assert (run_dir / CONFIG_FILE).read_bytes() == stored
+    with Run(run_dir) as run:
+        assert run.inventory().skipped == 3
+
+
+def test_a_run_that_is_opened_while_it_is_created_is_one_run(
+    study: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another process opens the run when ``config.yaml`` is there and the catalog is not
+    yet. It used to find the catalog half made and say "it was not made by surfcensus"."""
+    run_dir = tmp_path / "run"
+    path = run_dir / CATALOG_FILE
+    publish = store._publish
+    seen: list[tuple[str | None, bytes]] = []
+
+    def opened_meanwhile(tmp: Path, target: Path, **kwargs: object) -> bool:
+        if seen:  # the other process, publishing its own
+            return publish(tmp, target, **kwargs)
+        seen.append((None, b""))
+        assert (run_dir / CONFIG_FILE).is_file() and not path.exists()
+        with Run(run_dir) as other:  # no catalog yet: it makes the catalog, with the same salt
+            assert other.public().subjects().empty
+        with Catalog(path, readonly=True) as catalog:
+            seen[0] = (catalog.meta("run_id"), catalog.run_secret())
+        return publish(tmp, target, **kwargs)
+
+    monkeypatch.setattr(store, "_publish", opened_meanwhile)
+    with Run(run_dir, local(study)) as run:
+        monkeypatch.undo()
+        with Catalog(path, readonly=True) as catalog:
+            assert seen == [(catalog.meta("run_id"), catalog.run_secret())]
+        assert run.inventory().done == 3
+    assert {p.name for p in run_dir.iterdir()} == {CONFIG_FILE, CATALOG_FILE}
 
 
 def test_of_two_creations_at_once_the_second_leaves_the_run_of_the_first(

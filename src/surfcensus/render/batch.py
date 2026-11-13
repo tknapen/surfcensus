@@ -2,9 +2,9 @@
 
 ``run_render`` decides from the ``renders`` table what is pending, without opening a source
 file, renders the pending subjects batch by batch (``batches.run_batches``) and records every
-outcome. A subject is done when its row says so; the row is written after the files, so a
-crash in between leaves a render without a row, which the next run finds complete on disk
-and records.
+outcome. A subject is done when its row says so and its media directory holds the whole
+render; the row is written after the files, so a crash in between leaves a render without
+a row, which the next run finds complete on disk and records.
 
 This module holds the public side of a run only (``records.RunContext``): subjects by
 ``subject_uid``, datasets by pseudonym. The ``template`` argument of ``run_render`` is added
@@ -58,7 +58,7 @@ class _Plan:
     pending: list[str]
     """Units to render, in order."""
     skipped: int
-    """Units whose render is recorded as done and is on disk."""
+    """Units whose render is recorded as done and is whole on disk."""
     failures: dict[str, str]
     """``subject_uid`` -> reason, for the units recorded as failed that are not tried again
     and for every incomplete subject."""
@@ -112,7 +112,12 @@ def _plan(
         row = None if force else recorded(uid)
         if row is not None and row.status == "failed" and not retry_failed:
             failures[uid] = row.reason or RENDER_FAILURE
-        elif row is not None and row.status == "done" and _render_json(ctx, uid).is_file():
+        elif (
+            row is not None
+            and row.status == "done"
+            # a media directory that lost files (a partial copy, a restore) is rendered again
+            and api.render_on_disk(media_dir(ctx.run_dir, uid), config.render, video=video)
+        ):
             skipped += 1
         else:
             pending.append(uid)
@@ -130,8 +135,9 @@ def render_status(ctx: RunContext) -> tuple[int, int, int]:
     rendering or recording anything.
 
     ``done`` are the subjects whose render is recorded for the run's present configuration
-    and inputs and is on disk; ``failed`` those recorded as failed for them, and every
-    present subject that lacks a render role; ``pending`` what a call would render.
+    and inputs and is whole on disk (``api.render_on_disk``); ``failed`` those recorded as
+    failed for them, and every present subject that lacks a render role; ``pending`` what a
+    call would render.
     """
     plan = _status_plan(ctx)
     return plan.skipped, len(plan.failures), len(plan.pending)
@@ -215,9 +221,11 @@ def run_render(
     ``render_video`` of the run.
 
     A subject is skipped when its row is ``done`` for the same render config, the same
-    input signature and the same ``video``, and ``media/<uid>/render.json`` exists. A
-    ``failed`` row that matches in the same way is not tried again unless ``retry_failed``.
-    ``force`` ignores the rows and renders over what is there.
+    input signature and the same ``video``, and ``media/<uid>/`` holds the whole render:
+    its ``render.json`` and every file which that lists (``api.render_on_disk``). A media
+    directory that lost files is rendered again. A ``failed`` row that matches in the same
+    way is not tried again unless ``retry_failed``. ``force`` ignores the rows and renders
+    over what is there.
 
     Every present subject that lacks a render role gets a ``failed`` row with the reason
     ``missing surface``, selected or not, without its files being touched. A subject that
@@ -433,10 +441,6 @@ def _render_one(
     """What a worker does for one subject. Top-level, so that it can be sent to a process."""
     info = api.render_subject(files, media_root / uid, config, video=video, force=force)
     return RenderResult(info=info)
-
-
-def _render_json(ctx: RunContext, uid: str) -> Path:
-    return media_dir(ctx.run_dir, uid) / api.RENDER_JSON
 
 
 def _signature_extra(template_id: str | None) -> tuple[str, ...]:

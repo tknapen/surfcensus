@@ -175,7 +175,7 @@ These follow what milestone 1 does.
   | Class | Module | Reasons |
   |---|---|---|
   | `RenderError` | `render/api.py` (unchanged) | `missing surface`, `wrong orientation`, `render failure` |
-  | `SourceError` | `sources/base.py` | `layout`, `not found`, `changed`, `unreadable`, `unreachable` |
+  | `SourceError` | `sources/base.py` | `layout`, `not found`, `changed`, `unreadable`, `unreachable`, `invalid` (a root or subject glob that is not valid UTF-8) |
   | `ConfigError` | `config.py` | `missing`, `invalid`, `other root`, `newer schema`, `key` |
   | `TemplateNotFound`, `TemplateError` | `templates.py` | `TemplateNotFound.looked_in`; `TemplateError` reasons `not icosahedral`, `missing parcel`, `changed` |
   | `MetricError` | `metrics/__init__.py` (which holds nothing else) | `missing file`, `unreadable`, `vertex count mismatch`, `degenerate sphere`, `low coverage` |
@@ -208,7 +208,7 @@ These follow what milestone 1 does.
   | intensity (4d, milestone 5) | `intensity`, 1 | `IntensityConfig` | `RenderConfig.config_hash()`, `template_id` or `"none"` | the dataset's `intensity` part |
 
 - Input signature: first 16 hex of the SHA-256 of `"\n".join(f"{role}\t{location}\t{size}\t{etag_or_mtime}")` over the requested roles that the subject has, in `FileRole` definition order, followed by one line per `extra` string. A role whose `FileRef` has a `variant` adds `\t{variant}` to its line: a local `lh.pial` that is a link keeps its location when it is pointed at another variant, the pial variants of one subject have one size, and a copy can keep the modification time, so without it a retargeted link was skipped and `pial_variant` and `t2pial` went stale (review finding S1). It comes from the inventory, so deciding to skip costs no download and no hashing of source files. For a remote subject it is a function of the public bucket listing, so it is private: it is stored in `catalog.sqlite` (`work.input_signature`, `renders.input_signature`, `subjects.inventory_hash`) and nowhere else, no `PublicCatalog` method returns one in a frame, and no API response, table, export or log line carries one. What identifies a render outside the catalog is the keyed `render_key` (5.1).
-- The skip rule, the same in every phase: a unit is skipped when its row is `done`, `config_hash` and `input_signature` are equal, and the output file named in the table above exists. A `failed` row with equal hashes is not retried unless `--retry-failed`; a changed config or input retries it. `--force` ignores the row.
+- The skip rule, the same in every phase: a unit is skipped when its row is `done`, `config_hash` and `input_signature` are equal, and the output file named in the table above exists (for a render: `render.json` and every file it lists, `render.api.render_on_disk`). A `failed` row with equal hashes is not retried unless `--retry-failed`; a changed config or input retries it. `--force` ignores the row.
 - A commit writes files first and the ledger rows last, in one transaction. A crash in between leaves outputs without a row, which the next run redoes; it never leaves a row without its output.
 - Run-level stages (`reference`, `score`, `native`, `select`) always use every present subject and ignore `--dataset`. When `--dataset` is given without `--stage`, only the per-subject stages run.
 - Per-dataset output is always ordered by pseudonym, and per-subject output by `subject_uid`. Catalog row order (`dataset_id`, discovery order) follows the bucket listing and is never the order of anything written outside the catalog.
@@ -695,7 +695,11 @@ class Catalog:
     def __init__(self, path: Path, *, readonly: bool = False) -> None       # applies pending migrations; a file with a
                                                                             # higher user_version: ConfigError("newer schema")
     @classmethod
-    def create(cls, path: Path, *, mode: Literal["local", "census"], key: HashKey) -> Catalog   # also draws meta.run_secret
+    def create(cls, path: Path, *, mode: Literal["local", "census"], key: HashKey,
+               exist_ok: bool = False) -> Catalog                           # also draws meta.run_secret; built under a
+                                                                            # temporary name, named when whole. exist_ok:
+                                                                            # opens a catalog of the same run that is there,
+                                                                            # finishes an unfinished one (UnfinishedCatalog)
     def close(self) -> None                                                 # also a context manager
     def write(self) -> AbstractContextManager[sqlite3.Connection]           # BEGIN IMMEDIATE; commit or roll back
     def meta(self, key: str) -> str | None

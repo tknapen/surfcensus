@@ -157,7 +157,7 @@ class SourceError(Exception):
     """A source cannot do what was asked.
 
     ``reason`` is one of ``layout``, ``not found``, ``changed``, ``unreadable``,
-    ``unreachable``; ``detail`` says what and where.
+    ``unreachable``, ``invalid``; ``detail`` says what and where.
     """
 
     def __init__(self, reason: str, detail: str) -> None:

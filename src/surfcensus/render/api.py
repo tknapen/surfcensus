@@ -464,10 +464,9 @@ def _listed_files(info: RenderInfo) -> list[str]:
     return names
 
 
-def _complete_render(
-    out_dir: Path, config: RenderConfig, inputs: Mapping[str, InputFile], video: bool
-) -> RenderInfo | None:
-    """The render already in ``out_dir`` if it is complete and matches, else None."""
+def _stored_render(out_dir: Path, config: RenderConfig, video: bool) -> RenderInfo | None:
+    """The ``render.json`` in ``out_dir`` if it is of this schema, of ``config`` and of this
+    video setting, else None. Says nothing about the other files."""
     try:
         info = RenderInfo.model_validate_json((out_dir / RENDER_JSON).read_bytes())
     except (OSError, ValueError):  # absent, or not a render.json of this schema
@@ -475,11 +474,46 @@ def _complete_render(
     same = (
         info.schema_version == RENDER_SCHEMA_VERSION
         and info.config_hash == config.config_hash()
-        and info.inputs == inputs
         and (info.video is not None) == video
-        and all((out_dir / name).is_file() for name in _listed_files(info))
     )
     return info if same else None
+
+
+def _complete_render(
+    out_dir: Path, config: RenderConfig, inputs: Mapping[str, InputFile], video: bool
+) -> RenderInfo | None:
+    """The render already in ``out_dir`` if it is complete and matches, else None."""
+    info = _stored_render(out_dir, config, video)
+    if info is None or info.inputs != inputs:
+        return None
+    return info if all((out_dir / name).is_file() for name in _listed_files(info)) else None
+
+
+def render_on_disk(out_dir: Path | str, config: RenderConfig, *, video: bool) -> bool:
+    """Whether ``out_dir`` holds a whole render of ``config`` with this video setting: a
+    ``render.json`` that says so, and something under every name it lists.
+
+    This is the test for skipping a render that is recorded as done. It opens no source
+    file and does not compare the inputs, which the caller knows from its listing. The
+    names are looked up in a listing of each directory, two per render, and not one by one:
+    a census asks this of every subject each time ``render`` or ``status`` runs.
+    """
+    out_dir = Path(out_dir)
+    info = _stored_render(out_dir, config, video)
+    if info is None:
+        return False
+    listed: dict[str, set[str]] = {}
+    for name in _listed_files(info):
+        parent, _, base = name.rpartition("/")
+        listed.setdefault(parent, set()).add(base)
+    for parent, names in listed.items():
+        try:
+            present = os.listdir(out_dir / parent)
+        except OSError:
+            return False
+        if not names.issubset(present):
+            return False
+    return True
 
 
 def _lists_video(out_dir: Path) -> bool:

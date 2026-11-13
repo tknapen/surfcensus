@@ -478,6 +478,43 @@ def test_an_incomplete_directory_is_rendered_again(
     assert tree(small_copy) == before
 
 
+def test_render_on_disk_says_whether_a_recorded_render_can_be_skipped(
+    small_copy: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The test that a run makes for every subject it has recorded as done: the
+    ``render.json`` of this config and video setting, and every file it lists."""
+    assert api.render_on_disk(small_copy, SMALL, video=True)
+    assert api.render_on_disk(str(small_copy), SMALL, video=True)
+    assert not api.render_on_disk(small_copy, SMALL, video=False)
+    other = SMALL.model_copy(update={"crosshair_alpha": 0.2})
+    assert not api.render_on_disk(small_copy, other, video=True)
+    assert not api.render_on_disk(small_copy / "absent", SMALL, video=True)
+
+    # a census asks this of every subject: the files are found in listings, none is opened
+    opened: list[str] = []
+    monkeypatch.setattr(Path, "is_file", lambda path: opened.append(str(path)) or True)
+    monkeypatch.setattr(Path, "stat", lambda path, **kwargs: opened.append(str(path)))
+    assert api.render_on_disk(small_copy, SMALL, video=True) and opened == []
+    monkeypatch.undo()
+
+    info = RenderInfo.model_validate_json((small_copy / "render.json").read_bytes())
+    listed = api._listed_files(info)
+    assert len(listed) == 2 * sum(len(p.slices) for p in info.panels.values()) + 3
+    for name in ("tiles/axial_012.webp", "tiles/sagittal_000_c.webp", *listed[-3:]):
+        assert name in listed
+        kept = (small_copy / name).read_bytes()
+        (small_copy / name).unlink()
+        assert not api.render_on_disk(small_copy, SMALL, video=True), name
+        (small_copy / name).write_bytes(kept)
+        assert api.render_on_disk(small_copy, SMALL, video=True)
+    shutil.rmtree(small_copy / "tiles")
+    assert not api.render_on_disk(small_copy, SMALL, video=True)
+    (small_copy / "tiles").write_text("not a directory")
+    assert not api.render_on_disk(small_copy, SMALL, video=True)
+    (small_copy / "render.json").write_text('{"schema_version": 1}')
+    assert not api.render_on_disk(small_copy, SMALL, video=True)
+
+
 @pytest.mark.parametrize(
     "old", ["as version 1 wrote it", "version 1 that loads", "version alone", "hash alone"]
 )

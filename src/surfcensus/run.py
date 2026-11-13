@@ -29,7 +29,6 @@ from surfcensus.config import (
     with_changes,
     write_config,
 )
-from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
 from surfcensus.records import PhaseReport, RunContext
 from surfcensus.sources.base import DatasetRecord, FileRole, Source, SourceError
@@ -38,7 +37,6 @@ from surfcensus.store import (
     Catalog,
     PublicCatalog,
     UnfinishedCatalog,
-    discard_unfinished,
     media_dir,
 )
 
@@ -72,10 +70,10 @@ class Run:
     Of two processes that create a run in one directory at the same time, one is refused
     and changes nothing. A place where no run can be made (no permission, a read-only or
     full disk) raises ``ConfigError("invalid", ...)``. The catalog gets its name when it is
-    whole (``Catalog.create``). A creation that was stopped, however, leaves at most a
-    ``config.yaml`` without a catalog, or with one that holds nothing; the next opening
-    makes the catalog with the salt of that ``config.yaml``, and for a census run needs the
-    key to do so.
+    whole (``Catalog.create``). A creation that was stopped, also by a kill, leaves at most
+    a ``config.yaml`` without a catalog, or with a catalog in which no run was made yet;
+    the next opening makes the run in it with the salt of that ``config.yaml``, and for a
+    census run needs the key to do so.
 
     Opening needs no key, also for a census run; ``Run.inventory`` of a census run does.
     The sources are rebuilt from ``config.yaml`` when a phase first needs them, so a run
@@ -232,22 +230,17 @@ class Run:
         path = self.run_dir / CATALOG_FILE
         identity = self.config.identity
         try:
-            catalog = Catalog(path) if path.is_file() else None
-        except UnfinishedCatalog:
-            catalog = None
-        if catalog is None:
+            catalog = Catalog(path)
+        except ConfigError as exc:
+            if exc.reason != "missing" and not isinstance(exc, UnfinishedCatalog):
+                raise
             # a run whose creation stopped between its two files, or in the second one
             if self.config.mode == "census" and self._key is None:
                 raise ConfigError(
                     "key",
                     f"{self.run_dir} has no finished {CATALOG_FILE}; making it needs the key",
-                )
-            if discard_unfinished(path):
-                get_logger().warning(
-                    "the making of this run was interrupted; its empty %s is made again",
-                    CATALOG_FILE,
-                )
-            return Catalog.create(
+                ) from None
+            catalog = Catalog.create(
                 path, mode=self.config.mode, key=run_key(self.config, self._key), exist_ok=True
             )
         found = (catalog.meta("mode"), catalog.meta("key_fingerprint"))

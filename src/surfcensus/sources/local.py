@@ -96,6 +96,16 @@ def _keeping_name(path: Path | str) -> Path:
     return path.parent.resolve() / path.name
 
 
+def _is_text(name: str) -> bool:
+    """Whether a name from the file system can be stored and hashed as text. One with bytes
+    that are not UTF-8 (Latin-1, which Linux file systems take) cannot."""
+    try:
+        name.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 def _escape(name: str) -> str:
     """The glob that matches ``name`` and nothing else."""
     return re.sub(r"([*?\[])", r"[\1]", name)
@@ -184,14 +194,23 @@ def detect_layout(path: Path | str) -> tuple[DatasetRecord, tuple[str, ...]]:
 
     The record's ``root`` is resolved and its ``identity`` is that root. Raises
     :class:`SourceError`: ``not found`` when ``path`` is not a directory, ``unreadable`` when
-    it or one of the places above cannot be listed, ``layout`` when no rule matches.
+    it or one of the places above cannot be listed, ``layout`` when no rule matches, and
+    ``invalid`` when the root is not valid UTF-8: a run stores it, and hashes it into the
+    pseudonym and every ``subject_uid``, as text.
     """
     given = _keeping_name(path)
     try:
-        return _detect(given)
+        record, implied = _detect(given)
     except OSError as exc:
         where = exc.filename if isinstance(exc.filename, str) else str(given)
         raise SourceError("unreadable", f"{where}: {_strerror(exc)}") from exc
+    if not _is_text(record.root):
+        raise SourceError(
+            "invalid",
+            f"the path {record.root!r} is not valid UTF-8; the root of a source is stored "
+            "and hashed as text",
+        )
+    return record, implied
 
 
 def _detect(given: Path) -> tuple[DatasetRecord, tuple[str, ...]]:
@@ -287,6 +306,9 @@ class LocalSource:
             )
         given = (subjects,) if isinstance(subjects, str) else tuple(subjects)
         globs = tuple(dict.fromkeys(given))
+        for glob in globs:
+            if not _is_text(glob):  # a run stores the globs of its source as text
+                raise SourceError("invalid", f"the subject glob {glob!r} is not valid UTF-8")
         record, implied = detect_layout(path)
         if implied:
             name = _keeping_name(path).name
@@ -342,9 +364,7 @@ class LocalSource:
                     continue
             except OSError as exc:
                 problem = f"unreadable: {_strerror(exc)}"
-            try:
-                name.encode("utf-8")
-            except UnicodeEncodeError:
+            if not _is_text(name):
                 # a label is hashed into the subject_uid and stored as text; bytes that are
                 # no text can be neither
                 log.warning("%r in %s is skipped: its name is not valid UTF-8", name, subjects_dir)

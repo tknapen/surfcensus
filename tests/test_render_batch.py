@@ -517,6 +517,52 @@ def test_a_missing_render_json_renders_that_subject_again(
     assert (bench.media(one) / "render.json").is_file()
 
 
+@pytest.mark.parametrize(
+    "lost", ["a tile", "a contour tile", "the poster", "the vertex map", "the video", "the tiles"]
+)
+def test_a_render_that_lost_a_file_is_pending_and_is_rendered_again(
+    lost: str, new_bench: Callable[..., Bench], rendered: list[tuple[str, bool, bool]]
+) -> None:
+    """A media directory that was copied in part or restored from a backup. Its row says
+    done and its ``render.json`` is there; it used to be skipped for good, and the rater app
+    would have asked for tiles that are not there."""
+    video = lost == "the video"
+    bench = new_bench(["sub-01", "sub-02"], render_video=video)
+    run_render(bench.ctx())
+    one = bench.uid("sub-01")
+    whole = tree_bytes(bench.media(one))
+    info = RenderInfo.model_validate_json((bench.media(one) / "render.json").read_bytes())
+    last = len(info.panels["axial"].slices) - 1
+    victim = (
+        bench.media(one)
+        / {
+            "a tile": info.tiles.gray_path("axial", last),
+            "a contour tile": info.tiles.contours_path("sagittal", 0),
+            "the poster": "poster.webp",
+            "the vertex map": "vertex_map.npz",
+            "the video": "anim.mp4",
+            "the tiles": "tiles",
+        }[lost]
+    )
+    assert render_status(bench.ctx()) == (2, 0, 0)
+    if victim.is_dir():
+        shutil.rmtree(victim)
+    else:
+        victim.unlink()
+    row = bench.rows()[one]
+    assert row["status"] == "done"
+
+    del bench.leased[:]
+    assert render_status(bench.ctx()) == (1, 0, 1)
+    assert bench.leased == [] and bench.rows()[one] == row  # status looks, it changes nothing
+    del rendered[:]
+    report = run_render(bench.ctx())
+    assert uids_of(rendered) == [one] and (report.done, report.skipped) == (1, 1)
+    assert tree_bytes(bench.media(one)) == whole
+    assert render_status(bench.ctx()) == (2, 0, 0)
+    assert bench.rows()[one]["render_key"] == row["render_key"]
+
+
 def test_a_row_without_which_the_files_are_there_is_recorded_again(
     new_bench: Callable[..., Bench], rendered: list[tuple[str, bool, bool]]
 ) -> None:

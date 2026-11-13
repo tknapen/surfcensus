@@ -4,6 +4,7 @@ codes, what they store between calls, and that a source is only read."""
 from __future__ import annotations
 
 import errno
+import os
 import re
 import shutil
 import sqlite3
@@ -141,6 +142,27 @@ def test_inventory_options_are_stored_and_hold_until_they_are_given_again(
         subjects = run.public().subjects().set_index("subject_label")
     assert subjects["present"].to_dict() == {"sub-01": True, "sub-02": True, "sub-03": False}
     assert set(subjects.loc[["sub-01", "sub-02"], "field_strength"]) == {7.0}
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="needs file names of any bytes")
+def test_inventory_refuses_a_source_whose_path_is_not_utf8(tmp_path: Path) -> None:
+    """One line and exit code 2, as for any source that cannot be used, and no run is made.
+    It used to end in a traceback with exit code 1, the code of failed units."""
+    tree = write_tree(tmp_path / "study", "subjects_dir", ["sub-01", "sub-02"])
+    run_dir = tmp_path / "run"
+    assert cli("inventory", "--run-dir", run_dir, "--source", tree).exit_code == 0
+    stored = (run_dir / CONFIG_FILE).read_bytes()
+    odd = Path(os.fsdecode(os.fsencode(tmp_path) + b"/stud\xffy"))
+    os.rename(tree, odd)
+
+    for args in (("--run-dir", tmp_path / "new"), ("--run-dir", run_dir, "--relocate")):
+        result = cli("inventory", *args, "--source", odd)
+        assert result.exit_code == 2, result.output
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        (line,) = lines(result)
+        assert line.startswith("invalid: the path '") and "stud\\udcffy' is not valid UTF-8" in line
+    assert not (tmp_path / "new").exists()
+    assert (run_dir / CONFIG_FILE).read_bytes() == stored
 
 
 def test_inventory_stops_with_exit_2_for_what_is_wrong_with_the_call(
