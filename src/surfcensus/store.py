@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import secrets
 import sqlite3
@@ -42,7 +43,7 @@ from surfcensus.config import ConfigError
 from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
 from surfcensus.records import Provenance, RenderRow, WorkRow
-from surfcensus.schemas import KEYS, SCHEMAS
+from surfcensus.schemas import KEYS, SCHEMAS, split_flags
 from surfcensus.sources import base
 from surfcensus.sources.base import (
     HEMIS,
@@ -1726,6 +1727,34 @@ def primary_scores(run_dir: Path | str) -> pd.DataFrame:
     scores = read_table(table_path(run_dir, "scores"), SCHEMAS["scores"])
     scores = scores[scores["primary"].to_numpy(dtype=bool)]
     return scores.sort_values("primary_rank").reset_index(drop=True)
+
+
+def queue_order(
+    uids: Collection[str], scores: pd.DataFrame | None, *, blind: bool, seed: int
+) -> list[str]:
+    """The order in which a local run offers subjects for rating, and in which it renders
+    them, so that the first renders are the first subjects of the queue.
+
+    Not blind: first the subjects flagged ``partial_score``, by ``subject_uid`` (they could
+    not be fully scored and would otherwise sink); then by ``primary_rank`` ascending, worst
+    first; then the subjects without a score, by ``subject_uid``. ``scores`` are rows of
+    ``scores.parquet`` (:func:`primary_scores`; a row that is not primary is ignored), or
+    None for a run without scores. Blind: ``random.Random(seed).shuffle`` of the sorted
+    uids, whatever the scores.
+    """
+    ordered = sorted(set(uids))
+    if blind:
+        random.Random(seed).shuffle(ordered)
+        return ordered
+    position: dict[str, tuple[int, int]] = {}
+    if scores is not None:
+        for uid, rank, flags in zip(
+            scores["subject_uid"], scores["primary_rank"], scores["flags"], strict=True
+        ):
+            if not pd.isna(rank):
+                partial = "partial_score" in split_flags(flags)
+                position[uid] = (0, 0) if partial else (1, int(rank))
+    return sorted(ordered, key=lambda uid: (*position.get(uid, (2, 0)), uid))
 
 
 def clusters_with_native(run_dir: Path | str) -> pd.DataFrame:

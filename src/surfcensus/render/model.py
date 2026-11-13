@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from pathlib import Path
 from typing import Literal
 
 import numpy as np
@@ -19,6 +20,8 @@ RENDER_SCHEMA_VERSION = 3
 (``template``, ``fsaverage_poles``), lists the ``sphere.reg`` files among its inputs, and the
 vertex map can carry fsaverage counterparts. 2: the vertex map is selected by the clickable
 region of the tiles and carries ``{hemi}_visible``; 1 selected it by the view box."""
+RENDER_JSON = "render.json"
+"""The file of a media directory that holds a :class:`RenderInfo`; written last."""
 
 TILE_FIELDS: tuple[str, ...] = (
     "box_x_mm",
@@ -355,3 +358,18 @@ class RenderInfo(_Frozen):
     def to_json(self) -> str:
         """Canonical serialization: stable key order, trailing newline."""
         return json.dumps(self.model_dump(mode="json"), indent=1, sort_keys=True) + "\n"
+
+
+def read_render(out_dir: Path | str) -> RenderInfo | None:
+    """The ``render.json`` of a media directory, or None when there is none or it does not
+    read as one of this version: a render that is being written, a damaged file, the
+    ``render.json`` of an earlier schema.
+
+    It says nothing about the other files of the render (``render.api.render_on_disk``).
+    It is the whole file, with the sizes and digests of the sources, and stays on the
+    server: what a page of the rater app receives is ``app.schemas.RenderOut``.
+    """
+    try:
+        return RenderInfo.model_validate_json((Path(out_dir) / RENDER_JSON).read_bytes())
+    except (OSError, ValueError):
+        return None

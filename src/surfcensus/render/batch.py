@@ -39,7 +39,7 @@ from surfcensus.render import api, encode
 from surfcensus.render.model import RenderConfig
 from surfcensus.schemas import intensity_schema
 from surfcensus.sources.base import RENDER_ROLES, TIER_C, FileRole, SourceError
-from surfcensus.store import MEDIA_DIR, media_dir, read_table, table_path, upsert_part
+from surfcensus.store import MEDIA_DIR, media_dir, primary_scores, queue_order, upsert_part
 from surfcensus.templates import TEMPLATES_DIR, Template, load_template, store_template
 
 PHASE = "render"
@@ -525,21 +525,18 @@ def _units(
 
 
 def _queue_order(ctx: RunContext, uids: Sequence[str]) -> list[str]:
-    """``uids`` in the order the rater app of a local run offers them, when the run has
-    scores and is not blind: first the subjects that could not be fully scored, by
-    ``subject_uid``; then by rank, worst first; then the subjects without a score.
-    Otherwise as given."""
-    path = table_path(ctx.run_dir, "scores")
-    if ctx.public.mode() != "local" or ctx.config.app.blind or not path.is_file():
+    """``uids`` in the order the rater app of a local run offers them
+    (``store.queue_order``): by score, or shuffled with the seed of the run when it is
+    blind. A scores table of an earlier schema counts as none, until ``metrics`` has
+    written it again. A census run: as given."""
+    if ctx.public.mode() != "local":
         return list(uids)
-    scores = read_table(path)
-    position: dict[str, tuple[int, int]] = {}
-    for uid, primary, rank, flags in zip(
-        scores["subject_uid"], scores["primary"], scores["rank"], scores["flags"], strict=True
-    ):
-        if primary:
-            position[uid] = (0, 0) if "partial_score" in flags.split(",") else (1, int(rank))
-    return sorted(uids, key=lambda uid: (*position.get(uid, (2, 0)), uid))
+    try:
+        scores = primary_scores(ctx.run_dir)
+    except ValueError:
+        scores = None
+    app = ctx.config.app
+    return queue_order(uids, scores, blind=app.blind, seed=app.queue_seed)
 
 
 def _missing_details(ctx: RunContext, uids: Sequence[str]) -> dict[str, str]:

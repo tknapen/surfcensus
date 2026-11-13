@@ -37,6 +37,7 @@ from surfcensus.log import get_logger
 from surfcensus.render import encode, frames, geometry, vertexmap
 from surfcensus.render.model import (
     PANEL_ORDER,
+    RENDER_JSON,
     RENDER_SCHEMA_VERSION,
     Frame,
     FsaveragePole,
@@ -49,6 +50,7 @@ from surfcensus.render.model import (
     VertexMapInfo,
     VideoInfo,
     VolumeInfo,
+    read_render,
 )
 from surfcensus.render.slicing import MeshSlicer
 from surfcensus.sources.base import HEMIS, RENDER_ROLES, FileRole, Hemi
@@ -73,7 +75,6 @@ try:
 except ImportError:  # Windows has no flock: renders into one directory are not serialized there
     fcntl = None
 
-RENDER_JSON = "render.json"
 POSTER = "poster.webp"
 VIDEO = "anim.mp4"
 VERTEX_MAP = "vertex_map.npz"
@@ -747,9 +748,8 @@ def _listed_files(info: RenderInfo) -> list[str]:
 def _stored_render(out_dir: Path, config: RenderConfig, video: bool) -> RenderInfo | None:
     """The ``render.json`` in ``out_dir`` if it is of this schema, of ``config`` and of this
     video setting, else None. Says nothing about the other files."""
-    try:
-        info = RenderInfo.model_validate_json((out_dir / RENDER_JSON).read_bytes())
-    except (OSError, ValueError):  # absent, or not a render.json of this schema
+    info = read_render(out_dir)
+    if info is None:
         return None
     same = (
         info.schema_version == RENDER_SCHEMA_VERSION

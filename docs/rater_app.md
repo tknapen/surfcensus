@@ -100,23 +100,31 @@ Every rating stores rater, subject, criterion values, protocol version, app vers
 
 ## Database tables (`app.sqlite`)
 
-- `raters(rater_id, name, token_hash, role, created_at)`
-- `assignments(assignment_id, rater_id, subject_uid, kind[calibration|main|repeat|adjudication], assigned_at, completed_at)`
-- `ratings(rating_id, assignment_id, criterion, value, note, protocol_version, app_version, client_ts, server_ts, ms_on_subject)`
-- `events(assignment_id, ts, type, payload_json)`
-- `marks(mark_id, assignment_id, class[A|B|C|X], panel, frame, px, py, vox_i, vox_j, vox_k, tkr_x, tkr_y, tkr_z, ras_x, ras_y, ras_z, hemi, pial_vertex, pial_dist_mm, white_vertex, white_dist_mm, fsavg6_vertex, created_ts, deleted_ts)`
-- `final_labels(subject_uid, criterion, value, method[consensus|adjudicated|single])`
-- `final_marks(subject_uid, class, tkr_x, tkr_y, tkr_z, hemi, pial_vertex, fsavg6_vertex, source_mark_ids)`
+The tables are the SQLModel classes of `app/models.py`. Timestamps are UTC ISO 8601 text with milliseconds. A column with a fixed vocabulary (written `[a|b]` below) carries a CHECK constraint, so the database refuses a row with a value the app does not know. Code outside `app/` reads the tables with the standard library, by these names.
+
+- `raters(rater_id, name, token_hash, role[rater|adjudicator|lead], active, created_at)`; `name` is unique.
+- `assignments(assignment_id, rater_id, subject_uid, kind[calibration|main|repeat|adjudication], seq, render_key, assigned_at, completed_at, consensus_served_at)`, unique on `(rater_id, seq)`. `seq` numbers a rater's assignments from 1. `render_key` is `renders.render_key` of the render that was shown (`rendering.md`), so a rating stays with the tiles it was made on. `consensus_served_at` is for calibration: once the rater has seen the consensus, the rating is final.
+- `submissions(submission_id, assignment_id, revision, current, unratable_reason, other, note, protocol_version, protocol_sha256, calibration_sha256, app_version, client_ts, server_ts, ms_on_subject)`, unique on `(assignment_id, revision)`: one row per press of `Enter`. A revision (`Backspace`, then `Enter`) is a new row with the next `revision`; `current` moves to it, and the marks of the superseded submission get `deleted_ts`. Nothing is overwritten.
+- `ratings(rating_id, submission_id, assignment_id, criterion[A|B|C], value)`, unique on `(submission_id, criterion)`. An unratable submission has no rating rows. The view `ratings_flat` gives, for current submissions, the columns this table was first described with: `rating_id, assignment_id, criterion, value, note, protocol_version, app_version, client_ts, server_ts, ms_on_subject`.
+- `marks(mark_id, submission_id, assignment_id, class[A|B|C|X], panel[sagittal|coronal|axial], slice, frame, mode[sync|seq], px, py, vox_i, vox_j, vox_k, tkr_x, tkr_y, tkr_z, ras_x, ras_y, ras_z, hemi[lh|rh], pial_vertex, pial_dist_mm, white_vertex, white_dist_mm, fsavg6_vertex, vertex_surface[pial|white], box_dist_mm, created_ts, deleted_ts)`. `slice` is the position in the panel's slice list of the tile that was clicked, which is what the geometry needs; `frame` and `mode` are the playback context of the click and may be null. `vox_*` are continuous voxel coordinates. `vertex_surface` says whose vertex `fsavg6_vertex` is the counterpart of, and `box_dist_mm` is the distance from the mark to the view box (0 inside).
+- `events(event_id, assignment_id, ts, type, payload_json)`; `assignment_id` is null for an event of the run, such as a changed setting.
+- `final_labels(subject_uid, criterion[A|B|C|unratable], value, method[consensus|adjudicated|single])`, key `(subject_uid, criterion)`. In the row of criterion `unratable`, `value` is the position of the reason in the protocol's list of unratable reasons.
+- `final_marks(final_mark_id, subject_uid, class[A|B|C|X], tkr_x, tkr_y, tkr_z, hemi, pial_vertex, fsavg6_vertex, source_mark_ids)`; `source_mark_ids` is a JSON array.
+- `app_meta(key, value)`: `schema_version`, `run_id` and `mode`, which tie the database to its run.
+
+The tables and the view are written and tested (first step of milestone 4, decision D32). Nothing fills them yet: the functions that open the database and store a submission follow in the milestone.
 
 ## API
 
 - `GET /api/next` → next assignment for the authenticated rater: `subject_uid`, frame URLs, protocol version.
-- `POST /api/rating` → criterion values, marks (panel, frame, px, py, class), note, timing; returns the next assignment. The server validates marks against `render.json` and resolves coordinates and vertices.
+- `POST /api/rating` → criterion values, marks (class, panel, slice, px, py, and the frame and playback mode as context), note, timing; returns the next assignment. The server validates marks against `render.json` and resolves coordinates and vertices.
 - `POST /api/events` → batched interaction events.
 - `GET /api/back` → previous assignment for revision.
 - `GET /api/review?sort=&filter=` → adjudicator or local mode only.
 - `GET /api/stats` → dashboard numbers.
 - `GET /api/export` → CSV of ratings, team lead only.
+
+The request and response bodies are the pydantic models of `app/schemas.py`, and its `ROUTES` lists every route with the shapes it takes and answers with; the frontend and the server are both written against that module. A page receives the geometry of a render (`RenderOut`) without the sizes and digests of the source files and without the template's digests: `render.json` itself is never served. The shapes are written and tested; no route answers yet.
 
 ## Throughput budget
 

@@ -15,9 +15,9 @@ from __future__ import annotations
 import json
 import math
 import re
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
-from pydantic import ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from surfcensus.protocol import CriterionId, MarkClass, Protocol
 from surfcensus.render.model import (
@@ -85,6 +85,8 @@ MAX_EVENT_PAYLOAD_BYTES = 16_000
 """Of the payload as compact JSON."""
 MAX_MARKS_PER_RATING = 200
 MAX_NOTE_CHARS = 10_000
+MAX_REVIEW_ROWS = 1_000
+"""Rows of the review table in one answer."""
 
 MEDIA_FILE = re.compile(
     r"poster\.webp|anim\.mp4|tiles/(?:sagittal|coronal|axial)_(?:[0-9]{3}|[1-9][0-9]{3,})(?:_c)?\.webp"
@@ -426,6 +428,20 @@ class EventsOut(_Shape):
 # --- unblinded: review, statistics ----------------------------------------------------------
 
 
+class ReviewQuery(_Shape):
+    """The query parameters of ``GET /api/review``."""
+
+    sort: str | None = None
+    """A column of the table. None: by ``primary_rank``, worst first, the subjects without
+    a score last; rows that are equal in the column are in that order as well."""
+    order: Literal["asc", "desc"] = "asc"
+    filter: str = ""
+    """Comma-separated ``column:value``; a row passes when it has that value, as text, in
+    every column named. Empty: every row."""
+    offset: int = Field(default=0, ge=0)
+    limit: int = Field(default=200, ge=1, le=MAX_REVIEW_ROWS)
+
+
 class ReviewOut(_Shape):
     """``GET /api/review``: one row per subject. ``columns`` names the keys of a row in
     display order: ``subject_uid``, in a local run ``subject_label``, ``dataset``,
@@ -529,3 +545,45 @@ class ErrorsOut(_Shape):
 class HealthOut(_Shape):
     ok: bool
     version: str
+
+
+# --- routes ---------------------------------------------------------------------------------
+
+
+class Route(NamedTuple):
+    """One route of the app: what the server answers and what a page may call."""
+
+    method: Literal["GET", "POST"]
+    path: str
+    """With ``{name}`` for a part of the path that varies; the ``{path}`` of a file may
+    hold slashes."""
+    response: type[BaseModel] | None = None
+    """The shape of the JSON it answers with on success; None for a page, a file or CSV.
+    Whatever the route, an answer with a status of 400 or above is an :class:`ErrorsOut`."""
+    request: type[BaseModel] | None = None
+    """The shape of the JSON body of a POST, or of the query parameters of a GET."""
+    unblinded: bool = False
+    """Shows what a rater must not see while rating: 403 while the rater has work left
+    (``app.queue.has_work_left``), by the one rule of docs/rater_app.md."""
+
+
+ROUTES: tuple[Route, ...] = (
+    Route("GET", "/"),
+    Route("GET", "/review", unblinded=True),
+    Route("GET", "/static/{path}"),
+    Route("GET", "/media/{subject_uid}/{path}"),
+    Route("GET", "/healthz", HealthOut),
+    Route("GET", "/api/session", SessionOut),
+    Route("GET", "/api/next", NextOut),
+    Route("GET", "/api/back", NextOut),
+    Route("POST", "/api/rating", RatingOut, RatingIn),
+    Route("POST", "/api/events", EventsOut, EventsIn),
+    Route("GET", "/api/review", ReviewOut, ReviewQuery, unblinded=True),
+    Route("GET", "/api/review/{subject_uid}", SubjectOut, unblinded=True),
+    Route("GET", "/api/stats", StatsOut, unblinded=True),
+    Route("GET", "/api/export", unblinded=True),
+)
+"""Every route of the app in milestone 4 (local mode). The server serves these and no
+other, and the frontend calls none that is not here: ``/`` and ``/review`` are the pages,
+``/static`` the frontend files, ``/media`` the files of a render that :data:`MEDIA_FILE`
+names, ``/api/export`` the ratings as CSV."""
