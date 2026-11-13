@@ -132,6 +132,7 @@ def build_plan(
         order = queue_order(selected, scores, blind=app.blind, seed=app.queue_seed)
     else:
         order = selected
+    in_calibration = () if calibration is None else calibration.subjects
     return QueuePlan(
         mode=mode,
         order=tuple(order),
@@ -139,9 +140,7 @@ def build_plan(
         failed=failed,
         pending=pending,
         outdated=outdated,
-        calibration=()
-        if calibration is None
-        else tuple(s.subject_uid for s in calibration.subjects),
+        calibration=tuple(subject.subject_uid for subject in in_calibration),
         raters_per_subject=app.raters_per_subject,
         repeat_rate=app.repeat_rate,
         repeat_gap=app.repeat_gap,

@@ -279,6 +279,20 @@ def test_a_failure_without_a_reason_is_a_render_failure(catalog_run: Path, uids:
     assert planned(catalog_run).failed == {uids[0]: "render failure"}
 
 
+def test_a_done_row_without_a_render_key_is_not_ready(catalog_run: Path, uids: list[str]) -> None:
+    select_subjects(catalog_run, uids[:2])
+    record_render(catalog_run, uids[0])
+    keyless = RenderRow(
+        subject_uid=uids[1], config_hash=HASH, input_signature="0" * 16, video=False, status="done"
+    )
+    with PublicCatalog.open(catalog_run, readonly=False) as public:
+        public.record_renders([keyless])
+    plan = planned(catalog_run)
+    # no key, so no tiles that a rating could be tied to: to be rendered again
+    assert plan.render_keys == {uids[0]: key_of(uids[0])} and not plan.failed
+    assert (plan.pending, plan.outdated) == (0, 1)
+
+
 def test_a_run_without_a_selection_has_an_empty_plan(catalog_run: Path, uids: list[str]) -> None:
     record_render(catalog_run, uids[0])
     plan = planned(catalog_run)
@@ -682,6 +696,10 @@ def test_an_open_assignment_of_a_failed_or_awaited_render_is_not_returned(
     failed = plan_of(["a"], failed={"a": "source changed"})
     assert next_assignment(session, rater, failed) == Next("done")
     assert not has_work_left(session, rater, failed) and subjects_left(session, rater, failed) == 0
+    # also for a plan that still names the render it had
+    both = plan_of(["a"], keys={"a": key_of("a")}, failed={"a": "source changed"})
+    assert next_assignment(session, rater, both) == Next("done")
+    assert not has_work_left(session, rater, both)
     # its render is being made again: the rater waits
     awaited = plan_of(["a"], keys={}, outdated=1)
     assert next_assignment(session, rater, awaited) == Next("rendering")
@@ -810,7 +828,7 @@ def test_with_a_rate_of_one_every_subject_is_repeated_once_after_the_gap(
     plan = plan_of(["a", "b", "c", "d"], repeat_rate=1.0, repeat_gap=2, seed=11)
     shown: list[tuple[str, str]] = []
     while (following := next_assignment(session, rater, plan)).status == "assignment":
-        assert following.assignment is not None
+        assert following.assignment is not None and len(shown) < 20
         # a repeat is not among what comes next, and the walk goes on behind it
         assert all(key == key_of(uid) for uid, key in following.prefetch)
         assert has_work_left(session, rater, plan)
@@ -916,14 +934,26 @@ def test_a_repeat_shows_the_render_that_was_rated(session: Session, rater: Rater
     )
 
 
-def test_an_open_repeat_is_returned_again(session: Session, rater: Rater) -> None:
-    plan = plan_of(["a", "b"], repeat_rate=1.0, repeat_gap=1, seed=0)
+def test_an_open_repeat_is_returned_again_and_is_work_left(session: Session, rater: Rater) -> None:
+    # a seed whose draw makes the second assignment a repeat and the third none
+    def draw(seed: int, seq: int) -> float:
+        return random.Random(f"{seed}:{rater.rater_id}:{seq}").random()
+
+    seed = next(seed for seed in range(100) if draw(seed, 2) < 0.5 <= draw(seed, 3))
+    plan = plan_of(["a"], repeat_rate=0.5, repeat_gap=1, seed=seed)
     complete(session, assigned(session, rater, plan))
+    assert has_work_left(session, rater, plan)
     repeat = assigned(session, rater, plan)
-    assert (repeat.subject_uid, repeat.kind) == ("a", "repeat")
-    again = next_assignment(session, rater, plan)
-    assert again.assignment is repeat and again.prefetch == (("b", key_of("b")),)
+    assert (repeat.subject_uid, repeat.kind, repeat.seq) == ("a", "repeat", 2)
+    for _ in range(2):
+        again = next_assignment(session, rater, plan)
+        assert again.assignment is repeat and again.prefetch == ()
+        # nothing would follow it, and it is still to be rated
+        assert has_work_left(session, rater, plan)
     assert len(all_assignments(session)) == 2
+    complete(session, repeat)
+    assert next_assignment(session, rater, plan) == Next("done")
+    assert not has_work_left(session, rater, plan)
 
 
 # --- what the local branch does not do ----------------------------------------------------------

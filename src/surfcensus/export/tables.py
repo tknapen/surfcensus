@@ -37,6 +37,7 @@ from surfcensus._io import atomic_path, sha256_file
 from surfcensus.app import APP_DB_FILE
 from surfcensus.calibration import load_calibration
 from surfcensus.config import ConfigError, load_config, stage_hashes
+from surfcensus.log import get_logger
 from surfcensus.protocol import CRITERION_IDS, PROTOCOL_FILE, load_protocol
 from surfcensus.reference.strata import field_bin
 from surfcensus.schemas import KEYS, NO_REFERENCE, SCHEMAS
@@ -264,7 +265,15 @@ _MARK_KINDS: dict[str, _Kind] = {
     name: "str" for name in ("class", "panel", "mode", "hemi", "vertex_surface", "created_ts")
 } | {
     name: "int"
-    for name in ("mark_id", "submission_id", "slice", "frame", "pial_vertex", "white_vertex")
+    for name in (
+        "mark_id",
+        "submission_id",
+        "slice",
+        "frame",
+        "pial_vertex",
+        "white_vertex",
+        "fsavg6_vertex",
+    )
 }
 _FINAL_MARK_KINDS: dict[str, _Kind] = {
     "final_mark_id": "int",
@@ -367,10 +376,14 @@ def _arrow_type(dtype: object) -> pa.DataType:
     raise TypeError(f"no export type for a column of type {dtype}")
 
 
-def _arrow_table(frame: pd.DataFrame) -> pa.Table:
-    """``frame`` as a table whose types follow from the column types alone, so a table
-    without rows, and one whose column holds nothing, has the schema of a full one."""
-    schema = pa.schema([pa.field(str(name), _arrow_type(frame[name].dtype)) for name in frame])
+def _arrow_table(frame: pd.DataFrame, schema: pa.Schema | None = None) -> pa.Table:
+    """``frame`` as a table of ``schema``, or of types that follow from the column types
+    alone, every column nullable: a table without rows, and one whose column holds nothing,
+    has the schema of a full one."""
+    if schema is None:
+        schema = pa.schema([pa.field(str(name), _arrow_type(frame[name].dtype)) for name in frame])
+    else:
+        schema = pa.schema([schema.field(str(name)) for name in frame])
     table = pa.Table.from_pandas(frame, schema=schema, preserve_index=False)
     return table.replace_schema_metadata(None)
 
@@ -384,20 +397,34 @@ def frame_csv(frame: pd.DataFrame) -> str:
     return buffer.getvalue()
 
 
-def _write_csv(path: Path, frame: pd.DataFrame) -> None:
+def _write_csv(path: Path, frame: pd.DataFrame, schema: pa.Schema | None) -> None:
     with atomic_path(path) as tmp:
         tmp.write_text(frame_csv(frame), encoding="utf-8", newline="")
 
 
-def _write_parquet(path: Path, frame: pd.DataFrame) -> None:
-    table = _arrow_table(frame)
+def _write_parquet(path: Path, frame: pd.DataFrame, schema: pa.Schema | None) -> None:
+    table = _arrow_table(frame, schema)
     with atomic_path(path) as tmp:
         pq.write_table(table, tmp, compression="zstd")
 
 
-_WRITERS: dict[str, Callable[[Path, pd.DataFrame], None]] = {
+_WRITERS: dict[str, Callable[[Path, pd.DataFrame, pa.Schema | None], None]] = {
     "csv": _write_csv,
     "parquet": _write_parquet,
+}
+# the tables of a run keep their schema; the others get one from their column types
+_PARQUET_SCHEMAS: dict[str, pa.Schema] = {
+    "scores": SCHEMAS["scores"],
+    "clusters": pa.schema(
+        [
+            *SCHEMAS["clusters"],
+            *(
+                field.with_nullable(True)
+                for field in SCHEMAS["clusters_native"]
+                if field.name not in SCHEMAS["clusters"].names
+            ),
+        ]
+    ),
 }
 
 
@@ -533,11 +560,14 @@ def _sources(run_dir: Path | str) -> Iterator[_Sources]:
             connection.close()
 
 
-def _metric_table(read: Callable[[], pd.DataFrame], name: str) -> pd.DataFrame:
+def _metric_table(run_dir: Path, name: str) -> pd.DataFrame:
+    """A table of the metrics as this version writes it; empty for a run that has none."""
     try:
-        return read()
+        return read_table(table_path(run_dir, name), SCHEMAS[name])
     except (ValueError, OSError, pa.ArrowException) as exc:
-        raise ConfigError("invalid", f"tables/{name}.parquet cannot be used: {exc}") from exc
+        # the reason without the path, which the error of the system would name
+        why = (exc.strerror if isinstance(exc, OSError) else None) or exc
+        raise ConfigError("invalid", f"tables/{name}.parquet cannot be used: {why}") from exc
 
 
 def _rater_names(src: _Sources) -> dict[int, str]:
@@ -746,7 +776,8 @@ def _subjects(src: _Sources) -> pd.DataFrame:
             "render_reason": _looked_up(uids, by_uid["reason"], "str"),
         }
     )
-    scores = _metric_table(lambda: primary_scores(src.run_dir), "scores")
+    _metric_table(src.run_dir, "scores")
+    scores = primary_scores(src.run_dir)
     # the dataset and the holes of the log are columns of the subject already
     new = [name for name in scores.columns if name == "subject_uid" or name not in subjects]
     scored = _rows_at(scores[new], "subject_uid", uids)
@@ -755,12 +786,13 @@ def _subjects(src: _Sources) -> pd.DataFrame:
 
 
 def _scores(src: _Sources) -> pd.DataFrame:
-    path = table_path(src.run_dir, "scores")
-    return _metric_table(lambda: read_table(path, SCHEMAS["scores"]), "scores")
+    return _metric_table(src.run_dir, "scores")
 
 
 def _clusters(src: _Sources) -> pd.DataFrame:
-    clusters = _metric_table(lambda: clusters_with_native(src.run_dir), "clusters")
+    for name in ("clusters", "clusters_native"):
+        _metric_table(src.run_dir, name)
+    clusters = clusters_with_native(src.run_dir)
     # the join leaves the columns of a cluster without a native position in other types
     clusters["native_vertex"] = pd.Series(
         pd.array(
@@ -837,7 +869,7 @@ def _released(
     out = {}
     for name, frame in tables.items():
         if "subject_uid" in frame.columns:
-            frame = frame[[uid in selected for uid in frame["subject_uid"]]]
+            frame = frame[frame["subject_uid"].isin(list(selected))]
         frame = frame.drop(columns=list(RELEASE_LEFT_OUT.get(name, ()))).reset_index(drop=True)
         out[name] = frame
     subjects = out["subjects"]
@@ -884,11 +916,23 @@ def ratings_frame(run_dir: Path | str) -> pd.DataFrame:
 
     ``A``, ``B`` and ``C`` are missing in an unratable rating and for a criterion the
     protocol does not have. ``kind`` is that of the assignment, so a repeat says so here.
+    The database is read through a connection of its own: what another connection has not
+    committed is not in the frame.
+
     Raises ``ConfigError("invalid", ...)`` for an ``app.sqlite`` that cannot be read, is in
     use for longer than half a minute, or is not that of this run.
     """
     with _sources(run_dir) as src:
         return _ratings(src)
+
+
+def marks_frame(run_dir: Path | str) -> pd.DataFrame:
+    """The ``marks`` table (:data:`MARKS_COLUMNS`), sorted by ``mark_id``: the marks of the
+    current submissions of completed assignments, with the rater named as in
+    :func:`ratings_frame`. Empty, with its columns, for a run without ``app.sqlite``.
+    Raises what :func:`ratings_frame` raises."""
+    with _sources(run_dir) as src:
+        return _marks(src)
 
 
 def subjects_frame(run_dir: Path | str) -> pd.DataFrame:
@@ -967,6 +1011,7 @@ def _forget_earlier(target: Path, writing: Collection[str]) -> None:
         if _EXPORT_FILE.fullmatch(name) and name not in writing:
             if path.is_file() or path.is_symlink():
                 path.unlink()
+                get_logger().info("removed %s of the earlier export", name)
 
 
 def export_run(
@@ -1030,7 +1075,7 @@ def export_run(
     files = {}
     for name in EXPORT_TABLES:
         path = target / names[name]
-        _WRITERS[fmt](path, tables[name])
+        _WRITERS[fmt](path, tables[name], _PARQUET_SCHEMAS.get(name))
         files[path.name] = {"rows": len(tables[name]), "sha256": sha256_file(path)}
         paths.append(path)
     manifest["files"] = files
