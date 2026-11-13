@@ -14,7 +14,16 @@ Code outside ``app/`` reads these tables with the standard library, by the names
 
 from __future__ import annotations
 
-from sqlalchemy import CheckConstraint, Column, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import (
+    CheckConstraint,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlmodel import Field, SQLModel
 
 from surfcensus.app.schemas import ASSIGNMENT_KINDS, FINAL_METHODS, RATER_ROLES, UNRATABLE_CRITERION
@@ -70,7 +79,16 @@ class Submission(SQLModel, table=True):
     """One press of ``Enter``: the values, flags and note of a rating, in one revision."""
 
     __tablename__ = "submissions"
-    __table_args__ = (UniqueConstraint("assignment_id", "revision"),)
+    __table_args__ = (
+        UniqueConstraint("assignment_id", "revision"),
+        # at most one current submission per assignment: the view and the export count on it
+        Index(
+            "ux_submissions_current",
+            "assignment_id",
+            unique=True,
+            sqlite_where=text('"current" = 1'),
+        ),
+    )
 
     submission_id: int | None = Field(default=None, primary_key=True)
     assignment_id: int = Field(sa_column=_references("assignments.assignment_id"))
