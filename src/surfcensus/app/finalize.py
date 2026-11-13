@@ -48,6 +48,7 @@ from surfcensus.calibration import (
     write_calibration,
 )
 from surfcensus.config import ConfigError, validation_detail
+from surfcensus.log import get_logger
 from surfcensus.protocol import (
     CRITERION_IDS,
     OTHER_MARK_CLASS,
@@ -419,6 +420,12 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     rater this also removes the ``single`` rows that :func:`finalize` wrote for subjects
     with one rating, and leaves its ``consensus`` rows: after a submission the labels are
     those of ``finalize`` no longer, and it has to run again.
+
+    Never raises for what an earlier rating holds. The rating that gives the label need not
+    be the one that was just stored (a repeat of the subject was submitted, say), and it
+    can say unratable for a reason that ``protocol.yaml`` has lost since. The subject's
+    rows are then left as they are, with a warning: the submission in whose transaction
+    this runs is no worse for it, and :func:`finalize` names the rating.
     """
     n_raters = session.exec(select(func.count()).select_from(Rater)).one()
     if n_raters > 1:
@@ -432,7 +439,11 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     have = labels.get(subject_uid, [])
     if _adjudicated(have):
         return
-    wanted_labels, wanted_marks = _of_one(ratings[0], SINGLE, protocol, subject_uid)
+    try:
+        wanted_labels, wanted_marks = _of_one(ratings[0], SINGLE, protocol, subject_uid)
+    except ConfigError as exc:
+        get_logger().warning("the final label of %s is left as it is: %s", subject_uid, exc.detail)
+        return
     _set_final(session, subject_uid, wanted_labels, wanted_marks, have, marks.get(subject_uid, []))
     session.flush()
 

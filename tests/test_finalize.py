@@ -9,6 +9,7 @@ ratings are stored as the server stores them (``app.db.store_submission``). The 
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -401,6 +402,91 @@ def test_a_rating_replaces_the_label_of_a_failed_render(
     assert labels(session) == {S1: single(MINOR)}
 
 
+def test_an_earlier_rating_with_a_reason_the_protocol_lost_does_not_stop_a_submission(
+    session: Session, ada: Rater, shipped_protocol: Protocol, caplog: pytest.LogCaptureFixture
+) -> None:
+    rate(session, ada, S1, unratable="image too poor to judge")
+    record_single(session, S1, shipped_protocol)
+    before = labels(session)
+    reasons = shipped_protocol.unratable_reasons[:3]
+    shorter = shipped_protocol.model_copy(update={"unratable_reasons": reasons})
+
+    # a repeat of the subject is submitted: its label still comes from the earlier rating
+    rate(session, ada, S1, values(NONE), kind="repeat")
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        record_single(session, S1, shorter)
+    assert labels(session) == before
+    assert not session.dirty and not session.new and not session.deleted
+    (message,) = caplog.messages
+    assert S1 in message and "image too poor to judge" in message and PROTOCOL_FILE in message
+
+    # and the next subject is labelled as ever
+    rate(session, ada, S2, values(MINOR))
+    record_single(session, S2, shorter)
+    assert labels(session) == {**before, S2: single(MINOR)}
+
+
+def test_an_unratable_label_has_no_final_mark_whatever_the_marks_table_holds(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    """The server stores no mark with an unratable submission; a row that is there all the
+    same (another program wrote it) is no final mark."""
+    for rater in (ada, ben):
+        assignment = rate(session, rater, S1, unratable="image too poor to judge")
+        submission = session.exec(
+            select(Submission).where(Submission.assignment_id == assignment.assignment_id)
+        ).one()
+        assert submission.submission_id is not None and assignment.assignment_id is not None
+        session.add(
+            Mark(
+                submission_id=submission.submission_id,
+                assignment_id=assignment.assignment_id,
+                mark_class="A",
+                panel="sagittal",
+                slice=3,
+                px=1.0,
+                py=1.0,
+                vox_i=1.0,
+                vox_j=2.0,
+                vox_k=3.0,
+                tkr_x=1.5,
+                tkr_y=3.0,
+                tkr_z=-1.5,
+                ras_x=0.0,
+                ras_y=0.0,
+                ras_z=0.0,
+                box_dist_mm=0.0,
+                created_ts=T,
+            )
+        )
+        session.flush()
+    finalize(session, plan_of([S1]), shipped_protocol)
+    assert labels(session) == {S1: {"unratable": (3, "consensus")}}
+    assert final_marks(session) == {}
+
+    # and with one rating of the subject
+    rate(session, ada, S2, unratable="image too poor to judge")
+    lone = session.exec(select(Mark)).first()
+    assert lone is not None
+    submission = session.exec(
+        select(Submission)
+        .join(Assignment, col(Assignment.assignment_id) == col(Submission.assignment_id))
+        .where(Assignment.subject_uid == S2)
+    ).one()
+    assert submission.submission_id is not None
+    session.add(
+        Mark(
+            **lone.model_dump(exclude={"mark_id", "submission_id", "assignment_id"}),
+            submission_id=submission.submission_id,
+            assignment_id=submission.assignment_id,
+        )
+    )
+    session.flush()
+    finalize(session, plan_of([S1, S2]), shipped_protocol)
+    assert labels(session)[S2] == {"unratable": (3, "single")}
+    assert final_marks(session) == {}
+
+
 def test_record_single_leaves_an_adjudicated_subject_alone(
     session: Session, ada: Rater, shipped_protocol: Protocol
 ) -> None:
@@ -653,6 +739,18 @@ def test_the_union_leaves_out_the_marks_of_a_criterion_whose_consensus_is_none(
     assert len(session.exec(select(Mark).where(col(Mark.deleted_ts).is_(None))).all()) == 6
 
 
+def test_the_union_is_in_the_order_the_marks_were_stored(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    # the rater made second rates first: the order is that of the marks, not of the raters
+    rate(session, ben, S1, values(MINOR), marks=[mark("A", 1.5), mark("A", 2.5)])
+    rate(session, ada, S1, values(MINOR), marks=[mark("A", 3.5)])
+    finalize(session, plan_of([S1]), shipped_protocol)
+    found = final_marks(session)[S1]
+    assert [x for _, x, _ in found] == [1.5, 2.5, 3.5]
+    assert [ids for _, _, ids in found] == sorted(ids for _, _, ids in found)
+
+
 def test_two_steps_apart_is_open_and_has_no_label(
     session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
 ) -> None:
@@ -768,6 +866,32 @@ def test_finalize_reads_current_submissions_only(
     assert revised[0].deleted_ts is None
 
 
+def test_the_current_submission_is_the_rating_not_the_one_stored_last(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    """``current`` is what is read. The app only ever moves it to the newest revision;
+    here it is put back on the first by hand, so that the two can be told apart."""
+    by_ada = rate(session, ada, S1, values(MAJOR))
+    submit(session, by_ada, values(NONE))
+    rate(session, ben, S1, values(MAJOR))
+    first, second = session.exec(
+        select(Submission)
+        .where(Submission.assignment_id == by_ada.assignment_id)
+        .order_by(col(Submission.revision))
+    ).all()
+    assert (first.current, second.current) == (False, True)
+    second.current = False
+    session.add(second)
+    session.flush()  # an assignment has one current submission at any moment
+    first.current = True
+    session.add(first)
+    session.flush()
+
+    report = finalize(session, plan_of([S1]), shipped_protocol)
+    assert report == FinalizeReport(consensus=1, single=0, unratable=0, open=())
+    assert labels(session) == {S1: consensus(MAJOR)}
+
+
 def test_finalize_never_touches_adjudicated_rows(
     session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
 ) -> None:
@@ -844,6 +968,14 @@ def test_finalize_removes_rows_that_no_rating_explains(
     session.add(
         FinalMark(
             subject_uid=S1, mark_class="A", tkr_x=1.0, tkr_y=0.0, tkr_z=0.0, source_mark_ids="[]"
+        )
+    )
+    # an unratable row that is not the label of a failed render
+    session.add(FinalLabel(subject_uid=S3, criterion="unratable", value=0, method="consensus"))
+    # and a final mark of a subject that has no label at all
+    session.add(
+        FinalMark(
+            subject_uid=S2, mark_class="B", tkr_x=2.0, tkr_y=0.0, tkr_z=0.0, source_mark_ids="[]"
         )
     )
     session.flush()
@@ -1075,6 +1207,32 @@ def test_no_name_at_all_means_every_subject(
     freeze_calibration(app_run, subjects=[])
     loaded = load_calibration(app_run)
     assert loaded is not None and len(loaded[0].subjects) == 3
+
+
+def test_a_freeze_that_fails_at_the_selection_leaves_no_file_and_can_be_run_again(
+    app_run: Path,
+    app_engine: Engine,
+    small_run_uids: dict[str, str],
+    shipped_protocol: Protocol,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The file is written last: it says that the set is whole, and it is never replaced."""
+    rated_run(app_engine, small_run_uids, shipped_protocol)
+    before = selection_rows(app_run)
+
+    def full_disk(self: PublicCatalog, rows: object, reasons: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    with monkeypatch.context() as patched:
+        patched.setattr(PublicCatalog, "replace_selection", full_disk)
+        with pytest.raises(OSError, match="No space left"):
+            freeze_calibration(app_run)
+    assert not (app_run / CALIBRATION_FILE).exists()
+    assert selection_rows(app_run) == before
+
+    freeze_calibration(app_run)
+    assert load_calibration(app_run) is not None
+    assert len(selection_rows(app_run)) == len(before) + 3
 
 
 @pytest.mark.parametrize("name", ["sub-002", "ffffffffffffffff", "sub-000"])
