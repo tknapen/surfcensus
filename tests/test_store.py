@@ -2122,6 +2122,23 @@ def test_replace_selection_replaces_the_rows_of_the_named_reasons(local: Catalog
     ]
 
 
+def test_selected_uids_are_none_until_a_selection_is_made(local: Catalog, census: Catalog) -> None:
+    for catalog, key in ((local, SALT), (census, KEY)):
+        a, b, c = sorted(add_subject(catalog, key, make_dataset(), f"sub-0{n}") for n in (1, 2, 3))
+        public = catalog.public()
+        assert public.selected_uids() is None
+        public.replace_selection(selection_rows([c, a], "calibration"), ["calibration"])
+        # a frozen calibration set names examples in a local run, and is no selection of
+        # it; in a census run its subjects are selected, to be rendered and rated first
+        assert public.selected_uids() == (None if catalog is local else [a, c])
+        public.replace_selection(selection_rows([b, a], "prevalence", 0.5), ["prevalence"])
+        assert public.selected_uids() == [a, b, c]  # each once, whatever its reasons
+        public.replace_selection(selection_rows([], "calibration"), ["calibration"])
+        assert public.selected_uids() == [a, b]
+        public.replace_selection(selection_rows([], "prevalence"), ["prevalence"])
+        assert public.selected_uids() is None
+
+
 def test_replace_selection_refuses_rows_that_do_not_fit(local: Catalog) -> None:
     a, b = sorted(add_subject(local, SALT, make_dataset(), f"sub-0{n}") for n in (1, 2))
     public = local.public()

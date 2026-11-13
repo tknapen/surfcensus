@@ -631,7 +631,10 @@ def _checked_rater(name: str | None) -> str | None:
     return name
 
 
-@app.command("review")
+@app.command(
+    "review",
+    short_help="Score, render and rate the FreeSurfer subjects under PATH, in one go.",
+)
 def review_command(
     path: Path = typer.Argument(
         ...,
@@ -776,7 +779,10 @@ def serve_command(
         )
 
 
-@app.command("finalize")
+@app.command(
+    "finalize",
+    short_help="Write the final labels and marks from the ratings of all raters.",
+)
 def finalize_command(run_dir: Path = _RUN_DIR) -> None:
     """Write the final labels and marks from the ratings of all raters: one rating as it
     is, raters within one scale step as their consensus, and a list of the subjects that
@@ -867,7 +873,9 @@ def _is_missing(value: object) -> bool:
     return bool(pd.isna(value))  # pyrefly: ignore[no-matching-overload]
 
 
-@calibration_app.command("freeze")
+@calibration_app.command(
+    "freeze", short_help="Write calibration.yaml from the final labels and marks of a run."
+)
 def calibration_freeze(
     run_dir: Path = _RUN_DIR,
     subject: list[str] | None = typer.Option(
@@ -888,7 +896,7 @@ def calibration_freeze(
         typer.echo(str(path))
 
 
-@app.command("export")
+@app.command("export", short_help="Write the tables for analysis and a manifest (phase 8).")
 def export_command(
     run_dir: Path = _RUN_DIR,
     out: Path | None = typer.Option(
@@ -912,6 +920,16 @@ def export_command(
     with _stops_with_exit_2():
         from surfcensus.export.tables import export_run
 
+        if out is not None:
+            from surfcensus.config import load_config
+
+            # a source is only read. The export itself refuses an output in a source of a
+            # local run; the roots of a census run are in the catalog, which the run opens
+            if load_config(run_dir).mode == "census":
+                from surfcensus.run import Run
+
+                with Run(run_dir) as run:
+                    run.refuse_output_in_sources(out)
         paths = export_run(
             run_dir,
             out,

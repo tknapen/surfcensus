@@ -34,13 +34,15 @@ import pyarrow.parquet as pq
 
 from surfcensus import __version__
 from surfcensus._io import atomic_path, sha256_file
-from surfcensus.app import APP_DB_FILE
+from surfcensus.app import APP_DB_FILE, LABEL_REASONS_KEY, label_reasons
 from surfcensus.calibration import load_calibration
 from surfcensus.config import ConfigError, load_config, stage_hashes
 from surfcensus.log import get_logger
 from surfcensus.protocol import CRITERION_IDS, PROTOCOL_FILE, load_protocol
 from surfcensus.reference.strata import field_bin
 from surfcensus.schemas import KEYS, NO_REFERENCE, SCHEMAS
+from surfcensus.sources.base import SourceError
+from surfcensus.sources.local import detect_layout
 from surfcensus.store import (
     PublicCatalog,
     clusters_with_native,
@@ -78,6 +80,8 @@ RATINGS_COLUMNS: tuple[str, ...] = (
     "subject_uid",
     "rater",
     "kind",
+    "seq",
+    "blind",
     "render_key",
     "render_current",
     "A",
@@ -95,7 +99,13 @@ RATINGS_COLUMNS: tuple[str, ...] = (
     "ms_on_subject",
 )
 """``ratings``: one row per completed assignment, from its current submission.
-``render_current`` says whether the rating was made on the tiles the subject has now."""
+``render_current`` says whether the rating was made on the tiles the subject has now.
+``seq`` is the place of the assignment among those of its rater, from 1: the order in which
+the queue offered the subjects, which is the order of rating but for a subject that was
+skipped or revised (``server_ts`` is when the current submission was stored). ``blind``
+is the setting of the local queue when that submission was stored: false for the order of
+the scores, worst first, true for the seeded shuffle; missing when the database has no
+record of the setting before the submission. The queue of a census run does not read it."""
 
 SUBJECT_RATING_COLUMNS: tuple[str, ...] = (
     "final_A",
@@ -123,11 +133,16 @@ BEHAVIOUR_COLUMNS: tuple[str, ...] = (
     "n_back",
     "n_skips",
     "ms_skipped_visits",
+    "ms_revised_visits",
 )
-"""``behaviour``: one row per completed assignment, summed over its events. ``ms_on_subject``
-is the time of the visit that ended with the submission; ``n_skips`` is how often the
-assignment was skipped before and ``ms_skipped_visits`` the time of those visits together
-(missing where a skip event holds none)."""
+"""``behaviour``: one row per completed assignment. The counts of events (``n_frames_viewed``
+to ``n_back``) are over every visit to the subject in that assignment. The time is in three
+columns, one per kind of visit, and their sum covers the same visits as the counts:
+``ms_on_subject`` is the time of the visit that ended with the current submission;
+``ms_skipped_visits`` the time of the visits that ended with a skip, together (``n_skips``
+of them; missing where a skip event holds no time); ``ms_revised_visits`` the time of the
+visits that ended with a submission that a revision superseded, together (0 when the rating
+was never revised; missing where such a submission holds no time)."""
 
 SKIPS_COLUMNS: tuple[str, ...] = (
     "assignment_id",
@@ -258,6 +273,8 @@ _SORT_KEYS: dict[str, tuple[str, ...]] = {
     "skips": ("assignment_id", "n"),
 }
 _SKIP_EVENT = "skip"  # app.schemas.SKIP_EVENT, which is not imported: this module needs no extra
+_CONFIG_CHANGE = "config_change"  # app.events.CONFIG_CHANGE, likewise
+_BLIND_SETTING = "blind"
 _COUNTED_EVENTS = {
     "play": "n_plays",
     "pause": "n_pauses",
@@ -274,6 +291,7 @@ _RATING_ROWS: _Spec = (
     ("subject_uid", "str"),
     ("rater_id", "int"),
     ("kind", "str"),
+    ("seq", "int"),
     ("render_key", "str"),
     ("submission_id", "int"),
     ("unratable_reason", "str"),
@@ -622,7 +640,7 @@ def _rater_names(src: _Sources) -> dict[int, str]:
 
 def _ratings(src: _Sources) -> pd.DataFrame:
     rows = src.query(
-        "SELECT a.assignment_id, a.subject_uid, a.rater_id, a.kind, a.render_key, "
+        "SELECT a.assignment_id, a.subject_uid, a.rater_id, a.kind, a.seq, a.render_key, "
         "s.submission_id, s.unratable_reason, s.other, s.note, s.revision, "
         "s.protocol_version, s.protocol_sha256, s.app_version, s.client_ts, s.server_ts, "
         "s.ms_on_subject "
@@ -633,6 +651,8 @@ def _ratings(src: _Sources) -> pd.DataFrame:
     frame = _frame(_RATING_ROWS, rows)
     names = _rater_names(src)
     frame["rater"] = _column([names.get(rater_id) for rater_id in frame["rater_id"]], "str")
+    recorded = _blind_records(src)
+    frame["blind"] = _column([_blind_at(recorded, stored) for stored in frame["server_ts"]], "bool")
     renders = src.public.renders()
     done = renders[renders["status"] == "done"]
     shown_now = dict(zip(done["subject_uid"], done["render_key"], strict=True))
@@ -655,6 +675,40 @@ def _ratings(src: _Sources) -> pd.DataFrame:
             [values.get((submission, criterion)) for submission in frame["submission_id"]], "int"
         )
     return frame[list(RATINGS_COLUMNS)]
+
+
+def _blind_records(src: _Sources) -> list[tuple[str, bool]]:
+    """``(server time, value)`` of every record of the setting ``blind`` among the events of
+    the run, in the order they were written. The server writes one when it starts with
+    another value than the last record, and ``review`` one when the setting is changed
+    (``app.events.record_setting``). A payload of another form is no record."""
+    records: list[tuple[str, bool]] = []
+    for ts, text in src.query(
+        "SELECT ts, payload_json FROM events "
+        f"WHERE assignment_id IS NULL AND type = '{_CONFIG_CHANGE}' ORDER BY event_id"
+    ):
+        try:
+            payload = json.loads(text) if isinstance(text, str) else None
+        except ValueError:
+            continue
+        if not isinstance(payload, dict) or payload.get("setting") != _BLIND_SETTING:
+            continue
+        value = payload.get("new")
+        if isinstance(ts, str) and type(value) is bool:
+            records.append((ts, value))
+    return records
+
+
+def _blind_at(records: Sequence[tuple[str, bool]], server_ts: object) -> bool | None:
+    """The last recorded value of ``blind`` that is no later than ``server_ts``, or None.
+    Both times are the server's, in the one form the tables store, so they compare as text."""
+    if not isinstance(server_ts, str):
+        return None
+    value = None
+    for ts, recorded in records:
+        if ts <= server_ts:
+            value = recorded
+    return value
 
 
 def _marks(src: _Sources) -> pd.DataFrame:
@@ -740,6 +794,17 @@ def _behaviour(src: _Sources, ratings: pd.DataFrame) -> pd.DataFrame:
     frame["ms_skipped_visits"] = _column(
         [_sum_or_none(spent.get(assignment, [])) for assignment in assignments], "int"
     )
+    # a revision is a new submission, and the time of the visit that made the rating it
+    # replaced is in no other table
+    revised: dict[int, list[int | None]] = {}
+    for assignment, ms in src.query(
+        "SELECT assignment_id, ms_on_subject FROM submissions WHERE current = 0 "
+        "ORDER BY submission_id"
+    ):
+        revised.setdefault(int(assignment), []).append(_whole(ms))
+    frame["ms_revised_visits"] = _column(
+        [_sum_or_none(revised.get(assignment, [])) for assignment in assignments], "int"
+    )
     return frame[list(BEHAVIOUR_COLUMNS)]
 
 
@@ -813,20 +878,34 @@ def _skips(src: _Sources) -> pd.DataFrame:
     return _frame(_spec(SKIPS_COLUMNS, _SKIP_KINDS), rows)
 
 
+def _label_reasons(src: _Sources) -> tuple[tuple[str, ...], str]:
+    """The reasons that the values of the ``unratable`` final labels are positions in, and
+    what holds them: the list that ``app.sqlite`` keeps with its labels, so that a label
+    means what it was written as whatever ``protocol.yaml`` says now; for a database that
+    keeps none, the list of the protocol."""
+    kept = src.query(f"SELECT value FROM app_meta WHERE key = '{LABEL_REASONS_KEY}'")
+    if not kept:
+        return load_protocol(src.run_dir)[0].unratable_reasons, PROTOCOL_FILE
+    try:
+        return label_reasons(kept[0][0]), f"the list that {APP_DB_FILE} keeps"
+    except ValueError as exc:
+        raise ConfigError("invalid", f"{APP_DB_FILE}: {exc}") from exc
+
+
 def _unratable_reasons(src: _Sources, labels: Sequence[tuple[Any, ...]]) -> dict[str, str]:
     """Subject to the reason it cannot be rated, for the final labels of criterion
-    ``unratable``, whose value is the position of the reason in the protocol."""
+    ``unratable``, whose value is the position of the reason in :func:`_label_reasons`."""
     positions = {str(uid): value for uid, criterion, value, _ in labels if criterion == _UNRATABLE}
     if not positions:
         return {}
-    reasons = load_protocol(src.run_dir)[0].unratable_reasons
+    reasons, where = _label_reasons(src)
     named = {}
     for uid, position in positions.items():
         if type(position) is not int or not 0 <= position < len(reasons):
             raise ConfigError(
                 "invalid",
                 f"the final label of {uid} names unratable reason {position!r}, and "
-                f"{PROTOCOL_FILE} has the reasons 0 to {len(reasons) - 1}",
+                f"{where} has the reasons 0 to {len(reasons) - 1}",
             )
         named[uid] = reasons[position]
     return named
@@ -1093,6 +1172,7 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
     else:
         described = {"version": protocol.version, "sha256": protocol_sha256}
     calibration = load_calibration(src.run_dir)
+    config = load_config(src.run_dir)
     return {
         "manifest_schema_version": MANIFEST_SCHEMA_VERSION,
         "run_id": src.public.run_id(),
@@ -1102,8 +1182,15 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
         "key_fingerprint": src.public.meta("key_fingerprint"),
         "surfcensus_version": __version__,
         "stage_hashes": stage_hashes(
-            load_config(src.run_dir), template_id=template_id, with_reference=bool(references)
+            config, template_id=template_id, with_reference=bool(references)
         ),
+        # the settings as they are now; `ratings.blind` says under which each rating was made
+        "queue": {
+            "blind": config.app.blind,
+            "queue_seed": config.app.queue_seed,
+            "repeat_rate": config.app.repeat_rate,
+            "repeat_gap": config.app.repeat_gap,
+        },
         "template_id": template_id,
         "reference_ids": references,
         "protocol": described,
@@ -1111,6 +1198,30 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
         if calibration is None
         else {"version": calibration[0].version, "sha256": calibration[1]},
     }
+
+
+def _refuse_in_sources(run_dir: Path, target: Path) -> None:
+    """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, the subjects
+    directory of a source of a local run, compared after links are resolved: sources are
+    only read. The roots are those of ``config.yaml``; where a root holds no subjects now
+    (the data is not mounted), ``target`` is compared with the root itself. A census run
+    keeps its roots in the private catalog, out of reach of this module; the command checks
+    it through ``Run.refuse_output_in_sources``."""
+    resolved = target.resolve()
+    for stored in load_config(run_dir).sources:
+        if stored.kind != "local" or stored.root is None:
+            continue
+        try:
+            record, _ = detect_layout(stored.root)
+            place = Path(record.root) / record.fs_root
+        except SourceError:
+            place = Path(stored.root)
+        if resolved.is_relative_to(place.resolve()):
+            raise ConfigError(
+                "invalid",
+                f"{target} lies inside the subjects directory {place}, which is only read; "
+                "choose an output directory outside it",
+            )
 
 
 def _forget_earlier(target: Path, writing: Collection[str]) -> None:
@@ -1147,9 +1258,10 @@ def export_run(
 
     Works on a run without ratings and on one without ``app.sqlite``. The manifest holds
     the run id, mode, profile, key fingerprint, package version, stage hashes, template id,
-    reference ids, the versions and hashes of the protocol and the calibration set, and the
-    row count and SHA-256 of every exported file. It has no reveal argument and cannot
-    reach an accession.
+    reference ids, the versions and hashes of the protocol and the calibration set, how the
+    rating queue is ordered (``queue``: ``blind``, ``queue_seed``, ``repeat_rate`` and
+    ``repeat_gap`` of the configuration as it is now), and the row count and SHA-256 of
+    every exported file. It has no reveal argument and cannot reach an accession.
 
     Every table is made before anything is written, so an export that is refused leaves the
     directory as it was. The manifest of an earlier export is removed first and the new one
@@ -1167,7 +1279,11 @@ def export_run(
     or 7), ``datasets.n_subjects`` one of :data:`SUBJECT_COUNT_BINS` and
     ``selection.inclusion_prob`` rounded to two significant digits.
 
-    Raises ``ConfigError("invalid", ...)`` for the release profile of a local run and for
+    An ``out_dir`` that is, or lies inside, the subjects directory of a local run is
+    refused before anything is read or written: a source is only read.
+
+    Raises ``ConfigError("invalid", ...)`` for the release profile of a local run, for such
+    an ``out_dir`` and for
     what :func:`subjects_frame` raises it for, ``ConfigError("missing", ...)`` for a
     directory without a run, ``ValueError`` for a format or profile there is none of, and
     ``OSError`` for a place that cannot be written.
@@ -1177,6 +1293,8 @@ def export_run(
     if profile not in EXPORT_DIRS:
         raise ValueError(f"the export profiles are analysis and release, not {profile!r}")
     run_dir = Path(run_dir)
+    if out_dir is not None:
+        _refuse_in_sources(run_dir, Path(out_dir))
     with _sources(run_dir) as src:
         if profile == "release" and src.local:
             raise ConfigError(

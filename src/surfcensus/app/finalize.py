@@ -26,12 +26,19 @@ What the functions agree on:
   that was rated and whose render fails afterwards keeps what its ratings give.
 - A table is rewritten row by row: a row that is already as it should be is left as it is,
   so a second call changes nothing and a final mark keeps its id.
+- The value of an ``unratable`` label is a position in a list of reasons that the database
+  keeps with the labels (``app_meta``, ``surfcensus.app.LABEL_REASONS_KEY``), not in
+  whatever ``protocol.yaml`` holds when the label is read. Each of the three writers first
+  brings that list and the labels up to the protocol it was given
+  (:func:`_rebase_reasons`), so a label keeps its reason when the list of the protocol is
+  put in another order or loses a reason. Whoever reads a label names it through
+  :func:`stored_reasons`, and code that writes one outside this module has to do the same.
 """
 
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,9 +47,18 @@ from pydantic import ValidationError
 from sqlalchemy import func
 from sqlmodel import Session, col, select
 
-from surfcensus.app import APP_DB_FILE
+from surfcensus.app import APP_DB_FILE, LABEL_REASONS_KEY, label_reasons
 from surfcensus.app.db import app_db_mode, open_app_db
-from surfcensus.app.models import Assignment, FinalLabel, FinalMark, Mark, Rater, Rating, Submission
+from surfcensus.app.models import (
+    AppMeta,
+    Assignment,
+    FinalLabel,
+    FinalMark,
+    Mark,
+    Rater,
+    Rating,
+    Submission,
+)
 from surfcensus.app.queue import QueuePlan
 from surfcensus.app.schemas import UNRATABLE_CRITERION
 from surfcensus.calibration import (
@@ -62,14 +78,11 @@ from surfcensus.protocol import (
     load_protocol,
     render_reason,
 )
-from surfcensus.store import PublicCatalog
+from surfcensus.store import CALIBRATION_REASON, PublicCatalog
 
 SINGLE = "single"
 CONSENSUS = "consensus"
 ADJUDICATED = "adjudicated"
-
-CALIBRATION_REASON = "calibration"
-"""The ``selection.reason``, and the stratum, of the subjects of a calibration set."""
 
 MAX_STEP = 1
 """Raters who differ by at most this many scale steps on every criterion agree: the label
@@ -232,6 +245,63 @@ def _from_render(labels: Sequence[FinalLabel]) -> bool:
     )
 
 
+# --- what an unratable label means --------------------------------------------------------------
+
+
+def stored_reasons(session: Session, protocol: Protocol) -> tuple[str, ...]:
+    """The reasons that the values of the ``unratable`` final labels are positions in: the
+    list the database keeps, or that of ``protocol`` for a database that keeps none yet.
+    ``ConfigError("invalid", ...)`` for a row that holds no such list."""
+    row = session.get(AppMeta, LABEL_REASONS_KEY)
+    if row is None:
+        return protocol.unratable_reasons
+    try:
+        return label_reasons(row.value)
+    except ValueError as exc:
+        raise ConfigError("invalid", f"{APP_DB_FILE}: {exc}") from exc
+
+
+def _rebase_reasons(session: Session, protocol: Protocol) -> None:
+    """Make the kept list of reasons that of ``protocol``, and move every ``unratable``
+    label to the position its reason has there. Not committed.
+
+    A reason that the protocol has lost and that a label still names is kept after the
+    reasons of the protocol, so the label goes on naming it; it leaves the list with its
+    last label, and takes its place in the protocol again when it is put back. The
+    positions that the writers take from ``protocol.unratable_index`` are positions in the
+    kept list either way. A label whose value is no position in the list it was written
+    with is left as it is.
+    """
+    wanted = protocol.unratable_reasons
+    row = session.get(AppMeta, LABEL_REASONS_KEY)
+    if row is None:
+        # labels that are there were written before any list was kept, with this protocol
+        session.add(AppMeta(key=LABEL_REASONS_KEY, value=json.dumps(list(wanted))))
+        session.flush()
+        return
+    stored = stored_reasons(session, protocol)
+    if stored == wanted:
+        return
+    named = [
+        (label, stored[label.value])
+        for label in session.exec(
+            select(FinalLabel).where(FinalLabel.criterion == UNRATABLE_CRITERION)
+        ).all()
+        if label.value is not None and 0 <= label.value < len(stored)
+    ]
+    in_use = {reason for _, reason in named}
+    kept = wanted + tuple(reason for reason in stored if reason in in_use and reason not in wanted)
+    for label, reason in named:
+        position = kept.index(reason)
+        if label.value != position:
+            label.value = position
+            session.add(label)
+    if kept != stored:
+        row.value = json.dumps(list(kept))
+        session.add(row)
+    session.flush()
+
+
 # --- writing ------------------------------------------------------------------------------------
 
 
@@ -305,14 +375,35 @@ def _reason_index(protocol: Protocol, reason: str, subject_uid: str) -> int:
 def _of_one(
     rated: _Rated, method: str, protocol: Protocol, subject_uid: str
 ) -> tuple[dict[str, tuple[int | None, str]], tuple[_MarkRow, ...]]:
-    """The labels and marks that one rating gives: its values and its marks as they are."""
+    """The labels and marks that one rating gives: its values, and its marks without those
+    of a criterion that it rates the lowest value of the scale (:func:`_marks_of_errors`,
+    the rule of :func:`_consensus`), so that one input gives the same final marks either way.
+    """
     if rated.unratable is not None:
         index = _reason_index(protocol, rated.unratable, subject_uid)
         return {UNRATABLE_CRITERION: (index, method)}, ()
     labels: dict[str, tuple[int | None, str]] = {
         criterion: (rated.values[criterion], method) for criterion in sorted(rated.values)
     }
-    return labels, tuple(row for _, row in rated.marks)
+    return labels, _marks_of_errors(labels, rated.marks, protocol)
+
+
+def _marks_of_errors(
+    labels: _Labels, marks: Iterable[tuple[int, _MarkRow]], protocol: Protocol
+) -> tuple[_MarkRow, ...]:
+    """The final marks that ``labels`` leave of ``(mark_id, row)`` marks, by ``mark_id``.
+
+    A mark of a criterion whose label is the lowest value of the scale is left out: the
+    label says that there is no such error, and a final mark says where one is. A rater
+    gets there by rating a criterion minor, marking it and then rating it none; the page
+    and the server take that. Marks of class X belong to no criterion and stay, as do the
+    marks of a criterion that has no label.
+    """
+    none = min(protocol.values())
+    no_error = {criterion for criterion, (value, _) in labels.items() if value == none}
+    return tuple(
+        row for _, row in sorted(marks) if row[0] == OTHER_MARK_CLASS or row[0] not in no_error
+    )
 
 
 def _consensus(
@@ -323,8 +414,7 @@ def _consensus(
     Unratable: every rater must say so, for the same reason. Values: the raters rated the
     same criteria and are within :data:`MAX_STEP` on each; the label is the lowest value.
     Marks: those of every rater, by ``mark_id``, without the marks of a criterion whose
-    label is the lowest value of the scale: the label says that there is no such error,
-    and a final mark says where one is. Marks of class X belong to no criterion and stay.
+    label is the lowest value of the scale (:func:`_marks_of_errors`).
     """
     reasons = {rated.unratable for rated in ratings}
     if reasons != {None}:
@@ -342,15 +432,8 @@ def _consensus(
         if max(given) - min(given) > MAX_STEP:
             return None
         labels[criterion] = (min(given), CONSENSUS)
-    none = min(protocol.values())
-    no_error = {criterion for criterion, (value, _) in labels.items() if value == none}
-    marks = sorted(
-        (mark_id, row)
-        for rated in ratings
-        for mark_id, row in rated.marks
-        if row[0] == OTHER_MARK_CLASS or row[0] not in no_error
-    )
-    return labels, tuple(row for _, row in marks)
+    marks = [mark for rated in ratings for mark in rated.marks]
+    return labels, _marks_of_errors(labels, marks, protocol)
 
 
 # --- the three writers --------------------------------------------------------------------------
@@ -370,6 +453,7 @@ def sync_unratable(session: Session, plan: QueuePlan, protocol: Protocol) -> int
     label of a subject whose render is neither failed nor ready (pending, or made with
     another configuration) stays until the render is one or the other.
     """
+    _rebase_reasons(session, protocol)
     rated = _rated_subjects(session)
     labels, marks = _final_rows(session)
     carrying = 0
@@ -436,6 +520,8 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     With one rater in the database: replace the subject's ``final_labels`` (method
     ``single``: one row per criterion, or the ``unratable`` row) and ``final_marks`` by the
     current submission of the rater's latest completed ``main`` assignment of the subject.
+    A mark of a criterion that the submission rates none is no final mark, as in a
+    consensus (:func:`_marks_of_errors`); it stays in ``marks``.
     With more than one: delete every row of method ``single`` that comes from a rating,
     and the final marks of those subjects, and write nothing. Calibration and repeat
     assignments write nothing. Not committed.
@@ -454,6 +540,7 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     rows are then left as they are, with a warning: the submission in whose transaction
     this runs is no worse for it, and :func:`finalize` names the rating.
     """
+    _rebase_reasons(session, protocol)
     n_raters = session.exec(select(func.count()).select_from(Rater)).one()
     if n_raters > 1:
         _drop_per_submission(session)
@@ -486,10 +573,11 @@ def finalize(session: Session, plan: QueuePlan, protocol: Protocol) -> FinalizeR
     ``consensus``; where a criterion differs by two steps or more, or one rater said
     unratable and another did not, no label, and the subject is in ``open``. Not committed.
 
-    Every rated subject is labelled, in the plan or not. The union leaves out the marks
-    of a criterion whose consensus value is the lowest of the scale (one rater saw a minor
-    error and marked it, the other saw none: the label is none, and the subject has no
-    final mark of that class); the raters' own marks stay in ``marks``. Raters who all say
+    Every rated subject is labelled, in the plan or not. The final marks leave out the marks
+    of a criterion whose label is the lowest value of the scale, from one rating as from
+    several (one rater saw a minor error and marked it, the other saw none, or one rater
+    marked an error and then rated the criterion none: the label is none, and the subject
+    has no final mark of that class); the raters' own marks stay in ``marks``. Raters who all say
     unratable agree when they give the same reason; with different reasons, and when they
     rated different criteria, the subject is open. An open subject loses the labels and
     final marks it had. A subject with a label of method ``adjudicated`` is not looked at
@@ -503,20 +591,14 @@ def finalize(session: Session, plan: QueuePlan, protocol: Protocol) -> FinalizeR
     labels, marks = _final_rows(session)
     n_consensus = n_single = 0
     needs_adjudication: list[str] = []
-    wanted: dict[str, tuple[dict[str, tuple[int | None, str]], tuple[_MarkRow, ...]]] = {}
+    wanted: dict[str, tuple[dict[str, tuple[int | None, str]], tuple[_MarkRow, ...]] | None] = {}
     for subject_uid in sorted(set(ratings) | set(labels) | set(marks)):
         have_labels = labels.get(subject_uid, [])
         if _adjudicated(have_labels):
             continue
         rated = ratings.get(subject_uid, [])
         if not rated:
-            # what a failed render gave is sync_unratable's; nothing else explains a row
-            kept = {
-                label.criterion: (label.value, label.method)
-                for label in have_labels
-                if label.criterion == UNRATABLE_CRITERION and label.method == SINGLE
-            }
-            wanted[subject_uid] = (kept, ())
+            wanted[subject_uid] = None
         elif len(rated) == 1:
             wanted[subject_uid] = _of_one(rated[0], SINGLE, protocol, subject_uid)
             n_single += 1
@@ -529,14 +611,20 @@ def finalize(session: Session, plan: QueuePlan, protocol: Protocol) -> FinalizeR
             wanted[subject_uid] = _NOTHING if agreed is None else agreed
     # every label is known before a row is written: a rating that cannot be labelled
     # raises above, with the tables as they were
-    for subject_uid, (wanted_labels, wanted_marks) in wanted.items():
+    _rebase_reasons(session, protocol)
+    for subject_uid, given in wanted.items():
+        have_labels = labels.get(subject_uid, [])
+        if given is None:
+            # what a failed render gave is sync_unratable's; nothing else explains a row.
+            # Read after the rebase, which moves the values of the rows that are loaded
+            kept = {
+                label.criterion: (label.value, label.method)
+                for label in have_labels
+                if label.criterion == UNRATABLE_CRITERION and label.method == SINGLE
+            }
+            given = (kept, ())
         _set_final(
-            session,
-            subject_uid,
-            wanted_labels,
-            wanted_marks,
-            labels.get(subject_uid, []),
-            marks.get(subject_uid, []),
+            session, subject_uid, given[0], given[1], have_labels, marks.get(subject_uid, [])
         )
     session.flush()
     n_unratable = sync_unratable(session, plan, protocol)
@@ -547,8 +635,14 @@ def finalize(session: Session, plan: QueuePlan, protocol: Protocol) -> FinalizeR
 
 
 def _calibration_subject(
-    subject_uid: str, labels: Sequence[FinalLabel], marks: Sequence[FinalMark], protocol: Protocol
+    subject_uid: str,
+    labels: Sequence[FinalLabel],
+    marks: Sequence[FinalMark],
+    reasons: Sequence[str],
+    where: str,
 ) -> CalibrationSubject:
+    """``reasons`` is the list that the labels were written with (:func:`stored_reasons`),
+    and ``where`` what holds it, for the message."""
     values = {
         label.criterion: label.value
         for label in labels
@@ -558,12 +652,11 @@ def _calibration_subject(
     for label in labels:
         if label.criterion != UNRATABLE_CRITERION:
             continue
-        reasons = protocol.unratable_reasons
         if label.value is None or not 0 <= label.value < len(reasons):
             raise ConfigError(
                 "invalid",
                 f"the final label of {subject_uid} names unratable reason {label.value!r}, "
-                f"and {PROTOCOL_FILE} has the reasons 0 to {len(reasons) - 1}",
+                f"and {where} has the reasons 0 to {len(reasons) - 1}",
             )
         unratable = reasons[label.value]
     try:
@@ -657,9 +750,16 @@ def freeze_calibration(
             with Session(engine) as session:
                 labels, marks = _final_rows(session)
                 chosen = _choose(subjects, labels, _rated_subjects(session))
+                reasons = stored_reasons(session, protocol)
+                kept = session.get(AppMeta, LABEL_REASONS_KEY) is not None
+                where = f"the list that {APP_DB_FILE} keeps" if kept else PROTOCOL_FILE
                 members = tuple(
                     _calibration_subject(
-                        subject_uid, labels[subject_uid], marks.get(subject_uid, []), protocol
+                        subject_uid,
+                        labels[subject_uid],
+                        marks.get(subject_uid, []),
+                        reasons,
+                        where,
                     )
                     for subject_uid in chosen
                 )

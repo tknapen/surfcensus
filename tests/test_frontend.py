@@ -795,6 +795,40 @@ def geometry_case(name: str) -> tuple[dict[str, PanelInfo], dict[str, Any], np.n
 
 @needs_node
 @pytest.mark.parametrize("case", sorted(GEOMETRIES))
+def test_a_coordinate_half_way_between_two_slices_goes_to_the_first(
+    js_copy: Path, case: str
+) -> None:
+    """``nearestSlice`` gives the first of two tiles that are equally near, as numpy's
+    ``argmin`` does in ``geometry.nearest_slice``. The review screen places a mark and a
+    centroid on a tile with it, so a tie that went to the other tile would show them on
+    another slice than the renderer names."""
+    panels, render, _ = geometry_case(case)
+    wanted = []
+    for name in PANEL_ORDER:
+        slices = panels[name].slices
+        assert len(slices) >= 3
+        for position in (0, len(slices) // 2, len(slices) - 2):
+            wanted.append((name, position, (slices[position] + slices[position + 1]) / 2))
+    out = run_js(
+        js_copy,
+        """
+        import { nearestSlice } from "./js/coords.js";
+        output(
+          input.wanted.map(([name, _first, at]) => nearestSlice(input.render.panels[name], at)),
+        );
+        """,
+        {"render": render, "wanted": wanted},
+    )
+    for (name, position, at), got in zip(wanted, out, strict=True):
+        slices = np.array(panels[name].slices, dtype=float)
+        # a tie in exact arithmetic: both distances are the same float
+        assert abs(slices[position] - at) == abs(slices[position + 1] - at)
+        assert got == position == int(np.argmin(np.abs(slices - at)))
+        assert got == geometry.nearest_slice(panels[name], at)
+
+
+@needs_node
+@pytest.mark.parametrize("case", sorted(GEOMETRIES))
 def test_coords_js_is_the_arithmetic_of_render_geometry(js_copy: Path, case: str) -> None:
     panels, render, vox2ras_tkr = geometry_case(case)
     rng = np.random.default_rng(7)
@@ -966,6 +1000,37 @@ def test_a_click_is_taken_at_the_middle_of_its_screen_pixel(js_copy: Path) -> No
     )
     assert out["at"] == [0.5, 100.5, 453.5, 100.25, 0.5, -2.5]
     assert out["px"] == pytest.approx([100.5 * 320 / 454, 29.75 * 320 / 454])
+
+
+@needs_node
+def test_a_click_beyond_the_shown_tile_is_clamped_to_the_tile(js_copy: Path) -> None:
+    """The offset of a click on the last screen pixel can exceed the shown size: the middle
+    of a whole screen pixel less a box edge with a fraction. The server refuses a mark
+    outside ``0 <= px <= width`` and ``0 <= py <= height``, so ``clickToPixel`` keeps it on
+    the tile, along each axis on its own."""
+    out = run_js(
+        js_copy,
+        """
+        import { pointerAt } from "./js/viewer.js";
+        import { clickToPixel } from "./js/coords.js";
+        const panel = { width: 320, height: 300 };
+        output({
+          edge: pointerAt(464) - 10.25,
+          px: [
+            clickToPixel(panel, pointerAt(464) - 10.25, pointerAt(435) - 10.25, 454, 425),
+            clickToPixel(panel, -0.3, -2, 454, 425),
+            clickToPixel(panel, 500, -1, 454, 425),
+            clickToPixel(panel, -1, 500, 454, 425),
+            clickToPixel(panel, 454, 425, 454, 425),
+            clickToPixel(panel, 0, 0, 454, 425),
+          ],
+        });
+        """,
+        {},
+    )
+    # the last screen pixel of a box that starts at 10.25: an offset of 454.25 in 454
+    assert out["edge"] == 454.25
+    assert out["px"] == [[320, 300], [0, 0], [320, 0], [0, 300], [320, 300], [0, 0]]
 
 
 @needs_node
@@ -1278,6 +1343,17 @@ def test_enter_is_held_back_by_the_rules_of_a_submission(
     assert out["empty"] == {"values": {}, "unratable": None, "other": False, "note": ""}
     assert out["positive"] == [value in shipped_protocol.positive_values() for value in (0, 1, 2)]
     assert out["previous"] == {"values": {"A": 1}, "unratable": None, "other": True, "note": "x"}
+
+
+def test_the_doc_of_the_app_does_not_call_the_submit_button_disabled() -> None:
+    # docs/rater_app.md said in one place that `Enter` stays disabled while a mark is
+    # missing, and in another that the button is never disabled and a refused `Enter` is
+    # answered in a box under it, which is what the page does (the tests around this one)
+    doc = Path(__file__).parent.parent / "docs" / "rater_app.md"
+    text = " ".join(doc.read_text(encoding="utf-8").split())
+    assert "stays disabled" not in text
+    assert "The submit button is not disabled while a rating is incomplete" in text
+    assert "`Enter` is refused, and the box under the submit button names" in text
 
 
 LACKING_CASES: list[tuple[dict[str, Any], dict[str, int], bool, dict[str, str]]] = [

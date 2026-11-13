@@ -26,7 +26,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -41,7 +41,7 @@ from sqlalchemy.exc import OperationalError
 from sqlmodel import Session, select
 
 import surfcensus
-from surfcensus.app import schemas, server
+from surfcensus.app import LABEL_REASONS_KEY, schemas, server
 from surfcensus.app.db import get_or_create_rater, open_app_db
 from surfcensus.app.events import CONFIG_CHANGE, record_run_event, record_setting, store_events
 from surfcensus.app.models import Assignment, Event
@@ -533,6 +533,39 @@ def test_a_render_that_fails_while_the_server_runs_gets_its_label_and_is_not_wai
     assert fields(client.get(f"/media/{order[1]}/poster.webp"), 404) == ["path"]
 
 
+def test_a_run_of_the_phase_commands_is_served_without_a_selection(app_run: Path) -> None:
+    # `inventory`, `metrics` and `render` write no selection; only `review` does. The
+    # selection of a local run is then every present subject, as `render` reads it
+    order = queue(app_run)
+    in_catalog(app_run, "DELETE FROM selection")
+    in_catalog(
+        app_run,
+        "UPDATE renders SET status = 'failed', reason = 'missing surface', render_key = NULL "
+        "WHERE subject_uid = ?",
+        order[1],
+    )
+    with serving(app_run) as client:
+        body = get_next(client)
+        assert body["status"] == "assignment"
+        assert body["assignment"]["subject_uid"] == order[0]
+        expected = {"remaining": 2, "rendered": 2, "n_subjects": 2}
+        assert body["progress"] | expected == body["progress"]
+        # the subject whose render failed has its label, as in a run that `review` made
+        assert rows(app_run, "SELECT * FROM final_labels") == [(order[1], "unratable", 2, "single")]
+        assert rate_all(client) == 2
+        assert n_rows(app_run, "final_labels") == 7
+    # a frozen calibration set on such a run does not become its queue
+    in_catalog(
+        app_run,
+        "INSERT INTO selection (subject_uid, reason, stratum, inclusion_prob, seed) "
+        "VALUES (?, 'calibration', 'calibration', 1.0, 0)",
+        order[2],
+    )
+    with serving(app_run, rater="Grace") as grace:
+        progress = get_next(grace)["progress"]
+        assert progress | expected == progress
+
+
 def test_a_render_the_run_directory_has_lost_is_no_assignment(
     client: TestClient, app_run: Path
 ) -> None:
@@ -851,6 +884,73 @@ def test_a_rating_that_arrives_twice_is_one_submission(client: TestClient, app_r
     assert three["saved"]["revision"] == 2 and three["saved"]["marks"][0]["mark_id"] == 2
 
 
+RATED: dict[str, Any] = {"values": {"A": 1, "B": 0, "C": 0}, "note": "n"}
+UNRATABLE: dict[str, Any] = {"unratable": "image too poor to judge", "note": "n"}
+
+
+@pytest.mark.parametrize(
+    ("base", "marked", "change"),
+    [
+        (RATED, True, {"other": True}),
+        (RATED, True, {"note": "changed"}),
+        (RATED, True, {"values": {"A": 1, "B": 1, "C": 0}}),
+        (RATED, True, {"unratable": "image too poor to judge"}),
+        (UNRATABLE, False, {"unratable": "wrong orientation"}),
+        (RATED, True, {"marks": []}),
+        (RATED, True, {"marks": "class"}),
+        (RATED, True, {"marks": "panel"}),
+        (RATED, True, {"marks": "slice"}),
+        (RATED, True, {"marks": "px"}),
+        (RATED, True, {"marks": "py"}),
+    ],
+    ids=[
+        "other",
+        "note",
+        "values",
+        "unratable",
+        "reason",
+        "no_marks",
+        "mark_class",
+        "mark_panel",
+        "mark_slice",
+        "mark_px",
+        "mark_py",
+    ],
+)
+def test_a_resent_time_with_another_body_is_a_revision(
+    client: TestClient, app_run: Path, base: dict[str, Any], marked: bool, change: dict[str, Any]
+) -> None:
+    """One press of ``Enter`` is known by its client time and its body. A body that differs
+    in one field under the same time is another press, so a new revision, and is not
+    answered as the submission that is stored."""
+    first = shown(client)
+    posted, _expected = mark_on_surface(app_run, first["subject_uid"])
+    sent = rating(first, marks=[posted] if marked else [], **base)
+    one = shaped(client.post("/api/rating", json=sent), schemas.RatingOut)
+    assert one["saved"]["revision"] == 1
+    if isinstance(part := change.get("marks"), str):
+        panels = first["render"]["panels"]
+        other_panel = next(
+            name
+            for name in PANEL_ORDER
+            if name != posted["panel"] and posted["slice"] < len(panels[name]["slices"])
+        )
+        moved = {
+            "class": "X",
+            "panel": other_panel,
+            "slice": posted["slice"] + (1 if posted["slice"] == 0 else -1),
+            "px": posted["px"] + 0.25,
+            "py": posted["py"] + 0.25,
+        }
+        change = {"marks": [posted | {part: moved[part]}]}
+    two = shaped(client.post("/api/rating", json=sent | change), schemas.RatingOut)
+    assert two["saved"]["revision"] == 2
+    assert rows(app_run, "SELECT revision, current FROM submissions ORDER BY revision") == [
+        (1, 0),
+        (2, 1),
+    ]
+
+
 # --- back, and a revision -----------------------------------------------------------------------
 
 
@@ -1138,6 +1238,16 @@ def test_a_batch_the_shapes_refuse_stores_nothing(client: TestClient, app_run: P
     assert fields(post([good, good, large]), 422) == ["events.2.payload"]
     assert fields(post([good], 999), 404) == ["assignment_id"]
     assert fields(client.post("/api/events", json={"events": [good]}), 422) == ["assignment_id"]
+    # numbers that JSON has not: stored, the payload would be no JSON
+    for number in ("NaN", "1e400", "-Infinity"):
+        body = (
+            f'{{"assignment_id": {first["assignment_id"]}, "events": [{json.dumps(good)}, '
+            f'{{"ts": "t", "type": "frames", "payload": {{"visits": [[0, {number}]]}}}}]}}'
+        )
+        sent = client.post(
+            "/api/events", content=body, headers={"Content-Type": "application/json"}
+        )
+        assert fields(sent, 422) == ["events.1.payload"], number
     assert n_rows(app_run, "events") == before
     assert post([good] * 500).json() == {"stored": 500}
 
@@ -1216,6 +1326,23 @@ def test_the_server_records_the_settings_a_rating_is_made_under(app_run: Path) -
     with serving(app_run):
         pass
     assert settings()[3:] == [("blind", False, True)]
+
+
+def test_the_export_says_under_which_queue_each_rating_was_made(app_run: Path) -> None:
+    """The record the server makes at its start is what `ratings.blind` of the export reads."""
+    with serving(app_run) as scored:
+        first = shown(scored)
+        rate(scored, first)
+    set_app(app_run, blind=True)
+    with serving(app_run) as shuffled:
+        second = shown(shuffled)
+        rate(shuffled, second)
+    frame = ratings_frame(app_run).set_index("assignment_id")
+    assert frame["blind"].to_dict() == {
+        first["assignment_id"]: False,
+        second["assignment_id"]: True,
+    }
+    assert frame["seq"].to_dict() == {first["assignment_id"]: 1, second["assignment_id"]: 2}
 
 
 # --- files --------------------------------------------------------------------------------------
@@ -1770,6 +1897,42 @@ def test_with_two_raters_each_sees_the_review_only_after_their_own_ratings(app_r
         assert get_next(ada)["status"] == "done" and ada.get("/api/stats").status_code == 200
 
 
+def test_an_app_opened_without_a_name_beside_other_raters_says_that_it_made_a_rater(
+    app_run: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    def warned(**options: Any) -> list[str]:
+        caplog.clear()
+        with caplog.at_level("WARNING", logger="surfcensus"), serving(app_run, **options):
+            pass
+        return [record.getMessage() for record in caplog.records if "rater" in record.msg]
+
+    # the first rater of a run, named or not, and a second one who is named: nothing to say
+    assert warned(rater="Grace") == []
+    assert warned(rater="Ada") == []
+    # opened without a name, the app rates as `local`: a third rater, who has every subject
+    # left, so the review is closed to them and `finalize` lists them from now on
+    (message,) = warned()
+    assert message == (
+        "no rater was named, so the app rates as a new rater, local, beside Ada, Grace: "
+        "stop it and name the rater (--rater NAME) to go on as one of them"
+    )
+    assert [name for (name,) in rows(app_run, "SELECT name FROM raters ORDER BY name")] == [
+        "Ada",
+        "Grace",
+        "local",
+    ]
+    # the rater is there now: opening it again is no news
+    assert warned() == []
+
+
+def test_a_run_whose_first_rater_has_no_name_is_opened_without_a_warning(
+    app_run: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level("WARNING", logger="surfcensus"), serving(app_run):
+        pass
+    assert [record for record in caplog.records if "rater" in record.msg] == []
+
+
 # --- review, subject, statistics, export --------------------------------------------------------
 
 
@@ -1808,6 +1971,35 @@ def test_the_review_table_has_a_row_per_subject_in_the_order_of_the_queue(
     assert (first["final_method"], first["n_ratings"], first["n_marks"]) == ("single", 1, 0)
     assert body["rows"][1]["final_A"] is None and body["rows"][1]["n_ratings"] == 0
     assert isinstance(first["composite"], float) and first["primary"] is True
+
+
+@pytest.mark.parametrize("edit", ["reordered", "removed"])
+def test_an_unratable_label_keeps_its_reason_when_the_protocol_is_edited(
+    app_run: Path,
+    shipped_protocol: Protocol,
+    write_reasons: Callable[[Path, Sequence[str]], None],
+    edit: str,
+) -> None:
+    def reason_shown(client: TestClient, uid: str) -> object:
+        body = shaped(client.get("/api/review"), schemas.ReviewOut)
+        return next(row for row in body["rows"] if row["subject_uid"] == uid)["unratable_reason"]
+
+    reasons = list(shipped_protocol.unratable_reasons)
+    with serving(app_run) as client:
+        uid = shown(client)["subject_uid"]
+        rate(client, shown(client), values={}, unratable="image too poor to judge")
+        assert rows(app_run, "SELECT value FROM final_labels") == [(3,)]
+        # the file is edited while the server runs, and only the order of its list, or its
+        # length, changes: the label is read with the list it was written with
+        write_reasons(app_run, list(reversed(reasons)) if edit == "reordered" else reasons[:3])
+        assert reason_shown(client, uid) == "image too poor to judge"
+    # a server that starts with the edited protocol moves the label to where the reason is
+    # now; a reason that is gone stays behind the reasons of the protocol
+    with serving(app_run) as client:
+        assert reason_shown(client, uid) == "image too poor to judge"
+    assert rows(app_run, "SELECT value FROM final_labels") == [(0 if edit == "reordered" else 3,)]
+    (kept,) = rows(app_run, "SELECT value FROM app_meta WHERE key = ?", LABEL_REASONS_KEY)
+    assert json.loads(kept[0]) == (list(reversed(reasons)) if edit == "reordered" else reasons)
 
 
 def test_the_review_table_follows_the_ranks_not_the_uids(app_run: Path) -> None:
@@ -2550,6 +2742,34 @@ def test_serve_refuses_a_run_whose_renders_are_out_of_date(
         assert caught.value.reason == "invalid"
         assert caught.value.detail == f"{expected}; run surfcensus render --run-dir {app_run}"
     assert not (app_run / "app.sqlite").exists()
+
+
+def test_serve_says_when_there_is_nothing_to_rate(
+    app_run: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Started(Exception):
+        """In place of a server, which would wait for a signal."""
+
+    def started(*_args: object, **_kw: object) -> None:
+        raise Started
+
+    monkeypatch.setattr(server, "start_server", started)
+
+    def said() -> str:
+        with pytest.raises(Started):
+            serve(app_run, port=0, open_browser=False)
+        return capsys.readouterr().err
+
+    assert said() == ""
+    # a run of the phase commands: every present subject is in the queue, and nothing is said
+    in_catalog(app_run, "DELETE FROM selection")
+    assert said() == ""
+    # no subject at all: the app would only say that everything is rated
+    in_catalog(app_run, "UPDATE subjects SET present = 0")
+    assert said() == (
+        "There is nothing to rate: the run has no subject; "
+        f"run surfcensus inventory --run-dir {app_run}\n"
+    )
 
 
 def test_serve_listens_on_this_machine_only(app_run: Path, monkeypatch: pytest.MonkeyPatch) -> None:

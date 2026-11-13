@@ -231,8 +231,10 @@ def run_render(
 
     Which subjects: ``subjects`` (``subject_uid``s) in the order given; else every complete
     present subject when ``all_subjects``; else the subjects of the ``selection`` table;
-    else, when that table is empty, every complete present subject. ``all_subjects=None``
-    is ``select.render_scope == "all"`` in a census run and False in a local run.
+    else, while no selection is made (``PublicCatalog.selected_uids``: the table is empty,
+    or holds only the calibration rows of a local run), every complete present subject.
+    ``all_subjects=None`` is ``select.render_scope == "all"`` in a census run and False in
+    a local run.
     ``datasets`` (pseudonyms) restricts all of this. Without an order given, subjects go by
     pseudonym, then ``subject_uid``; the selected subjects of a local run that has scores
     and is not blind go in the order the rater app offers them. ``video=None`` is
@@ -522,9 +524,10 @@ def _units(
     elif all_subjects:
         candidates = list(present)
     else:
-        selected = set(public.selection()["subject_uid"])
-        if selected:
-            candidates = _queue_order(ctx, [uid for uid in present if uid in selected])
+        selected = public.selected_uids()
+        if selected is not None:
+            chosen = set(selected)
+            candidates = _queue_order(ctx, [uid for uid in present if uid in chosen])
         else:
             candidates = list(present)
     return [uid for uid in candidates if uid in complete], notes

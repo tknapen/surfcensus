@@ -30,6 +30,7 @@ pytest.importorskip("sqlmodel")
 
 from fastapi.testclient import TestClient
 
+from surfcensus import config as config_module
 from surfcensus import review as reviewing
 from surfcensus.app.server import create_app
 from surfcensus.config import (
@@ -430,20 +431,25 @@ def test_a_blind_review_renders_in_the_shuffled_order_of_its_queue(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(reviewing, "_render_rest", lambda *args, **kwargs: None)
-    seen = set()
-    for attempt in range(4):
+    # The seed of each new run is given here, not drawn. With four drawn seeds the first
+    # subject was the same one in all four runs once in 27. The uids follow the salt of the
+    # run, so what is fixed is the place of the first subject among the sorted uids:
+    # random.Random(seed).shuffle of three items puts item 0, 1, 2 and 0 first for the seeds
+    # 0, 1, 4 and 5, whatever the items are.
+    seed = [0]
+    monkeypatch.setattr(config_module, "_queue_seed", lambda: seed[0])
+    for attempt, (given, first) in enumerate(((0, 0), (1, 1), (4, 2), (5, 0))):
+        seed[0] = given
         run_dir = tmp_path / f"run{attempt}"
         run, app = open_review(small_run_cohort.root, run_dir=run_dir, jobs=1, port=0, blind=True)
         opened.append((run, app))
         assert app is not None
+        assert load_config(run_dir).app.queue_seed == given
         queue = queue_of(run_dir)
+        assert len(queue) == 3 and queue[0] == sorted(queue)[first]
         done = [uid for uid in queue if (run_dir / "media" / uid / "render.json").is_file()]
         assert done == queue[:1]
-        labels = {uid: label for label, uid in uids_by_label(run_dir).items()}
-        seen.add(labels[queue[0]])
         app.stop()
-    # four runs with four seeds: the first subject is not always the same one
-    assert len(seen) > 1
 
 
 def test_a_stopped_renderer_leaves_the_rest_pending_and_the_next_call_makes_it(

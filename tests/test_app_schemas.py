@@ -536,6 +536,20 @@ def test_the_values_of_a_rating_are_left_to_the_rules_of_the_server() -> None:
 # --- events ---------------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "payload", ['{"x": NaN}', '{"x": 1e400}', '{"x": -Infinity}', '{"visits": [[0, NaN]]}']
+)
+def test_a_payload_holds_only_numbers_that_json_has(payload: str) -> None:
+    # Python's JSON parser, which the server reads a body with, takes all four
+    body = f'{{"ts": "2026-11-12T14:03:12Z", "type": "pause", "payload": {payload}}}'
+    with pytest.raises(ValidationError, match="JSON has not"):
+        EventIn.model_validate(json.loads(body))
+    with pytest.raises(ValidationError):
+        EventIn.model_validate_json(body)
+    finite = EventIn.model_validate({"ts": "t", "type": "pause", "payload": {"f": 1.5e300}})
+    assert finite.payload == {"f": 1.5e300}
+
+
 def test_a_batch_of_events_has_its_limits() -> None:
     assert (MAX_EVENTS_PER_CALL, MAX_EVENT_PAYLOAD_BYTES) == (500, 16_000)
     event = {"ts": "2026-11-12T14:03:12Z", "type": "pause", "payload": {"frame": 5}}

@@ -389,6 +389,26 @@ class Run:
                 f"{subjects_dir}, which is only read; choose a run directory outside it",
             )
 
+    def refuse_output_in_sources(self, out: Path | str) -> None:
+        """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, the
+        subjects directory of a local source of the run, compared after links are
+        resolved: sources are only read. Where the source cannot be built now (the data
+        is not mounted), ``out`` is compared with its stored root."""
+        target = Path(out).resolve()
+        for stored in self._stored_locals():
+            try:
+                place = getattr(self._source(stored.index), "subjects_dir", None)
+            except SourceError:
+                place = None
+            if not isinstance(place, Path):
+                place = Path(stored.root)
+            if target.is_relative_to(place.resolve()):
+                raise ConfigError(
+                    "invalid",
+                    f"{out} lies inside the subjects directory {place}, which is only "
+                    "read; choose an output directory outside it",
+                )
+
     # sources
 
     def _source(self, index: int, *, root: str | None = None) -> Source:

@@ -52,6 +52,42 @@ function dropDraft(assignmentId) {
   }
 }
 
+// The time of a visit that leaving the page cut short, kept like a draft: a reload of the
+// page shows the subject again, and the visit goes on from this time. One per assignment,
+// taken back (and removed) when the subject is opened.
+const VISIT_KEY = "surfcensus.visit";
+const visitKey = (assignmentId) => `${VISIT_KEY}.${assignmentId}`;
+
+function keepVisit(assignmentId, ms) {
+  try {
+    sessionStorage.setItem(
+      visitKey(assignmentId),
+      JSON.stringify({ assignment_id: assignmentId, ms: Math.round(ms) }),
+    );
+  } catch {
+    // without storage the time before a reload is not counted; nothing else changes
+  }
+}
+
+function takeVisit(assignmentId) {
+  try {
+    const visit = JSON.parse(sessionStorage.getItem(visitKey(assignmentId)) ?? "null");
+    sessionStorage.removeItem(visitKey(assignmentId));
+    const kept = visit && visit.assignment_id === assignmentId ? visit.ms : 0;
+    return Number.isFinite(kept) && kept > 0 ? kept : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function dropVisit(assignmentId) {
+  try {
+    sessionStorage.removeItem(visitKey(assignmentId));
+  } catch {
+    // nothing to drop
+  }
+}
+
 function html(name, className = "", text = "") {
   const element = document.createElement(name);
   if (className) element.className = className;
@@ -186,7 +222,15 @@ class RatePage {
     );
     document.addEventListener("visibilitychange", () => this.watched());
     window.addEventListener("resize", () => this.pointRefusal());
-    window.addEventListener("pagehide", () => this.events.leave());
+    window.addEventListener("pagehide", () => {
+      this.keepVisit();
+      this.events.leave();
+    });
+    // a page that comes back as it was left (the browser's back and forward) still has its
+    // clock: the kept time would count twice
+    window.addEventListener("pageshow", (event) => {
+      if (event.persisted && this.assignment) dropVisit(this.assignment.assignment_id);
+    });
   }
 
   // --- state of the page ----------------------------------------------------------------
@@ -254,6 +298,15 @@ class RatePage {
   msOnSubject() {
     const running = this.visibleSince === null ? 0 : performance.now() - this.visibleSince;
     return this.visibleMs + running;
+  }
+
+  // The page is being left. A subject without a rating is shown again after a reload, and
+  // the time of this visit is in no request yet: keep it for the page that comes. Not while
+  // a rating or a skip is on its way, which carries the time, and not for a subject shown
+  // for revision, which a reload does not bring back.
+  keepVisit() {
+    if (!this.assignment || this.assignment.previous || this.busy) return;
+    keepVisit(this.assignment.assignment_id, this.msOnSubject());
   }
 
   // --- the queue ------------------------------------------------------------------------
@@ -328,8 +381,9 @@ class RatePage {
     this.noteBox.hidden = !this.rating.note;
     this.picker.close();
     this.events.begin(assignment.assignment_id);
-    // of this visit: an earlier visit that ended with a skip was sent with the skip
-    this.visibleMs = 0;
+    // of this visit: an earlier visit that ended with a skip was sent with the skip, and
+    // one that a reload of the page cut short goes on here
+    this.visibleMs = assignment.previous ? 0 : takeVisit(assignment.assignment_id);
     this.visibleSince = this.watching() ? performance.now() : null;
     this.setState("rating");
     const started = performance.now();
@@ -682,6 +736,7 @@ class RatePage {
       this.busy = false;
       this.notice = "";
       dropDraft(assignment.assignment_id);
+      dropVisit(assignment.assignment_id);
       await this.take(stored.next);
     } catch (failure) {
       this.busy = false;
@@ -747,6 +802,8 @@ class RatePage {
       return;
     }
     this.busy = false;
+    // the skip carried the time of the visit
+    dropVisit(assignment.assignment_id);
     try {
       await this.take(next);
     } catch (failure) {

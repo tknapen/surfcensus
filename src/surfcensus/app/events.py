@@ -23,8 +23,10 @@ CONFIG_CHANGE = "config_change"
 
 
 def payload_json(payload: Mapping[str, object]) -> str:
-    """A payload as the ``events`` table holds it: compact JSON with sorted keys."""
-    return json.dumps(payload, separators=(",", ":"), sort_keys=True)
+    """A payload as the ``events`` table holds it: compact JSON with sorted keys.
+    ``ValueError`` for a NaN or an infinity, which JSON has no text for; ``EventIn`` lets
+    none through."""
+    return json.dumps(payload, separators=(",", ":"), sort_keys=True, allow_nan=False)
 
 
 def store_events(session: Session, assignment: Assignment, events: Sequence[EventIn]) -> int:

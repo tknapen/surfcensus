@@ -801,6 +801,33 @@ def test_a_local_run_renders_its_selection_unless_all_are_asked_for(
     assert bench.leased == [one] and (everything.done, everything.skipped) == (1, 2)
 
 
+def test_a_frozen_calibration_set_alone_is_no_selection_of_a_local_run(
+    new_bench: Callable[..., Bench],
+) -> None:
+    # `calibration freeze` on a run that `review` never selected in: the renders, like the
+    # rating queue, stay those of every present subject
+    bench = new_bench(["sub-01", "sub-02", "sub-03"], incomplete=["sub-03"])
+    one, two, three = (bench.uid(f"sub-0{n}") for n in (1, 2, 3))
+    select(bench, [two], reason="calibration")
+    assert bench.catalog.public().selected_uids() is None
+
+    report = run_render(bench.ctx())
+    assert bench.leased == sorted([one, two]) and report.done == 2
+    assert failed(report) == {three: "missing surface"}
+
+
+def test_a_census_run_renders_its_calibration_set_when_nothing_else_is_selected(
+    new_bench: Callable[..., Bench],
+) -> None:
+    bench = new_bench(["sub-01", "sub-02", "sub-03"], census=True)
+    two = bench.uid("sub-02")
+    select(bench, [two], reason="calibration")
+    assert bench.catalog.public().selected_uids() == [two]
+
+    selected = bench.ctx(select=SelectConfig(render_scope="selected"))
+    assert run_render(selected).done == 1 and bench.leased == [two]
+
+
 def test_a_census_run_renders_every_complete_subject_unless_its_scope_is_the_selection(
     new_bench: Callable[..., Bench],
 ) -> None:

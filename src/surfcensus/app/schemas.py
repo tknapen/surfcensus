@@ -456,7 +456,13 @@ class EventIn(_Shape):
     @field_validator("payload")
     @classmethod
     def _small(cls, payload: dict[str, Any]) -> dict[str, Any]:
-        size = len(json.dumps(payload, separators=(",", ":")).encode())
+        try:
+            text = json.dumps(payload, separators=(",", ":"), allow_nan=False)
+        except ValueError:
+            # Python's parser takes NaN and Infinity, and a number such as 1e400 becomes
+            # infinity; written out again, none of them is JSON
+            raise ValueError("a payload holds a number that JSON has not (NaN, infinity)") from None
+        size = len(text.encode())
         if size > MAX_EVENT_PAYLOAD_BYTES:
             raise ValueError(
                 f"a payload of {size} bytes; at most {MAX_EVENT_PAYLOAD_BYTES} are stored"

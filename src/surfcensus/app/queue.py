@@ -102,7 +102,10 @@ def build_plan(
 ) -> QueuePlan:
     """The plan of the present state of the run.
 
-    The selected subjects are the rows of ``selection``. ``scores`` are the primary rows of
+    The selected subjects are the rows of ``selection``. While no selection is made
+    (``PublicCatalog.selected_uids``), they are every present subject of a local run, as
+    for ``render``, so a run of ``inventory``, ``metrics`` and ``render`` has a queue
+    without ``review``; a census run then has none. ``scores`` are the primary rows of
     ``scores.parquet`` (``store.primary_scores``), or None when the run has none; the local
     order is ``store.queue_order(selected, scores, blind=app.blind, seed=app.queue_seed)``,
     so the queue and the renderer of a local run go through the subjects alike. A render
@@ -117,7 +120,10 @@ def build_plan(
     """
     if mode not in ("local", "team"):
         raise ValueError(f"mode is local or team, not {mode!r}")
-    selected = sorted({str(uid) for uid in public.selection()["subject_uid"]})
+    selected = public.selected_uids()
+    if selected is None:
+        # as `render` reads it: nobody has to run `review` to get a queue
+        selected = sorted(public.subject_uids()) if public.mode() == "local" else []
     renders = public.renders()
     rows = {
         str(uid): (status, config_hash, render_key, reason)

@@ -505,10 +505,21 @@ class _App:
             name = app.rater_name if rater is None else rater
             plan = self.plan()
             with Session(self.engine) as session:
+                earlier = sorted(session.exec(select(Rater.name)).all())
                 try:
                     made = get_or_create_rater(session, name, role="lead")
                 except ValueError as exc:
                     raise ConfigError("invalid", str(exc)) from exc
+                if rater is None and earlier and name not in earlier:
+                    # opening the app is the first use of the default rater: say that it
+                    # made one, since a rater more closes the unblinded screens to whoever
+                    # has subjects left and is listed by `finalize` from then on
+                    get_logger().warning(
+                        "no rater was named, so the app rates as a new rater, %s, beside %s: "
+                        "stop it and name the rater (--rater NAME) to go on as one of them",
+                        name,
+                        ", ".join(earlier),
+                    )
                 assert made.rater_id is not None
                 self.rater_id = made.rater_id
                 self.rater_name = made.name
@@ -1726,10 +1737,12 @@ def serve(
     """:func:`start_server`, print the URL, open the browser, wait for Ctrl-C or SIGTERM in
     the main thread, stop. Refuses to start (``ConfigError("invalid", ...)``) when renders
     of the selection are out of date: ``N renders are out of date; run surfcensus render
-    --run-dir DIR``."""
+    --run-dir DIR``. Says on stderr when selected subjects are not rendered yet, and when
+    the queue is empty because the run has no subject to rate."""
     run_dir = Path(run_dir)
     config = load_config(run_dir)
     with PublicCatalog.open(run_dir) as public:
+        census = public.mode() == "census"
         plan = build_plan(
             public,
             queue_scores(run_dir),
@@ -1743,6 +1756,14 @@ def serve(
             "invalid",
             f"{plan.outdated} {renders} out of date; run surfcensus render --run-dir {run_dir}",
         )
+    if not plan.order:
+        # the app would say that everything is rated
+        why = (
+            "no subject of the run is selected"
+            if census
+            else f"the run has no subject; run surfcensus inventory --run-dir {run_dir}"
+        )
+        print(f"There is nothing to rate: {why}", file=sys.stderr, flush=True)
     if plan.pending > 0:
         # nothing renders behind this server: the queue would wait for them for good
         subjects = "subject is" if plan.pending == 1 else "subjects are"

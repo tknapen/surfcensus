@@ -1426,6 +1426,52 @@ def test_what_is_entered_survives_a_reload_of_the_page(rater: Rater, state: Mock
     assert rater.pressed() == {} and rater.counts()["A"] == 0
 
 
+def test_the_time_before_a_reload_counts_on_the_subject(rater: Rater, state: MockState) -> None:
+    """A reload shows the subject again: the visit goes on, and its time is one time."""
+    rater.open().paused()
+    rater.page.wait_for_timeout(2000)
+    rater.page.reload()
+    rater.ready(0)
+    rater.press("1", "4", "7", "Enter")
+    rater.wait_ratings(1)
+    assert 1900 <= state.ratings[0].ms_on_subject < 60_000
+    assert rater.console == []
+
+
+def test_the_time_before_a_reload_is_sent_once(rater: Rater, state: MockState) -> None:
+    rater.open().paused()
+    rater.page.wait_for_timeout(2000)
+    rater.page.reload()
+    rater.ready(0)
+    # a page that is hidden and comes back as it was (back and forward) keeps its own clock
+    kept = "Object.keys(sessionStorage).filter((key) => key.startsWith('surfcensus.visit'))"
+    assert rater.page.evaluate(kept) == []
+    rater.page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+    assert rater.page.evaluate(kept) == [f"surfcensus.visit.{FIRST_ASSIGNMENT}"]
+    rater.page.evaluate(
+        "window.dispatchEvent(new PageTransitionEvent('pageshow', { persisted: true }))"
+    )
+    assert rater.page.evaluate(kept) == []
+    # the skip carries the visit, the part before the reload included, and with it goes
+    # whatever a page that was left in between has kept
+    rater.page.evaluate("window.dispatchEvent(new Event('pagehide'))")
+    rater.press("k")
+    rater.wait_skips(1)
+    assert state.skips[0].assignment_id == FIRST_ASSIGNMENT
+    assert 1900 <= state.skips[0].ms_on_subject < 60_000
+    # so it is not on the subject again when the subject comes back
+    for position in range(1, len(state.subjects)):
+        rater.ready(position)
+        rater.press("1", "4", "7", "Enter")
+    rater.ready(0)
+    rater.press("1", "4", "7", "Enter")
+    rater.wait_ratings(len(state.subjects))
+    last = state.ratings[-1]
+    assert last.assignment_id == FIRST_ASSIGNMENT and last.ms_on_subject < 1500
+    # and no other subject carries it
+    assert all(rating.ms_on_subject < 1500 for rating in state.ratings)
+
+
 # --- a server that refuses, or is away ---------------------------------------------------------
 
 

@@ -168,8 +168,10 @@ class Protocol(_Frozen):
         raise KeyError(f"no scale level {value}")
 
     def unratable_index(self, reason: str) -> int:
-        """The position of an unratable reason in the protocol, which is the ``value`` of a
-        final label of criterion ``unratable``; KeyError for a reason the protocol lacks."""
+        """The position of an unratable reason in the protocol, which is the ``value`` that
+        a final label of criterion ``unratable`` is written with; KeyError for a reason the
+        protocol lacks. A stored label is read through the list the database keeps
+        (``app.finalize.stored_reasons``), since the protocol may have changed since."""
         if reason not in self.unratable_reasons:
             raise KeyError(f"no unratable reason {reason!r}")
         return self.unratable_reasons.index(reason)

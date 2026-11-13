@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -22,7 +22,7 @@ pytest.importorskip("sqlmodel")
 from sqlalchemy.engine import Engine
 from sqlmodel import Session, col, select
 
-from surfcensus.app import APP_DB_FILE
+from surfcensus.app import APP_DB_FILE, LABEL_REASONS_KEY
 from surfcensus.app.db import app_db_path, get_or_create_rater, open_app_db, store_submission
 from surfcensus.app.finalize import (
     CALIBRATION_REASON,
@@ -30,9 +30,18 @@ from surfcensus.app.finalize import (
     finalize,
     freeze_calibration,
     record_single,
+    stored_reasons,
     sync_unratable,
 )
-from surfcensus.app.models import Assignment, FinalLabel, FinalMark, Mark, Rater, Submission
+from surfcensus.app.models import (
+    AppMeta,
+    Assignment,
+    FinalLabel,
+    FinalMark,
+    Mark,
+    Rater,
+    Submission,
+)
 from surfcensus.app.queue import QueuePlan, build_plan
 from surfcensus.app.schemas import MarkIn, RatingIn, ResolvedMark
 from surfcensus.calibration import (
@@ -279,6 +288,48 @@ def test_one_rating_gives_single_labels_and_its_marks(
         None,
         None,
     )
+
+
+def test_one_rating_leaves_out_the_marks_of_a_criterion_it_rates_none(
+    session: Session, ada: Rater, shipped_protocol: Protocol
+) -> None:
+    """A rater who rates A minor, marks it and then rates A none: the page and the server
+    take that, and the mark is no final mark, as in a consensus of none."""
+    assignment = rate(
+        session,
+        ada,
+        S1,
+        values(NONE, MINOR),
+        marks=[mark("A", 1.5, vertex=211), mark("B", 2.5), mark("C", 3.0), mark("X", 3.5)],
+    )
+    ids = live_mark_ids(session, assignment)
+    wanted = {S1: [("B", 2.5, [ids[1]]), ("X", 3.5, [ids[3]])]}
+
+    record_single(session, S1, shipped_protocol)
+    assert labels(session) == {S1: single(NONE, MINOR)}
+    assert final_marks(session) == wanted
+    # the rater's own marks stay
+    assert len(ids) == 4
+
+    report = finalize(session, plan_of([S1]), shipped_protocol)
+    assert report.single == 1
+    assert labels(session) == {S1: single(NONE, MINOR)}
+    assert final_marks(session) == wanted
+
+
+def test_one_rating_and_a_consensus_of_the_same_values_keep_the_same_classes(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    given = values(NONE, MAJOR)
+    marks = [mark("A", 1.5), mark("B", 2.5), mark("X", 3.5)]
+    rate(session, ada, S1, given, marks=marks)
+    rate(session, ada, S2, given, marks=marks)
+    rate(session, ben, S2, given, marks=marks)
+    finalize(session, plan_of([S1, S2]), shipped_protocol)
+
+    found = final_marks(session)
+    assert [name for name, _, _ in found[S1]] == ["B", "X"]
+    assert sorted({name for name, _, _ in found[S2]}) == ["B", "X"]
 
 
 def test_a_revision_replaces_the_labels_and_the_marks(
@@ -1153,6 +1204,145 @@ def test_finalize_is_not_committed(
         assert labels(later) == {}
 
 
+# --- what an unratable label means when the protocol changes ------------------------------------
+
+
+def with_reasons(protocol: Protocol, *reasons: str) -> Protocol:
+    return protocol.model_copy(update={"unratable_reasons": reasons})
+
+
+def reason_of(session: Session, subject_uid: str, protocol: Protocol) -> str:
+    """The reason that the unratable label of a subject names, as a reader finds it."""
+    value, _method = labels(session)[subject_uid]["unratable"]
+    assert value is not None
+    return stored_reasons(session, protocol)[value]
+
+
+def test_a_database_keeps_the_reasons_its_labels_were_written_with(
+    session: Session, ada: Rater, shipped_protocol: Protocol
+) -> None:
+    assert session.get(AppMeta, LABEL_REASONS_KEY) is None
+    # a database that keeps no list yet is read with the protocol it is given
+    assert stored_reasons(session, shipped_protocol) == shipped_protocol.unratable_reasons
+    rate(session, ada, S1, unratable="image too poor to judge")
+    record_single(session, S1, shipped_protocol)
+    kept = session.get(AppMeta, LABEL_REASONS_KEY)
+    assert kept is not None
+    assert json.loads(kept.value) == list(shipped_protocol.unratable_reasons)
+
+    # read with a protocol in another order, the label still names its reason
+    turned = with_reasons(shipped_protocol, *reversed(shipped_protocol.unratable_reasons))
+    assert stored_reasons(session, turned) == shipped_protocol.unratable_reasons
+    assert reason_of(session, S1, turned) == "image too poor to judge"
+
+
+@pytest.mark.parametrize("writer", ["record_single", "sync_unratable", "finalize"])
+def test_every_writer_moves_the_labels_to_the_order_of_its_protocol(
+    session: Session, ada: Rater, shipped_protocol: Protocol, writer: str
+) -> None:
+    rate(session, ada, S1, unratable="image too poor to judge")
+    record_single(session, S1, shipped_protocol)
+    # S2 failed to render, and its render is neither failed nor ready when the labels are
+    # written again: its label is kept, so nothing but the rebase can move it
+    sync_unratable(session, plan_of(failed={S2: "missing surface"}), shipped_protocol)
+    assert labels(session) == {
+        S1: {"unratable": (3, "single")},
+        S2: {"unratable": (2, "single")},
+    }
+
+    turned = with_reasons(shipped_protocol, *reversed(shipped_protocol.unratable_reasons))
+    plan = plan_of(pending=[S2])
+    if writer == "record_single":
+        rate(session, ada, S3, values(NONE))
+        record_single(session, S3, turned)
+    elif writer == "sync_unratable":
+        sync_unratable(session, plan, turned)
+    else:
+        finalize(session, plan, turned)
+    assert stored_reasons(session, shipped_protocol) == turned.unratable_reasons
+    found = labels(session)
+    assert found[S1] == {"unratable": (0, "single")}
+    assert found[S2] == {"unratable": (1, "single")}
+    assert reason_of(session, S1, turned) == "image too poor to judge"
+    assert reason_of(session, S2, turned) == "missing surface"
+
+
+def test_a_reason_the_protocol_lost_stays_with_the_label_that_names_it(
+    session: Session, ada: Rater, shipped_protocol: Protocol
+) -> None:
+    rate(session, ada, S1, unratable="image too poor to judge")
+    record_single(session, S1, shipped_protocol)
+    render, orientation, surface, poor = shipped_protocol.unratable_reasons
+
+    # the reason is taken out and the others are put in another order
+    fewer = with_reasons(shipped_protocol, surface, render, orientation)
+    assert sync_unratable(session, plan_of(failed={S2: "missing surface"}), fewer) == 1
+    assert stored_reasons(session, fewer) == (surface, render, orientation, poor)
+    assert labels(session) == {
+        S1: {"unratable": (3, "single")},
+        S2: {"unratable": (0, "single")},
+    }
+    assert reason_of(session, S1, fewer) == poor
+    # a second call changes nothing
+    sync_unratable(session, plan_of(failed={S2: "missing surface"}), fewer)
+    assert not session.dirty and not session.new
+    assert stored_reasons(session, fewer) == (surface, render, orientation, poor)
+
+    # put back, at another place: the label follows, and the list is the protocol's again
+    back = with_reasons(shipped_protocol, poor, surface, render, orientation)
+    sync_unratable(session, plan_of(failed={S2: "missing surface"}), back)
+    assert stored_reasons(session, back) == back.unratable_reasons
+    assert labels(session) == {
+        S1: {"unratable": (0, "single")},
+        S2: {"unratable": (1, "single")},
+    }
+
+
+def test_a_lost_reason_leaves_the_list_with_its_last_label(
+    session: Session, ada: Rater, shipped_protocol: Protocol
+) -> None:
+    assignment = rate(session, ada, S1, unratable="image too poor to judge")
+    record_single(session, S1, shipped_protocol)
+    fewer = with_reasons(shipped_protocol, *shipped_protocol.unratable_reasons[:3])
+    sync_unratable(session, plan_of(), fewer)
+    assert stored_reasons(session, fewer) == shipped_protocol.unratable_reasons
+
+    submit(session, assignment, values(NONE))  # rated after all
+    record_single(session, S1, fewer)
+    assert labels(session) == {S1: single(NONE)}
+    sync_unratable(session, plan_of(), fewer)
+    assert stored_reasons(session, fewer) == fewer.unratable_reasons
+
+
+def test_finalize_that_is_refused_leaves_the_kept_reasons_as_they_were(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    rate(session, ada, S1, unratable="image too poor to judge")
+    sync_unratable(session, plan_of(failed={S2: "missing surface"}), shipped_protocol)
+    before = labels(session)
+    surface = shipped_protocol.unratable_reasons[2]
+    other = with_reasons(shipped_protocol, surface, *shipped_protocol.unratable_reasons[:2])
+    with pytest.raises(ConfigError, match="put the reason back"):
+        finalize(session, plan_of(failed={S2: "missing surface"}), other)
+    assert labels(session) == before
+    assert stored_reasons(session, other) == shipped_protocol.unratable_reasons
+    assert not session.dirty and not session.new and not session.deleted
+
+
+def test_a_row_that_holds_no_list_of_reasons_is_a_config_error(
+    session: Session, shipped_protocol: Protocol
+) -> None:
+    session.add(AppMeta(key=LABEL_REASONS_KEY, value='{"render failure": 0}'))
+    session.flush()
+    for call in (
+        lambda: stored_reasons(session, shipped_protocol),
+        lambda: sync_unratable(session, plan_of(), shipped_protocol),
+    ):
+        with pytest.raises(ConfigError) as caught:
+            call()
+        assert caught.value.reason == "invalid" and LABEL_REASONS_KEY in caught.value.detail
+
+
 # --- a subject that a rater skipped -------------------------------------------------------------
 
 
@@ -1624,3 +1814,20 @@ def test_the_frozen_set_is_a_calibration_set(
     loaded = load_calibration(app_run)
     assert loaded is not None and isinstance(loaded[0], CalibrationSet)
     assert len(loaded[1]) == 64
+
+
+def test_the_frozen_set_names_the_reason_a_label_was_written_with(
+    app_run: Path,
+    app_engine: Engine,
+    small_run_uids: dict[str, str],
+    shipped_protocol: Protocol,
+    write_reasons: Callable[[Path, Sequence[str]], None],
+) -> None:
+    rated_run(app_engine, small_run_uids, shipped_protocol)
+    write_reasons(app_run, list(reversed(shipped_protocol.unratable_reasons)))
+    freeze_calibration(app_run)
+    loaded = load_calibration(app_run)
+    assert loaded is not None
+    frozen = {subject.subject_uid: subject.unratable for subject in loaded[0].subjects}
+    assert frozen[small_run_uids["sub-001"]] == "image too poor to judge"
+    assert frozen[small_run_uids["sub-000"]] is None

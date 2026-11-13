@@ -205,6 +205,40 @@ def test_a_run_directory_inside_the_subjects_directory_is_refused(study: Path, p
     Run(study / "derived" / "run", local(study)).close()
 
 
+@pytest.mark.parametrize("mode", ["local", "census"])
+def test_an_output_in_the_subjects_directory_is_refused(
+    study: Path, tmp_path: Path, mode: str
+) -> None:
+    run_dir = tmp_path / "run"
+    key = DATASET_KEY if mode == "census" else None
+    Run(run_dir, local(study), key=key).close()
+    subjects_dir = study / FS_ROOT
+    link = tmp_path / "link"
+    link.symlink_to(subjects_dir / "sub-02")
+    with Run(run_dir) as run:  # a census run is opened without its key
+        for out in (
+            subjects_dir,
+            subjects_dir / "sub-01",
+            subjects_dir / "sub-01" / "surf" / "tables",
+            subjects_dir / "new",
+            link,
+            link / "tables",
+        ):
+            with pytest.raises(ConfigError, match="lies inside the subjects directory") as raised:
+                run.refuse_output_in_sources(out)
+            assert raised.value.reason == "invalid"
+        # beside the subjects directory, inside the fMRIPrep output, is a place like any other
+        for out in (study / "derived", study, tmp_path / "out", run_dir / "export"):
+            run.refuse_output_in_sources(out)
+
+    # the data is not mounted: the root is all the run knows of where the subjects were
+    study.rename(tmp_path / "moved")
+    with Run(run_dir) as run:
+        with pytest.raises(ConfigError, match="lies inside the subjects directory"):
+            run.refuse_output_in_sources(study / "tables")
+        run.refuse_output_in_sources(tmp_path / "out")
+
+
 def test_one_subject_directory_is_a_run_of_that_subject(tmp_path: Path) -> None:
     tree = write_tree(tmp_path / "subjects", "subjects_dir", LABELS)
     with pytest.raises(ConfigError, match="lies inside the subjects directory"):

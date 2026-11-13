@@ -41,6 +41,7 @@ from surfcensus.app.queue import (
 from surfcensus.app.schemas import AppMode, RatingIn, SkipIn
 from surfcensus.calibration import CalibrationSet, CalibrationSubject
 from surfcensus.config import AppConfig, load_config
+from surfcensus.privacy import HashKey
 from surfcensus.records import RenderRow
 from surfcensus.run import Run
 from surfcensus.sources.local import local
@@ -180,6 +181,18 @@ def light_run(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return base / "run"
 
 
+@pytest.fixture(scope="module")
+def light_census(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """The run directory of a census run on three light subjects, inventoried and nothing
+    else. Read-only."""
+    base = tmp_path_factory.mktemp("queue_census")
+    root = write_tree(base / "subjects", "subjects_dir", LABELS[:3])
+    key = HashKey(bytes(range(1, 33)), "dataset-key")
+    with Run(base / "run", [local(root)], key=key) as run:
+        assert run.inventory().done == 3
+    return base / "run"
+
+
 @pytest.fixture
 def catalog_run(light_run: Path, tmp_path: Path) -> Path:
     run_dir = tmp_path / "catalog_run"
@@ -240,6 +253,13 @@ def forget_render(run_dir: Path, uid: str) -> None:
     connection = sqlite3.connect(run_dir / CATALOG_FILE)
     with connection:
         connection.execute("DELETE FROM renders WHERE subject_uid = ?", (uid,))
+    connection.close()
+
+
+def in_catalog(run_dir: Path, sql: str, *args: object) -> None:
+    connection = sqlite3.connect(run_dir / CATALOG_FILE)
+    with connection:
+        connection.execute(sql, args)
     connection.close()
 
 
@@ -327,11 +347,60 @@ def test_a_done_row_without_a_render_key_is_not_ready(catalog_run: Path, uids: l
     assert (plan.pending, plan.outdated) == (0, 1)
 
 
-def test_a_run_without_a_selection_has_an_empty_plan(catalog_run: Path, uids: list[str]) -> None:
+def test_a_local_run_without_a_selection_offers_every_present_subject(
+    catalog_run: Path, uids: list[str]
+) -> None:
+    # a run of `inventory` and `render`, which write no selection: as `render` reads it,
+    # every present subject is selected, so the app has a queue without `review`
+    gone = uids[7]
+    in_catalog(catalog_run, "UPDATE subjects SET present = 0 WHERE subject_uid = ?", gone)
     record_render(catalog_run, uids[0])
+    record_render(catalog_run, uids[1], status="failed", reason="missing surface")
+    record_render(catalog_run, gone)
     plan = planned(catalog_run)
-    assert plan.order == () and plan.render_keys == {} and plan.failed == {}
-    assert (plan.pending, plan.outdated) == (0, 0)
+    assert sorted(plan.order) == uids[:7]
+    assert plan.render_keys == {uids[0]: key_of(uids[0])}
+    # so the subject without a surface gets its unratable label
+    assert plan.failed == {uids[1]: "missing surface"}
+    assert (plan.pending, plan.outdated) == (5, 0)
+    # in the order of the queue, like a selection of the same subjects
+    scores = scores_of([(uid, rank, "") for rank, uid in enumerate(reversed(uids[:7]), start=1)])
+    unselected = planned(catalog_run, scores)
+    select_subjects(catalog_run, uids[:7])
+    assert unselected == planned(catalog_run, scores)
+    assert list(unselected.order) == uids[6::-1]
+
+
+def test_a_frozen_calibration_set_is_not_the_selection_of_a_local_run(
+    catalog_run: Path, uids: list[str]
+) -> None:
+    # `calibration freeze` writes its rows whether or not `review` selected the subjects:
+    # on a run of the phase commands they must not cut the queue down to the set
+    select_subjects(catalog_run, uids[1:3], reason="calibration")
+    assert sorted(planned(catalog_run).order) == uids
+    # beside a selection they are rows of it
+    select_subjects(catalog_run, uids[:2])
+    assert sorted(planned(catalog_run).order) == uids[:3]
+
+
+def test_a_census_run_without_a_selection_has_an_empty_plan(
+    light_census: Path, tmp_path: Path
+) -> None:
+    # the selection of a census is its rating sample: nothing drawn, nothing to rate
+    run_dir = tmp_path / "census_run"
+    run_dir.mkdir()
+    shutil.copy(light_census / CATALOG_FILE, run_dir / CATALOG_FILE)
+    with PublicCatalog.open(run_dir) as public:
+        found = public.subject_uids()
+    assert len(found) == 3
+    record_render(run_dir, found[0])
+    for mode in ("local", "team"):
+        plan = planned(run_dir, mode=mode)
+        assert plan.order == () and plan.render_keys == {} and plan.failed == {}
+        assert (plan.pending, plan.outdated) == (0, 0)
+    # its calibration subjects are part of the selection: they are rendered and rated first
+    select_subjects(run_dir, found[1:2], reason="calibration")
+    assert planned(run_dir).order == (found[1],)
 
 
 def test_a_subject_selected_for_two_reasons_is_in_the_plan_once(

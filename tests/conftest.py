@@ -28,7 +28,7 @@ import logging
 import os
 import shutil
 import sys
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -62,8 +62,10 @@ from synth_tierb import (  # noqa: E402  # pyrefly: ignore[missing-import]
 
 from surfcensus.config import MetricsConfig, new_local_config  # noqa: E402
 from surfcensus.protocol import (  # noqa: E402
+    PROTOCOL_FILE,
     Protocol,
     install_protocol,
+    load_protocol,
     parse_protocol,
     shipped_protocol_bytes,
 )
@@ -251,6 +253,21 @@ def small_run_renders(small_run: Path, small_run_uids: dict[str, str]) -> dict[s
 def shipped_protocol() -> Protocol:
     """The protocol of ``data/protocol.yaml``, which a new run starts with."""
     return parse_protocol(shipped_protocol_bytes())
+
+
+@pytest.fixture(scope="session")
+def write_reasons() -> Callable[[Path, Sequence[str]], None]:
+    """A function that rewrites the unratable reasons in the ``protocol.yaml`` of a run
+    directory, as an editor would: the rest of the file, its version included, stays."""
+
+    def write(run_dir: Path, reasons: Sequence[str]) -> None:
+        path = run_dir / PROTOCOL_FILE
+        head, name, _ = path.read_text().partition("unratable_reasons:")
+        assert name, "the protocol lists its unratable reasons last"
+        path.write_text(head + name + "\n" + "".join(f"  - {reason}\n" for reason in reasons))
+        assert load_protocol(run_dir)[0].unratable_reasons == tuple(reasons)
+
+    return write
 
 
 @pytest.fixture

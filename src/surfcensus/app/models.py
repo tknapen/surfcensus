@@ -201,7 +201,9 @@ class Event(SQLModel, table=True):
 
 class FinalLabel(SQLModel, table=True):
     """The final value of a criterion for a subject, or (criterion ``unratable``) the reason
-    it cannot be rated, as the position of the reason in the protocol."""
+    it cannot be rated, as the position of the reason in the list that the database keeps
+    with its labels (``surfcensus.app.LABEL_REASONS_KEY``): the protocol's when final
+    labels were last written."""
 
     __tablename__ = "final_labels"
     __table_args__ = (
@@ -236,7 +238,8 @@ class FinalMark(SQLModel, table=True):
 
 
 class AppMeta(SQLModel, table=True):
-    """``schema_version``, ``run_id`` and ``mode``: what ties the database to its run."""
+    """``schema_version``, ``run_id`` and ``mode``: what ties the database to its run. And
+    ``surfcensus.app.LABEL_REASONS_KEY``, once a final label was written."""
 
     __tablename__ = "app_meta"
 

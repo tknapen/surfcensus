@@ -36,9 +36,12 @@ from fastapi.testclient import TestClient
 from surfcensus.app.server import create_app
 from surfcensus.calibration import CALIBRATION_FILE
 from surfcensus.cli import app
-from surfcensus.config import load_config, with_changes, write_config
-from surfcensus.export.tables import EXPORT_TABLES, MANIFEST
+from surfcensus.config import ConfigError, load_config, with_changes, write_config
+from surfcensus.export.tables import EXPORT_TABLES, MANIFEST, export_run
+from surfcensus.privacy import HashKey
 from surfcensus.review import DEFAULT_RUN_DIR
+from surfcensus.run import Run
+from surfcensus.sources.local import local
 from surfcensus.store import PublicCatalog
 
 BASE = "http://127.0.0.1"
@@ -110,6 +113,27 @@ def app_rows(run_dir: Path, sql: str) -> list[tuple[Any, ...]]:
 
 
 # --- review ---------------------------------------------------------------------------------------
+
+
+def test_the_command_table_has_one_line_per_command() -> None:
+    """``surfcensus --help`` lists each command with the first paragraph of its help and keeps
+    the line breaks of a docstring, so a summary of two source lines came out ragged
+    (``... inventory, metrics,`` / ``render and ...``). Each has a summary of one line."""
+    import inspect
+
+    from typer.main import get_command
+
+    def summaries(group: Any, prefix: str = "") -> Iterator[tuple[str, str]]:
+        for name, command in group.commands.items():
+            text = command.short_help or inspect.cleandoc(command.help or "").split("\n\n")[0]
+            yield prefix + name, text
+            if hasattr(command, "commands"):
+                yield from summaries(command, f"{prefix}{name} ")
+
+    listed = dict(summaries(get_command(app)))
+    assert {"review", "serve", "finalize", "export", "calibration freeze"} <= set(listed)
+    assert all(text for text in listed.values())
+    assert {name: text for name, text in listed.items() if "\n" in text} == {}
 
 
 def test_review_without_the_app_prepares_the_run_and_says_what_it_did(study: Path) -> None:
@@ -391,6 +415,33 @@ def test_finalize_of_two_raters_prints_the_counts_and_the_open_subjects(
     assert cli("finalize", "--run-dir", run_dir).stdout == two.stdout
 
 
+def test_a_run_of_the_phase_commands_is_rated_and_finalized_like_one_of_review(
+    study: Path, tmp_path: Path
+) -> None:
+    # `inventory` and `render` write no selection. The selection of a local run is then
+    # every present subject, for the app and for `finalize` as for `render`
+    run_dir = tmp_path / "run"
+    assert cli("inventory", "--run-dir", run_dir, "--source", study).exit_code == 0
+    rendered = cli("render", "--run-dir", run_dir, "--jobs", 1)
+    assert rendered.exit_code == 1 and "render: 2 done, 0 skipped, 1 failed" in rendered.output
+    with PublicCatalog.open(run_dir) as public:
+        assert len(public.selection()) == 0
+    none = {"A": 0, "B": 0, "C": 0}
+    rate_all(run_dir, "ada", {"sub-01": {"A": 1, "B": 0, "C": 0}, "sub-02": none})
+    rate_all(run_dir, "ben", {"sub-01": none, "sub-02": none})
+    result = cli("finalize", "--run-dir", run_dir)
+    assert result.exit_code == 0, result.output
+    assert result.stdout.splitlines() == [
+        "final labels: 2 by consensus, 0 from one rating, 1 unratable (render failed), 0 open"
+    ]
+    by_label = uids(run_dir)
+    labels = app_rows(run_dir, "SELECT subject_uid, criterion, method FROM final_labels")
+    assert sorted(labels) == sorted(
+        [(by_label[label], criterion, "consensus") for label in LABELS[:2] for criterion in "ABC"]
+        + [(by_label["sub-03"], "unratable", "single")]
+    )
+
+
 def test_finalize_names_a_rater_who_has_subjects_left(run_dir: Path) -> None:
     with TestClient(create_app(run_dir, rater="ada"), base_url=BASE) as client:
         version = client.get("/api/session").json()["protocol"]["version"]
@@ -489,6 +540,63 @@ def test_export_stops_with_exit_2_for_what_it_cannot_do(run_dir: Path, tmp_path:
     blocked = cli("export", "--run-dir", run_dir, "--out", taken)
     assert blocked.exit_code == 2
     assert blocked.stderr.startswith("invalid: the run directory cannot be used: ")
+
+
+@pytest.mark.parametrize("where", ["subjects directory", "subject", "below a subject", "link"])
+def test_export_refuses_an_output_in_the_subjects_directory(
+    run_dir: Path, study: Path, tmp_path: Path, where: str
+) -> None:
+    subjects_dir = study / "sourcedata" / "freesurfer"
+    out = {
+        "subjects directory": subjects_dir,
+        "subject": subjects_dir / "sub-01",
+        "below a subject": subjects_dir / "sub-01" / "tables",
+        "link": tmp_path / "link",
+    }[where]
+    if where == "link":
+        out.symlink_to(subjects_dir / "sub-02")
+    before = snapshot_tree(study)
+    result = cli("export", "--run-dir", run_dir, "--out", out)
+    assert result.exit_code == 2, result.output
+    assert result.stdout == "" and len(result.stderr.splitlines()) == 1
+    assert result.stderr.startswith("invalid: ")
+    assert "lies inside the subjects directory" in result.stderr
+    # the same from Python
+    with pytest.raises(ConfigError, match="lies inside the subjects directory") as raised:
+        export_run(run_dir, out)
+    assert raised.value.reason == "invalid"
+    assert snapshot_tree(study) == before
+    # beside the subjects directory, inside the fMRIPrep output, is a place like any other
+    beside = cli("export", "--run-dir", run_dir, "--out", study / "tables")
+    assert beside.exit_code == 0, beside.output
+    assert (study / "tables" / MANIFEST).is_file()
+
+
+def test_export_refuses_an_output_where_the_subjects_were(
+    run_dir: Path, study: Path, tmp_path: Path
+) -> None:
+    study.rename(tmp_path / "moved")  # the data is not mounted: the root is what is known
+    result = cli("export", "--run-dir", run_dir, "--out", study / "sourcedata" / "tables")
+    assert result.exit_code == 2 and "lies inside the subjects directory" in result.stderr
+    assert not study.exists()
+    assert cli("export", "--run-dir", run_dir).exit_code == 0
+
+
+def test_export_of_a_census_run_refuses_an_output_in_a_local_source(
+    study: Path, tmp_path: Path
+) -> None:
+    run_dir = tmp_path / "census"
+    Run(run_dir, local(study), key=HashKey(bytes(range(1, 33)), "dataset-key")).close()
+    assert load_config(run_dir).sources[0].root is None  # the root is in the catalog only
+    before = snapshot_tree(study)
+    out = study / "sourcedata" / "freesurfer" / "sub-01"
+    result = cli("export", "--run-dir", run_dir, "--out", out)
+    assert result.exit_code == 2, result.output
+    assert result.stderr.startswith("invalid: ")
+    assert "lies inside the subjects directory" in result.stderr
+    assert snapshot_tree(study) == before
+    elsewhere = cli("export", "--run-dir", run_dir, "--out", tmp_path / "out")
+    assert elsewhere.exit_code == 0, elsewhere.output
 
 
 def test_the_commands_are_listed_in_the_help() -> None:

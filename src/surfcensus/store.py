@@ -60,6 +60,9 @@ from surfcensus.sources.base import (
 SCHEMA_VERSION = 1
 CATALOG_FILE = "catalog.sqlite"
 MEDIA_DIR = "media"
+CALIBRATION_REASON = "calibration"
+"""The ``selection.reason``, and the stratum, of the subjects of a frozen calibration set
+(``app/finalize.py``). Such a row names an example, not a subject of the rating sample."""
 
 Mode = Literal["local", "census"]
 
@@ -1566,6 +1569,23 @@ class PublicCatalog:
             f"SELECT {_names(_SELECTION_COLUMNS)} FROM selection ORDER BY subject_uid, reason"
         )
         return _frame(_SELECTION_COLUMNS, rows)
+
+    def selected_uids(self) -> list[str] | None:
+        """The subjects of the selection, each once and sorted, or None while no selection
+        is made: the table is empty, or it is that of a local run and holds nothing but the
+        rows of a frozen calibration set.
+
+        The selection of a local run is every present subject until one is made (``render``
+        and the rating queue both read it so), and ``surfcensus calibration freeze`` writes
+        its rows into a run whether or not ``review`` selected its subjects. Read as a
+        selection, those rows would cut the queue and the renders of a run made with the
+        phase commands down to the calibration set. In a census run they are part of the
+        selection: its calibration subjects are rendered and rated first."""
+        selection = self.selection()
+        reasons = set(map(str, selection["reason"]))
+        if not reasons or (self.mode() == "local" and reasons == {CALIBRATION_REASON}):
+            return None
+        return sorted(set(map(str, selection["subject_uid"])))
 
     def replace_selection(self, rows: pd.DataFrame, reasons: Collection[str]) -> None:
         """Replace the rows of those reasons by ``rows``, in one transaction.

@@ -14,7 +14,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -25,11 +25,11 @@ import pyarrow.parquet as pq
 import pytest
 from sqlalchemy import func
 from sqlalchemy.engine import Engine
-from sqlmodel import Session, SQLModel, select
+from sqlmodel import Session, SQLModel, col, select
 from synth_tree import write_tier_a, write_tree  # pyrefly: ignore[missing-import]
 
 from surfcensus import __version__
-from surfcensus.app import APP_DB_FILE
+from surfcensus.app import APP_DB_FILE, LABEL_REASONS_KEY
 from surfcensus.app.db import (
     APP_SCHEMA_VERSION,
     get_or_create_rater,
@@ -37,7 +37,18 @@ from surfcensus.app.db import (
     record_skip,
     store_submission,
 )
-from surfcensus.app.models import Assignment, Event, FinalLabel, FinalMark, Mark
+from surfcensus.app.events import CONFIG_CHANGE, record_setting
+from surfcensus.app.finalize import record_single, sync_unratable
+from surfcensus.app.models import (
+    AppMeta,
+    Assignment,
+    Event,
+    FinalLabel,
+    FinalMark,
+    Mark,
+    Submission,
+)
+from surfcensus.app.queue import QueuePlan
 from surfcensus.app.schemas import (
     EVENT_TYPES,
     FINAL_METHODS,
@@ -47,7 +58,7 @@ from surfcensus.app.schemas import (
     SkipIn,
 )
 from surfcensus.calibration import CalibrationSet, CalibrationSubject, write_calibration
-from surfcensus.config import CONFIG_FILE, ConfigError
+from surfcensus.config import CONFIG_FILE, ConfigError, load_config, with_changes, write_config
 from surfcensus.export import tables
 from surfcensus.export.tables import (
     BEHAVIOUR_COLUMNS,
@@ -333,11 +344,14 @@ def test_a_rating_is_a_row_with_its_values_and_what_it_was_made_on(
     assert list(frame.columns) == list(RATINGS_COLUMNS)
     assert list(frame["assignment_id"]) == [first, second]
     row = frame.iloc[0].to_dict()
+    # nothing recorded how the queue was ordered before the rating was stored
+    assert pd.isna(row.pop("blind"))
     assert row == {
         "assignment_id": first,
         "subject_uid": uids[1],
         "rater": "local",
         "kind": "main",
+        "seq": 1,
         "render_key": render_key(run, uids[1]),
         "render_current": True,
         "A": 2,
@@ -371,6 +385,77 @@ def test_a_revised_rating_is_exported_as_it_stands_now(
     assert (row["A"], row["B"], row["C"]) == (2, 0, 1)
     assert (row["revision"], row["note"], row["server_ts"]) == (2, "second look", T2)
     assert row["ms_on_subject"] == 900
+
+
+def test_a_rating_says_where_it_stood_in_the_queue_and_whether_the_queue_was_blind(
+    run: Path, engine: Engine, uids: list[str]
+) -> None:
+    """Whether a rater saw the subjects worst first or shuffled is an order effect, and the
+    notebooks read the export only."""
+    before = rate(engine, run, uids[2], rater="early", now="2026-11-13T09:00:00.000Z")
+    with Session(engine) as session:
+        record_setting(session, tables._BLIND_SETTING, False, now="2026-11-13T10:00:00.000Z")
+        # another setting, and records that are not of the form the server writes
+        record_setting(session, "require_marks", True, now="2026-11-13T10:00:00.500Z")
+        session.commit()
+    log(
+        engine,
+        None,
+        (CONFIG_CHANGE, "not json"),
+        (CONFIG_CHANGE, {"setting": "blind", "new": "yes"}),
+        (CONFIG_CHANGE, ["blind", True]),
+    )
+    scored = rate(engine, run, uids[0], now=T1)
+    with Session(engine) as session:
+        record_setting(session, tables._BLIND_SETTING, True, now="2026-11-13T10:00:02.500Z")
+        session.commit()
+    shuffled = rate(engine, run, uids[1], now=T3)
+    other = rate(engine, run, uids[0], rater="second", now=T3)
+    # a revision keeps the place in the queue and is under the setting it was stored under
+    submit(engine, scored, values=NONE, now=T3)
+    again = rate(engine, run, uids[2], rater="second", now=T2)
+
+    frame = ratings_frame(run).set_index("assignment_id")
+    assert frame["seq"].to_dict() == {before: 1, scored: 1, shuffled: 2, other: 1, again: 2}
+    assert pd.isna(frame.loc[before, "blind"])
+    assert frame["blind"].drop(index=before).to_dict() == {
+        scored: True,
+        shuffled: True,
+        other: True,
+        again: False,
+    }
+
+    export_run(run)
+    written = by_assignment(read_csv(run / "export" / "ratings.csv"))
+    assert written["blind"].to_dict() == {
+        str(before): "",
+        str(scored): "True",
+        str(shuffled): "True",
+        str(other): "True",
+        str(again): "False",
+    }
+    assert written["seq"].to_dict() == {
+        str(before): "1",
+        str(scored): "1",
+        str(shuffled): "2",
+        str(other): "1",
+        str(again): "2",
+    }
+
+
+def test_a_rating_under_the_first_record_of_the_setting_is_not_blind(
+    run: Path, engine: Engine, uids: list[str]
+) -> None:
+    with Session(engine) as session:
+        record_setting(session, tables._BLIND_SETTING, False, now=T1)
+        session.commit()
+    # the record and the submission in one millisecond: the server records before it serves
+    rate(engine, run, uids[0], now=T1)
+    assert ratings_frame(run)["blind"].tolist() == [False]
+
+
+def test_the_export_reads_the_setting_the_app_records() -> None:
+    assert tables._CONFIG_CHANGE == CONFIG_CHANGE
 
 
 def test_an_assignment_that_is_still_open_is_no_rating(
@@ -736,6 +821,84 @@ def test_an_unratable_label_that_the_protocol_cannot_name_stops_the_export(
     assert listing(run / "export") == before
 
 
+def unratable(engine: Engine, run: Path, uid: str, reason: str, protocol: Protocol) -> None:
+    """Rate a subject unratable and label it as the server does at a submission."""
+    rate(engine, run, uid, unratable=reason)
+    with Session(engine) as session:
+        record_single(session, uid, protocol)
+        session.commit()
+
+
+@pytest.mark.parametrize("edit", ["reordered", "removed"])
+def test_an_unratable_label_keeps_its_reason_when_the_protocol_is_edited(
+    run: Path,
+    engine: Engine,
+    uids: list[str],
+    shipped_protocol: Protocol,
+    write_reasons: Callable[[Path, Sequence[str]], None],
+    edit: str,
+) -> None:
+    unratable(engine, run, uids[0], "image too poor to judge", shipped_protocol)
+    with Session(engine) as session:
+        # a render that failed, labelled when the server started
+        plan = QueuePlan("local", (uids[1],), {}, {uids[1]: "missing surface"}, 0, 0)
+        sync_unratable(session, plan, shipped_protocol)
+        session.commit()
+    reasons = list(shipped_protocol.unratable_reasons)
+    write_reasons(run, list(reversed(reasons)) if edit == "reordered" else reasons[:3])
+
+    expected = {uids[0]: "image too poor to judge", uids[1]: "missing surface", uids[2]: None}
+    assert by_uid(subjects_frame(run))["unratable_reason"].to_dict() == expected
+    written = {path.name: read_csv(path) for path in export_run(run)[:-1]}
+    subjects = written["subjects.csv"].set_index("subject_uid")
+    assert subjects.loc[uids[0], "unratable_reason"] == "image too poor to judge"
+    assert subjects.loc[uids[1], "unratable_reason"] == "missing surface"
+    # the two tables of one export say the same of the rating
+    ratings = written["ratings.csv"].set_index("subject_uid")
+    assert ratings.loc[uids[0], "unratable_reason"] == "image too poor to judge"
+
+
+def test_the_reasons_a_database_keeps_need_no_protocol(
+    run: Path, engine: Engine, uids: list[str], shipped_protocol: Protocol
+) -> None:
+    unratable(engine, run, uids[0], "wrong orientation", shipped_protocol)
+    (run / PROTOCOL_FILE).unlink()
+    assert by_uid(subjects_frame(run)).loc[uids[0], "unratable_reason"] == "wrong orientation"
+
+
+def test_kept_reasons_that_are_no_list_stop_the_export(
+    run: Path, engine: Engine, uids: list[str], shipped_protocol: Protocol
+) -> None:
+    unratable(engine, run, uids[0], "wrong orientation", shipped_protocol)
+    with Session(engine) as session:
+        kept = session.get(AppMeta, LABEL_REASONS_KEY)
+        assert kept is not None
+        kept.value = "render failure"
+        session.add(kept)
+        session.commit()
+    with pytest.raises(ConfigError, match=LABEL_REASONS_KEY) as raised:
+        subjects_frame(run)
+    assert raised.value.reason == "invalid"
+    with Session(engine) as session:
+        session.add(AppMeta(key="other", value="[]"))  # a row more is nothing to the export
+        kept = session.get(AppMeta, LABEL_REASONS_KEY)
+        assert kept is not None
+        kept.value = json.dumps(["a", "wrong orientation"])
+        session.add(kept)
+        session.commit()
+    # the label is at position 1 of the shipped list, and the kept list is what names it
+    assert by_uid(subjects_frame(run)).loc[uids[0], "unratable_reason"] == "wrong orientation"
+    with Session(engine) as session:
+        kept = session.get(AppMeta, LABEL_REASONS_KEY)
+        assert kept is not None
+        kept.value = json.dumps(["a"])
+        session.add(kept)
+        session.commit()
+    with pytest.raises(ConfigError, match="reasons 0 to 0") as raised:
+        subjects_frame(run)
+    assert APP_DB_FILE in raised.value.detail and PROTOCOL_FILE not in raised.value.detail
+
+
 def test_unratable_labels_need_the_protocol_and_nothing_else_does(
     run: Path, engine: Engine, uids: list[str]
 ) -> None:
@@ -1005,6 +1168,7 @@ def test_behaviour_sums_the_events_of_each_completed_assignment(
             "n_back": "1",
             "n_skips": "0",
             "ms_skipped_visits": "0",
+            "ms_revised_visits": "0",
         },
         {
             "assignment_id": str(quiet),
@@ -1018,6 +1182,7 @@ def test_behaviour_sums_the_events_of_each_completed_assignment(
             "n_back": "0",
             "n_skips": "0",
             "ms_skipped_visits": "0",
+            "ms_revised_visits": "0",
         },
     ]
 
@@ -1290,6 +1455,14 @@ def test_the_manifest_names_the_run_and_every_file_with_its_hash(
     scores = read_table(table_path(run, "scores"), SCHEMAS["scores"])
     del manifest["files"]
     stage_hashes = manifest.pop("stage_hashes")
+    app = load_config(run).app
+    assert (app.blind, app.repeat_rate) == (False, 0.0)
+    assert manifest.pop("queue") == {
+        "blind": False,
+        "queue_seed": app.queue_seed,
+        "repeat_rate": 0.0,
+        "repeat_gap": app.repeat_gap,
+    }
     assert manifest == {
         "manifest_schema_version": 1,
         "run_id": run_id,
@@ -2021,3 +2194,56 @@ def test_the_bins_of_a_subject_count(count: int | None, expected: str | None) ->
 )
 def test_a_probability_is_released_to_two_digits(value: float, expected: float) -> None:
     assert tables._two_digits(value) == expected
+
+
+def test_behaviour_keeps_the_time_of_a_revised_rating(
+    run: Path, engine: Engine, uids: list[str]
+) -> None:
+    """A revision is a new submission: the visit that made the first rating is counted in
+    the events of the row, so its time has to be in the row as well."""
+    twice = rate(engine, run, uids[0], values=NONE, ms=3949)
+    submit(engine, twice, values=VALUES, now=T2, ms=2529)
+    submit(engine, twice, values=NONE, now=T3, ms=700)
+    once = rate(engine, run, uids[1], ms=1100)
+
+    export_run(run)
+    behaviour = by_assignment(read_csv(run / "export" / "behaviour.csv"))
+    assert behaviour.loc[str(twice), ["ms_on_subject", "ms_revised_visits"]].tolist() == [
+        "700",
+        "6478",
+    ]
+    assert behaviour.loc[str(once), ["ms_on_subject", "ms_revised_visits"]].tolist() == [
+        "1100",
+        "0",
+    ]
+    # the ratings table still has the visit of the current submission only
+    ratings = by_assignment(read_csv(run / "export" / "ratings.csv"))
+    assert ratings.loc[str(twice), "ms_on_subject"] == "700"
+
+
+def test_a_superseded_submission_without_a_time_is_not_counted_as_none(
+    run: Path, engine: Engine, uids: list[str]
+) -> None:
+    assignment = rate(engine, run, uids[0], values=NONE, ms=3949)
+    submit(engine, assignment, values=VALUES, now=T2, ms=2529)
+    with Session(engine) as session:
+        first = session.exec(select(Submission).where(col(Submission.current).is_(False))).one()
+        first.ms_on_subject = None
+        session.add(first)
+        session.commit()
+    export_run(run)
+    row = read_csv(run / "export" / "behaviour.csv").to_dict("records")[0]
+    assert (row["ms_on_subject"], row["ms_revised_visits"]) == ("2529", "")
+
+
+def test_the_manifest_says_how_the_queue_was_ordered(run: Path) -> None:
+    config = load_config(run)
+    changed = config.app.model_dump() | {"blind": True, "repeat_rate": 0.25, "repeat_gap": 7}
+    write_config(run, with_changes(config, app=changed))
+    export_run(run)
+    assert manifest_of(run / "export")["queue"] == {
+        "blind": True,
+        "queue_seed": config.app.queue_seed,
+        "repeat_rate": 0.25,
+        "repeat_gap": 7,
+    }
