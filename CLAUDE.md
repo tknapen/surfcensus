@@ -121,6 +121,7 @@ Measured 2026-11-13 with the rater app of milestone 4 (one machine, 4 processors
 - Package 4.A, same day, `ds000102` sub-01 at 320 px in both display orientations: for a click at the centre of every opaque pial contour pixel (231,079 and 231,036 pixels) the resolved hemisphere, vertices, distances and fsaverage6 vertex equal those from the full surfaces; 0.305% of those clicks resolve to a vertex that is not `visible`.
 - `ms_on_subject` of three submissions and one skip equals the time the subject was on screen in that visit within 12 ms; the time the tour was open is not in it.
 - `review` on the 26 subjects of `ds000102` with Tier A and B only: 35 s, every subject `missing surface`, exit code 1. On a synthetic set of 32 the queue is the partial-score block, then `primary_rank`; blind, the seeded shuffle.
+- When the milestone was closed, the same tree through the commands with two raters one after the other (`review --rater`, then `serve --rater`): `finalize` gave one subject by consensus and one open, the six exported marks equal a computation from the surface files, and the tiles, poster and video of `ds000102` sub-01 are byte-identical to the render of milestone 2 (all 356 files to that of milestone 3). The 34 subjects with Tier A and B as one run gave the numbers of `docs/metrics.md` again and 34 unratable labels (`docs/decisions.md`, after D34).
 
 Anything else in these docs marked "(to verify)" has not been checked. Do not promote it to fact without checking.
 
