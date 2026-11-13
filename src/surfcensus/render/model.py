@@ -14,9 +14,11 @@ from typing import Literal
 import numpy as np
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-RENDER_SCHEMA_VERSION = 2
-"""Version of ``render.json`` and of the files it lists. 2: the vertex map is selected by the
-clickable region of the tiles and carries ``{hemi}_visible``; 1 selected it by the view box."""
+RENDER_SCHEMA_VERSION = 3
+"""Version of ``render.json`` and of the files it lists. 3: ``render.json`` names the template
+(``template``, ``fsaverage_poles``), lists the ``sphere.reg`` files among its inputs, and the
+vertex map can carry fsaverage counterparts. 2: the vertex map is selected by the clickable
+region of the tiles and carries ``{hemi}_visible``; 1 selected it by the view box."""
 
 TILE_FIELDS: tuple[str, ...] = (
     "box_x_mm",
@@ -279,7 +281,33 @@ class VertexMapInfo(_Frozen):
     (``lh_visible`` in the file); likewise ``n_rh_visible``."""
     n_rh_visible: int
     fsaverage: str | None = None
-    """Name of the fsaverage mesh the counterparts refer to; None while they are unset (-1)."""
+    """Name of the mesh the counterparts refer to (``fsaverage6``), which is
+    ``RenderInfo.template.mesh``; None when no hemisphere has counterparts (all -1)."""
+
+
+class TemplateInfo(_Frozen):
+    """The template that the fsaverage counterparts of a render refer to."""
+
+    mesh: str
+    """Name of the target mesh, for example ``fsaverage6``."""
+    template_id: str
+    """``Template.template_id``: 12 hex characters over the content of the template."""
+    sphere_sha256: dict[Literal["lh", "rh"], str]
+    """SHA-256 of the template's ``surf/?h.sphere.reg``, the spheres that the subject's
+    ``sphere.reg`` files were mapped onto."""
+
+
+class FsaveragePole(_Frozen):
+    """The template's occipital pole on the native surface of one hemisphere (decision D12)."""
+
+    template_vertex: int
+    """``TemplateHemi.pole_vertex`` on the template mesh."""
+    native_vertex: int
+    """The native vertex whose place on the registered sphere is nearest that vertex."""
+    tkr: Vec3
+    """Its pial position."""
+    distance_mm: float
+    """From there to the geometric pole of the hemisphere (``RenderInfo.poles``)."""
 
 
 class RenderInfo(_Frozen):
@@ -291,7 +319,9 @@ class RenderInfo(_Frozen):
     config_hash: str
     volume: VolumeInfo
     inputs: dict[str, InputFile]
-    """Keyed by file role (``t1``, ``lh_pial``, ...)."""
+    """Keyed by file role (``t1``, ``lh_pial``, ...). The files the tiles are made from, and,
+    when the render was given a template, the ``sphere.reg`` files it read (``lh_sphere_reg``,
+    ``rh_sphere_reg``), whether or not they could be used."""
     poles: dict[Literal["lh", "rh"], PoleInfo]
     box: BoxInfo
     window: tuple[float, float]
@@ -301,7 +331,26 @@ class RenderInfo(_Frozen):
     video: VideoInfo | None = None
     poster: str | None = "poster.webp"
     vertex_map: VertexMapInfo | None = None
+    template: TemplateInfo | None = None
+    """Set when at least one hemisphere has fsaverage counterparts in the vertex map."""
+    fsaverage_poles: dict[Literal["lh", "rh"], FsaveragePole] | None = None
+    """One entry per hemisphere that has counterparts; None when ``template`` is."""
     versions: dict[str, str]
+    """Versions of the libraries that made the tiles."""
+
+    @model_validator(mode="after")
+    def _one_template(self) -> RenderInfo:
+        # the three places that say whether counterparts exist say the same
+        mesh = None if self.vertex_map is None else self.vertex_map.fsaverage
+        if self.template is None:
+            if self.fsaverage_poles is not None or mesh is not None:
+                raise ValueError("fsaverage_poles and vertex_map.fsaverage need a template")
+        elif not self.fsaverage_poles or mesh != self.template.mesh:
+            raise ValueError(
+                "a template needs fsaverage_poles for at least one hemisphere and its mesh "
+                "name in vertex_map.fsaverage"
+            )
+        return self
 
     def to_json(self) -> str:
         """Canonical serialization: stable key order, trailing newline."""

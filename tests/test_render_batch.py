@@ -63,6 +63,7 @@ from surfcensus.sources.base import (
 from surfcensus.sources.local import LocalSource
 from surfcensus.sources.patterns import resolve_subject_files
 from surfcensus.store import CATALOG_FILE, Catalog
+from surfcensus.templates import Template
 
 # 32 px tiles; the default box on a light subject (10 mm voxels) gives 7, 6 and 7 slices
 CONFIG = RenderConfig(panel_px=32)
@@ -219,11 +220,12 @@ def rendered(monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, bool, bool]]:
         out_dir: Path | str,
         config: RenderConfig | None = None,
         *,
+        template: Template | None = None,
         video: bool = True,
         force: bool = False,
     ) -> RenderInfo:
         calls.append((Path(out_dir).name, video, force))
-        return original(files, out_dir, config, video=video, force=force)
+        return original(files, out_dir, config, template=template, video=video, force=force)
 
     monkeypatch.setattr(api, "render_subject", spy)
     return calls

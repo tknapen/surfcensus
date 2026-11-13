@@ -1038,7 +1038,7 @@ def euler_number(holes: int) -> int                            # 2 - 2 * holes, 
 - A measure line is `# Measure <a>, <b>..., <value>, <unit>`, split on commas: the unit is the last field, the value the one before it, the key the first whitespace-separated token of the second field. A line that does not end in a number and a unit is skipped. This reads the malformed FreeSurfer 6 line as `CortexVol`.
 - Only `# Measure`, `# ColHeaders` and data rows are read. `SUBJECTS_DIR`, `hostname`, `user`, `cmdline`, `subjectname` are never parsed or kept.
 - Data rows are split on whitespace; a row whose field count differs from the header raises `ValueError` with the line number.
-- Holes come from `aseg.stats`; when it has none, the caller uses the log's (`subjects.holes_*`). The Euler number is not stored: it is `2 - 2 * holes` (the relation `mris_euler_number` prints, from memory).
+- Holes come from `aseg.stats`; when it has none, the caller uses the log's (`subjects.holes_*`). The Euler number is not stored: it is `2 - 2 * holes` (`mri_segstats` writes the count as `1 - euler / 2`; read in source at v5.3.0, v6.0.0 and v7.4.1).
 
 ### 6.2 `fsio/annot.py`, `fsio/morph.py`
 
@@ -1268,7 +1268,10 @@ def native_centroids(rows: pd.DataFrame, vmap: Mapping[str, np.ndarray],
 
 ```python
 def subject_metrics(vertex_summary: pd.DataFrame, clusters: pd.DataFrame | None, regional: pd.DataFrame,
-                    subjects: pd.DataFrame, regions: RegionConfig, *, mass: Literal["excess", "sum_z"]) -> pd.DataFrame
+                    subjects: pd.DataFrame, regions: RegionConfig, *, mass: Literal["excess", "sum_z"],
+                    zmaps: Mapping[str, Collection[str]] | None = None) -> pd.DataFrame
+    # zmaps: reference_id -> subject_uids with a z-map against it (added when built; without it every subject
+    # with a map is taken to be scored against every reference named in clusters)
     # one row per subject and reference_id ("none" when there are no clusters). Per-hemisphere metrics
     # (largest-cluster mass and area, peak z, ceiling fractions) take the larger of the two hemispheres; the
     # regional ratio pools both. Cluster metrics are 0 for a subject that has a z-map and no cluster, null for one
@@ -1364,7 +1367,7 @@ def merge_tables(ctx: RunContext) -> PhaseReport                                
 
 String columns are Arrow `string`. Floats are `float32` unless noted. Key columns come first, and the key is the sort order.
 
-`regional.parquet`, key (`subject_uid`, `hemi`, `parcel`): `subject_uid`, `hemi`, `parcel` string; `num_vert`, `surf_area_mm2`, `gray_vol_mm3` int32; `thick_avg_mm`, `thick_std_mm` float32. All parcels of the file (34 per hemisphere).
+`regional.parquet`, key (`subject_uid`, `hemi`, `parcel`): `subject_uid`, `hemi`, `parcel` string; `num_vert`, `surf_area_mm2`, `gray_vol_mm3` int32; `thick_avg_mm`, `thick_std_mm` float32. Every parcel of the file that has a finite thickness (34 per hemisphere in the real subjects looked at; FreeSurfer writes no row for a parcel without vertices).
 
 `vertex_summary.parquet`, key (`subject_uid`, `hemi`):
 
@@ -2631,6 +2634,15 @@ What step 3.0 delivered (2026-11-13), for the packages that follow. Where this d
 - `tests/synth_template.py`: as in 9.1, plus `SyntheticTemplate.n_vertices`, `pole_vertex` and `with_avg_area`; the closed-form rules as functions (`template_mesh`, `parcel_of`, `medial_coordinate`, `template_white`, `expected_regions`, `direction`, `mesh_vertex_areas`, `desikan_colours`) and constants (`DESIKAN_NAMES`, `WHITE_CENTRE`, `AVG_AREA_FACTOR_CAP` 1.5 inside the posterior cap, `AVG_AREA_FACTOR_REST` 1.2). `masks[hemi]` holds `cortex`, `medial_wall`, `posterior_cap`, the 11 parcels with vertices, and the five regions under the default `RegionConfig`; a coarser mesh takes the first entries. The cortex label is written in descending order. The pole is vertex 21.
 - `tests/synth_tierb.py`: as in 9.1, plus `add_tier_b(..., offset_mm=0.0)`, `warp_directions`, `unwarp_directions`, `subject_directions`, `in_patch`, `cohort_patches`, `SyntheticCohort`, `CANARIES`, `NOISE_SD_MM`. The warp is a rotation about `WARP_AXIS` by `warp * sin(pi * t)` at latitude `t`. `add_tier_a` computes the parcel rows from the subject's thickness and annotation when `add_tier_b` ran before it (11 rows), else writes 34 rows by rule; with `truncations=None` it writes (12, 140) and (30, 201).
 - `tests/conftest.py`: `synth_template` (order 7, 40 MB, about 1 s), `synth_cohort` and `small_cohort` return a `SyntheticCohort` (root, subjects, template, bad, no_sphere_reg, no_stats). In `synth_cohort`, `sub-004`, `sub-013` and `sub-022` carry a patch, `sub-009` has no `sphere.reg`, `sub-027` no stats; the template is linked next to the subjects as `fsaverage`. All three are read-only.
+
+What step 3.Z delivered (2026-11-13). Where this differs from sections 6 and 9, this is what the code has; the reasons are in decision D31 of `docs/decisions.md`.
+
+- `metrics/pipeline.py`: `run_metrics`, `update_native`, `merge_tables` as in 6.9, plus `metrics_pending` (how many subjects a call would read), `map_path`, `reference_dir`, `frame_of` and the constants `PER_SUBJECT_STAGES`, `RUN_UNIT`, `FSAVG_DIR`, `REFERENCE_DIR`. The `regional` stage leases the two `aparc.stats` files only; holes are the log's. The `fsaverage` stage takes every subject with a thickness file. A failure is reported as `(unit, "<stage>: <reason>")`, with the reasons of `MetricError` and `source changed`, `metric failure`, `reference not current`. The `score` unit's signature is over the content of the three tables it reads.
+- `Run`: `template(*, retemplate=False)`, `metrics(*, datasets, stages=None, jobs, force, retry_failed, retemplate)`, `scores()`, `clusters()`, `zmap(subject_uid, reference_id=None)`. `Run.render()` passes the template and ends with `update_native`.
+- `render/batch.py`: `run_render(ctx, *, template=None, ...)` and `render_pending(ctx, *, template=None, ...)`; `render_status` and `render_failures` take the template id from the pin (`meta.template_id`).
+- `templates.py`: `TEMPLATES_DIR`, `store_template(cache_dir, template)`, `load_template(directory)`.
+- CLI: `metrics` as in 6.10; `render-subject --fsaverage DIR | --no-template`; `render --fsaverage DIR`. `--fsaverage` is not stored in `config.yaml`.
+- `tests/conftest.py`: `small_run` (the run directory) and `small_run_cohort` (its three subjects), `run_copy`, `SMALL_RUN_METRICS`; `real_template` and `real_fsaverage5` (network); `real_subject_fs7` now has all of Tier B. `FREESURFER_HOME` is removed from the environment of the tests.
 
 ### Milestone 4
 

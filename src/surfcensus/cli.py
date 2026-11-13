@@ -36,6 +36,13 @@ _DATASET = typer.Option(
     metavar="ID",
     help="Only this dataset, by pseudonym or accession. Repeatable.",
 )
+_FSAVERAGE = typer.Option(
+    None,
+    "--fsaverage",
+    metavar="DIR",
+    help="The fsaverage directory to take the template from (any FreeSurfer install has one "
+    "in subjects/). The run keeps the template it first used.",
+)
 _MAX_NAMES = 10  # subjects named on one summary line
 _RELOCATE_ANY = "*"  # --relocate given without a pseudonym
 
@@ -59,23 +66,41 @@ def render_subject(
     ),
     force: bool = typer.Option(False, "--force", help="Render even if the output is up to date."),
     no_video: bool = typer.Option(False, "--no-video", help="Do not write anim.mp4."),
+    fsaverage: Path | None = typer.Option(
+        None,
+        "--fsaverage",
+        metavar="DIR",
+        help="The fsaverage directory that click marks are mapped to. Without it: "
+        "$FREESURFER_HOME/subjects/fsaverage, else fsaverage next to the subject.",
+    ),
+    no_template: bool = typer.Option(
+        False, "--no-template", help="Render without fsaverage counterparts."
+    ),
 ) -> None:
     """Render one subject without a run directory: tiles, poster, video, render.json."""
     # imports matplotlib
     from surfcensus.render import OutputInSourceError, RenderError, three_plane
     from surfcensus.render.model import PANEL_ORDER
+    from surfcensus.templates import TemplateError, TemplateNotFound
 
     if not out.strip():  # an unset shell variable; as a path it would be the current directory
         raise typer.BadParameter("the output path is empty", param_hint="--out")
     target = Path(out)
     if no_video and target.suffix.lower() == ".mp4":
         raise typer.BadParameter("--no-video contradicts an --out that names a video")
+    if no_template and fsaverage is not None:
+        raise typer.BadParameter("--no-template contradicts --fsaverage")
+    template = None if no_template else "auto" if fsaverage is None else fsaverage
     start = time.perf_counter()
     try:
         with _terminated_like_interrupted():
-            info = three_plane(subject_dir, target, video=not no_video, force=force)
+            info = three_plane(
+                subject_dir, target, template=template, video=not no_video, force=force
+            )
     except OutputInSourceError as exc:  # a call that cannot be meant, like an empty --out
         raise typer.BadParameter(str(exc), param_hint="--out") from exc
+    except (TemplateNotFound, TemplateError) as exc:  # only for a directory that was given
+        raise typer.BadParameter(_template_problem(exc), param_hint="--fsaverage") from exc
     except (RenderError, OSError) as exc:
         # OSError: the output cannot be written (not a directory, read-only, disk full)
         typer.echo(f"render failed: {' '.join(str(exc).split())}", err=True)
@@ -126,17 +151,31 @@ class _RelocateCommand(TyperCommand):
         return super().parse_args(ctx, filled)
 
 
+def _template_problem(exc: Exception) -> str:
+    """One line for a template that was asked for and cannot be used."""
+    looked_in = getattr(exc, "looked_in", None)
+    if looked_in:
+        return "not found: no usable fsaverage template; " + "; ".join(
+            f"{where}: {state}" for _, where, state in looked_in
+        )
+    return " ".join(str(exc).split())
+
+
 @contextmanager
 def _stops_with_exit_2() -> Iterator[None]:
-    """What is wrong with the call, the run, a source or the machine, and not with a
-    subject: one line ``reason: detail`` on stderr and exit code 2."""
+    """What is wrong with the call, the run, a source, the template or the machine, and not
+    with a subject: one line ``reason: detail`` on stderr and exit code 2."""
     from surfcensus.config import ConfigError
     from surfcensus.sources.base import SourceError
+    from surfcensus.templates import TemplateError, TemplateNotFound
 
     try:
         yield
     except (ConfigError, SourceError) as exc:
         typer.echo(" ".join(str(exc).split()), err=True)
+        raise typer.Exit(2) from exc
+    except (TemplateError, TemplateNotFound) as exc:
+        typer.echo(_template_problem(exc), err=True)
         raise typer.Exit(2) from exc
     except BrokenPipeError:  # the reader of the output went away; click ends the command
         raise
@@ -333,11 +372,86 @@ def inventory(
     raise typer.Exit(1 if report.failed else 0)
 
 
+def _with_fsaverage(run: Run, fsaverage: Path | None) -> None:
+    """Take the template of this call from ``--fsaverage``. The directory is not written to
+    ``config.yaml``: the run keeps the template itself, by content, from its first use."""
+    if fsaverage is None:
+        return
+    from surfcensus.config import with_changes
+
+    metrics = run.config.metrics.model_dump() | {"fsaverage_dir": str(fsaverage.resolve())}
+    run.config = with_changes(run.config, metrics=metrics)
+
+
+def _print_scores(run: Run) -> None:
+    """One line on what the subjects were scored against."""
+    from surfcensus.schemas import NO_REFERENCE
+
+    scores = run.scores()
+    if scores.empty:
+        return
+    counts = scores.groupby(["score_kind", "reference_id"], sort=True).size()
+    parts = []
+    for key, count in counts.items():
+        kind, reference = key if isinstance(key, tuple) else (key, NO_REFERENCE)
+        if kind == "fallback_rank":
+            parts.append(f"{count} ranked without a reference (decision D16)")
+        elif reference == NO_REFERENCE:
+            parts.append(f"{count} without a z-map")
+        else:
+            parts.append(f"{count} against {reference}")
+    typer.echo(f"scores: {len(scores)} subjects; {', '.join(parts)}")
+
+
+@app.command("metrics")
+def metrics(
+    run_dir: Path = _RUN_DIR,
+    stage: list[str] | None = typer.Option(
+        None,
+        "--stage",
+        metavar="NAME",
+        help="Only this stage: regional, fsaverage, reference, score, native or merge. "
+        "Repeatable. Without it the first four run.",
+    ),
+    dataset: list[str] | None = _DATASET,
+    jobs: int = typer.Option(1, "--jobs", min=1, metavar="J", help="Worker processes."),
+    fsaverage: Path | None = _FSAVERAGE,
+    retemplate: bool = typer.Option(
+        False,
+        "--retemplate",
+        help="Look for the template again and keep what is found, also when it differs "
+        "from the one the run was scored with.",
+    ),
+    force: bool = typer.Option(False, "--force", help="Compute over what is there."),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Try the units again that failed with these inputs."
+    ),
+) -> None:
+    """Compute the metrics and scores that are pending (phase 4)."""
+    from surfcensus.run import Run
+
+    with _stops_with_exit_2(), Run(run_dir) as run:
+        _with_fsaverage(run, fsaverage)
+        with _interrupted_is_exit_130(), _terminated_like_interrupted():
+            report = run.metrics(
+                datasets=dataset or None,
+                stages=stage or None,
+                jobs=jobs,
+                force=force,
+                retry_failed=retry_failed,
+                retemplate=retemplate,
+            )
+        _print_report(run, report)
+        _print_scores(run)
+    raise typer.Exit(1 if report.failed else 0)
+
+
 @app.command("render")
 def render(
     run_dir: Path = _RUN_DIR,
     jobs: int = typer.Option(1, "--jobs", min=1, metavar="J", help="Worker processes."),
     dataset: list[str] | None = _DATASET,
+    fsaverage: Path | None = _FSAVERAGE,
     all_subjects: bool = typer.Option(
         False, "--all", help="Every complete subject, whatever the selection."
     ),
@@ -370,6 +484,7 @@ def render(
     if all_subjects and selected:
         raise typer.BadParameter("--all contradicts --selected")
     rendering = all_subjects or selected or video is not None or force or retry_failed
+    rendering = rendering or fsaverage is not None
     if check_sample and (rendering or dataset or jobs != 1):
         raise typer.BadParameter("--check-sample renders nothing and takes --fraction and --seed")
     if not check_sample and (fraction is not None or seed is not None):
@@ -393,6 +508,7 @@ def render(
                 summary = listing.read_text(encoding="utf-8").splitlines()[0].lstrip("# ")
                 typer.echo(f"{summary}: {listing} and {listing.with_suffix('.html').name}")
                 raise typer.Exit()
+            _with_fsaverage(run, fsaverage)
             with _interrupted_is_exit_130(), _terminated_like_interrupted():
                 report = run.render(
                     jobs=jobs,
@@ -415,6 +531,7 @@ def status(
     ),
 ) -> None:
     """Say where a run stands: one line per phase, from its catalog."""
+    from surfcensus.records import ALL_METRIC_STAGES
     from surfcensus.render.batch import PHASE as RENDER
     from surfcensus.render.batch import render_failures, render_status
     from surfcensus.run import Run
@@ -432,6 +549,11 @@ def status(
         absent = len(subjects) - len(present)
         gone = f" ({absent} no longer in the source)" if absent else ""
         typer.echo(f"inventory: {len(present) - unreadable} done, {unreadable} failed{gone}")
+        for name in ALL_METRIC_STAGES:
+            ledger = public.work(name)
+            if len(ledger):  # a stage that never ran has no line
+                failed = int((ledger["status"] == "failed").sum())
+                typer.echo(f"metrics {name}: {len(ledger) - failed} done, {failed} failed")
         done, failed, pending = render_status(context)
         typer.echo(f"render: {done} done, {failed} failed, {pending} pending")
         if failures:

@@ -1,8 +1,8 @@
 """What the modules of milestone 3 share: error classes, the vocabulary of the metric
 tables, and the names that the packages of the milestone import from each other.
 
-A function that is not written yet raises NotImplementedError; nothing here calls one, so
-these tests hold before and after the functions arrive.
+The names were fixed before the functions were written (decision D30), and stay fixed now
+that they are.
 """
 
 from __future__ import annotations
@@ -58,6 +58,8 @@ INTERFACE: dict[str, tuple[str, ...]] = {
         "write_template",
         "read_template",
         "find_template",
+        "store_template",
+        "load_template",
     ),
     "surfcensus.metrics.regional": ("regional_rows", "region_mean_thickness", "occ_ctrl_ratio"),
     "surfcensus.metrics.ceiling": ("CeilingCounts", "ceiling_counts", "native_region"),
@@ -83,7 +85,14 @@ INTERFACE: dict[str, tuple[str, ...]] = {
         "fallback_rank",
         "add_rank",
     ),
-    "surfcensus.metrics.pipeline": ("run_metrics", "update_native", "merge_tables"),
+    "surfcensus.metrics.pipeline": (
+        "run_metrics",
+        "update_native",
+        "merge_tables",
+        "metrics_pending",
+        "map_path",
+        "reference_dir",
+    ),
     "surfcensus.reference.load": (
         "ReferenceMaps",
         "Reference",
@@ -91,6 +100,8 @@ INTERFACE: dict[str, tuple[str, ...]] = {
         "applicable_stratum",
         "write_reference",
         "read_reference",
+        "read_index",
+        "stratum_size",
     ),
     "surfcensus.reference.strata": (
         "field_bin",

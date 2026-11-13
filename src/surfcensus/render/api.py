@@ -3,11 +3,18 @@
 ``render.json`` is written last, so its presence marks a complete render. Source files are
 only read; everything written lies inside the output directory, which may not lie inside a
 source directory. Renders into one directory run one after the other (``_exclusive``).
+
+With a template, the vertex map carries for every native vertex its counterpart on the
+template mesh, and ``render.json`` the template's occipital pole on the native surface
+(decision D12). The tiles, the poster and the video do not depend on the template: a
+directory whose tiles are current is brought up to date with another template, or with
+none, by writing ``vertex_map.npz`` and ``render.json`` alone (``_update_counterparts``).
 """
 
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import tempfile
@@ -16,33 +23,49 @@ from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from importlib.metadata import version
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 
 import surfcensus
 from surfcensus._io import sha256_file
+from surfcensus.config import MetricsConfig
+from surfcensus.fsio.registration import SphereMap, build_sphere_map
 from surfcensus.fsio.surfaces import Surface, read_surface
 from surfcensus.fsio.volumes import Volume, intensity_window, read_volume
+from surfcensus.log import get_logger
 from surfcensus.render import encode, frames, geometry, vertexmap
 from surfcensus.render.model import (
     PANEL_ORDER,
     RENDER_SCHEMA_VERSION,
     Frame,
+    FsaveragePole,
     InputFile,
     PanelName,
+    PoleInfo,
     RenderConfig,
     RenderInfo,
+    TemplateInfo,
     VertexMapInfo,
     VideoInfo,
     VolumeInfo,
 )
 from surfcensus.render.slicing import MeshSlicer
-from surfcensus.sources.base import RENDER_ROLES, FileRole
+from surfcensus.sources.base import HEMIS, RENDER_ROLES, FileRole, Hemi
 from surfcensus.sources.patterns import (
     ROLE_CANDIDATES,
+    TEMPLATE_FILES,
     is_file,
     resolve_subject_files,
     variant_name,
+)
+from surfcensus.templates import (
+    Template,
+    TemplateError,
+    TemplateNotFound,
+    build_template,
+    find_template,
+    template_candidates,
 )
 
 try:
@@ -55,6 +78,10 @@ POSTER = "poster.webp"
 VIDEO = "anim.mp4"
 VERTEX_MAP = "vertex_map.npz"
 _SURFACE_ROLES = (FileRole.LH_WHITE, FileRole.RH_WHITE, FileRole.LH_PIAL, FileRole.RH_PIAL)
+_SPHERE_ROLES: dict[Hemi, FileRole] = {"lh": FileRole.LH_SPHERE_REG, "rh": FileRole.RH_SPHERE_REG}
+_PIAL_ROLES: dict[Hemi, FileRole] = {"lh": FileRole.LH_PIAL, "rh": FileRole.RH_PIAL}
+_TEMPLATE_SPHERE = TEMPLATE_FILES[0]  # surf/{h}.sphere.reg
+_NO_COUNTERPARTS = "click marks will not map to fsaverage"
 _VERSIONED = ("numpy", "matplotlib", "pillow", "nibabel")
 # The names this module writes, which are the only ones it ever removes (_write,
 # _remove_stale). A tile number is what "{index:03d}" writes: ASCII digits, three of them, or
@@ -87,6 +114,28 @@ class OutputInSourceError(ValueError):
 
 
 @dataclass(frozen=True)
+class _Located:
+    """The input files of a render that exist, and their identity (name, size, SHA-256)."""
+
+    paths: dict[FileRole, Path]
+    inputs: dict[str, InputFile]
+    no_sphere: dict[Hemi, str]
+    """Per hemisphere without a ``sphere.reg`` among ``paths``, why; empty when the render
+    has no template, which reads none."""
+
+
+@dataclass(frozen=True)
+class _Counterparts:
+    """What a template adds to a render. All empty without a template, and when no
+    hemisphere has a ``sphere.reg`` that can be used."""
+
+    nearest_target: dict[Hemi, np.ndarray]
+    """Per hemisphere that could be mapped, the template vertex nearest each native one."""
+    poles: dict[Hemi, FsaveragePole]
+    template: TemplateInfo | None
+
+
+@dataclass(frozen=True)
 class _Prepared:
     """A subject that passed every check, and what its render will write. Nothing has been
     written when one exists."""
@@ -102,6 +151,7 @@ def render_subject(
     out_dir: Path | str,
     config: RenderConfig | None = None,
     *,
+    template: Template | None = None,
     video: bool = True,
     force: bool = False,
 ) -> RenderInfo:
@@ -109,11 +159,27 @@ def render_subject(
 
     ``files`` maps roles to local paths; ``t1`` and the four surfaces are required, and
     ``brainmask`` is used when present. If ``out_dir`` already holds a complete render of the
-    same inputs (size and SHA-256), config and ``video`` setting, its ``render.json`` is
-    returned and nothing is written, unless ``force``. Otherwise the directory is rendered
-    again, and what an earlier render left and the new one does not list is removed: its
-    tiles, and its video if the ``render.json`` in the directory lists one. While another
-    render writes to ``out_dir``, this one waits for it.
+    same inputs (size and SHA-256), config, ``video`` setting and template, its
+    ``render.json`` is returned and nothing is written, unless ``force``. Otherwise the
+    directory is rendered again, and what an earlier render left and the new one does not
+    list is removed: its tiles, and its video if the ``render.json`` in the directory lists
+    one. While another render writes to ``out_dir``, this one waits for it.
+
+    With a ``template``, the two ``sphere_reg`` files are read as well, where ``files`` has
+    them. For each hemisphere whose ``sphere.reg`` has the vertices of its pial surface,
+    ``{hemi}_fsavg6`` of the vertex map holds the nearest template vertex of every vertex
+    (``SphereMap.nearest_target``), and ``render.json`` gets the template's occipital pole
+    on the native surface (``fsaverage_poles``). ``template`` and ``vertex_map.fsaverage``
+    of ``render.json`` are set when at least one hemisphere was mapped. A hemisphere
+    without a ``sphere.reg``, or with one that cannot be read, has another vertex count or
+    is no sphere, keeps -1 and gets no pole; that is logged as a warning and is no failure
+    of the render. The ``sphere.reg`` files that were read are among the ``inputs`` in
+    either case.
+
+    The tiles, the poster and the video do not depend on the template. When ``out_dir``
+    holds a render that is whole and differs from the one asked for only in the template
+    or in the ``sphere.reg`` files, ``vertex_map.npz`` and ``render.json`` are written and
+    nothing else is touched, unless ``force``.
 
     Raises :class:`RenderError` for a subject that cannot be rendered, or for a video that
     cannot be encoded because there is no ffmpeg binary, and ValueError for a config that
@@ -123,15 +189,26 @@ def render_subject(
     """
     config = _checked_config(config, video)
     out_dir = Path(out_dir)
-    paths, inputs = _locate(files)
-    _refuse_output_inside(out_dir, _source_dirs(paths))
-    if not force and (done := _complete_render(out_dir, config, inputs, video)) is not None:
-        return done
-    prepared = _prepare(paths, inputs, config, video)
+    located = _locate(files, spheres=template is not None)
+    _refuse_output_inside(out_dir, _source_dirs(located.paths))
+    wanted = None if template is None else _template_info(template)
+    current = None if force else _current_tiles(out_dir, config, located.inputs, video)
+    if current is not None and _up_to_date(current, located.inputs, wanted):
+        return current
+    # with current tiles there is nothing to refuse and, as a rule, nothing to draw
+    prepared = None if current is not None else _prepare(located, config, video, template)
     with _exclusive(out_dir) as locked:
-        # the render this one waited for may have left just what is asked for
-        if not force and (done := _complete_render(out_dir, config, inputs, video)) is not None:
-            return done
+        if not force:
+            # the render this one waited for may have left just what is asked for
+            current = _current_tiles(out_dir, config, located.inputs, video)
+            if current is not None:
+                if _up_to_date(current, located.inputs, wanted):
+                    return current
+                updated = _update_counterparts(out_dir, current, located, template)
+                if updated is not None:
+                    return updated
+        if prepared is None:
+            prepared = _prepare(located, config, video, template)
         _write(out_dir, prepared, remove_temporaries=locked)
     return prepared.info
 
@@ -141,6 +218,7 @@ def three_plane(
     out: Path | str,
     config: RenderConfig | None = None,
     *,
+    template: Template | Path | Literal["auto"] | None = "auto",
     video: bool = True,
     force: bool = False,
 ) -> RenderInfo:
@@ -150,21 +228,45 @@ def three_plane(
     alone. ``video`` and ``force`` are the switches of :func:`render_subject`; a video alone is
     always rendered. An ``out`` that is the subject directory or lies inside it is refused
     with :class:`OutputInSourceError`: a source directory is only read.
+
+    ``template`` says where the fsaverage counterparts of the vertex map come from:
+
+    * ``"auto"``: the template that ``templates.find_template`` finds with the default
+      metrics config: ``$FREESURFER_HOME/subjects/fsaverage``, else an ``fsaverage``
+      directory next to the subject directory. When there is none, or the one found cannot
+      be used, the subject is rendered without counterparts, and once it is rendered a
+      warning says so and where a template was looked for;
+    * a ``Path``: that fsaverage directory, built with the default metrics config.
+      ``TemplateNotFound`` or ``TemplateError`` when it cannot be used, before anything is
+      written;
+    * a ``Template``: as given;
+    * None: no counterparts.
+
+    The template that was used is recorded in ``render.json``. An ``out`` in the fsaverage
+    directory that the template was read from is refused like one in the subject directory.
     """
     try:
         files = resolve_subject_files(subject_dir)
     except OSError as exc:
         raise _unreadable(exc) from exc
     out = Path(out)
-    if out.suffix.lower() != ".mp4":
-        return render_subject(files, out, config, video=video, force=force)
-    if not video:
+    to_video = out.suffix.lower() == ".mp4"
+    if to_video and not video:
         raise ValueError(f"video=False contradicts the video output {out}")
-    # every refusal comes first, so that a refused subject leaves no directory behind
+    found, found_in, none_found = _resolve_template(Path(subject_dir), template)
+    if found_in is not None:
+        _refuse_output_inside(out, [found_in])
+    if not to_video:
+        info = render_subject(files, out, config, template=found, video=video, force=force)
+        if none_found is not None:
+            get_logger().warning(none_found)
+        return info
+    # A video has no marks, so nothing is said here when no template was found.
+    # Every refusal comes first, so that a refused subject leaves no directory behind.
     config = _checked_config(config, video=True)
-    paths, inputs = _locate(files)
-    _refuse_output_inside(out, _source_dirs(paths))
-    prepared = _prepare(paths, inputs, config, video=True)
+    located = _locate(files, spheres=found is not None)
+    _refuse_output_inside(out, _source_dirs(located.paths))
+    prepared = _prepare(located, config, True, found)
     created = [folder for folder in (out.parent, *out.parent.parents) if not folder.exists()]
     try:
         out.parent.mkdir(parents=True, exist_ok=True)
@@ -229,8 +331,51 @@ def _refuse_output_inside(out: Path, sources: Iterable[Path]) -> None:
                 )
 
 
-def _locate(files: Mapping[FileRole, Path]) -> tuple[dict[FileRole, Path], dict[str, InputFile]]:
-    """The files of the render roles that exist, and their identity (name, size, SHA-256)."""
+def _resolve_template(
+    subject_dir: Path, template: Template | Path | Literal["auto"] | None
+) -> tuple[Template | None, Path | None, str | None]:
+    """The template of a call of :func:`three_plane`; the directory it was read from, when
+    that is known; and, when ``"auto"`` found none that can be used, what to tell the user
+    once the subject is rendered. A subject that cannot be rendered gets its own message
+    and not this one."""
+    if template is None or isinstance(template, Template):
+        return template, None, None
+    defaults = MetricsConfig()
+    if template != "auto":
+        directory = Path(template)
+        built = build_template(directory, "explicit", mesh=defaults.mesh, regions=defaults.regions)
+        return built, directory, None
+    # next to the subject directory under the name it was given by, as a local source looks
+    named = subject_dir if subject_dir.name not in ("", "..") else subject_dir.resolve()
+    adjacent = named.parent / "fsaverage"
+    try:
+        found = find_template(config=defaults, adjacent=adjacent)
+    except TemplateNotFound as exc:
+        looked_in = "; ".join(f"{where}: {state}" for _, where, state in exc.looked_in)
+        none_found = (
+            f"no fsaverage template found: {_NO_COUNTERPARTS}. Looked in {looked_in}. Give "
+            "an fsaverage directory as the template (--fsaverage DIR on the command line), "
+            "set FREESURFER_HOME, or put one next to the subject directory."
+        )
+        return None, None, none_found
+    except TemplateError as exc:
+        unusable = f"the fsaverage template that was found cannot be used ({exc})"
+        return None, None, f"{unusable}: {_NO_COUNTERPARTS}"
+    return found, dict(template_candidates(adjacent=adjacent)).get(found.origin), None
+
+
+def _template_info(template: Template) -> TemplateInfo:
+    return TemplateInfo(
+        mesh=template.mesh,
+        template_id=template.template_id,
+        sphere_sha256={hemi: template.files[_TEMPLATE_SPHERE.format(h=hemi)][1] for hemi in HEMIS},
+    )
+
+
+def _locate(files: Mapping[FileRole, Path], *, spheres: bool = False) -> _Located:
+    """The files of the render roles that exist and, with ``spheres``, the ``sphere.reg``
+    files. A ``sphere.reg`` that is absent or cannot be examined is left out with its
+    reason: the render does not depend on it."""
     try:
         paths = {
             role: Path(files[role])
@@ -239,9 +384,20 @@ def _locate(files: Mapping[FileRole, Path]) -> tuple[dict[FileRole, Path], dict[
         }
         if missing := [role.value for role in RENDER_ROLES if role not in paths]:
             raise RenderError("missing surface", "no file for " + ", ".join(missing))
-        return paths, {role.value: _input_file(role, path) for role, path in paths.items()}
+        inputs = {role.value: _input_file(role, path) for role, path in paths.items()}
     except OSError as exc:
         raise _unreadable(exc) from exc
+    no_sphere: dict[Hemi, str] = {}
+    for hemi, role in _SPHERE_ROLES.items() if spheres else ():
+        try:
+            if role not in files or not is_file(files[role]):
+                no_sphere[hemi] = f"no {hemi}.sphere.reg"
+                continue
+            inputs[role.value] = _input_file(role, Path(files[role]))
+            paths[role] = Path(files[role])
+        except OSError as exc:
+            no_sphere[hemi] = _unreadable(exc, Path(files[role])).detail
+    return _Located(paths=paths, inputs=inputs, no_sphere=no_sphere)
 
 
 def _unreadable(exc: Exception, path: Path | None = None) -> RenderError:
@@ -259,14 +415,71 @@ def _unreadable(exc: Exception, path: Path | None = None) -> RenderError:
     return RenderError("render failure", f"unreadable input ({name}: {problem})")
 
 
+def _map_sphere(located: _Located, hemi: Hemi, n_pial: int, template: Template) -> SphereMap | str:
+    """The mapping between one hemisphere's ``sphere.reg`` and the template sphere, or why
+    there is none."""
+    if hemi in located.no_sphere:
+        return located.no_sphere[hemi]
+    path = located.paths[_SPHERE_ROLES[hemi]]
+    try:
+        sphere = read_surface(path)
+    except Exception as exc:  # nibabel raises many kinds of error on a damaged file
+        return _unreadable(exc, path).detail
+    if len(sphere.vertices) != n_pial:
+        return (
+            f"{hemi}.sphere.reg has {len(sphere.vertices)} vertices and the pial surface {n_pial}"
+        )
+    try:
+        return build_sphere_map(sphere, template.hemis[hemi].sphere)
+    except ValueError as exc:  # no sphere: radii that differ, are zero or are not finite
+        return f"{hemi}.sphere.reg: {exc}"
+
+
+def _counterparts(
+    located: _Located,
+    pial: Mapping[Hemi, np.ndarray],
+    geometric: Mapping[str, PoleInfo],
+    template: Template | None,
+) -> _Counterparts:
+    """Map each hemisphere's ``sphere.reg`` onto the template sphere.
+
+    ``pial`` holds the pial vertices of every hemisphere that has a ``sphere.reg`` among the
+    located files, and ``geometric`` the geometric poles. A hemisphere that cannot be
+    mapped is left out with a warning; nothing raises. Why a hemisphere fails does not
+    depend on the template: a file that cannot be read, another vertex count than the pial
+    surface, or vertices that do not lie on a sphere.
+    """
+    nearest_target: dict[Hemi, np.ndarray] = {}
+    poles: dict[Hemi, FsaveragePole] = {}
+    if template is None:
+        return _Counterparts(nearest_target, poles, None)
+    for hemi in HEMIS:
+        mapped = _map_sphere(located, hemi, len(pial[hemi]) if hemi in pial else 0, template)
+        if isinstance(mapped, str):
+            get_logger().warning("no fsaverage counterparts for %s: %s", hemi, mapped)
+            continue
+        template_vertex = template.hemis[hemi].pole_vertex
+        native_vertex = int(mapped.nearest_source[template_vertex])
+        there = pial[hemi][native_vertex]
+        pole = pial[hemi][geometric[hemi].vertex]
+        # squared and summed in Python: the digits then do not depend on numpy's linear algebra
+        squares = [(float(there[axis]) - float(pole[axis])) ** 2 for axis in range(3)]
+        nearest_target[hemi] = mapped.nearest_target
+        poles[hemi] = FsaveragePole(
+            template_vertex=template_vertex,
+            native_vertex=native_vertex,
+            tkr=(float(there[0]), float(there[1]), float(there[2])),
+            distance_mm=math.sqrt(squares[0] + squares[1] + squares[2]),
+        )
+    return _Counterparts(nearest_target, poles, _template_info(template) if poles else None)
+
+
 def _prepare(
-    paths: Mapping[FileRole, Path],
-    inputs: Mapping[str, InputFile],
-    config: RenderConfig,
-    video: bool,
+    located: _Located, config: RenderConfig, video: bool, template: Template | None = None
 ) -> _Prepared:
     """Read the inputs and work out the whole of ``render.json``. Every :class:`RenderError`
     is raised here or in :func:`_locate`; nothing is written."""
+    paths, inputs = located.paths, located.inputs
     if video:
         # found now: write_mp4 comes after render.json is removed and every tile is written
         try:
@@ -313,12 +526,17 @@ def _prepare(
     # nearest vertex in the map as on the full surface, for any snap radius up to the margin
     region = geometry.clickable_region(box, panels, config)
     vmap = vertexmap.build_vertex_map(surfaces, region, config.vertex_map_margin_mm)
+    found = _counterparts(
+        located, {hemi: surfaces[f"{hemi}_pial"].vertices for hemi in HEMIS}, poles, template
+    )
+    vmap = vertexmap.fill_fsaverage(vmap, found.nearest_target)
     vertex_map = VertexMapInfo(
         file=VERTEX_MAP,
         n_lh=len(vmap["lh_index"]),
         n_rh=len(vmap["rh_index"]),
         n_lh_visible=int(vmap["lh_visible"].sum()),
         n_rh_visible=int(vmap["rh_visible"].sum()),
+        fsaverage=None if found.template is None else found.template.mesh,
     )
     width, height = 3 * config.panel_px, config.panel_px
     info = RenderInfo(
@@ -350,9 +568,71 @@ def _prepare(
         else None,
         poster=POSTER,
         vertex_map=vertex_map,
+        template=found.template,
+        fsaverage_poles=dict(found.poles) or None,
         versions={name: version(name) for name in _VERSIONED},
     )
     return _Prepared(info=info, t1=t1, surfaces=surfaces, vertex_map=vmap)
+
+
+def _update_counterparts(
+    out_dir: Path, stored: RenderInfo, located: _Located, template: Template | None
+) -> RenderInfo | None:
+    """Bring a render whose tiles are current up to date with ``template`` and the
+    ``sphere.reg`` files, by writing ``vertex_map.npz`` and ``render.json`` alone.
+
+    ``stored`` is the ``render.json`` in ``out_dir``, of the same config and the same tile
+    inputs. Everything in it that describes the tiles stays, the library versions included.
+    ``render.json`` is removed first and written last, as in a full render. Returns None,
+    with nothing written, when the vertex map in the directory is not the one that
+    ``stored`` describes or a pial surface cannot be read: the caller then renders in full.
+    """
+    sizes = stored.vertex_map
+    if sizes is None:
+        return None
+    try:
+        vmap = vertexmap.read_vertex_map(out_dir / sizes.file)
+        pial = {
+            hemi: read_surface(located.paths[_PIAL_ROLES[hemi]]).vertices
+            for hemi, role in _SPHERE_ROLES.items()
+            if role in located.paths
+        }
+    except Exception:  # absent, damaged, or without the arrays of a vertex map
+        return None
+    for hemi, n, n_visible in (
+        ("lh", sizes.n_lh, sizes.n_lh_visible),
+        ("rh", sizes.n_rh, sizes.n_rh_visible),
+    ):
+        shapes = {field: vmap[f"{hemi}_{field}"].shape for field in ("index", "pial", "white")}
+        visible = vmap[f"{hemi}_visible"]
+        if shapes != {"index": (n,), "pial": (n, 3), "white": (n, 3)}:
+            return None
+        if visible.shape != (n,) or int(np.count_nonzero(visible)) != n_visible:
+            return None
+        if hemi in pial and not 0 <= stored.poles[hemi].vertex < len(pial[hemi]):
+            return None
+    found = _counterparts(located, pial, stored.poles, template)
+    try:
+        vmap = vertexmap.fill_fsaverage(vmap, found.nearest_target)
+    except ValueError:  # the map names a vertex that the surface does not have
+        return None
+    info = RenderInfo.model_validate(
+        stored.model_copy(
+            update={
+                "inputs": dict(located.inputs),
+                "vertex_map": sizes.model_copy(
+                    update={"fsaverage": None if found.template is None else found.template.mesh}
+                ),
+                "template": found.template,
+                "fsaverage_poles": dict(found.poles) or None,
+            }
+        ).model_dump()
+    )
+    (out_dir / RENDER_JSON).unlink(missing_ok=True)  # incomplete from here on
+    vertexmap.write_vertex_map(out_dir / sizes.file, vmap)
+    with encode.atomic_path(out_dir / RENDER_JSON) as tmp:
+        tmp.write_bytes(info.to_json().encode())
+    return info
 
 
 def _write(out_dir: Path, prepared: _Prepared, *, remove_temporaries: bool) -> None:
@@ -479,14 +759,35 @@ def _stored_render(out_dir: Path, config: RenderConfig, video: bool) -> RenderIn
     return info if same else None
 
 
-def _complete_render(
+def _tile_inputs(inputs: Mapping[str, InputFile]) -> dict[str, InputFile]:
+    """The inputs that the tiles are made from: all but the ``sphere.reg`` files."""
+    spheres = {role.value for role in _SPHERE_ROLES.values()}
+    return {role: entry for role, entry in inputs.items() if role not in spheres}
+
+
+def _current_tiles(
     out_dir: Path, config: RenderConfig, inputs: Mapping[str, InputFile], video: bool
 ) -> RenderInfo | None:
-    """The render already in ``out_dir`` if it is complete and matches, else None."""
+    """The render already in ``out_dir`` if it is whole and its tiles are those asked for:
+    this schema, config and video setting, the same tile inputs, every listed file there.
+    Else None. Says nothing about the template."""
     info = _stored_render(out_dir, config, video)
-    if info is None or info.inputs != inputs:
+    if info is None or _tile_inputs(info.inputs) != _tile_inputs(inputs):
         return None
     return info if all((out_dir / name).is_file() for name in _listed_files(info)) else None
+
+
+def _up_to_date(
+    current: RenderInfo, inputs: Mapping[str, InputFile], wanted: TemplateInfo | None
+) -> bool:
+    """Whether a render with current tiles also has the counterparts asked for: the same
+    ``sphere.reg`` files among its inputs and the template ``wanted``.
+
+    A render that read these ``sphere.reg`` files and names no template could map neither
+    hemisphere. That does not depend on the template (:func:`_counterparts`), so it is up
+    to date with any.
+    """
+    return current.inputs == inputs and current.template in (None, wanted)
 
 
 def render_on_disk(out_dir: Path | str, config: RenderConfig, *, video: bool) -> bool:

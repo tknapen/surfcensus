@@ -1069,7 +1069,7 @@ def test_config_hash_of_the_defaults_is_unchanged() -> None:
     """The hash decides whether a render is up to date, so it may change only when the
     serialized value of a default changes (or the schema version). Validation rules such as
     the colour format are not part of it."""
-    assert RenderConfig().config_hash() == "17f83a0c9b6c"
+    assert RenderConfig().config_hash() == "61154ffcd5ab"
 
 
 def test_config_defaults_are_the_documented_ones() -> None:
@@ -1145,7 +1145,7 @@ def test_render_info_serializes_deterministically_and_round_trips(name: str) -> 
 def test_render_info_contents() -> None:
     info = make_info(CASES["conformed"])
     data = json.loads(info.to_json())
-    assert data["schema_version"] == 2
+    assert data["schema_version"] == 3
     assert data["vertex_map"] == {
         "file": "vertex_map.npz",
         "fsaverage": None,

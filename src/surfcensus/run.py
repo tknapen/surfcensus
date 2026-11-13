@@ -3,11 +3,12 @@
 ``Run`` is the Python API of docs/architecture.md; the CLI is a thin layer over it. It holds
 the configuration, the private catalog and the sources, and only delegates: each phase
 method imports the phase it calls and hands it the public side of the run
-(``records.RunContext``), never the run itself. The metrics methods arrive in milestone 3.
+(``records.RunContext``), never the run itself.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 import sqlite3
 from collections.abc import Collection, Mapping, Sequence
@@ -29,9 +30,10 @@ from surfcensus.config import (
     with_changes,
     write_config,
 )
+from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
 from surfcensus.records import METRIC_STAGES, PhaseReport, RunContext
-from surfcensus.sources.base import DatasetRecord, FileRole, Source, SourceError
+from surfcensus.sources.base import HEMIS, DatasetRecord, FileRole, Hemi, Source, SourceError
 from surfcensus.store import (
     CATALOG_FILE,
     Catalog,
@@ -42,9 +44,12 @@ from surfcensus.store import (
 
 if TYPE_CHECKING:
     import httpx
+    import numpy as np
     import pandas as pd
 
-_METRICS = "metrics arrive in milestone 3"
+    from surfcensus.templates import Template, TemplateNotFound
+
+_PER_SUBJECT_STAGES = ("regional", "fsaverage")
 
 
 @dataclass(frozen=True)
@@ -105,6 +110,9 @@ class Run:
         self._key = key
         self._transport = transport
         self._built: dict[int, Source] = {}
+        self._template: Template | None = None
+        self._template_looked_for = False
+        self._no_template: tuple[str, int] | None = None  # the message, the level it was logged at
         if source is None:
             given: tuple[Source, ...] = ()
         elif isinstance(source, Sequence):
@@ -451,16 +459,165 @@ class Run:
             force=force,
         )
 
+    def template(self, *, retemplate: bool = False) -> Template | None:
+        """The fsaverage template of the run (``templates.find_template``), or None for a
+        run that has none.
+
+        Looked for, in this order: the directory of ``metrics.fsaverage_dir`` when it is set,
+        ``$FREESURFER_HOME/subjects/fsaverage``, the ``fsaverage`` next to the subjects of
+        the first dataset, in pseudonym order, that has one. The first use stores the
+        template under ``templates/<template_id>/``, records it in the catalog and pins the
+        run to it (``meta.template_id``); from then on the run keeps that template whatever
+        the environment looks like. ``retemplate`` looks again and pins what it finds.
+
+        A run that never had a template gets None, after one warning that says where a
+        template was looked for and how to give one. A run that is pinned never does:
+        ``TemplateError("changed", ...)`` is raised when its template can be neither read
+        from the cache nor built again, or when the directory given builds another one.
+        ``TemplateNotFound`` is raised for a directory that was given, cannot be used and
+        has no pinned template to stand in for it.
+        """
+        return self._find_template(retemplate, logging.WARNING)
+
+    def _find_template(self, retemplate: bool, level: int) -> Template | None:
+        """:meth:`template`, saying that there is none at ``level``: a render mentions it
+        only to those who ask for more output, because the metrics say it aloud."""
+        from surfcensus.templates import (
+            TEMPLATE_JSON,
+            TemplateError,
+            TemplateNotFound,
+            find_template,
+            write_template,
+        )
+
+        if self._template_looked_for and not retemplate:
+            if self._no_template is not None and level > self._no_template[1]:
+                get_logger().log(level, self._no_template[0])
+                self._no_template = (self._no_template[0], level)
+            return self._template
+        pinned = self._catalog.meta("template_id")
+        cache = self.run_dir / "templates"
+        adjacent, adjacent_id = self._adjacent_template()
+        try:
+            found = find_template(
+                config=self.config.metrics,
+                adjacent=adjacent,
+                cache_dir=cache,
+                pinned=pinned,
+                retemplate=retemplate,
+            )
+        except TemplateNotFound as exc:
+            if self.config.metrics.fsaverage_dir is not None:
+                raise  # a directory that was asked for and cannot be used is no "none found"
+            if pinned is not None:
+                raise TemplateError(
+                    "changed",
+                    "the template this run was scored with is no longer available; "
+                    "pass --fsaverage DIR or --retemplate",
+                ) from exc
+            self._no_template = (self._no_template_message(exc), level)
+            get_logger().log(level, self._no_template[0])
+            self._template, self._template_looked_for = None, True
+            return None
+        if not (cache / found.template_id / TEMPLATE_JSON).is_file():
+            write_template(cache / found.template_id, found)
+        if found.template_id != pinned:
+            self._catalog.upsert_template(
+                found.template_id,
+                found.mesh,
+                found.origin,
+                adjacent_id if found.origin == "adjacent" else None,
+                found.build_stamp,
+                {
+                    name: {"size": size, "sha256": digest}
+                    for name, (size, digest) in found.files.items()
+                },
+            )
+            self._catalog.set_meta("template_id", found.template_id)
+        self._template, self._template_looked_for, self._no_template = found, True, None
+        return found
+
+    def _adjacent_template(self) -> tuple[Path | None, int | None]:
+        """The ``fsaverage`` next to the subjects of the first dataset, in pseudonym order,
+        that the inventory found one for, and that dataset's row."""
+        rows = self._catalog.query(
+            "SELECT dataset_id, source, root, template_location FROM datasets "
+            "WHERE template_location IS NOT NULL ORDER BY pseudonym, source, pipeline"
+        )
+        for row in rows:
+            if row["source"] == "local" and row["root"] is not None:
+                return Path(row["root"]) / row["template_location"], row["dataset_id"]
+        return None, None
+
+    def _no_template_message(self, exc: TemplateNotFound) -> str:
+        names = {
+            "explicit": "the directory given",
+            "freesurfer_home": "$FREESURFER_HOME/subjects/fsaverage",
+            "adjacent": "fsaverage next to the subjects",
+            "bundled": "bundled copy",
+        }
+        lines = ["No fsaverage template found. Looked in:"]
+        for origin, where, state in exc.looked_in:
+            # a census run keeps its paths out of sight
+            place = where if self.config.mode == "local" else names.get(origin, origin)
+            lines.append(f"  {place}   ({state})")
+        lines += [
+            "Thickness is not compared per location, and click marks will not map to "
+            "fsaverage. Subjects are ranked on",
+            "the raw ceiling fraction and the occipital-to-control thickness ratio (decision D16).",
+            "To enable: pass --fsaverage /path/to/fsaverage (any FreeSurfer install has one "
+            "in subjects/).",
+        ]
+        return "\n".join(lines)
+
     def metrics(
         self,
         *,
         datasets: Collection[str] | None = None,
-        stages: Collection[str] = METRIC_STAGES,
+        stages: Collection[str] | None = None,
         jobs: int = 1,
         force: bool = False,
         retry_failed: bool = False,
+        retemplate: bool = False,
     ) -> PhaseReport:
-        raise NotImplementedError(_METRICS)
+        """Compute the metrics that are pending (phase 4); see
+        ``metrics.pipeline.run_metrics``.
+
+        ``stages`` are names of ``records.ALL_METRIC_STAGES``. Without them the four stages
+        of ``records.METRIC_STAGES`` run, or, when ``datasets`` are given, only the two that
+        work per subject: a stage on the whole run is not restricted by a dataset.
+        ``retemplate`` is that of :meth:`template`.
+
+        Raises ``TemplateError`` when the run's template is gone, ``ConfigError`` for a
+        stage that does not exist, and ``SourceError`` when a subject has to be read and a
+        source cannot be built, before anything is recorded against a subject.
+        """
+        from surfcensus.metrics.pipeline import metrics_pending, run_metrics
+
+        pseudonyms = self._pseudonyms(datasets)
+        if stages is None:
+            stages = METRIC_STAGES if datasets is None else _PER_SUBJECT_STAGES
+        template = self.template(retemplate=retemplate)
+        context = self.context()
+        pending = metrics_pending(
+            context,
+            template=template,
+            datasets=pseudonyms,
+            stages=stages,
+            force=force,
+            retry_failed=retry_failed,
+        )
+        if pending:
+            self._sources()  # a source that is gone is not a property of its subjects
+        return run_metrics(
+            context,
+            template=template,
+            datasets=pseudonyms,
+            stages=stages,
+            jobs=jobs,
+            force=force,
+            retry_failed=retry_failed,
+        )
 
     def render(
         self,
@@ -476,18 +633,27 @@ class Run:
         """Render the pending subjects into ``media/<subject_uid>/`` (phase 6); see
         ``render.batch.run_render``.
 
+        With a template (:meth:`template`), the vertex map of each render carries the
+        fsaverage counterparts of its vertices, and the call ends with the ``native`` stage
+        of the metrics, which gives the cluster centroids their native position. Without
+        one the renders have no counterparts, which is said at info level only: the metrics
+        are where a missing template is reported.
+
         ``subjects`` are ``subject_uid``s; in a local run a subject may also be named by
         its label. Raises ``SourceError`` when there is something to render and a source
         cannot be built, before anything is recorded against a subject. A call that finds
         every render recorded needs no source.
         """
+        from surfcensus.metrics.pipeline import update_native
         from surfcensus.render.batch import render_pending, run_render
 
+        template = self._find_template(False, logging.INFO)
         context = self.context()
         pseudonyms = self._pseudonyms(datasets)
         uids = None if subjects is None else self._subject_uids(subjects)
         pending = render_pending(
             context,
+            template=template,
             datasets=pseudonyms,
             subjects=uids,
             all_subjects=all_subjects,
@@ -497,8 +663,9 @@ class Run:
         )
         if pending:
             self._sources()  # a source that is gone is not a property of its subjects
-        return run_render(
+        report = run_render(
             context,
+            template=template,
             jobs=jobs,
             datasets=pseudonyms,
             subjects=uids,
@@ -507,6 +674,9 @@ class Run:
             force=force,
             retry_failed=retry_failed,
         )
+        # the cluster centroids of the subjects just rendered get their native position
+        update_native(context, template=template)
+        return report
 
     def _subject_uids(self, names: Sequence[str]) -> list[str]:
         named = [names] if isinstance(names, str) else list(names)
@@ -530,12 +700,76 @@ class Run:
         return resolved
 
     def scores(self) -> pd.DataFrame:
-        """The primary rows of ``tables/scores.parquet``, sorted by rank."""
-        raise NotImplementedError(_METRICS)
+        """The primary rows of ``tables/scores.parquet``, one per present subject: first the
+        subjects scored against a reference, by rank, then those without one, by rank.
+        Empty before ``metrics`` has run."""
+        from surfcensus.schemas import NO_REFERENCE, SCHEMAS
+        from surfcensus.store import read_table, table_path
+
+        scores = read_table(table_path(self.run_dir, "scores"), SCHEMAS["scores"])
+        scores = scores[scores["primary"].to_numpy(dtype=bool)]
+        order = scores.assign(unreferenced=scores["reference_id"] == NO_REFERENCE)
+        order = order.sort_values(["unreferenced", "rank", "subject_uid"])
+        return order.drop(columns="unreferenced").reset_index(drop=True)
 
     def clusters(self) -> pd.DataFrame:
-        """``clusters.parquet`` left-joined with ``clusters_native.parquet``."""
-        raise NotImplementedError(_METRICS)
+        """``clusters.parquet`` left-joined with ``clusters_native.parquet``: every outlier
+        cluster that was kept, with the native position of its centroid where a render
+        gives one. Empty before ``metrics`` has found a reference."""
+        from surfcensus.schemas import KEYS, SCHEMAS
+        from surfcensus.store import read_table, table_path
+
+        clusters = read_table(table_path(self.run_dir, "clusters"), SCHEMAS["clusters"])
+        native = read_table(table_path(self.run_dir, "clusters_native"), SCHEMAS["clusters_native"])
+        return clusters.merge(native, how="left", on=list(KEYS["clusters"]))
+
+    def zmap(self, subject_uid: str, reference_id: str | None = None) -> dict[Hemi, np.ndarray]:
+        """The subject's z-map per hemisphere on the template mesh, against ``reference_id``
+        or, by default, the reference of its primary score. z-maps are not stored: this
+        reads the subject's thickness map and the reference and computes
+        ``metrics.fsaverage.zmap``.
+
+        Raises ``KeyError`` for a subject that has no score against that reference, and
+        ``ConfigError("missing", ...)`` when the map or the reference is not on disk.
+        """
+        from surfcensus.metrics.fsaverage import global_median, read_maps, zmap
+        from surfcensus.metrics.pipeline import map_path, reference_dir
+        from surfcensus.reference.load import read_reference, shipped_reference
+        from surfcensus.reference.strata import SHIPPED_PREFIX
+        from surfcensus.schemas import NO_REFERENCE, SCHEMAS
+        from surfcensus.store import read_table, table_path
+
+        scores = read_table(table_path(self.run_dir, "scores"), SCHEMAS["scores"])
+        rows = scores[scores["subject_uid"] == subject_uid]
+        if reference_id is None:
+            rows = rows[rows["primary"].to_numpy(dtype=bool)]
+        else:
+            rows = rows[rows["reference_id"] == reference_id]
+        if rows.empty or rows["reference_id"].iloc[0] == NO_REFERENCE:
+            against = "a reference" if reference_id is None else reference_id
+            raise KeyError(f"{subject_uid} has no z-map against {against}")
+        reference_id, stratum = rows["reference_id"].iloc[0], rows["stratum"].iloc[0]
+        template = self.template()
+        try:
+            if reference_id.startswith(SHIPPED_PREFIX):
+                reference = shipped_reference()
+            else:
+                reference = read_reference(reference_dir(self.run_dir, reference_id))
+            maps = read_maps(map_path(self.run_dir, subject_uid))
+        except FileNotFoundError as exc:
+            raise ConfigError(
+                "missing", f"the map or the reference of {subject_uid} is not in the run"
+            ) from exc
+        if template is None or reference is None:
+            raise ConfigError("missing", f"the run has no template or no reference {reference_id}")
+        return {
+            hemi: zmap(
+                maps[hemi],
+                global_median(maps[hemi], template.hemis[hemi]),
+                reference.strata[stratum][hemi],
+            )
+            for hemi in HEMIS
+        }
 
     def public(self) -> PublicCatalog:
         """The public side of the catalog, on the run's connection."""

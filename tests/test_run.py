@@ -794,12 +794,33 @@ def test_a_label_of_two_datasets_is_ambiguous(tmp_path: Path, rendered: list[Pat
         assert other not in renders(run) and len(rendered) == 2
 
 
-def test_metrics_arrive_in_milestone_3(study: Path, new_run: Callable[..., Run]) -> None:
+def test_metrics_of_light_subjects_give_every_subject_a_row_without_a_score(
+    study: Path, new_run: Callable[..., Run], caplog: pytest.LogCaptureFixture
+) -> None:
+    """The light subjects have no thickness and no template, and the stats file of
+    ``sub-01`` is a few lines that are no parcel table: the metrics run, record that file
+    as unreadable and give every subject a row without a score. ``tests/test_pipeline.py``
+    has the runs that compute something."""
     run = new_run(study)
+    run.inventory()
     assert METRIC_STAGES == ("regional", "fsaverage", "reference", "score")
-    for call in (run.metrics, run.scores, run.clusters):
-        with pytest.raises(NotImplementedError, match="milestone 3"):
-            call()
+    with caplog.at_level("WARNING", logger="surfcensus"):
+        report = run.metrics()
+    assert [r.getMessage().splitlines()[0] for r in caplog.records] == [
+        "No fsaverage template found. Looked in:"
+    ]
+    assert report.phase == "metrics"
+    assert report.failures == ((uids(run)["sub-01"], "regional: unreadable"),)
+    assert any("No fsaverage template" in note for note in report.notes)
+    scores = run.scores()
+    assert sorted(scores["subject_uid"]) == sorted(run.public().subject_uids())
+    assert scores["composite"].isna().all() and set(scores["score_kind"]) == {"fallback_rank"}
+    assert run.clusters().empty
+    # the failed unit is not tried again, and is still counted
+    again = run.metrics()
+    assert (again.done, again.failed) == (0, 1)
+    with pytest.raises(ConfigError, match="no metric stage nonsense"):
+        run.metrics(stages=["nonsense"])
 
 
 # ---------------------------------------------------------------------------------------

@@ -32,9 +32,9 @@ Each source implements the `Source` protocol of `sources/base.py`. It yields `Da
 
 ## Scoring with a normative reference
 
-Outlier detection runs in fsaverage space: each subject's thickness is resampled to fsaverage6 through its `sphere.reg` and z-scored per vertex against a reference distribution (see `metrics.md`). For the census, the reference is the census itself, stratified. A local user with 12 subjects cannot build a stable per-vertex reference from their own data. The package therefore ships a normative reference derived from the census as package data (`surfcensus/data/reference/`). It holds per-vertex median and MAD maps of globally normalized thickness on fsaverage6 (about 0.7 MB per stratum), stratified by field strength and FreeSurfer major version, plus the regional parcel reference, all computed only from subjects that raters passed. Local scoring reports z-maps against the shipped reference and, when the local set has at least 30 subjects, against the local set. The reference is versioned; scores record which reference version they used. The fsaverage6 template is taken from a local FreeSurfer install, from an `fsaverage/` directory next to the subjects, or from a copy bundled in the wheel, in that order (decision D14).
+Outlier detection runs in fsaverage space: each subject's thickness is resampled to fsaverage6 through its `sphere.reg` and z-scored per vertex against a reference distribution (see `metrics.md`). For the census, the reference is the census itself, stratified. A local user with 12 subjects cannot build a stable per-vertex reference from their own data. The package therefore ships a normative reference derived from the census as package data (`surfcensus/data/reference/`). It holds per-vertex median, MAD and subject-count maps of globally normalized thickness on fsaverage6 (0.98 MB per stratum, as `.npz` beside a JSON index), stratified by field strength and FreeSurfer major version, plus the regional parcel reference, all computed only from subjects that raters passed. Local scoring reports z-maps against the shipped reference and, when the local set has at least 30 subjects, against the local set. The reference is versioned; scores record which reference they used (`scores.reference_id`). The fsaverage6 template is built at run time from an `fsaverage` directory: the one given with `--fsaverage`, else that of a local FreeSurfer install, else the one next to the subjects. Nothing fsaverage-derived ships in the wheel, so without such a directory there is no per-location scoring (decisions D14 and D22). A run keeps the template it first used.
 
-Until the census has produced ratings, the shipped reference is empty. Local sets of at least 30 subjects are scored within the set; smaller sets are ranked on raw ceiling fraction and occipital-to-control thickness ratio only (decision D16).
+Until the census has produced ratings, the shipped reference is empty. Local sets of at least 30 subjects are scored within the set; smaller sets, and sets without a template, are ranked on raw ceiling fraction and occipital-to-control thickness ratio only (decision D16).
 
 ## Package layout
 
@@ -79,18 +79,20 @@ surfcensus/
       stats.py             # parse ?h.aparc.stats, aseg.stats
       annot.py             # read ?h.aparc.annot and .label files
       morph.py             # read ?h.thickness
-    templates.py           # locate or fetch fsaverage spheres, cortex labels, search-region label
+    templates.py           # the fsaverage template: find a directory, derive the target mesh,
+                           # cortex, regions and vertex areas, cache it by content
     fsio/registration.py   # sphere.reg mapping: barycentric resampling, vertex correspondences
     metrics/
+      __init__.py          # MetricError
       regional.py          # parcel thickness from stats files
-      fsaverage.py         # resample thickness to fsaverage6, per-vertex reference, z-maps
-      clusters.py          # outlier clusters on the fsaverage mesh, centroid back-mapping
+      fsaverage.py         # resample thickness to fsaverage6, per-vertex reference, z-maps, strata
+      clusters.py          # outlier clusters on the fsaverage mesh, centroids on the native surface
       ceiling.py           # ceiling fraction on native surfaces
-      intensity.py
-      scoring.py           # composite score
-      pipeline.py          # phase 4 for a run: the metric stages and their tables
+      intensity.py         # milestone 5
+      scoring.py           # subject metrics, standardisation, composite score, ranks
+      pipeline.py          # phase 4 for a run: the stages, their skip tests, their tables
     reference/
-      build.py             # build a normative reference from a rated census run
+      build.py             # build a normative reference from a rated census run (milestone 6)
       load.py              # a reference in memory and on disk
       strata.py            # names of strata and of references, field-strength bins
     data/reference/        # shipped reference tables (parquet + JSON metadata)
@@ -148,7 +150,7 @@ Local users:
 surfcensus review PATH [--run-dir DIR] [--subjects GLOB] [--rater NAME] [--no-browser]
     # inventory + metrics + scoring + render + serve, in one go
 surfcensus export --run-dir DIR [--format csv|parquet]
-surfcensus render-subject SUBJECT_DIR --out DIR
+surfcensus render-subject SUBJECT_DIR --out DIR [--fsaverage DIR | --no-template]
     # one subject, no run directory; the CLI form of sc.render.three_plane
 ```
 
@@ -162,10 +164,12 @@ surfcensus discover   --run-dir DIR [--source openneuro-derivatives|openneuro-em
 surfcensus inventory  --run-dir DIR [--source PATH] [--subjects GLOB]... [--field-strength T]
                       [--dataset ID]... [--force] [--relocate [PSEUDONYM]]
 surfcensus enrich     --run-dir DIR
-surfcensus metrics    --run-dir DIR
+surfcensus metrics    --run-dir DIR [--stage regional|fsaverage|reference|score|native|merge]...
+                      [--dataset ID]... [--jobs J] [--fsaverage DIR] [--retemplate]
+                      [--force] [--retry-failed]
 surfcensus select     --run-dir DIR --n N --seed S
 surfcensus render     --run-dir DIR [--jobs J] [--dataset ID]... [--all | --selected]
-                      [--video / --no-video] [--force] [--retry-failed]
+                      [--video / --no-video] [--fsaverage DIR] [--force] [--retry-failed]
 surfcensus render     --run-dir DIR --check-sample [--fraction 0.02] [--seed S]
 surfcensus status     --run-dir DIR [--failures]
 surfcensus serve      --run-dir DIR --host 0.0.0.0 --port 8000
@@ -175,14 +179,15 @@ surfcensus reference build --run-dir DIR --out reference/
 
 Every phase command is idempotent and resumable. It skips work whose outputs exist with a matching config hash, and accepts `--dataset` filters so Snakemake can parallelize per dataset. Remote concurrency is bounded (`remote.max_concurrency`, default 8) with exponential backoff on 5xx and S3 `SlowDown`.
 
-`inventory`, `render` and `status` are built (milestone 2), for local sources:
+`inventory`, `render` and `status` (milestone 2) and `metrics` (milestone 3) are built, for local sources:
 
 - `inventory --source PATH` creates a local run in `DIR` when it holds none, and says which layout it found, how many subjects are complete and have Tier A and Tier B files, their FreeSurfer versions, and which subjects lack what. On a run that exists, `--source` only says which source is meant: it must be the stored root, or come with `--relocate` when the data moved. `--relocate` replaces the stored root and, when the data now lies in another layout of the same pipeline (an fMRIPrep output moved from `sourcedata/freesurfer/` to the older `freesurfer/` beside `fmriprep/`), where the subjects are under it. Nothing else changes, so every `subject_uid`, render and rating stays; with several local sources it takes the pseudonym of the dataset that moved. Data that an inventory finds in the layout of another pipeline (a subjects directory that became an fMRIPrep output) is a new set of subjects with new identifiers: the earlier ones are marked absent, with a note, and keep their renders and ratings (decision D21).
 - `render` renders what is pending and prints counts and one line per failure reason. When nothing is pending it reads no source, so it also works while the data is not mounted. `--all` renders every complete subject, `--selected` only the selection (which is every complete subject while nothing is selected). `--check-sample` renders nothing: it draws a seeded sample of the done renders for the by-eye check of phase 6 and writes `logs/render-check-<seed>.txt` and `.html`.
-- `status` prints one line per phase from the catalog: subjects inventoried and unreadable; renders done, failed and pending, where pending is what `render` would do now. `--failures` lists every failed unit with its reason and detail; for the render these are the subjects counted as failed on the line above, so an incomplete subject is listed before `render` has recorded it, and a recorded failure of a subject that left the source or is pending again is not. It reads the private catalog, so its output is for the operator's terminal, not for a log.
+- `metrics` computes what is pending of phase 4 and prints the counts, one line per failure reason, the notes of the report and one line that says what the subjects were scored against. Without `--stage` it runs the stages `regional`, `fsaverage`, `reference` and `score`; with `--dataset` and no `--stage`, only the two that work per subject, since a stage on the whole run is not restricted by a dataset. `native` (cluster centroids on the native surface, from the vertex maps of the renders) also runs at the end of every `render`; `merge` joins the per-dataset parts of each table. `--fsaverage DIR` gives the template for this call; the directory is not written to `config.yaml`, because the run keeps the template itself, by content, from its first use. A directory that builds another template than the one the run is pinned to stops the command (`changed: <old> -> <new>; pass --retemplate`); `--retemplate` takes the new one, and every map is made again. `render` takes `--fsaverage` as well.
+- `status` prints one line per phase from the catalog: subjects inventoried and unreadable; for each metric stage that has run, its units done and failed; renders done, failed and pending, where pending is what `render` would do now. `--failures` lists every failed unit with its reason and detail; for the metrics these are the failed rows of the ledger; for the render these are the subjects counted as failed on the line above, so an incomplete subject is listed before `render` has recorded it, and a recorded failure of a subject that left the source or is pending again is not. It reads the private catalog, so its output is for the operator's terminal, not for a log.
 - `--dataset` takes a pseudonym or an accession. An accession given on the command line is resolved in the catalog and stored nowhere.
 - Options that are stored in `config.yaml` (`--subjects`, `--field-strength`, `--video`) hold until they are given again: a command run a second time without them changes nothing. A subject glob that matches nothing is refused before it is stored.
-- Exit codes: 0 when no unit is in the failed state when the command ends; 1 when at least one is, also when it failed in an earlier call and was not tried again; 2 for a usage or configuration error, including a source that cannot be found, printed as one line `reason: detail`. What lies in the machine and not in a subject is such an error as well and is recorded against no subject: a run directory that cannot be made or written, a catalog that another process keeps locked, media on a full or read-only disk, a video encoder that is absent or cannot encode. Once the cause is gone, the same command does the work (decision D29). `status` reports and always ends with 0.
+- Exit codes: 0 when no unit is in the failed state when the command ends; 1 when at least one is, also when it failed in an earlier call and was not tried again; 2 for a usage or configuration error, including a source that cannot be found, printed as one line `reason: detail`. What lies in the machine and not in a subject is such an error as well and is recorded against no subject: a run directory that cannot be made or written, a catalog that another process keeps locked, media on a full or read-only disk, a video encoder that is absent or cannot encode, a template directory that was given and cannot be used, a template that differs from the one the run is pinned to. Once the cause is gone, the same command does the work (decision D29). `status` reports and always ends with 0.
 - Two commands that create a run in the same directory at the same time: one creates it, the other either opens it or is refused with exit code 2 and changes nothing. A command that opens a run while another is still creating it gets the same run. A command that is killed while it creates a run leaves no run, or one that the next command finishes: `config.yaml` alone, or with a catalog in which no run was made yet.
 - `--backend mpl|freeview` is not offered until the Freeview backend exists.
 
@@ -198,11 +203,13 @@ run = sc.Run("/data/sc-run", source=src)
 run.inventory()
 run.metrics()
 run.render(jobs=8)
-scores = run.scores()  # pandas DataFrame
+scores = run.scores()  # pandas DataFrame, one row per subject, by rank
+clusters = run.clusters()  # outlier clusters, with native positions where a render gives them
+z = run.zmap(scores["subject_uid"][0])  # {"lh": ..., "rh": ...} on the template mesh
 sc.render.three_plane(subject_dir, out="sub-01.mp4")  # single subject, no run dir
 ```
 
-`Run(run_dir, source)` creates a run in a new or empty directory; `Run(run_dir)` opens one, without a key also for a census run (only `inventory` and, later, `discover` need the key). Each phase method returns a `PhaseReport` with the counts of units done, skipped and failed. `run.metrics()`, `run.scores()` and `run.clusters()` arrive in milestone 3.
+`Run(run_dir, source)` creates a run in a new or empty directory; `Run(run_dir)` opens one, without a key also for a census run (only `inventory` and, later, `discover` need the key). Each phase method returns a `PhaseReport` with the counts of units done, skipped and failed. `run.template()` returns the fsaverage template of the run, or None for a run that never had one; it stores the template in the run directory and pins the run to it on first use, and raises when a pinned template can neither be read nor built again. `run.zmap(subject_uid)` computes a subject's z-map from its stored thickness map and the reference; z-maps are not stored.
 
 `Run` holds the private catalog and only delegates. A phase function receives a `RunContext` (`records.py`), never the `Run`: the run directory, the configuration, a `PublicCatalog`, a `lease(subject_uid, roles)` function that looks the subject up and leases through its source, a `render_key` function with the run secret bound, and a `scrub` function for the text of exceptions. So code downstream of the inventory names subjects by `subject_uid` and datasets by pseudonym, and cannot reach an accession, a root or an input signature even by attribute access. `run.public()` and `PublicCatalog.open(run_dir)` give the same public side to the app and to exports.
 
@@ -215,13 +222,16 @@ run/
   catalog.sqlite         # datasets, subjects, files, provenance, the work ledger, selection, renders
   tables/
     regional.parquet     # subject x hemisphere x parcel
-    vertex_summary.parquet
-    scores.parquet       # one row per subject
-    clusters.parquet     # outlier clusters per subject: hemi, area, peak z, centroid vertex, native tkr RAS
+    vertex_summary.parquet    # subject x hemisphere: resampling facts, ceiling counts, flags
+    scores.parquet       # one row per subject and reference; one of them primary per subject
+    clusters.parquet     # outlier clusters per subject, reference, hemisphere and region:
+                         # area, mass, excess mass, peak z, peak and centroid vertex
+    clusters_native.parquet   # the clusters whose centroid has a native position in a render
     _parts/<table>/<pseudonym>.parquet   # the rows of one dataset; merged into the table above
-    fsavg/<subject_uid>.npz   # fsaverage6 thickness (and z) maps, float16
-    reference/           # per-vertex reference maps per stratum for this run
-  templates/             # cached fsaverage sphere, cortex label, search-region label
+    fsavg/<subject_uid>.npz   # fsaverage6 thickness maps of both hemispheres, float16, 164 kB
+    reference/<reference_id>/ # a reference built in this run: index.json (written last, marks it
+                              # complete), stratum_<nnn>.npz (median, MAD, count), members.parquet
+  templates/<template_id>/    # the template of the run: template.json, template.npz (5.9 MB)
   cache/                 # remote downloads only, content-addressed, prunable
   logs/                  # render-check-<seed>.txt and .html; in a census run also the phase logs
   media/<subject_uid>/
@@ -247,26 +257,27 @@ A new catalog is built under a temporary name in the run directory and gets the 
 
 Tables in `catalog.sqlite` (the DDL is migration 1 in `store.py`):
 
-- `meta(key, value)`: run id, mode, key kind and fingerprint, creation time, package version, later the template id; and the run secret.
+- `meta(key, value)`: run id, mode, key kind and fingerprint, creation time, package version, the id of the template the run is pinned to (`template_id`, from its first use); and the run secret.
 - `datasets(dataset_id, pseudonym, source, identity, accession, root, fs_root, template_location, layout, pipeline, pipeline_version, derivative_ref, snapshot_tag, n_subjects_listed, ..., discovered_at)`, unique on `(source, identity, pipeline)`; for a local source, one row with `root` set to the path.
 - `subjects(subject_uid, dataset_id, subject_label, participant, fs_dir, present, complete, tier_a, tier_b, missing_roles, problem, longitudinal, fs_build_stamp, fs_version, fs_major, recon_flags, n_invocations, recon_finished, t2pial, flairpial, hires, expert, xopts, edited, pial_variant, holes_lh, holes_rh, trunc_lh_1, trunc_lh_2, trunc_rh_1, trunc_rh_2, age, sex, field_strength, manufacturer, inventory_hash, inventoried_at)`. `complete` means every file a render needs is present; `tier_a` and `tier_b` that the stats files, and the thickness and `sphere.reg` files, are. `present = 0` marks a subject that the source no longer lists; its row, render and ratings stay.
 - `files(subject_uid, role, location, variant, size, etag_or_mtime, last_modified, version_id, sha256)` with roles `t1`, `brainmask`, `lh_white`, `rh_white`, `lh_pial`, `rh_pial`, `lh_thickness`, `rh_thickness`, `lh_sphere_reg`, `rh_sphere_reg`, `lh_annot`, `rh_annot`, `lh_stats`, `rh_stats`, `aseg_stats`, `talairach`, `recon_log`, `build_stamp`, `recon_log_lh`, `recon_log_rh`. `location` is relative to the subject directory, so the table holds no accession. `sha256` is set when a file was read in full: by the inventory for the build stamp and the recon-all logs (not for a log of which only the head was read), by a render for the T1, the surfaces and the brainmask. The other roles have none yet.
 - `dataset_files(...)`: dataset-level files that a stored value was read from (`dataset_description.json`, `participants.tsv`, a T1w sidecar). Empty until milestone 5.
-- `templates(...)`: empty until milestone 3.
-- `work(phase, unit, config_hash, input_signature, status, reason, detail, output, surfcensus_version, finished_at)`: the ledger of every phase but inventory and render; a unit is a `subject_uid`, `dataset:<pseudonym>` or `run`.
+- `templates(template_id, mesh, origin, dataset_id, build_stamp, files_json, created_at)`: every template the run has used, with the size and SHA-256 of the fsaverage files it was built from.
+- `work(phase, unit, config_hash, input_signature, status, reason, detail, output, surfcensus_version, finished_at)`: the ledger of every phase but inventory and render; a unit is a `subject_uid`, `dataset:<pseudonym>` or `run`. The metric stages are the phases `regional` and `fsaverage` (one unit per subject) and `reference`, `score` and `native` (the unit `run`).
 - `renders(subject_uid, config_hash, input_signature, tile_hash, render_key, video, status, reason, detail, media_path, n_frames, template_id, rendered_at)`
 - `selection(subject_uid, reason, stratum, inclusion_prob, seed)`
 
 What is private stays in the catalog and is reached only through `store.Catalog`, which `run.py`, `cli.py` and the inventory use: `dataset_id` (assigned in the order of the bucket listing), identity, accession, root, `fs_root`, template location, derivative ref and snapshot tag; `fs_dir`; file locations, sizes, ETags and digests; every input signature; the run secret; and in a census run the subject labels and every failure detail (a local run shows the details of its own renders). Three views (`public_datasets`, `public_subjects`, `public_files`) leave these out, and no frame that `store.PublicCatalog` returns holds any of them. It hands out an input signature only as a value to pass back for the skip test. Everything `PublicCatalog` returns is ordered by pseudonym or `subject_uid`, never by `dataset_id`.
 
-An input signature is 16 hex characters of the SHA-256 over role, location, size and ETag or modification time of the files a stage reads, and for a role with several candidate names the name that was read (`variant`), which is what changes when a `?h.pial` link is pointed at another variant. It comes from the listing, so deciding to skip a unit opens no source file. The skip rule is the same in every phase: a unit is skipped when its row is `done`, its config hash and input signature are those of the present configuration and listing, and its output exists. For a render the output is the whole media directory: `render.json` and a file under every name it lists, so a directory that lost files (a partial copy, a restore) is rendered again. A `failed` row that matches is not tried again unless `--retry-failed`; a changed configuration or input tries it again; `--force` ignores the row. Outputs are written first and the row last, so a crash leaves an output without a row, which the next run redoes, never a row without its output. The inventory has no ledger rows; its skip test is `subjects.inventory_hash`, the signature over all listed files of the subject.
+An input signature is 16 hex characters of the SHA-256 over role, location, size and ETag or modification time of the files a stage reads, and for a role with several candidate names the name that was read (`variant`), which is what changes when a `?h.pial` link is pointed at another variant. It comes from the listing, so deciding to skip a unit opens no source file. The skip rule is the same in every phase: a unit is skipped when its row is `done`, its config hash and input signature are those of the present configuration and listing, and its output exists. For a render the output is the whole media directory: `render.json` and a file under every name it lists, so a directory that lost files (a partial copy, a restore) is rendered again. A `failed` row that matches is not tried again unless `--retry-failed`; a changed configuration or input tries it again; `--force` ignores the row. Outputs are written first and the row last, so a crash leaves an output without a row, which the next run redoes, never a row without its output. The inventory has no ledger rows; its skip test is `subjects.inventory_hash`, the signature over all listed files of the subject. The stages on the whole run have signatures of their own: that of `reference` covers the subjects that have a map, with the signatures of their files, their dataset, field strength and FreeSurfer version; that of `score` the content of the three tables it reads, what it takes from the catalog and who is scored against which reference; that of `native` the content of `clusters.parquet` and the render keys. So one more subject redoes the stages on the run and nothing per subject.
 
 ## Testing
 
 - Unit tests on synthetic meshes (ellipsoids, and a folded closed surface that a slice crosses in several loops) for slicing, contour drawing, normals, pole finding and ROI construction.
 - Layout detection tests for the local source on fake directory trees (SUBJECTS_DIR, fMRIPrep old and new layouts, BIDS derivatives).
 - Golden-image tests for frame composition with a tolerance, using a tiny synthetic volume.
-- Network fixtures, marked `network`: `ds000102` sub-01 (FreeSurfer 6.0.1; Tier A, B and C, 43 MB) and `ds003020` sub-UTS01 (FreeSurfer 7.3.2; Tier A, Tier C and thickness, 25 MB), each fetched once into the pytest cache. Linked into an fMRIPrep layout, they are the end-to-end test of inventory and render through `Run`, and later of `surfcensus review --no-browser`.
+- Network fixtures, marked `network`: `ds000102` sub-01 (FreeSurfer 6.0.1; Tier A, B and C, 43 MB) and `ds003020` sub-UTS01 (FreeSurfer 7.3.2; Tier A, B and C, 37 MB) and the template files of the `fsaverage` next to the subjects of `ds000102` (40 MB), each fetched once into the pytest cache. Linked into an fMRIPrep layout, they are the end-to-end test of inventory, metrics and render through `Run`, and later of `surfcensus review --no-browser`.
 - Property tests (hypothesis) for mesh-plane intersection: every segment endpoint lies on the plane and on a mesh edge.
-- Resampling tests: resampling fsaverage onto itself is the identity; a smooth field on a synthetic sphere survives resampling within tolerance; agreement with `mri_surf2surf` on the network fixture within a stated tolerance (run once by a developer with FreeSurfer, stored as a reference array).
+- Resampling tests: resampling fsaverage onto itself is the identity; a smooth field on a synthetic sphere survives resampling within tolerance; agreement with `mri_surf2surf` on the network fixture within a stated tolerance (run once by a developer with FreeSurfer, stored as a reference array; not made yet, and the test is skipped until it is).
+- Metric fixtures: a synthetic fsaverage directory of the real size (163,842 vertices, coarsened to fsaverage6 by the code under test) with Desikan parcels laid out by rule, and synthetic subjects whose `sphere.reg` is a known warp and whose thickness is a known function of the template position, with a 5 mm patch planted in some. A cohort of 32 crosses the 30-subject rule; one of 5 does not. `small_run` is a run of three such subjects that went through inventory, metrics and render.
 - Click round-trip tests: random voxels to panel pixels and back for every panel and slice in `render.json`; marks resolve to the expected vertex on a synthetic mesh.

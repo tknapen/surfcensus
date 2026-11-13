@@ -10,12 +10,15 @@ The session fixtures are shared and must be treated as read-only; a test that ne
 a subject writes its own with ``write_synthetic_subject(tmp_path, ...)``.
 
 Milestone 3 adds the template and the cohorts: ``synth_template``, ``synth_cohort`` and
-``small_cohort``, built from ``tests/synth_template.py`` and ``tests/synth_tierb.py``.
+``small_cohort``, built from ``tests/synth_template.py`` and ``tests/synth_tierb.py``; a run
+that went through inventory, metrics and render (``small_run``, and ``run_copy`` for a test
+that writes); and the real template for the network tests (``real_template``).
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import sys
 from collections.abc import Iterator
@@ -27,7 +30,11 @@ install_import_hook(
     "surfcensus", "beartype.beartype(conf=beartype.BeartypeConf(is_pep484_tower=True))"
 )
 sys.path.insert(0, str(Path(__file__).parent))
+# The template lookup takes $FREESURFER_HOME/subjects/fsaverage first. The tests bring their
+# own template, or none, whatever is installed where they run.
+os.environ.pop("FREESURFER_HOME", None)
 
+import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 from synth import (  # noqa: E402  # pyrefly: ignore[missing-import]
     SyntheticSubject,
@@ -43,6 +50,11 @@ from synth_tierb import (  # noqa: E402  # pyrefly: ignore[missing-import]
     cohort_patches,
     synthetic_cohort,
 )
+
+from surfcensus.config import MetricsConfig, new_local_config  # noqa: E402
+from surfcensus.render.model import RenderConfig  # noqa: E402
+from surfcensus.run import Run  # noqa: E402
+from surfcensus.sources.local import local  # noqa: E402
 
 
 @pytest.fixture(scope="session")
@@ -142,6 +154,59 @@ def small_cohort(
     )
 
 
+SMALL_RUN_METRICS = MetricsConfig(min_reference_n=3, min_vertex_n=2)
+"""With three subjects in the reference the run of ``small_run`` is scored within the set."""
+
+
+@pytest.fixture(scope="session")
+def small_run_cohort(
+    tmp_path_factory: pytest.TempPathFactory, synth_template: SyntheticTemplate
+) -> SyntheticCohort:
+    """The three subjects of ``small_run``, ``sub-001`` with the medial patch, in a subjects
+    directory with the template next to them. Read-only."""
+    return _cohort(
+        tmp_path_factory.mktemp("small_run_data"),
+        3,
+        synth_template,
+        seed=3,
+        bad={1: cohort_patches()["medial"]},
+    )
+
+
+@pytest.fixture(scope="session")
+def small_run(tmp_path_factory: pytest.TempPathFactory, small_run_cohort: SyntheticCohort) -> Path:
+    """The run directory of a local run on ``small_run_cohort`` that went through inventory,
+    metrics and render: panels of 64 px, no video, every subject selected. It has z-maps
+    within the set (``SMALL_RUN_METRICS``), clusters with native centroids and
+    ``composite_z`` scores. Read-only; a test that writes takes ``run_copy``."""
+    root = small_run_cohort.root
+    run_dir = tmp_path_factory.mktemp("small_run") / "run"
+    config = new_local_config(root, render=RenderConfig(panel_px=64), metrics=SMALL_RUN_METRICS)
+    with Run(run_dir, local(root), config=config) as run:
+        run.inventory()
+        run.metrics()
+        uids = run.public().subject_uids()
+        selection = pd.DataFrame(
+            {
+                "subject_uid": uids,
+                "reason": "all",
+                "stratum": "all",
+                "inclusion_prob": 1.0,
+                "seed": 0,
+            }
+        )
+        run.public().replace_selection(selection, ["all"])
+        run.render(video=False)
+    return run_dir
+
+
+@pytest.fixture
+def run_copy(small_run: Path, tmp_path: Path) -> Path:
+    """A copy of the run directory of ``small_run`` that a test may write to. Its source is
+    still the read-only cohort."""
+    return Path(shutil.copytree(small_run, tmp_path / "run"))
+
+
 @pytest.fixture(autouse=True)
 def _package_logger_as_it_was() -> Iterator[None]:
     """The CLI puts a handler and a level on the package logger; no test inherits them."""
@@ -195,7 +260,29 @@ REAL_SUBJECT_FS7_FILES = {  # sizes in bytes, from the bucket listing of 2026-11
     "scripts/recon-all-rh.log": 312_262,
     "surf/lh.thickness": 525_623,
     "surf/rh.thickness": 528_503,
+    # the rest of Tier B, from the bucket listing of 2026-11-13
+    "surf/lh.sphere.reg": 4_733_385,
+    "surf/rh.sphere.reg": 4_759_305,
+    "label/lh.aparc.annot": 1_052_729,
+    "label/rh.aparc.annot": 1_058_489,
 }
+REAL_TEMPLATE_URL = BUCKET_URL + "ds000102-fmriprep/sourcedata/freesurfer/"
+REAL_TEMPLATE_FILES = {  # of fsaverage/; sizes in bytes, from the bucket listing of 2026-11-13
+    "surf/lh.sphere.reg": 5_898_546,
+    "surf/rh.sphere.reg": 5_898_546,
+    "surf/lh.white": 5_898_808,
+    "surf/rh.white": 5_898_808,
+    "label/lh.cortex.label": 6_117_569,
+    "label/rh.cortex.label": 5_964_904,
+    "label/lh.aparc.annot": 1_312_250,
+    "label/rh.aparc.annot": 1_312_250,
+    "surf/lh.white.avg.area.mgh": 655_672,
+    "surf/rh.white.avg.area.mgh": 655_672,
+    "scripts/build-stamp.txt": 49,
+}
+REAL_FSAVERAGE5_FILES = {"surf/lh.sphere.reg": 368_946}
+REAL_TEMPLATE_CACHE = "ds000102-fsaverage"
+REAL_FSAVERAGE5_CACHE = "ds000102-fsaverage5"
 
 
 def _fetched(request: pytest.FixtureRequest, name: str, url: str, files: dict[str, int]) -> Path:
@@ -238,6 +325,25 @@ def real_subject(request: pytest.FixtureRequest) -> Path:
 
 @pytest.fixture(scope="session")
 def real_subject_fs7(request: pytest.FixtureRequest) -> Path:
-    """ds003020 sub-UTS01 (FreeSurfer 7.3.2): Tier A, Tier C and the thickness files, 25.2 MB,
-    in the pytest cache. Its pial surfaces exist as ``?h.pial.T1`` only. Network tests only."""
+    """ds003020 sub-UTS01 (FreeSurfer 7.3.2): Tier A, B and C, 36.8 MB, in the pytest cache.
+    Its pial surfaces exist as ``?h.pial.T1`` only. Network tests only."""
     return _fetched(request, "ds003020-sub-UTS01", REAL_SUBJECT_FS7_URL, REAL_SUBJECT_FS7_FILES)
+
+
+@pytest.fixture(scope="session")
+def real_template(request: pytest.FixtureRequest) -> Path:
+    """The ``fsaverage`` directory next to the subjects of ds000102: the eight files a
+    template needs, the two average-area files and the build stamp, 39.6 MB, in the pytest
+    cache. Network tests only."""
+    return _fetched(
+        request, REAL_TEMPLATE_CACHE, REAL_TEMPLATE_URL + "fsaverage/", REAL_TEMPLATE_FILES
+    )
+
+
+@pytest.fixture(scope="session")
+def real_fsaverage5(request: pytest.FixtureRequest) -> Path:
+    """``fsaverage5/surf/lh.sphere.reg`` from next to the subjects of ds000102, in the pytest
+    cache: the mesh one order below fsaverage6. Network tests only."""
+    return _fetched(
+        request, REAL_FSAVERAGE5_CACHE, REAL_TEMPLATE_URL + "fsaverage5/", REAL_FSAVERAGE5_FILES
+    )

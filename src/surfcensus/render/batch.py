@@ -6,9 +6,13 @@ outcome. A subject is done when its row says so and its media directory holds th
 render; the row is written after the files, so a crash in between leaves a render without
 a row, which the next run finds complete on disk and records.
 
+With a template, a render also reads the subject's ``sphere.reg`` files and its vertex map
+carries the fsaverage counterparts of its vertices. The template is part of a render's input
+signature and of no key of its tiles, so a template that arrives later brings the vertex
+maps up to date and leaves every tile and every ``render_key`` as it was.
+
 This module holds the public side of a run only (``records.RunContext``): subjects by
-``subject_uid``, datasets by pseudonym. The ``template`` argument of ``run_render`` is added
-in milestone 3, when ``templates.py`` exists.
+``subject_uid``, datasets by pseudonym.
 """
 
 from __future__ import annotations
@@ -36,6 +40,7 @@ from surfcensus.render.model import RenderConfig
 from surfcensus.schemas import intensity_schema
 from surfcensus.sources.base import RENDER_ROLES, TIER_C, FileRole, SourceError
 from surfcensus.store import MEDIA_DIR, media_dir, read_table, table_path, upsert_part
+from surfcensus.templates import TEMPLATES_DIR, Template, load_template, store_template
 
 PHASE = "render"
 LOGS_DIR = "logs"
@@ -43,14 +48,19 @@ MISSING_SURFACE = "missing surface"
 SOURCE_CHANGED = "source changed"
 RENDER_FAILURE = "render failure"
 
-# what a render reads; milestone 3 adds the two sphere_reg roles when the run has a template
-_LEASED: tuple[FileRole, ...] = TIER_C
+_SPHERES: tuple[FileRole, ...] = (FileRole.LH_SPHERE_REG, FileRole.RH_SPHERE_REG)
+
+
+def _leased(template_id: str | None) -> tuple[FileRole, ...]:
+    """What a render reads: with a template also the two ``sphere.reg`` files."""
+    return TIER_C if template_id is None else (*TIER_C, *_SPHERES)
 
 
 @dataclass
 class _Plan:
     """What a call of ``run_render`` finds before it renders anything."""
 
+    template_id: str | None
     video: bool
     config_hash: str
     signatures: dict[str, str]
@@ -70,6 +80,7 @@ class _Plan:
 def _plan(
     ctx: RunContext,
     *,
+    template_id: str | None,
     datasets: Collection[str] | None,
     subjects: Sequence[str] | None,
     all_subjects: bool | None,
@@ -89,7 +100,7 @@ def _plan(
     incomplete = [uid for uid in present if uid not in complete]
     config_hash = config.render.config_hash()
     signatures = {
-        uid: public.input_signature(uid, _LEASED, _signature_extra(None))
+        uid: public.input_signature(uid, _leased(template_id), _signature_extra(template_id))
         for uid in (*units, *incomplete)
     }
 
@@ -127,7 +138,9 @@ def _plan(
         for uid in incomplete
         if (row := recorded(uid)) is None or row.status != "failed" or row.reason != MISSING_SURFACE
     ]
-    return _Plan(video, config_hash, signatures, pending, skipped, failures, unrecorded, notes)
+    return _Plan(
+        template_id, video, config_hash, signatures, pending, skipped, failures, unrecorded, notes
+    )
 
 
 def render_status(ctx: RunContext) -> tuple[int, int, int]:
@@ -161,9 +174,10 @@ def render_failures(ctx: RunContext) -> dict[str, tuple[str, str | None]]:
 
 
 def _status_plan(ctx: RunContext) -> _Plan:
-    """What ``run_render(ctx)`` would find now."""
+    """What ``run_render`` would find now, with the template the run is pinned to."""
     return _plan(
         ctx,
+        template_id=ctx.public.meta("template_id"),
         datasets=None,
         subjects=None,
         all_subjects=None,
@@ -176,6 +190,7 @@ def _status_plan(ctx: RunContext) -> _Plan:
 def render_pending(
     ctx: RunContext,
     *,
+    template: Template | None = None,
     datasets: Collection[str] | None = None,
     subjects: Sequence[str] | None = None,
     all_subjects: bool | None = None,
@@ -188,6 +203,7 @@ def render_pending(
     opens no source file and records nothing. Zero means that the call needs no source."""
     plan = _plan(
         ctx,
+        template_id=None if template is None else template.template_id,
         datasets=datasets,
         subjects=subjects,
         all_subjects=all_subjects,
@@ -201,6 +217,7 @@ def render_pending(
 def run_render(
     ctx: RunContext,
     *,
+    template: Template | None = None,
     jobs: int = 1,
     datasets: Collection[str] | None = None,
     subjects: Sequence[str] | None = None,
@@ -219,6 +236,12 @@ def run_render(
     pseudonym, then ``subject_uid``; the selected subjects of a local run that has scores
     and is not blind go in the order the rater app offers them. ``video=None`` is
     ``render_video`` of the run.
+
+    ``template`` is the run's template. With one, the ``sphere.reg`` files are read as well
+    and the vertex maps carry fsaverage counterparts (``render_subject``); the template and
+    those two files are part of the input signature, so a render made without them, or with
+    another template, is pending. Its tiles are current, and only its vertex map and
+    ``render.json`` are written again.
 
     A subject is skipped when its row is ``done`` for the same render config, the same
     input signature and the same ``video``, and ``media/<uid>/`` holds the whole render:
@@ -256,6 +279,7 @@ def run_render(
         )
     plan = _plan(
         ctx,
+        template_id=None if template is None else template.template_id,
         datasets=datasets,
         subjects=subjects,
         all_subjects=all_subjects,
@@ -332,6 +356,8 @@ def run_render(
                     render_key=ctx.render_key(tile_hash, read),
                     media_path=f"{MEDIA_DIR}/{uid}",
                     n_frames=len(info.modes["sync"].frames),
+                    # None when no hemisphere could be mapped: the map has no counterparts
+                    template_id=None if info.template is None else info.template.template_id,
                 )
             )
             results.append((uid, outcome))
@@ -350,12 +376,14 @@ def run_render(
         _render_one,
         media_root=media_root,
         config=render_config,
+        template_dir=_template_dir(ctx, template) if pending else None,
         video=video,
         force=force,
     )
+    leased = _leased(plan.template_id)
     run_batches(
         pending,
-        lambda uid: ctx.lease(uid, _LEASED),
+        lambda uid: ctx.lease(uid, leased),
         work,
         commit,
         batch_subjects=config.cache.batch_subjects,
@@ -435,12 +463,23 @@ def _render_one(
     *,
     media_root: Path,
     config: RenderConfig,
+    template_dir: str | None,
     video: bool,
     force: bool,
 ) -> RenderResult:
     """What a worker does for one subject. Top-level, so that it can be sent to a process."""
-    info = api.render_subject(files, media_root / uid, config, video=video, force=force)
+    template = None if template_dir is None else load_template(template_dir)
+    info = api.render_subject(
+        files, media_root / uid, config, template=template, video=video, force=force
+    )
     return RenderResult(info=info)
+
+
+def _template_dir(ctx: RunContext, template: Template | None) -> str | None:
+    """Where workers read the run's template from."""
+    if template is None:
+        return None
+    return str(store_template(Path(ctx.run_dir) / TEMPLATES_DIR, template))
 
 
 def _signature_extra(template_id: str | None) -> tuple[str, ...]:

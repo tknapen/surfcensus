@@ -62,6 +62,13 @@ SURFACES = ("lh_white", "rh_white", "lh_pial", "rh_pial")
 OLD_NS = 1_000_000_000_000_000_000  # an mtime in 2001
 
 
+@pytest.fixture(autouse=True)
+def _no_freesurfer_install(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``three_plane`` looks for an fsaverage template in ``$FREESURFER_HOME`` first; these
+    tests render without one, whatever is installed where they run."""
+    monkeypatch.delenv("FREESURFER_HOME", raising=False)
+
+
 def tree(root: Path) -> dict[str, bytes]:
     return {p.relative_to(root).as_posix(): p.read_bytes() for p in root.rglob("*") if p.is_file()}
 
@@ -190,7 +197,7 @@ def test_render_json_is_the_returned_info(default_render: Rendered) -> None:
     text = (out / "render.json").read_text()
     assert text == info.to_json()
     assert RenderInfo.model_validate_json(text) == info
-    assert info.schema_version == 2 and info.surfcensus_version == surfcensus.__version__
+    assert info.schema_version == 3 and info.surfcensus_version == surfcensus.__version__
     assert info.config == RenderConfig() and info.config_hash == RenderConfig().config_hash()
     assert info.versions == {
         name: version(name) for name in ("numpy", "matplotlib", "pillow", "nibabel")
@@ -531,7 +538,7 @@ def test_a_render_of_schema_version_1_is_rendered_again(
     alone, since each is a reason of its own to render again."""
     before = tree(small_copy)
     doc = json.loads(before["render.json"])
-    assert doc["schema_version"] == 2
+    assert doc["schema_version"] == 3
     if old != "hash alone":
         doc["schema_version"] = 1
     if old != "version alone":  # the hash that version 1 gave the very same config
@@ -558,7 +565,7 @@ def test_a_render_of_schema_version_1_is_rendered_again(
         )
     age(small_copy)
     info = render_subject(resolve_subject_files(coarse_subject.path), small_copy, SMALL)
-    assert info.schema_version == 2 and info.config_hash == SMALL.config_hash()
+    assert info.schema_version == 3 and info.config_hash == SMALL.config_hash()
     assert not any(aged(small_copy).values())
     assert tree(small_copy) == before
 

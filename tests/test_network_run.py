@@ -100,7 +100,7 @@ def test_the_freesurfer_7_subject_is_inventoried_and_rendered(
 
     # inventory: FreeSurfer 7 writes ?h.pial.T1, and the bucket holds no ?h.pial key
     assert (row["fs_version"], row["fs_major"], row["pial_variant"]) == ("7.3.2", 7, "pial.T1")
-    assert (row["complete"], row["tier_a"], row["tier_b"]) == (True, True, False)
+    assert (row["complete"], row["tier_a"], row["tier_b"]) == (True, True, True)
     assert main_log_invocations(real_subject_fs7) == 5 and row["n_invocations"] == 9
     assert row["recon_finished"] == True  # noqa: E712
     flags = json.loads(row["recon_flags"])

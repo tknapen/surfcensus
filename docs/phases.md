@@ -1,6 +1,6 @@
 # Phases of the search
 
-The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`; until `review` exists (milestone 4) they run phases 2 and 6 with `surfcensus inventory` and `surfcensus render`.
+The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`; until `review` exists (milestone 4) they run phases 2, 4 and 6 with `surfcensus inventory`, `surfcensus metrics` and `surfcensus render`.
 
 Cheap phases run on everything; expensive phases run on what the cheap phases select. The guiding cost asymmetry is that downloading and computing are cheap compared with rater time, so the pipeline spends compute freely to make every rated minute informative.
 
@@ -62,6 +62,8 @@ Input: complete subjects. Output: `regional.parquet`, `vertex_summary.parquet`, 
 - Scoring: composite score and rank.
 
 Exit check: score distributions per dataset look sane (no dataset whose whole distribution is shifted by a parsing bug); the pilot subjects' scores agree with the pilot ratings at least roughly.
+
+Built (milestone 3) for local sources: `surfcensus metrics --run-dir DIR`, with the stages `regional` (4a), `fsaverage` (4b), `reference` (4c: the reference of the set and the clusters) and `score`, and `native`, which gives cluster centroids their native position from the vertex maps of the renders and also runs at the end of `render`. The maps need an fsaverage template (`metrics.md`); without one, and for fewer than 30 subjects, the scores are the ranking of decision D16. 4d and the shipped reference are not built. Run on 34 real subjects on 2026-11-13; what was measured is in `metrics.md`.
 
 ## Phase 5: selection
 

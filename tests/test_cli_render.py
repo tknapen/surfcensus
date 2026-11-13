@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 from synth import SyntheticSubject  # pyrefly: ignore[missing-import]
+from synth_template import SyntheticTemplate  # pyrefly: ignore[missing-import]
 from typer import rich_utils
 from typer.testing import CliRunner
 
@@ -57,7 +58,14 @@ def test_render_subject_end_to_end(synth_subject_pial_t1: SyntheticSubject, tmp_
     assert result.exit_code == 0, result.output
     # one line: the output directory, the slice counts, the elapsed seconds
     line = re.escape(str(out)) + r": 61 sagittal, 54 coronal, 61 axial slices, \d+\.\d s\n"
-    assert re.fullmatch(line, result.output)
+    assert re.fullmatch(line, result.stdout)
+    # and one on stderr: the subject has no fsaverage next to it (and the tests no FreeSurfer)
+    no_template = (
+        r"WARNING: no fsaverage template found: click marks will not map to fsaverage\. "
+        r"Looked in .*fsaverage: absent.*--fsaverage DIR.*\n"
+    )
+    assert re.fullmatch(no_template, result.stderr), result.stderr
+    assert json.loads((out / "render.json").read_text())["template"] is None
     info = RenderInfo.model_validate_json((out / "render.json").read_text())
     assert info.config == RenderConfig()
     assert info.inputs["lh_pial"].name == "lh.pial.T1"
@@ -71,28 +79,34 @@ def test_render_subject_end_to_end(synth_subject_pial_t1: SyntheticSubject, tmp_
     again = CliRunner().invoke(
         app, ["render-subject", str(synth_subject_pial_t1.path), "--out", str(out)]
     )
-    assert again.exit_code == 0 and re.fullmatch(line, again.output), again.output
+    assert again.exit_code == 0 and re.fullmatch(line, again.stdout), again.output
+    assert re.fullmatch(no_template, again.stderr), again.stderr
     assert {p: p.stat().st_mtime_ns for p in out.rglob("*")} == stamps
 
 
 @pytest.mark.parametrize(
     ("flags", "expected"),
     [
-        ([], {"video": True, "force": False}),
-        (["--force"], {"video": True, "force": True}),
-        (["--no-video"], {"video": False, "force": False}),
-        (["--no-video", "--force"], {"video": False, "force": True}),
+        ([], {"template": "auto", "video": True, "force": False}),
+        (["--force"], {"template": "auto", "video": True, "force": True}),
+        (["--no-video"], {"template": "auto", "video": False, "force": False}),
+        (["--no-video", "--force"], {"template": "auto", "video": False, "force": True}),
+        (["--no-template"], {"template": None, "video": True, "force": False}),
+        (
+            ["--fsaverage", "some/fsaverage"],
+            {"template": Path("some/fsaverage"), "video": True, "force": False},
+        ),
     ],
 )
 def test_flags_reach_three_plane(
     flags: list[str],
-    expected: dict[str, bool],
+    expected: dict[str, object],
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = []
 
-    def record(subject_dir: Path, out: Path, **kwargs: bool) -> None:
+    def record(subject_dir: Path, out: Path, **kwargs: object) -> None:
         calls.append((subject_dir, out, kwargs))
         raise api.RenderError("render failure", "stop here")
 
@@ -263,3 +277,50 @@ def test_said_reads_through_colour_and_frames() -> None:
     assert "--no-video" not in styled  # what the assertion on the raw output ran into on CI
     assert said(styled) == "Error Invalid value: --no-video contradicts"
     assert said("plain  text\n") == "plain text"
+
+
+def test_no_template_contradicts_fsaverage(tmp_path: Path, terminal: str) -> None:
+    result = CliRunner().invoke(
+        app,
+        ["render-subject", "x", "--out", str(tmp_path), "--no-template", "--fsaverage", "y"],
+    )
+    assert result.exit_code == 2
+    assert "--no-template contradicts --fsaverage" in said(result.output)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_fsaverage_gives_the_render_its_template(
+    synth_subject_pial_t1: SyntheticSubject, synth_template: SyntheticTemplate, tmp_path: Path
+) -> None:
+    """The subject has no ``sphere.reg``, so no vertex gets a counterpart; the template is
+    read all the same, and one that cannot be used is a usage error."""
+    out = tmp_path / "media"
+    subject = str(synth_subject_pial_t1.path)
+    template = str(synth_template.path)
+    result = CliRunner().invoke(
+        app, ["render-subject", subject, "--out", str(out), "--no-video", "--fsaverage", template]
+    )
+    assert result.exit_code == 0, result.output
+    assert "no fsaverage template found" not in result.stderr
+    assert "sphere.reg" in result.stderr  # why no hemisphere has counterparts
+
+    empty = tmp_path / "fsaverage"
+    empty.mkdir()
+    refused = CliRunner().invoke(
+        app,
+        ["render-subject", subject, "--out", str(tmp_path / "b"), "--fsaverage", str(empty)],
+    )
+    assert refused.exit_code == 2
+    assert "no usable fsaverage template" in said(refused.output)
+    assert not (tmp_path / "b").exists()
+
+
+def test_no_template_renders_without_looking_for_one(
+    synth_subject_pial_t1: SyntheticSubject, tmp_path: Path
+) -> None:
+    out, subject = tmp_path / "media", str(synth_subject_pial_t1.path)
+    result = CliRunner().invoke(
+        app, ["render-subject", subject, "--out", str(out), "--no-video", "--no-template"]
+    )
+    assert result.exit_code == 0 and result.stderr == "", result.output
+    assert json.loads((out / "render.json").read_text())["template"] is None
