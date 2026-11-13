@@ -47,7 +47,8 @@ class SphereMap:
     weights: Float[np.ndarray, "t 3"]
     """Barycentric weights: non-negative, each row sums to 1; a fallback row is (1, 0, 0)."""
     fallback: Bool[np.ndarray, " t"]
-    """True where no containing face was found and the nearest source vertex is used."""
+    """True where no containing face was found among those searched and the nearest source
+    vertex is used. A face farther off may still contain the point (:func:`build_sphere_map`)."""
     nearest_source: Int[np.ndarray, " t"]
     """The source vertex nearest each target vertex."""
     nearest_target: Int[np.ndarray, " s"]
@@ -153,6 +154,11 @@ def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: in
     source faces are, every face is reversed once and ``flipped`` is set. No input raises
     but a degenerate sphere (:func:`unit_sphere`). The result does not depend on thread
     count or platform.
+
+    A fallback says that none of the faces searched contains the point, not that no face
+    does: on a sheared or folded sphere the face of a point need not touch any of its ``k``
+    nearest vertices. A larger ``k`` resolves more points and gives those already resolved
+    the same face. What that costs on real subjects is in docs/metrics.md (The mapping).
 
     A target point that is a source vertex (within :data:`COINCIDENT`) takes that vertex
     alone, with the row of a fallback, ``(v, v, v)`` and ``(1, 0, 0)``, and ``fallback``

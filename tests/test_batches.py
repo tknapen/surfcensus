@@ -12,6 +12,7 @@ import io
 import logging
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections.abc import Collection, Iterator, Mapping, Sequence
@@ -233,6 +234,18 @@ class Redact(logging.Filter):
 
 def expected(leases: Leases, unit: str) -> tuple[str, list[tuple[str, str]]]:
     return unit, [(role.value, f"{unit} {role.value}") for role in leases.paths(unit)]
+
+
+@pytest.fixture(autouse=True)
+def _ctrl_c_as_in_a_terminal() -> Iterator[None]:
+    """SIGINT raises ``KeyboardInterrupt`` in the test process, also when the suite was
+    started with SIGINT ignored (``cmd &`` from a shell without job control, ``nohup``, some
+    schedulers). The tests of what Ctrl-C does would otherwise inherit that."""
+    before = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, before)
 
 
 @pytest.mark.parametrize("jobs", [1, 2])
@@ -640,6 +653,32 @@ def test_ctrl_c_waits_for_running_work_before_the_leases_are_released(tmp_path: 
     for unit in leases.released():
         assert "finished-signal" in leases.seen_at_release[unit], unit
     assert not list(tmp_path.rglob("*.mgz"))
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="sends SIGINT with os.kill")
+def test_the_ctrl_c_tests_pass_in_a_process_that_ignores_sigint() -> None:
+    """The two tests that depend on what SIGINT does, run by a pytest that was started the
+    way ``cmd &`` and ``nohup`` start one."""
+    names = (
+        "test_one_job_works_in_this_process_and_more_jobs_in_reused_workers",
+        "test_ctrl_c_waits_for_running_work_before_the_leases_are_released",
+    )
+    code = (
+        "import signal, sys, pytest\n"
+        "signal.signal(signal.SIGINT, signal.SIG_IGN)\n"
+        "sys.exit(pytest.main(sys.argv[1:]))\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code, "-q", "-p", "no:cacheprovider"]
+        + [f"{__file__}::{name}" for name in names],
+        cwd=Path(__file__).parent.parent,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+    assert done.returncode == 0, done.stdout[-3000:]
+    assert "2 passed" in done.stdout
 
 
 @pytest.mark.parametrize("jobs", [1, 2])

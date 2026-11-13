@@ -7,10 +7,12 @@ a run work on a copy of its directory or on a small cohort of their own.
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
 import logging
 import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -29,7 +31,11 @@ from synth_tierb import (  # pyrefly: ignore[missing-import]
 )
 
 from surfcensus.config import ConfigError, MetricsConfig, RunConfig, new_local_config, with_changes
-from surfcensus.metrics.fsaverage import MAD_TO_SD, global_median, read_maps
+from surfcensus.fsio.annot import read_annotation
+from surfcensus.fsio.morph import read_morph
+from surfcensus.fsio.surfaces import read_surface
+from surfcensus.metrics.clusters import find_clusters
+from surfcensus.metrics.fsaverage import MAD_TO_SD, global_median, read_maps, resample_hemi
 from surfcensus.metrics.pipeline import (
     map_path,
     merge_tables,
@@ -49,7 +55,7 @@ from surfcensus.schemas import SCHEMAS
 from surfcensus.sources.base import HEMIS
 from surfcensus.sources.local import LocalSource, local
 from surfcensus.store import CATALOG_FILE, Catalog, read_table, table_path
-from surfcensus.templates import TemplateError
+from surfcensus.templates import Template, TemplateError
 
 SET_OF_THREE = MetricsConfig(min_reference_n=3, min_vertex_n=2)
 TABLES = ("regional", "vertex_summary", "clusters", "scores")
@@ -1064,3 +1070,233 @@ def test_a_shipped_reference_is_scored_beside_the_set_and_is_primary_in_a_local_
     with Run(run_copy) as run:
         assert counts(run.metrics()) == (2, 6, 0)
         assert set(table(run_copy, "scores")["reference_id"]) == {set_id}
+
+
+# ---------------------------------------------------------------------------------------
+# what the stages copy into their tables (review of milestone 3, tests)
+
+
+def test_the_cluster_rows_are_those_of_find_clusters_on_the_zmap(cohort_run: CohortRun) -> None:
+    """Every column of a cluster row is the field of that name: peak and centroid are two
+    vertices in some clusters of a subject with a patch, so a row with the two exchanged
+    does not pass."""
+    label = sorted(cohort_run.cohort.bad)[0]
+    uid = cohort_run.uids[label]
+    config = cohort_run.config.metrics
+    with Run(cohort_run.run_dir) as run:
+        z = run.zmap(uid)
+        template = run.template()
+    assert template is not None
+    rows = table(cohort_run.run_dir, "clusters").query("subject_uid == @uid")
+    assert set(rows["hemi"]) == set(HEMIS) and {"medial", "search"} <= set(rows["region"])
+    n_apart = 0
+    for (hemi, region), group in rows.groupby(["hemi", "region"]):
+        half = template.hemis[hemi]
+        found = find_clusters(
+            z[hemi],
+            half.regions[region],
+            half,
+            template.adjacency(hemi),
+            threshold=config.cluster_z,
+            min_vertices=config.cluster_min_vertices,
+        )[: config.clusters_kept]
+        group = group.sort_values("rank")
+        assert list(group["rank"]) == list(range(1, len(found) + 1))
+        for (_, row), cluster in zip(group.iterrows(), found, strict=True):
+            assert row["peak_vertex"] == cluster.peak_vertex
+            assert row["centroid_vertex"] == cluster.centroid_vertex
+            assert row["n_vertices"] == len(cluster.vertices)
+            assert row["area_mm2"] == pytest.approx(cluster.area_mm2, rel=1e-6)
+            assert row["mass"] == pytest.approx(cluster.mass, rel=1e-6)
+            assert row["excess_mass"] == pytest.approx(cluster.excess_mass, rel=1e-6)
+            assert row["peak_z"] == pytest.approx(cluster.peak_z, rel=1e-6)
+            # without find_clusters: the peak is where the z-map has the peak value
+            assert z[hemi][row["peak_vertex"]] == pytest.approx(row["peak_z"], rel=1e-6)
+            assert half.regions[region][row["centroid_vertex"]]
+            n_apart += cluster.peak_vertex != cluster.centroid_vertex
+    assert n_apart > 0
+
+
+def test_native_reads_no_vertex_map_made_on_another_template(run_copy: Path) -> None:
+    """After a change of template the done renders carry counterparts on the earlier mesh
+    until they are rendered again; until then no centroid gets a native position."""
+    assert not table(run_copy, "clusters_native").empty
+    with Run(run_copy) as run:
+        config = run.config
+        first = run.template()
+    assert first is not None
+    coarse = with_changes(config, metrics=config.metrics.model_dump() | {"mesh": "fsaverage4"})
+    with Run(run_copy, config=coarse) as run:
+        assert counts(run.metrics(retemplate=True)) == (3 + 2, 3, 0)
+        template = run.template()
+        assert template is not None and template.template_id != first.template_id
+        clusters = table(run_copy, "clusters")
+        assert not clusters.empty and clusters["centroid_vertex"].max() < 2_562
+        # the vertex maps still name vertices of fsaverage6, whose first 2,562 have the
+        # numbers of this mesh: read as they are, they would place the centroids
+        assert set(run.public().renders()["template_id"]) == {first.template_id}
+        assert counts(run.metrics(stages=["native"])) == (1, 0, 0)
+        assert table(run_copy, "clusters_native").empty
+        assert run.clusters()["native_vertex"].isna().all()
+        # the render brings the vertex maps to the new mesh, and the centroids follow
+        assert counts(run.render()) == (3, 0, 0)
+        native = table(run_copy, "clusters_native")
+        assert not native.empty and set(native["template_id"]) == {template.template_id}
+
+
+def test_native_passes_over_a_render_recorded_with_another_template(run_copy: Path) -> None:
+    """The row of the render says which template its vertex map refers to, and the stage
+    goes by the row: the same files under another template id give no native row."""
+    assert not table(run_copy, "clusters_native").empty
+    with contextlib.closing(sqlite3.connect(run_copy / CATALOG_FILE)) as db, db:
+        db.execute("UPDATE renders SET template_id = 'another-template'")
+    with Run(run_copy) as run:
+        assert counts(run.metrics(stages=["native"])) == (1, 0, 0)
+    assert table(run_copy, "clusters_native").empty
+
+
+@dataclass(frozen=True)
+class PlantedRun:
+    run_dir: Path
+    cohort: SyntheticCohort
+    config: RunConfig
+    uids: dict[str, str]
+    summary: pd.DataFrame
+    scores: pd.DataFrame
+    template: Template
+
+
+def _lh_parcel(subject: Path, name: str) -> np.ndarray:
+    annot_labels, _, names = fs.read_annot(str(subject / "label" / "lh.aparc.annot"))
+    return np.flatnonzero(annot_labels == [n.decode() for n in names].index(name))
+
+
+@pytest.fixture(scope="module")
+def planted_run(
+    tmp_path_factory: pytest.TempPathFactory, synth_template: SyntheticTemplate
+) -> PlantedRun:
+    """Three subjects scored within the set, with values planted on the left hemisphere
+    that no subject of the cohorts has.
+
+    ``sub-000``: four vertices of superiorfrontal (control) at 5.0 mm; in lateraloccipital
+    three at 4.95 mm, two at 0 and one at 5.5 mm. ``sub-001`` (which has the medial patch):
+    three vertices of ``lh.sphere.reg`` moved onto three others, so that faces fold and some
+    targets lie in no face. ``sub-002``: the faces of ``lh.sphere.reg`` wound inward."""
+    tmp_path = tmp_path_factory.mktemp("planted_run")
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    first, second, third = (subject.path for subject in cohort.subjects)
+
+    thickness_file = first / "surf" / "lh.thickness"
+    thickness = fs.read_morph_data(str(thickness_file)).astype(np.float32)
+    control = _lh_parcel(first, "superiorfrontal")
+    occipital = _lh_parcel(first, "lateraloccipital")
+    assert 0 < thickness[control].min() and thickness[control].max() < 4.9
+    assert 0 < thickness[occipital].min() and thickness[occipital].max() < 4.9
+    thickness[control[:4]] = 5.0
+    thickness[occipital[:3]] = 4.95
+    thickness[occipital[3:5]] = 0.0
+    thickness[occipital[5]] = 5.5
+    fs.write_morph_data(str(thickness_file), thickness)
+
+    folded = second / "surf" / "lh.sphere.reg"
+    vertices, faces = fs.read_geometry(str(folded))
+    vertices = vertices.copy()
+    vertices[[0, 50, 100]] = vertices[[300, 400, 500]]
+    fs.write_geometry(str(folded), vertices, faces)
+
+    inward = third / "surf" / "lh.sphere.reg"
+    vertices, faces = fs.read_geometry(str(inward))
+    fs.write_geometry(str(inward), vertices, faces[:, ::-1].copy())
+
+    run_dir = tmp_path / "run"
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        assert counts(run.metrics()) == (3 + 3 + 2, 0, 0)
+        uids = labels(run)
+        template = run.template()
+        scores = run.scores().set_index("subject_uid")
+    assert template is not None
+    summary = table(run_dir, "vertex_summary").set_index(["subject_uid", "hemi"])
+    return PlantedRun(run_dir, cohort, config, uids, summary, scores, template)
+
+
+def test_ceiling_vertices_of_the_control_region_are_counted_and_scored(
+    planted_run: PlantedRun,
+) -> None:
+    uid = planted_run.uids["sub-000"]
+    row = planted_run.summary.loc[(uid, "lh")]
+    assert row["control_n"] > 100
+    assert row["control_n_exact"] == 4 and row["control_n_near"] == 4
+    assert row["control_n_zero"] == 0
+    assert row["control_ceiling_frac"] == pytest.approx(4 / row["control_n"])
+    # the subject's value is that of its larger hemisphere, and rh has none at the ceiling
+    assert planted_run.summary.loc[(uid, "rh"), "control_ceiling_frac"] == 0
+    assert planted_run.scores.loc[uid, "control_ceiling_frac"] == pytest.approx(
+        4 / row["control_n"]
+    )
+    for label in ("sub-001", "sub-002"):
+        other = planted_run.uids[label]
+        assert planted_run.summary.loc[(other, "lh"), "control_ceiling_frac"] == 0
+        assert planted_run.scores.loc[other, "control_ceiling_frac"] == 0
+
+
+def test_near_the_ceiling_at_it_and_at_zero_are_three_counts(planted_run: PlantedRun) -> None:
+    """4.95 mm is near the ceiling and not at it, 5.5 mm is both, and a zero inside cortex
+    is in the fraction and in neither count."""
+    uid = planted_run.uids["sub-000"]
+    row = planted_run.summary.loc[(uid, "lh")]
+    assert row["region_kind"] == "template"
+    assert row["search_n_exact"] == 1 and row["search_n_near"] == 4
+    assert row["search_n_zero"] == 2
+    assert row["ceiling_frac"] == pytest.approx(6 / row["search_n"])
+    # the same on the subject's own occipital parcels, which are another set of vertices
+    assert row["annot_search_n"] != row["search_n"]
+    assert row["annot_search_n_near"] == 4 and row["annot_search_n_zero"] == 2
+    assert row["ceiling_frac_annot"] == pytest.approx(6 / row["annot_search_n"])
+    scores = planted_run.scores.loc[uid]
+    assert scores["ceiling_frac"] == pytest.approx(6 / row["search_n"])
+    assert scores["ceiling_frac_annot"] == pytest.approx(6 / row["annot_search_n"])
+
+
+def test_a_thickness_above_the_maximum_and_an_inward_sphere_are_flagged(
+    planted_run: PlantedRun,
+) -> None:
+    uids, summary, scores = planted_run.uids, planted_run.summary, planted_run.scores
+    assert summary.loc[(uids["sub-000"], "lh"), "thickness_max_mm"] == 5.5
+    assert summary.loc[(uids["sub-000"], "lh"), "flags"] == "thickness_above_max"
+    assert summary.loc[(uids["sub-002"], "lh"), "flags"] == "sphere_flipped"
+    for label in ("sub-000", "sub-001", "sub-002"):
+        assert summary.loc[(uids[label], "rh"), "flags"] == ""
+    assert summary.loc[(uids["sub-001"], "lh"), "flags"] == ""
+    assert scores.loc[uids["sub-000"], "flags"] == "thickness_above_max"
+    assert scores.loc[uids["sub-001"], "flags"] == ""
+    assert scores.loc[uids["sub-002"], "flags"] == "sphere_flipped"
+    # the inward sphere is mapped like the outward one of the other hemisphere
+    maps = read_maps(map_path(planted_run.run_dir, uids["sub-002"]))
+    assert np.isfinite(maps["lh"]).sum() > 30_000
+
+
+def test_the_mapping_counts_are_those_of_resample_hemi_on_the_same_files(
+    planted_run: PlantedRun,
+) -> None:
+    n_fallback = {}
+    for subject in planted_run.cohort.subjects:
+        for hemi in HEMIS:
+            hemi_map, _ = resample_hemi(
+                read_morph(subject.path / "surf" / f"{hemi}.thickness"),
+                read_surface(subject.path / "surf" / f"{hemi}.sphere.reg"),
+                planted_run.template.hemis[hemi],
+                annot=read_annotation(subject.path / "label" / f"{hemi}.aparc.annot"),
+                config=planted_run.config.metrics,
+            )
+            row = planted_run.summary.loc[(planted_run.uids[subject.path.name], hemi)]
+            assert row["n_fallback"] == hemi_map.n_fallback
+            assert row["n_missing_cortex"] == hemi_map.n_missing_cortex
+            assert row["global_median_mm"] == pytest.approx(hemi_map.global_median, rel=1e-6)
+            n_fallback[subject.path.name, hemi] = hemi_map.n_fallback
+            # a value of its own in every hemisphere: a constant in the table does not pass
+            assert hemi_map.n_missing_cortex > 0
+    # the folded sphere is the only one with targets that lie in no face
+    assert n_fallback.pop(("sub-001", "lh")) > 0
+    assert set(n_fallback.values()) == {0}

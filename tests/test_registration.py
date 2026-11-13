@@ -619,6 +619,16 @@ def test_more_neighbours_only_ever_resolve_more_points() -> None:
     lost = np.flatnonzero(maps[1].fallback)
     (inside,) = containing_faces(source_unit, source.faces, target[lost], CONTAIN_TOLERANCE)
     assert all(len(faces) == 1 for faces in inside)
+    # what such a fallback costs, on a field that is linear in position: the value of the
+    # nearest vertex where the face interpolates
+    axis = np.array([0.6, 0.0, 0.8])
+    field, truth = source_unit @ axis, target[lost] @ axis
+    by_vertex, by_face = (resample(field, smap)[lost] for smap in maps[1:])
+    np.testing.assert_array_equal(by_vertex, field[maps[1].nearest_source[lost]])
+    vertex_error, face_error = np.abs(by_vertex - truth), np.abs(by_face - truth)
+    # measured: median 0.043 and at most 0.097 by vertex, 0.0036 and 0.0093 in the face
+    assert face_error.max() < 0.012 < 0.03 < np.median(vertex_error) < vertex_error.max() < 0.12
+    assert np.median(face_error) < 0.005
 
 
 def test_k_larger_than_the_sphere() -> None:

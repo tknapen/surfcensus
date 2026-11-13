@@ -135,6 +135,9 @@ class MetricsConfig(_Frozen):
     """An explicit template directory. Not hashed: the template's content is."""
     regions: RegionConfig = RegionConfig()
     knn: int = Field(default=8, ge=1)
+    """Nearest source vertices whose faces are searched for the one that contains a template
+    vertex. A vertex they leave without a face takes the value of its nearest source
+    vertex, also where a face farther off contains it (docs/metrics.md, The mapping)."""
     min_valid_weight: float = Field(default=0.5, ge=0, le=1)
     thickness_max_mm: float = Field(default=5.0, gt=0)
     ceiling_margin_mm: float = Field(default=0.1, ge=0)

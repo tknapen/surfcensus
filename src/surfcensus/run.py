@@ -50,8 +50,6 @@ if TYPE_CHECKING:
 
     from surfcensus.templates import Template, TemplateNotFound
 
-_PER_SUBJECT_STAGES = ("regional", "fsaverage")
-
 
 @dataclass(frozen=True)
 class _StoredLocal:
@@ -484,6 +482,7 @@ class Run:
         """:meth:`template`, saying that there is none at ``level``: a render mentions it
         only to those who ask for more output, because the metrics say it aloud."""
         from surfcensus.templates import (
+            TEMPLATES_DIR,
             TemplateError,
             TemplateNotFound,
             find_template,
@@ -496,7 +495,7 @@ class Run:
                 self._no_template = (self._no_template[0], level)
             return self._template
         pinned = self._catalog.meta("template_id")
-        cache = self.run_dir / "templates"
+        cache = self.run_dir / TEMPLATES_DIR
         adjacent, adjacent_id = self._adjacent_template()
         try:
             found = find_template(
@@ -591,11 +590,15 @@ class Run:
         stage that does not exist, and ``SourceError`` when a subject has to be read and a
         source cannot be built, before anything is recorded against a subject.
         """
-        from surfcensus.metrics.pipeline import metrics_pending, run_metrics
+        from surfcensus.metrics.pipeline import (
+            PER_SUBJECT_STAGES,
+            metrics_pending,
+            run_metrics,
+        )
 
         pseudonyms = self._pseudonyms(datasets)
         if stages is None:
-            stages = METRIC_STAGES if datasets is None else _PER_SUBJECT_STAGES
+            stages = METRIC_STAGES if datasets is None else PER_SUBJECT_STAGES
         template = self.template(retemplate=retemplate)
         context = self.context()
         pending = metrics_pending(

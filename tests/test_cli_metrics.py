@@ -7,6 +7,7 @@ import re
 import shutil
 from pathlib import Path
 
+import pandas as pd
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_template import (  # pyrefly: ignore[missing-import]
@@ -248,3 +249,55 @@ def test_the_template_next_to_the_subjects_is_found_without_an_option(
     assert result.exit_code == 0 and closing(result, 8, 0, 0) and result.stderr == ""
     shutil.rmtree(three_run / "templates")
     assert closing(cli("metrics", "--run-dir", three_run), 0, 8, 0)
+
+
+def test_a_damaged_map_of_the_run_is_one_line_and_exit_code_2(run_copy: Path) -> None:
+    """It used to be a traceback with exit code 1, the code of failed units."""
+    maps = sorted((run_copy / "tables" / "fsavg").iterdir())
+    whole = maps[0].read_bytes()
+    maps[0].write_bytes(whole[:300])
+    stopped = cli("metrics", "--run-dir", run_copy, "--stage", "reference", "--force")
+    assert stopped.exit_code == 2, stopped.output
+    assert isinstance(stopped.exception, SystemExit)
+    assert stopped.output == (
+        "invalid: the fsaverage map of 1 subject(s) in tables/fsavg could not be read "
+        f"({maps[0].stem}) and was removed; run the metrics again to make it anew\n"
+    )
+    # a fault of the run: no unit of any stage is in the failed state
+    status = cli("status", "--run-dir", run_copy).stdout.splitlines()[1:]
+    assert status and all(", 0 failed" in line for line in status), status
+    # once the cause is gone, the plain command does the work
+    again = cli("metrics", "--run-dir", run_copy)
+    assert again.exit_code == 0 and closing(again, 1, 7, 0), again.output
+    assert maps[0].read_bytes() == whole
+
+
+def test_a_damaged_vertex_map_is_a_note_and_no_failure(run_copy: Path) -> None:
+    """It used to be a traceback at the end of ``render`` and of ``metrics --stage native``."""
+    with Run(run_copy) as run:
+        clusters = run.clusters()
+    uid = str(clusters.loc[clusters["native_vertex"].notna(), "subject_uid"].iloc[0])
+    vertex_map = run_copy / "media" / uid / "vertex_map.npz"
+    vertex_map.write_bytes(vertex_map.read_bytes()[:500])
+    note = (
+        f"  media/<subject_uid>/vertex_map.npz of 1 rendered subject(s) cannot be read ({uid}): "
+        "their cluster centroids have no native position. Remove the file and run "
+        "`surfcensus render`, which makes such a render again."
+    )
+    native = cli("metrics", "--run-dir", run_copy, "--stage", "native", "--force")
+    assert native.exit_code == 0 and closing(native, 1, 0, 0), native.output
+    assert native.stdout.splitlines()[1] == note
+    rendered = cli("render", "--run-dir", run_copy)
+    assert rendered.exit_code == 0, rendered.output
+    assert rendered.stdout.startswith("render: 0 done, 3 skipped, 0 failed")
+    assert rendered.stdout.splitlines()[1:] == [note]
+    with Run(run_copy) as run:
+        assert uid not in set(run.clusters().dropna(subset=["native_vertex"])["subject_uid"])
+
+    vertex_map.unlink()
+    repaired = cli("render", "--run-dir", run_copy)
+    assert repaired.exit_code == 0, repaired.output
+    assert repaired.stdout.startswith("render: 1 done, 2 skipped, 0 failed")
+    assert len(repaired.stdout.splitlines()) == 1
+    with Run(run_copy) as run:
+        pd.testing.assert_frame_equal(run.clusters(), clusters)
