@@ -19,6 +19,8 @@
   --centroid: #ff9d2e;
   --crosshair: #33c7ff;
   --crosshair-alpha: 0.45;
+  --warn: #9a3412;
+  --warn-line: #ffb15c;
   --gap: 8px;
   --pad: 10px;
 }
@@ -105,6 +107,13 @@ textarea:focus-visible {
 .primary:not(:disabled) {
   border-color: var(--accent);
   background: #1f5fa8;
+}
+
+/* A submit that would be refused: it can be pressed, and then says what is missing. */
+.primary[aria-disabled="true"]:not(:disabled) {
+  border-color: var(--line);
+  background: var(--raised);
+  color: var(--muted);
 }
 
 /* --- the rating page ------------------------------------------------------------------ */
@@ -510,9 +519,15 @@ textarea:focus-visible {
   font-weight: 600;
 }
 
+/* takes the room the buttons leave and no more: it is cut short before a button wraps */
 .legend {
+  flex: 100 1 0;
+  min-width: 0;
+  overflow: hidden;
   color: var(--muted);
   font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .legend kbd {
@@ -546,6 +561,79 @@ textarea:focus-visible {
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
+}
+
+/* A refused Enter: why, and how to leave the subject. Under the submit button, with an
+   arrow to it, in a colour nothing else on the screen has. */
+.refusal {
+  position: relative;
+  align-self: flex-end;
+  max-width: min(100%, 600px);
+  margin-top: 4px;
+  padding: 9px 13px;
+  border: 2px solid var(--warn-line);
+  border-radius: 7px;
+  background: var(--warn);
+  color: #fff;
+  font-size: 15px;
+}
+
+.refusal::before {
+  content: "";
+  position: absolute;
+  top: -9px;
+  left: var(--arrow, 50%);
+  margin-left: -8px;
+  border: 8px solid transparent;
+  border-top-width: 0;
+  border-bottom-color: var(--warn-line);
+}
+
+.refusal-title {
+  font-size: 16px;
+}
+
+.refusal-reasons {
+  margin: 4px 0;
+  padding-left: 1.2em;
+}
+
+.refusal-skip {
+  margin: 0;
+}
+
+.refusal-again {
+  animation: refusal-flash 0.5s ease-out 2;
+}
+
+@keyframes refusal-flash {
+  from {
+    background: #d8531f;
+    box-shadow: 0 0 0 5px rgb(255 177 92 / 55%);
+  }
+
+  to {
+    background: var(--warn);
+    box-shadow: 0 0 0 0 rgb(255 177 92 / 0%);
+  }
+}
+
+/* the rows a refused Enter names: a frame around what has to be filled in, and words */
+.criterion[data-lacking="value"] .levels,
+.criterion[data-lacking="mark"] .class-cell {
+  border-radius: 6px;
+  outline: 2px solid var(--warn-line);
+  outline-offset: 2px;
+}
+
+.criterion-need:not(:empty) {
+  margin: 0 6px 0 2px;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: var(--warn);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .hint {
@@ -630,6 +718,92 @@ textarea:focus-visible {
 .dialog-foot {
   margin: 6px 0;
   color: var(--muted);
+}
+
+/* --- the tour of the rating screen ---------------------------------------------------- */
+
+/* Over the whole window: nothing under it takes a click. The part a step is about is lit
+   by .tour-spot, whose shadow dims the rest; the card with the text lies beside it. */
+.tour {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  overflow: hidden;
+}
+
+.tour-spot {
+  position: absolute;
+  border: 2px solid var(--warn-line);
+  border-radius: 8px;
+  box-shadow: 0 0 0 200vmax rgb(0 0 0 / 62%);
+  pointer-events: none;
+}
+
+.tour-card {
+  position: absolute;
+  width: min(380px, calc(100vw - 16px));
+  max-height: calc(100vh - 16px);
+  padding: 12px 14px;
+  overflow: auto;
+  border: 1px solid var(--warn-line);
+  border-radius: 8px;
+  outline: none;
+  background: var(--surface);
+  box-shadow: 0 6px 24px rgb(0 0 0 / 60%);
+  font-size: 15px;
+}
+
+.tour-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.tour-count {
+  color: var(--muted);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.tour-title {
+  flex: 1 1 auto;
+  margin: 0;
+  font-size: 16px;
+}
+
+.tour-close {
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 1px solid var(--line);
+  border-radius: 5px;
+  background: var(--raised);
+  font-size: 17px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.tour-text p {
+  margin: 7px 0;
+}
+
+.tour-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+}
+
+.tour-leave {
+  flex: 1 1 auto;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.help-tour {
+  float: right;
+  margin: 0 0 6px 10px;
 }
 
 .reasons {

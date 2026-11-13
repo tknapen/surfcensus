@@ -16,6 +16,7 @@ its next transaction at its next read, and holds the lock again until it is clos
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable, Iterator, Sequence
 from datetime import UTC, datetime
@@ -28,8 +29,15 @@ from sqlalchemy.exc import DBAPIError
 from sqlmodel import Session, SQLModel, col, select
 
 from surfcensus.app import APP_DB_FILE, APP_TABLES, RATINGS_FLAT_VIEW
-from surfcensus.app.models import Assignment, Mark, Rater, Rating, Submission
-from surfcensus.app.schemas import AppMode, RaterRole, RatingIn, ResolvedMark
+from surfcensus.app.models import Assignment, Event, Mark, Rater, Rating, Submission
+from surfcensus.app.schemas import (
+    SKIP_EVENT,
+    AppMode,
+    RaterRole,
+    RatingIn,
+    ResolvedMark,
+    SkipIn,
+)
 from surfcensus.config import ConfigError
 from surfcensus.log import get_logger
 
@@ -492,3 +500,54 @@ def store_submission(
         session.add_all(stored)
     session.flush()
     return submission, stored
+
+
+def record_skip(
+    session: Session, assignment: Assignment, skip: SkipIn, *, now: str | None = None
+) -> bool:
+    """Record that the rater skipped an open assignment: nothing of a rating is stored.
+
+    ``assignment.skipped_at`` becomes ``now`` and ``assignment.skip_count`` goes up by one,
+    and an event of type ``skip`` is stored with the assignment: its ``ts`` is the client's
+    time (``skip.client_ts``), its payload ``{"server_ts": now, "ms_on_subject": ..., "n":
+    the new count}`` as compact JSON with sorted keys. The assignment stays open. Flushed,
+    not committed. Whether the assignment is the rater's and its render still the
+    subject's is for the caller (``app.queue.skip_assignment``).
+
+    A skip is named by its assignment and the client's time. One that is recorded already
+    (the page sent its request again) changes nothing and returns False; True otherwise.
+
+    Raises ``ValueError``, with nothing stored, for a skip of another assignment and for an
+    assignment that has a submission: a rated subject cannot be skipped.
+    """
+    assignment_id = assignment.assignment_id
+    if assignment_id is None:
+        raise ValueError("the assignment has no id yet: flush it first")
+    if skip.assignment_id != assignment_id:
+        raise ValueError(f"the skip is of assignment {skip.assignment_id}, not of {assignment_id}")
+    if assignment.completed_at is not None:
+        raise ValueError(f"assignment {assignment_id} has a submission and cannot be skipped")
+    again = session.exec(
+        select(Event.event_id).where(
+            Event.assignment_id == assignment_id,
+            Event.type == SKIP_EVENT,
+            Event.ts == skip.client_ts,
+        )
+    ).first()
+    if again is not None:
+        return False
+    now = utc_now() if now is None else now
+    assignment.skipped_at = now
+    assignment.skip_count += 1
+    session.add(assignment)
+    payload = {"ms_on_subject": skip.ms_on_subject, "n": assignment.skip_count, "server_ts": now}
+    session.add(
+        Event(
+            assignment_id=assignment_id,
+            ts=skip.client_ts,
+            type=SKIP_EVENT,
+            payload_json=json.dumps(payload, separators=(",", ":"), sort_keys=True),
+        )
+    )
+    session.flush()
+    return True

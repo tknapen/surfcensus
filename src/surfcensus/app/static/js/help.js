@@ -1,5 +1,6 @@
-// The `?` screen: the scale definitions and the criteria of the protocol, the keyboard map
-// and, when the session has any, reference examples (tiles of calibration subjects).
+// The `?` screen: the scale definitions and the criteria of the protocol, the keyboard map,
+// a way back to the tour of the screen and, when the session has any, reference examples
+// (tiles of calibration subjects).
 
 import { tileUrl } from "./coords.js";
 
@@ -55,18 +56,24 @@ export function keyboardRows(protocol) {
     [["u"], "unratable, with a reason"],
     [["o"], "other problem (needs a note)"],
     [["n"], "note; Esc leaves the note"],
-    [["Enter"], "submit and next"],
-    [["Backspace"], "back to the previous subject, to revise it"],
+    [["Enter"], "submit and next (every criterion needs a value, or u)"],
+    [["k"], "skip: nothing is stored, the subject comes back after the others"],
+    [["Backspace"], "back to the subject before, rated or skipped"],
     [["?"], "this screen"],
+    [["t"], "the tour of the screen"],
   );
   return rows;
 }
 
 export class Help {
-  // `root` is the empty, hidden overlay element.
-  constructor(root, session) {
+  // `root` is the empty, hidden overlay element. onTour() is called for the button that
+  // opens the tour of the screen; without it the screen has no such button.
+  constructor(root, session, { onTour = null } = {}) {
     this.root = root;
     this.session = session;
+    this.onTour = onTour;
+    this.tourAllowed = true;
+    this.tourButton = null;
     this.built = false;
     root.addEventListener("click", (event) => {
       if (event.target === root) this.close();
@@ -80,6 +87,16 @@ export class Help {
   build() {
     const protocol = this.session.protocol;
     const box = html("div", "dialog dialog-wide");
+    if (this.onTour) {
+      const tour = html("button", "control help-tour");
+      tour.type = "button";
+      tour.id = "help-tour";
+      tour.append(html("kbd", "", "t"), " show the tour of the screen");
+      tour.addEventListener("click", () => this.onTour());
+      tour.disabled = !this.tourAllowed;
+      this.tourButton = tour;
+      box.append(tour);
+    }
     box.append(html("h2", "", "Rating scale"));
     box.append(
       html(
@@ -152,6 +169,12 @@ export class Help {
     box.append(foot);
     this.root.replaceChildren(box);
     this.built = true;
+  }
+
+  // Whether the button that opens the tour can be pressed.
+  allowTour(allowed) {
+    this.tourAllowed = allowed;
+    if (this.tourButton) this.tourButton.disabled = !allowed;
   }
 
   show() {

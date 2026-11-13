@@ -14,9 +14,11 @@
       <span class="legend">click: mark · <kbd>Delete</kbd> remove · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · hold <kbd>h</kbd> marks off · hold <kbd>s</kbd> contours off</span>
       <span class="spacer"></span>
       <button type="button" id="back" class="control"><kbd>Backspace</kbd> back</button>
+      <button type="button" id="skip" class="control" disabled><kbd>k</kbd> skip</button>
       <button type="button" id="help-toggle" class="control"><kbd>?</kbd> help</button>
-      <button type="button" id="submit" class="control primary" disabled><kbd>Enter</kbd> submit and next</button>
+      <button type="button" id="submit" class="control primary" disabled aria-disabled="true"><kbd>Enter</kbd> submit and next</button>
     </div>
+    <div id="refusal" class="refusal" role="alert" hidden></div>
     <div id="note-box" class="note-box" hidden>
       <textarea id="note" rows="2" maxlength="10000" placeholder="Note" aria-label="Note"></textarea>
       <span class="note-hint"><kbd>Esc</kbd> back to the keys</span>
@@ -32,6 +34,7 @@
   <p id="message" class="message" role="status" hidden></p>
   <div id="unratable-picker" class="overlay" role="dialog" aria-label="Unratable" hidden></div>
   <div id="help" class="overlay" role="dialog" aria-label="Help" hidden></div>
+  <div id="tour" class="tour" hidden></div>
 </main>
 {% endblock %}
 {% block scripts %}

@@ -563,6 +563,131 @@ def test_a_submission_after_finalize_removes_its_single_rows_and_keeps_the_conse
     assert set(final_marks(session)) == {S1}
 
 
+def test_a_revision_after_finalize_takes_the_subjects_stale_consensus_away(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    rate(session, ada, S1, values(MINOR), marks=[mark("A", 1.5)])
+    by_ben = rate(session, ben, S1, values(MINOR), marks=[mark("A", 2.5)])
+    for subject_uid in (S2, S3):
+        rate(session, ada, subject_uid, values(MINOR))
+        rate(session, ben, subject_uid, values(MINOR))
+    adjudicate(session, S4, MINOR, 8.5)
+    # the adjudicator decided A and B and left C as the raters had it
+    left = session.exec(
+        select(FinalLabel).where(FinalLabel.subject_uid == S4, FinalLabel.criterion == "C")
+    ).one()
+    left.method = "consensus"
+    session.add(left)
+    rate(session, ada, S4, values(MINOR))
+    by_ben_s4 = rate(session, ben, S4, values(MINOR))
+    finalize(session, plan_of([S1, S2, S3, S4]), shipped_protocol)
+    assert {uid: found["A"] for uid, found in labels(session).items()} == {
+        S1: (MINOR, "consensus"),
+        S2: (MINOR, "consensus"),
+        S3: (MINOR, "consensus"),
+        S4: (MINOR, "adjudicated"),
+    }
+    assert set(final_marks(session)) == {S1, S4}
+
+    # two steps apart now: the consensus of S1 goes with its marks, and nothing is written
+    submit(session, by_ben, values(MINOR, MAJOR), marks=[mark("B", 3.5)])
+    record_single(session, S1, shipped_protocol)
+    assert set(labels(session)) == {S2, S3, S4}
+    assert set(final_marks(session)) == {S4}
+
+    # a subject with an adjudicated label keeps every row, whatever is revised
+    decided = labels(session)[S4]
+    assert decided == {
+        "A": (MINOR, "adjudicated"),
+        "B": (NONE, "adjudicated"),
+        "C": (NONE, "consensus"),
+    }
+    submit(session, by_ben_s4, values(MAJOR, MAJOR))
+    record_single(session, S4, shipped_protocol)
+    assert labels(session)[S4] == decided
+    assert final_marks(session) == {S4: [("A", 8.5, [])]}
+
+
+def test_a_revision_that_only_moves_a_mark_takes_the_consensus_away_as_well(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    rate(session, ada, S1, values(MINOR), marks=[mark("A", 1.5)])
+    by_ben = rate(session, ben, S1, values(MINOR), marks=[mark("A", 2.5)])
+    finalize(session, plan_of([S1]), shipped_protocol)
+    assert labels(session) == {S1: consensus(MINOR)}
+
+    # the same values: but the final marks name a mark that the revision deleted
+    submit(session, by_ben, values(MINOR), marks=[mark("A", 4.5)])
+    record_single(session, S1, shipped_protocol)
+    assert labels(session) == {} and final_marks(session) == {}
+
+    assert finalize(session, plan_of([S1]), shipped_protocol).consensus == 1
+    assert [x for _, x, _ in final_marks(session)[S1]] == [1.5, 4.5]
+
+
+def test_a_consensus_that_the_ratings_still_give_stays(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    rate(session, ada, S1, values(MINOR), marks=[mark("A", 1.5)])
+    by_ben = rate(session, ben, S1, values(MINOR, MINOR))
+    finalize(session, plan_of([S1]), shipped_protocol)
+    before = (labels(session), final_marks(session), final_mark_ids(session))
+    assert before[0] == {S1: consensus(MINOR, NONE)}
+
+    # a repeat of the subject is no rating of it
+    rate(session, ben, S1, values(MAJOR, MAJOR, MAJOR), kind="repeat")
+    record_single(session, S1, shipped_protocol)
+    assert (labels(session), final_marks(session), final_mark_ids(session)) == before
+
+    # a revision without marks that moves no label: the lower value of B is ada's
+    submit(session, by_ben, values(MAJOR, MINOR))
+    record_single(session, S1, shipped_protocol)
+    assert (labels(session), final_marks(session), final_mark_ids(session)) == before
+    assert not session.dirty and not session.new and not session.deleted
+
+
+def test_a_consensus_of_a_subject_with_one_rating_goes_at_its_next_submission(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol
+) -> None:
+    """One rating gives no consensus. Such a row is not one of ``finalize``; it is put
+    there by hand, as the rating would have it."""
+    rate(session, ada, S1, values(MINOR))
+    rate(session, ben, S2, values(MINOR))
+    for criterion, value in values(MINOR).items():
+        for subject_uid in (S1, S2):
+            session.add(
+                FinalLabel(
+                    subject_uid=subject_uid, criterion=criterion, value=value, method="consensus"
+                )
+            )
+    session.flush()
+    record_single(session, S1, shipped_protocol)
+    assert labels(session) == {S2: consensus(MINOR)}
+
+
+def test_a_stale_consensus_whose_rating_names_a_lost_reason_is_left_with_a_warning(
+    session: Session,
+    ada: Rater,
+    ben: Rater,
+    shipped_protocol: Protocol,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    for rater in (ada, ben):
+        rate(session, rater, S1, unratable="image too poor to judge")
+    finalize(session, plan_of([S1]), shipped_protocol)
+    before = labels(session)
+    assert before == {S1: {"unratable": (3, "consensus")}}
+
+    reasons = shipped_protocol.unratable_reasons[:3]
+    shorter = shipped_protocol.model_copy(update={"unratable_reasons": reasons})
+    rate(session, ben, S1, values(NONE), kind="repeat")
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        record_single(session, S1, shorter)
+    assert labels(session) == before
+    (message,) = caplog.messages
+    assert S1 in message and "image too poor to judge" in message
+
+
 # --- sync_unratable -----------------------------------------------------------------------------
 
 
@@ -1028,6 +1153,91 @@ def test_finalize_is_not_committed(
         assert labels(later) == {}
 
 
+# --- a subject that a rater skipped -------------------------------------------------------------
+
+
+def pass_over(
+    session: Session, rater: Rater, subject_uid: str, *, completed: bool, key: str = "key"
+) -> Assignment:
+    """A ``main`` assignment of the subject without any submission. Open is what a skip
+    leaves: it stores no submission and does not complete the assignment (what else it
+    records, the labels do not read). Completed without a submission is a state that the
+    tables allow and no writer of the app leaves."""
+    assert rater.rater_id is not None
+    earlier = session.exec(
+        select(Assignment.seq)
+        .where(Assignment.rater_id == rater.rater_id)
+        .order_by(col(Assignment.seq).desc())
+    ).first()
+    assignment = Assignment(
+        rater_id=rater.rater_id,
+        subject_uid=subject_uid,
+        kind="main",
+        seq=(earlier or 0) + 1,
+        render_key=key,
+        assigned_at=T,
+        completed_at=T if completed else None,
+    )
+    session.add(assignment)
+    session.flush()
+    return assignment
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_an_assignment_without_a_submission_is_no_rating(
+    session: Session, ada: Rater, shipped_protocol: Protocol, completed: bool
+) -> None:
+    pass_over(session, ada, S1, completed=completed)
+    record_single(session, S1, shipped_protocol)
+    assert labels(session) == {} and final_marks(session) == {}
+
+    report = finalize(session, plan_of([S1]), shipped_protocol)
+    assert report == FinalizeReport(consensus=0, single=0, unratable=0, open=())
+    assert labels(session) == {}
+
+    # nobody rated it: when its render fails it gets the label of a failed render
+    failed = plan_of(failed={S1: "missing surface"})
+    assert sync_unratable(session, failed, shipped_protocol) == 1
+    assert labels(session) == {S1: {"unratable": (2, "single")}}
+    assert finalize(session, failed, shipped_protocol).unratable == 1
+    assert labels(session) == {S1: {"unratable": (2, "single")}}
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_skipping_a_subject_leaves_what_it_was_rated_as_before(
+    session: Session, ada: Rater, shipped_protocol: Protocol, completed: bool
+) -> None:
+    rated = rate(session, ada, S1, values(MINOR), marks=[mark("A", 1.5)], key="tiles-1")
+    record_single(session, S1, shipped_protocol)
+    before = (labels(session), final_marks(session), final_mark_ids(session))
+    assert before[1] == {S1: [("A", 1.5, live_mark_ids(session, rated))]}
+
+    # offered again on other tiles, and skipped this time
+    pass_over(session, ada, S1, completed=completed, key="tiles-2")
+    record_single(session, S1, shipped_protocol)
+    assert (labels(session), final_marks(session), final_mark_ids(session)) == before
+    assert finalize(session, plan_of([S1]), shipped_protocol).single == 1
+    assert (labels(session), final_marks(session), final_mark_ids(session)) == before
+
+
+@pytest.mark.parametrize("completed", [True, False])
+def test_a_subject_one_rater_skipped_has_the_label_of_the_rater_who_rated_it(
+    session: Session, ada: Rater, ben: Rater, shipped_protocol: Protocol, completed: bool
+) -> None:
+    pass_over(session, ada, S1, completed=completed)
+    by_ben = rate(session, ben, S1, values(MAJOR), marks=[mark("A", 1.5)])
+    pass_over(session, ada, S2, completed=completed)
+    pass_over(session, ben, S2, completed=completed)
+    rate(session, ada, S3, values(MINOR))
+    rate(session, ben, S3, values(MINOR))
+    report = finalize(session, plan_of([S1, S2, S3]), shipped_protocol)
+
+    # S1 is neither open nor a consensus: one rater said something about it
+    assert report == FinalizeReport(consensus=1, single=1, unratable=0, open=())
+    assert labels(session) == {S1: single(MAJOR), S3: consensus(MINOR)}
+    assert final_marks(session) == {S1: [("A", 1.5, live_mark_ids(session, by_ben))]}
+
+
 # --- on a run: a plan from the catalog, and the calibration set ---------------------------------
 
 
@@ -1190,7 +1400,9 @@ def test_freeze_takes_the_named_subjects_only(
     app_run: Path, app_engine: Engine, small_run_uids: dict[str, str], shipped_protocol: Protocol
 ) -> None:
     rated_run(app_engine, small_run_uids, shipped_protocol)
-    named = [small_run_uids["sub-002"], small_run_uids["sub-000"], small_run_uids["sub-002"]]
+    # named last first, and one of them twice: the set is in the order of the uids
+    last, first = sorted((small_run_uids["sub-002"], small_run_uids["sub-000"]), reverse=True)
+    named = [last, first, last]
     freeze_calibration(app_run, subjects=named)
     loaded = load_calibration(app_run)
     assert loaded is not None

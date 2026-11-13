@@ -23,18 +23,22 @@ from synth_tree import write_tree  # pyrefly: ignore[missing-import]
 
 from surfcensus import store
 from surfcensus.app.db import app_db_path, get_or_create_rater, open_app_db, store_submission
-from surfcensus.app.models import Assignment, Rater
+from surfcensus.app.models import Assignment, Event, Rater
 from surfcensus.app.queue import (
     PREFETCH,
     Next,
     QueuePlan,
+    SkipRefused,
     build_plan,
     has_work_left,
+    is_open_for,
     next_assignment,
     previous_assignment,
+    skip_assignment,
     subjects_left,
+    subjects_skipped,
 )
-from surfcensus.app.schemas import AppMode, RatingIn
+from surfcensus.app.schemas import AppMode, RatingIn, SkipIn
 from surfcensus.calibration import CalibrationSet, CalibrationSubject
 from surfcensus.config import AppConfig, load_config
 from surfcensus.records import RenderRow
@@ -104,6 +108,36 @@ def complete(session: Session, assignment: Assignment, *, now: str | None = None
     store_submission(
         session, assignment, rating, (), protocol_sha256="9c", app_version="0", now=now
     )
+
+
+def skip_in(assignment: Assignment, client_ts: str, ms: int = 2500) -> SkipIn:
+    assert assignment.assignment_id is not None
+    return SkipIn(assignment_id=assignment.assignment_id, client_ts=client_ts, ms_on_subject=ms)
+
+
+class Skipper:
+    """Skips as a page does: each skip with a client time of its own, a second later."""
+
+    def __init__(self, session: Session, rater: Rater, plan: QueuePlan) -> None:
+        self.session, self.rater, self.plan = session, rater, plan
+        self.n = 0
+
+    def __call__(self, assignment: Assignment, *, plan: QueuePlan | None = None) -> Next:
+        self.n += 1
+        return skip_assignment(
+            self.session,
+            self.rater,
+            assignment,
+            skip_in(assignment, f"client-{self.n:03d}"),
+            self.plan if plan is None else plan,
+            now=T[self.n],
+        )
+
+    def to(self, assignment: Assignment, **kw: Any) -> Assignment:
+        """Skip, and the assignment that follows."""
+        following = self(assignment, **kw)
+        assert following.status == "assignment" and following.assignment is not None
+        return following.assignment
 
 
 def assigned(session: Session, rater: Rater, plan: QueuePlan) -> Assignment:
@@ -961,10 +995,14 @@ def test_an_open_repeat_is_returned_again_and_is_work_left(session: Session, rat
 
 def test_the_team_branch_is_not_written(session: Session, rater: Rater) -> None:
     team = dataclasses.replace(plan_of(["a"]), mode="team")
-    for function in (next_assignment, has_work_left, subjects_left):
+    for function in (next_assignment, has_work_left, subjects_left, subjects_skipped):
         with pytest.raises(NotImplementedError, match="milestone 5"):
             function(session, rater, team)
     assert all_assignments(session) == []
+    mine = assigned(session, rater, plan_of(["a"]))
+    with pytest.raises(NotImplementedError, match="milestone 5"):
+        skip_assignment(session, rater, mine, skip_in(mine, "t"), team)
+    assert (mine.skipped_at, mine.skip_count) == (None, 0)
 
 
 def test_a_rater_without_an_id_is_refused(session: Session) -> None:
@@ -994,3 +1032,397 @@ def test_subjects_left_counts_what_is_ready_and_what_is_awaited(
     assigned(session, rater, plan)  # open: still to rate
     assert subjects_left(session, rater, plan) == 4
     assert len(all_assignments(session)) == 2
+
+
+# --- skips: a subject is deferred, never dropped ------------------------------------------------
+
+
+def skip_events(session: Session) -> list[tuple[int | None, str]]:
+    rows = session.exec(select(Event).where(Event.type == "skip").order_by(col(Event.event_id)))
+    return [(event.assignment_id, event.ts) for event in rows]
+
+
+def test_a_skipped_subject_comes_back_after_every_subject_not_yet_shown(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c", "d", "e"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    b = skip.to(a)
+    assert (a.subject_uid, b.subject_uid, b.seq) == ("a", "b", 2)
+    # a skip stores nothing of a rating and leaves the assignment open
+    assert a.completed_at is None and (a.skipped_at, a.skip_count) == (T[1], 1)
+    complete(session, b)
+    c = assigned(session, rater, plan)
+    d = skip.to(c)
+    assert (c.subject_uid, d.subject_uid) == ("c", "d")
+    complete(session, d)
+    e = assigned(session, rater, plan)
+    assert e.subject_uid == "e"
+    complete(session, e)
+    # everything was shown: the skipped ones come back in the order of skipping, as the
+    # assignments they were
+    assert assigned(session, rater, plan) is a
+    complete(session, a)
+    assert assigned(session, rater, plan) is c
+    complete(session, c)
+    assert next_assignment(session, rater, plan) == Next("done")
+    assert subjects(all_assignments(session)) == ["a", "b", "c", "d", "e"]
+    assert [x.seq for x in all_assignments(session)] == [1, 2, 3, 4, 5]
+    assert skip_events(session) == [
+        (a.assignment_id, "client-001"),
+        (c.assignment_id, "client-002"),
+    ]
+
+
+def test_the_order_of_skipping_decides_and_not_the_order_of_the_queue(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    b = skip.to(a)
+    complete(session, b)
+    c = assigned(session, rater, plan)
+    # c is skipped, a comes back and is skipped again: now a was skipped last
+    assert skip.to(c) is a
+    assert skip.to(a) is c
+    assert (a.skip_count, c.skip_count) == (2, 1) and a.skipped_at > c.skipped_at
+    complete(session, c)
+    assert assigned(session, rater, plan) is a
+
+
+def test_when_only_skipped_subjects_are_left_skip_goes_round_them(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    skip = Skipper(session, rater, plan)
+    first = assigned(session, rater, plan)
+    shown = [first]
+    for _ in range(8):
+        shown.append(skip.to(shown[-1]))
+    assert subjects(shown) == ["a", "b", "c", "a", "b", "c", "a", "b", "c"]
+    assert len(all_assignments(session)) == 3  # one assignment per subject, however often
+    assert [x.skip_count for x in all_assignments(session)] == [3, 3, 2]
+    assert len(skip_events(session)) == 8
+    # the one on the page is returned again until it is rated or skipped
+    assert assigned(session, rater, plan) is shown[-1]
+    assert assigned(session, rater, plan) is shown[-1]
+    assert has_work_left(session, rater, plan)
+
+
+def test_the_only_subject_comes_straight_back(session: Session, rater: Rater) -> None:
+    plan = plan_of(["a"])
+    skip = Skipper(session, rater, plan)
+    only = assigned(session, rater, plan)
+    for count in (1, 2, 3):
+        following = skip(only)
+        assert following == Next("assignment", only, ())
+        assert only.skip_count == count
+    assert has_work_left(session, rater, plan) and subjects_left(session, rater, plan) == 1
+    assert subjects_skipped(session, rater, plan, only) == 0
+
+
+def test_the_queue_is_done_only_when_every_subject_has_a_submission(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    b = skip.to(a)
+    c = skip.to(b)
+    complete(session, c)
+    # two of three have no rating: nothing is done, nothing is dropped
+    for _ in range(3):
+        following = next_assignment(session, rater, plan)
+        assert following.status == "assignment" and following.assignment is a
+        assert has_work_left(session, rater, plan)
+        assert subjects_left(session, rater, plan) == 2
+    complete(session, a)
+    assert has_work_left(session, rater, plan) and subjects_left(session, rater, plan) == 1
+    assert assigned(session, rater, plan) is b
+    complete(session, b)
+    assert next_assignment(session, rater, plan) == Next("done")
+    assert not has_work_left(session, rater, plan) and subjects_left(session, rater, plan) == 0
+    # an unratable submission ends a subject as well (the queue asks for a submission)
+    assert all(x.completed_at is not None for x in all_assignments(session))
+
+
+def test_a_skip_is_no_rating_and_gives_the_subject_to_nobody_else(session: Session) -> None:
+    first = get_or_create_rater(session, "first", role="lead")
+    second = get_or_create_rater(session, "second")
+    plan = plan_of(["a", "b"])
+    mine = assigned(session, first, plan)
+    following = skip_assignment(session, first, mine, skip_in(mine, "c1"), plan, now=T[1])
+    assert following.assignment is not None and following.assignment.subject_uid == "b"
+    complete(session, following.assignment)
+    # the other rater walks the same order and is told nothing of the skip
+    theirs = assigned(session, second, plan)
+    assert theirs.subject_uid == "a" and theirs is not mine
+    assert subjects_skipped(session, second, plan) == 0
+    complete(session, theirs)
+    complete(session, assigned(session, second, plan))
+    assert not has_work_left(session, second, plan)
+    # and their rating of it does not take it from the first, who still has to rate it
+    assert has_work_left(session, first, plan)
+    assert assigned(session, first, plan) is mine
+    assert [(x.rater_id, x.subject_uid) for x in all_assignments(session)] == [
+        (first.rater_id, "a"),
+        (first.rater_id, "b"),
+        (second.rater_id, "a"),
+        (second.rater_id, "b"),
+    ]
+
+
+def test_backspace_after_a_skip_goes_back_to_the_skipped_subject(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c", "d"])
+    a = assigned(session, rater, plan)
+    complete(session, a, now=T[1])
+    b = assigned(session, rater, plan)
+    assert previous_assignment(session, rater) is a
+    c = skip_assignment(session, rater, b, skip_in(b, "c1"), plan, now=T[2]).assignment
+    assert c is not None and c.subject_uid == "c"
+    # the assignment the rater left last is the skipped one, open as it was
+    assert previous_assignment(session, rater) is b
+    assert b.completed_at is None and (b.skipped_at, b.skip_count) == (T[2], 1)
+    # looking back changes nothing: the page of the server is still c, and b still waits
+    assert assigned(session, rater, plan) is c
+    assert subjects_skipped(session, rater, plan, c) == 1
+    # rated from there, it is done and the skip stays recorded
+    complete(session, b, now=T[3])
+    assert (b.completed_at, b.skipped_at, b.skip_count) == (T[3], T[2], 1)
+    assert previous_assignment(session, rater) is b
+    assert assigned(session, rater, plan) is c
+    complete(session, c, now=T[4])
+    assert previous_assignment(session, rater) is c
+    d = assigned(session, rater, plan)
+    complete(session, d, now=T[5])
+    assert next_assignment(session, rater, plan) == Next("done")
+    assert len(all_assignments(session)) == 4
+
+
+def test_the_previous_assignment_is_the_one_left_last_rated_or_skipped(
+    session: Session, rater: Rater
+) -> None:
+    assert rater.rater_id is not None
+
+    def made(seq: int, uid: str, completed_at: str | None, skipped_at: str | None) -> Assignment:
+        assignment = Assignment(
+            rater_id=rater.rater_id,
+            subject_uid=uid,
+            seq=seq,
+            render_key=key_of(uid),
+            assigned_at=T[0],
+            completed_at=completed_at,
+            skipped_at=skipped_at,
+            skip_count=0 if skipped_at is None else 1,
+        )
+        session.add(assignment)
+        session.flush()
+        return assignment
+
+    made(1, "a", None, None)  # never left
+    assert previous_assignment(session, rater) is None
+    rated = made(2, "b", T[4], None)
+    skipped = made(3, "c", None, T[3])
+    assert previous_assignment(session, rater) is rated
+    later = made(4, "d", None, T[6])
+    assert previous_assignment(session, rater) is later
+    # skipped first and rated afterwards: left when it was rated
+    both = made(5, "e", T[8], T[2])
+    assert previous_assignment(session, rater) is both
+    # two left in the same millisecond: the one made later
+    tie = made(6, "f", None, T[8])
+    assert previous_assignment(session, rater) is tie
+    assert skipped.completed_at is None
+    # another rater's are not this rater's to go back to
+    assert previous_assignment(session, get_or_create_rater(session, "second")) is None
+
+
+def test_a_skip_request_that_arrives_twice_is_one_skip(session: Session, rater: Rater) -> None:
+    plan = plan_of(["a", "b", "c"])
+    a = assigned(session, rater, plan)
+    request = skip_in(a, "2026-11-13T09:59:59.250Z")
+    first = skip_assignment(session, rater, a, request, plan, now=T[1])
+    assert first.assignment is not None and first.assignment.subject_uid == "b"
+    # the answer was lost and the page sends the same request again, twice
+    for now in (T[2], T[3]):
+        again = skip_assignment(session, rater, a, request, plan, now=now)
+        assert again == first and again.assignment is first.assignment
+    assert (a.skipped_at, a.skip_count) == (T[1], 1)
+    assert skip_events(session) == [(a.assignment_id, "2026-11-13T09:59:59.250Z")]
+    assert len(all_assignments(session)) == 2
+    assert subjects_skipped(session, rater, plan, first.assignment) == 1
+
+
+def test_a_skip_of_an_assignment_that_is_not_open_is_refused(session: Session) -> None:
+    rater = get_or_create_rater(session, "first", role="lead")
+    other = get_or_create_rater(session, "second")
+    plan = plan_of(["a", "b", "c"])
+    rated = assigned(session, rater, plan)
+    complete(session, rated, now=T[1])
+    mine = assigned(session, rater, plan)
+    theirs = assigned(session, other, plan)
+    changed = plan_of(["a", "b", "c"], keys={"a": key_of("a"), "b": "new-key", "c": key_of("c")})
+    failed = plan_of(["a", "b", "c"], failed={"b": "source changed"})
+    cases = [
+        (rater, rated, plan, "has a rating"),
+        (rater, theirs, plan, "another rater's"),
+        (other, mine, plan, "another rater's"),
+        (rater, mine, changed, "its render changed"),
+        (rater, mine, failed, "its render failed"),
+    ]
+    for who, assignment, state, why in cases:
+        assert not is_open_for(who, assignment, state), why
+        with pytest.raises(SkipRefused, match="is not open for the rater"):
+            skip_assignment(session, who, assignment, skip_in(assignment, why), state, now=T[5])
+    assert issubclass(SkipRefused, ValueError)
+    # a skip that names another assignment is the caller's mistake, not a refusal
+    with pytest.raises(ValueError, match="not of") as caught:
+        skip_assignment(session, rater, mine, skip_in(theirs, "x"), plan, now=T[5])
+    assert not isinstance(caught.value, SkipRefused)
+    # nothing was recorded, and nothing moved
+    assert skip_events(session) == []
+    assert [(x.skipped_at, x.skip_count) for x in all_assignments(session)] == [(None, 0)] * 3
+    assert is_open_for(rater, mine, plan) and is_open_for(other, theirs, plan)
+    assert assigned(session, rater, plan) is mine and len(all_assignments(session)) == 3
+
+
+def test_a_skipped_subject_waits_for_a_render_that_is_awaited(
+    session: Session, rater: Rater
+) -> None:
+    waiting = plan_of(["a", "b"], keys={"a": key_of("a")}, pending=1)
+    a = assigned(session, rater, waiting)
+    # b was not shown yet, since it is still being rendered: the rater waits for it
+    following = skip_assignment(session, rater, a, skip_in(a, "c1"), waiting, now=T[1])
+    assert following == Next("rendering")
+    assert next_assignment(session, rater, waiting) == Next("rendering")
+    assert has_work_left(session, rater, waiting)
+    assert subjects_left(session, rater, waiting) == 2
+    assert subjects_skipped(session, rater, waiting) == 1
+    # rendered: b comes first, then the skipped one
+    ready = plan_of(["a", "b"])
+    b = assigned(session, rater, ready)
+    assert b.subject_uid == "b" and next_assignment(session, rater, ready).prefetch == (
+        ("a", key_of("a")),
+    )
+    complete(session, b)
+    assert assigned(session, rater, ready) is a
+    assert len(all_assignments(session)) == 2
+
+
+def test_a_skipped_assignment_whose_render_changed_is_left_and_the_subject_is_new_again(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    b = skip.to(a)
+    changed = plan_of(["a", "b", "c"], keys={"a": "new-key", "b": key_of("b"), "c": key_of("c")})
+    assert subjects_skipped(session, rater, changed, b) == 0  # its tiles are gone
+    complete(session, b)
+    # a has other tiles now: it is a subject the rater has not been shown, in its place
+    fresh = assigned(session, rater, changed)
+    assert fresh is not a and (fresh.subject_uid, fresh.render_key, fresh.seq) == (
+        "a",
+        "new-key",
+        3,
+    )
+    complete(session, fresh)
+    complete(session, assigned(session, rater, changed))
+    assert next_assignment(session, rater, changed) == Next("done")
+    assert (a.completed_at, a.skip_count) == (None, 1)
+    # with the earlier render back, the skipped assignment is the rater's again
+    assert assigned(session, rater, plan) is a
+
+
+def test_what_comes_next_is_what_was_not_shown_and_then_what_was_skipped(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c", "d"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    after_a = skip(a)
+    assert after_a.assignment is not None and after_a.assignment.subject_uid == "b"
+    assert after_a.prefetch == (("c", key_of("c")), ("d", key_of("d")))
+    after_b = skip(after_a.assignment)
+    assert after_b.assignment is not None and after_b.assignment.subject_uid == "c"
+    # one subject not shown, then the one skipped first
+    assert after_b.prefetch == (("d", key_of("d")), ("a", key_of("a")))
+    complete(session, after_b.assignment)
+    last = next_assignment(session, rater, plan)
+    assert last.assignment is not None and last.assignment.subject_uid == "d"
+    assert last.prefetch == (("a", key_of("a")), ("b", key_of("b")))
+    complete(session, last.assignment)
+    back = next_assignment(session, rater, plan)
+    assert back.assignment is a and back.prefetch == (("b", key_of("b")),)
+    assert len(back.prefetch) < PREFETCH
+
+
+def test_the_progress_line_counts_the_skipped_subjects_that_wait(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    skip = Skipper(session, rater, plan)
+    a = assigned(session, rater, plan)
+    assert subjects_skipped(session, rater, plan, a) == 0
+    b = skip.to(a)
+    assert subjects_skipped(session, rater, plan, b) == 1
+    c = skip.to(b)
+    assert subjects_skipped(session, rater, plan, c) == 2
+    # a skipped subject is still to rate
+    assert subjects_left(session, rater, plan) == 3
+    complete(session, c)
+    assert assigned(session, rater, plan) is a
+    # the one that is given back is on the page: it does not wait any more
+    assert subjects_skipped(session, rater, plan, a) == 1
+    assert subjects_skipped(session, rater, plan) == 2  # nothing on the page
+    # shown again by Backspace while another is the open one
+    assert subjects_skipped(session, rater, plan, b) == 1
+    complete(session, a)
+    complete(session, b)
+    assert subjects_skipped(session, rater, plan) == 0
+    assert all_assignments(session)[0].skip_count == 1  # the record stays
+    assert len(all_assignments(session)) == 3  # and counting made no assignment
+
+
+def test_two_skips_at_one_moment_come_back_in_the_order_they_were_made(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b", "c"])
+    a = assigned(session, rater, plan)
+    b = skip_assignment(session, rater, a, skip_in(a, "c1"), plan, now=T[1]).assignment
+    assert b is not None
+    c = skip_assignment(session, rater, b, skip_in(b, "c2"), plan, now=T[1]).assignment
+    assert c is not None and c.subject_uid == "c"
+    complete(session, c)
+    assert assigned(session, rater, plan) is a
+
+
+def test_a_skipped_repeat_waits_like_any_subject_and_is_not_drawn_twice(
+    session: Session, rater: Rater
+) -> None:
+    plan = plan_of(["a", "b"], repeat_rate=1.0, repeat_gap=1, seed=3)
+    skip = Skipper(session, rater, plan)
+    complete(session, assigned(session, rater, plan))
+    repeat = assigned(session, rater, plan)
+    assert (repeat.subject_uid, repeat.kind, repeat.seq) == ("a", "repeat", 2)
+    # skipped: no second repeat of a is made while this one waits
+    b = skip.to(repeat)
+    assert (b.subject_uid, b.kind, b.seq) == ("b", "main", 3)
+    complete(session, b)
+    again = assigned(session, rater, plan)
+    assert (again.subject_uid, again.kind, again.seq) == ("b", "repeat", 4)
+    complete(session, again)
+    assert assigned(session, rater, plan) is repeat
+    assert has_work_left(session, rater, plan)
+    complete(session, repeat)
+    assert next_assignment(session, rater, plan) == Next("done")
+    assert [(x.subject_uid, x.kind) for x in all_assignments(session)] == [
+        ("a", "main"),
+        ("a", "repeat"),
+        ("b", "main"),
+        ("b", "repeat"),
+    ]

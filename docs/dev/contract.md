@@ -1516,7 +1516,7 @@ def load_protocol(run_dir: Path) -> tuple[Protocol, str]       # (protocol, sha2
 def marks_required(protocol: Protocol, app: AppConfig) -> bool # app.require_marks if not None, else the protocol's flag
 ```
 
-Validation beyond the field types, each failure naming the entry: scale values are `0 .. n-1`; each criterion has as many keys as scale levels; keys and mark keys are unique across the file and collide with no fixed key of the keyboard map of `rater_app.md`; criterion ids are unique; the three `RenderError` reasons are in `unratable_reasons`. The file is read at server start. A local run is created with `app.require_marks = False` (`--require-marks` sets and stores true), so the shipped `true` never surprises a local user, and the YAML file is never rewritten by a program. The model classes are written in the first step of the milestone, because `app/schemas.py` embeds `Protocol`.
+Validation beyond the field types, each failure naming the entry: scale values are `0 .. n-1`; each criterion has as many keys as scale levels; keys and mark keys are unique across the file and collide with no fixed key of the keyboard map of `rater_app.md` (`FIXED_KEYS`, which since package 4.H holds `k`, skip, and `t`, the tour); criterion ids are unique; the three `RenderError` reasons are in `unratable_reasons`. The file is read at server start. A local run is created with `app.require_marks = False` (`--require-marks` sets and stores true), so the shipped `true` never surprises a local user, and the YAML file is never rewritten by a program. The model classes are written in the first step of the milestone, because `app/schemas.py` embeds `Protocol`.
 
 ### 7.2 `app/models.py`, `app/db.py` (SQLModel, `app.sqlite`)
 
@@ -1527,7 +1527,8 @@ raters        Rater         rater_id PK, name UNIQUE, token_hash NULL, role ('ra
                             active + (default 1), created_at
 assignments   Assignment    assignment_id PK, rater_id FK, subject_uid, kind ('calibration'|'main'|'repeat'|'adjudication'),
                             seq + (per rater, from 1), render_key +, assigned_at, completed_at NULL,
-                            consensus_served_at + NULL, UNIQUE (rater_id, seq)
+                            consensus_served_at + NULL, skipped_at + NULL, skip_count + (default 0),
+                            UNIQUE (rater_id, seq)
 submissions + Submission    submission_id PK, assignment_id FK, revision (from 1), current (0|1), unratable_reason NULL,
                             other (0|1), note, protocol_version, protocol_sha256, calibration_sha256 NULL, app_version,
                             client_ts, server_ts, ms_on_subject, UNIQUE (assignment_id, revision)
@@ -1557,6 +1558,7 @@ def open_app_db(run_dir: Path, *, run_id: str, mode: Literal["local", "team"]) -
 - The `class` column: the Python field is `mark_class`, declared with `sa_column=Column("class", String, nullable=False)` (checked with sqlmodel 0.0.49).
 - `submissions` is the one structural addition. One submission per press of `Enter`. A revision (`Backspace`, then `Enter`) is a new submission with `revision + 1`; `current` moves to it, and the marks of the superseded submission get `deleted_ts`. Nothing is overwritten. A view `ratings_flat` reproduces the `ratings` columns of `rater_app.md` for current submissions.
 - `assignments.render_key` is `renders.render_key` of the render that was shown (5.1, T19): keyed, built from the tile settings and the content of the tile inputs. It does not change when a file is touched or the data moves, when the render schema is bumped, when the video or the template changes, or when the vertex map is rewritten; it changes when a surface or the T1 changes or a tile setting does.
+- A skip (package 4.H; `rater_app.md`, "From subject to subject"). `assignments.skipped_at` is the server's time of the latest skip and `skip_count` the number of skips; a skipped assignment stays open (`completed_at` NULL). The two columns came without a new schema version: no `app.sqlite` existed outside tests. `db.record_skip(session, assignment, skip: SkipIn, *, now=None) -> bool` sets both and stores an event of type `skip` with the assignment: `ts` is the client's time, the payload `{"ms_on_subject", "n", "server_ts"}`. A skip is named by its assignment and the client's time: one that is recorded already returns False and changes nothing. `ValueError` for an assignment with a submission.
 - `marks.slice` is the position in the panel's slice list, which is what the geometry needs. `frame` and `mode` are the playback context of the click, kept for the behaviour analysis. `vox_*` are continuous voxel coordinates.
 - `final_labels` with criterion `unratable`: `value` is the index of the reason in the protocol. A selected subject whose render failed gets such a row (method `single`, the render's reason) from `finalize.sync_unratable`, which runs at server start and in `finalize`; so every selected subject can end with a final label, and the unratable reasons of the protocol that come from the renderer are recorded as labels.
 - Who writes final labels. With one rater in the database (the normal local case), each submission rewrites the subject's `final_labels` (method `single`) and `final_marks`, so review and export read the same two tables in every mode. As soon as a second rater exists, the rows of method `single` that come from ratings are deleted and nothing is written per submission; final labels then come from `finalize` (7.7) and, in milestone 5, adjudication.
@@ -1646,13 +1648,22 @@ def build_plan(public: PublicCatalog, scores: pd.DataFrame | None, app: AppConfi
                mode: Literal["local", "team"], *, render_config_hash: str,
                calibration: CalibrationSet | None = None) -> QueuePlan
 def next_assignment(session: Session, rater: Rater, plan: QueuePlan) -> Next
-def previous_assignment(session: Session, rater: Rater) -> Assignment | None     # the rater's most recent completed one
+def previous_assignment(session: Session, rater: Rater) -> Assignment | None     # the one the rater left last, rated or skipped
 def has_work_left(session: Session, rater: Rater, plan: QueuePlan) -> bool      # an open assignment, or next would give one
+def subjects_left(session: Session, rater: Rater, plan: QueuePlan) -> int       # progress.remaining
+# package 4.H
+class SkipRefused(ValueError)                                                   # the assignment is not open for the rater: 409
+def is_open_for(rater: Rater, assignment: Assignment, plan: QueuePlan) -> bool  # the rater's, no submission, render current
+def skip_assignment(session: Session, rater: Rater, assignment: Assignment, skip: SkipIn, plan: QueuePlan, *,
+                    now: str | None = None) -> Next                              # record_skip, then next_assignment
+def subjects_skipped(session: Session, rater: Rater, plan: QueuePlan,
+                     shown: Assignment | None = None) -> int                     # progress.skipped
 ```
 
 - A render is ready when its row is `done` and its `config_hash` equals `render_config_hash`, the hash of the running version's config (which includes the schema number). A `done` row with another hash counts as `outdated`.
 - Selected subjects are the rows of `selection` (a local run: every present subject, reason `all`). Local order without `blind`: first the subjects flagged `partial_score` (they could not be fully scored and would otherwise sink, 6.8), by `subject_uid`; then by `scores.primary_rank` ascending (worst first; `rank` is within a reference and occurs twice among the primary rows, 6.10); then subjects without a score, by `subject_uid`. With `blind`: `random.Random(seed).shuffle` of the sorted uids. Team: sorted uids (the order is not used).
 - `next_assignment` is idempotent: an open assignment is returned again, so a reload never skips a subject.
+- Skips (package 4.H). A skipped assignment stays open and waits; no second assignment is made for its subject while its render stays the same. `next_assignment` decides in this order: the latest open assignment that was not skipped and is servable; a repeat, when the draw says so; the first subject of the order that is ready, not done and has no waiting assignment; `rendering` when renders are pending or outdated; the waiting assignment that was skipped longest ago (`skipped_at`, then `seq`); `done`. So a skipped subject comes back after every subject the rater has not been shown, those still being rendered among them, in the order of skipping, and when only skipped subjects are left a skip goes round them. `has_work_left` is true while a skipped assignment waits; `subjects_left` counts it. `prefetch` is the subjects not shown yet in queue order, then the waiting ones in the order of skipping. A skipped repeat waits like any other assignment, and its subject is not drawn for a second repeat meanwhile. `previous_assignment` orders by the later of `completed_at` and `skipped_at`, then `seq`. A skip never completes an assignment and never changes what another rater is given. The team branch (milestone 5) keeps the rule within each stage: a skipped calibration subject comes back after the calibration subjects not yet shown and before the first main one.
 - Local: walk `order`. A subject is done for a rater when the rater has a completed `main` assignment whose `render_key` equals the subject's current one. The first subject that is not done and is ready gets an assignment. Nothing ready and `pending + outdated > 0`: `rendering`. Nothing left: `done`. Subjects whose render failed are never offered; they have an unratable final label (7.2) and appear in review and export with their reason. Several local raters each walk the same order on their own.
 - Repeats, in both modes, when `repeat_rate > 0`: with that probability the next assignment is a subject this rater completed at least `repeat_gap` assignments ago and has not yet repeated. It is stored with kind `repeat`.
 - Team (milestone 5, same function): calibration subjects first, in a per-rater seeded order. Then a repeat as above, or a subject the rater has not seen, drawn uniformly among those with the fewest assignments (completed or open) that still need raters. Every draw uses `random.Random(f"{seed}:{rater_id}:{seq}")`, so the queue is reproducible from the database.
@@ -1693,8 +1704,9 @@ Unblinded routes are `/review`, `/api/review*`, `/api/stats`, `/api/export` and,
 | `GET /healthz` | | `{"ok": true, "version": "0.0.1"}` |
 | `GET /api/session` | rater | below |
 | `GET /api/next` | rater | below |
-| `GET /api/back` | rater | the rater's most recent completed assignment, in the envelope of `next` with `previous` filled; 404 when there is none; 409 when it is a calibration assignment whose consensus has been served |
+| `GET /api/back` | rater | the assignment the rater left last (`previous_assignment`), in the envelope of `next`: a rated one with `previous` filled, a skipped one as it is, with `previous` null; 404 when there is none; 409 when it is a calibration assignment whose consensus has been served |
 | `POST /api/rating` | rater | below |
+| `POST /api/skip` | rater | below (package 4.H): the next assignment, as `GET /api/next` |
 | `POST /api/events` | rater | `{"stored": n}` |
 | `GET /api/review?sort=&order=&filter=&offset=&limit=` | unblinded | `{"total": n, "columns": [...], "rows": [...]}`: per subject the primary `scores.parquet` columns, `fs_version`, render status and reason, `final` labels, `n_ratings`, `n_marks`, and in a local run `subject_label`. `filter` is a comma-separated list of `column:value`. |
 | `GET /api/review/{subject_uid}` | unblinded | `{"media_base", "render_key", "render", "scores", "ratings": [...], "marks": [...], "clusters": [{"reference_id", "hemi", "region", "rank", "tkr": [x, y, z], "area_mm2", "peak_z"}]}`; clusters are those with a row in `clusters_native`; the page draws marks and centroids through `vox2pix` |
@@ -1753,7 +1765,11 @@ Rules, in this order, all-or-nothing in one transaction:
 
 Response: `{"saved": {"assignment_id": 12, "submission_id": 30, "revision": 1, "marks": [{"client_id": "m1", "mark_id": 8, "hemi": "lh", "pial_vertex": 101234, "pial_dist_mm": 0.8, "white_vertex": 101234, "white_dist_mm": 2.9, "fsavg6_vertex": 12950, "vertex_surface": "pial", "box_dist_mm": 0.0}]}, "next": <as GET /api/next>}`.
 
-`POST /api/events`: `{"assignment_id": 12, "events": [{"ts": "...", "type": "pause", "payload": {"frame": 57}}]}`. At most 500 events per call, each payload at most 16 kB (422 otherwise). Types: `load`, `play`, `pause`, `frames`, `mode`, `speed`, `zoom`, `contours`, `marks_hidden`, `mark_add`, `mark_delete`, `mark_undo`, `help`, `back`. Frame viewing is run-length encoded, not logged per frame: `{"type": "frames", "payload": {"mode": "sync", "visits": [[frame, ms], ...]}}`. Unknown types are stored as given. The client flushes every 5 s, on submit, and with `navigator.sendBeacon` on unload.
+`POST /api/skip` (package 4.H): `{"assignment_id": 12, "client_ts": "2026-11-12T14:03:22.120Z", "ms_on_subject": 9400}` (`SkipIn`; `client_ts` is required, since it names the skip). Nothing of the rating is in it: what was entered stays in the page as the draft of the assignment. Rules: the assignment exists (404) and is the rater's (403); it is open for the rater, `queue.is_open_for` (409 otherwise, as for a stale rating; the page asks for `next` again). Then `queue.skip_assignment` in one transaction: the skip is recorded (7.2) unless it is one that arrived before, and the answer is what `GET /api/next` answers now, with `progress.skipped` from `queue.subjects_skipped(session, rater, plan, <the assignment of the answer>)`. No submission, no final label and no mark is written.
+
+`progress` has `skipped` beside the fields of the example above: the skipped assignments that wait, without the one the answer shows.
+
+`POST /api/events`: `{"assignment_id": 12, "events": [{"ts": "...", "type": "pause", "payload": {"frame": 57}}]}`. At most 500 events per call, each payload at most 16 kB (422 otherwise). Types: `load`, `play`, `pause`, `frames`, `mode`, `speed`, `zoom`, `contours`, `marks_hidden`, `mark_add`, `mark_delete`, `mark_undo`, `help`, `back`, `tour_open` (`{"how": "first" | "key" | "help"}`), `tour_close` (`{"step", "steps", "finished", "ms"}`). The type `skip` is the server's (`SERVER_EVENT_TYPES`): `EventIn` refuses it, so a batch that holds one is a 422. Frame viewing is run-length encoded, not logged per frame: `{"type": "frames", "payload": {"mode": "sync", "visits": [[frame, ms], ...]}}`. Unknown types are stored as given. The client flushes every 5 s, on submit, and with `navigator.sendBeacon` on unload.
 
 `GET /api/stats` (`StatsOut`): `{"raters": [{"rater": "local", "n_completed": 40, "median_s": 14.2, "by_day": [{"day": "2026-11-12", "n": 40}]}], "agreement": null, "drift": null}`. The milestone 4 pages do not use it; milestone 5 fills `agreement` and `drift` and adds the dashboard page (8.7).
 
@@ -1891,12 +1907,13 @@ Profiles. `analysis` is the full pseudonymous export for the team's notebooks an
 | `js/viewer.js` | per panel two stacked images (grayscale, contours); both playback modes from the frame tables; play, scrub, speed, 2x zoom, contour toggle; crosshairs and edge letters from the `render` object; preloads the current subject's tiles and prefetches the next two |
 | `js/coords.js` | click offset to tile pixel (`px = ox * width / w`), `pix2vox`, `vox2pix`, voxel to tkr; the same arithmetic as `render/geometry.py`. Display only: the server is the authority |
 | `js/marks.js` | SVG layer per panel: place (pauses playback), select, delete, undo, hide; a mark shows in the other panels within `mark_show_mm` of their current slice, with opacity falling off |
-| `js/rating.js` | the rating bar built from the protocol; note, unratable, other; the active class; whether `Enter` is enabled, and the hint when it is not |
-| `js/keys.js` | the keyboard map of `rater_app.md`, with criterion and mark keys taken from the protocol |
+| `js/rating.js` | the rating bar built from the protocol; note, unratable, other; the active class; whether `Enter` is enabled, and the hint when it is not; which rows hold a refused `Enter` back; the body of a skip |
+| `js/keys.js` | the keyboard map of `rater_app.md`, with criterion and mark keys taken from the protocol; the keys of the tour while it is open |
 | `js/events.js` | run-length frame log, batching, `sendBeacon` |
-| `js/rate.js` | page controller: session, next, submit, back, progress line |
+| `js/rate.js` | page controller: session, next, submit, skip, back, progress line; the refusal beside the submit button; one draft per assignment in `sessionStorage`; when the tour opens, and that its time is not the subject's |
+| `js/tour.js` | package 4.H: the tour of the rating screen. Five steps as data (`tourSteps(protocol, keyMap)`, the keys read from the key map), the lit part and the card beside it (`unionBox`, `placeCard`; `scrollFor` where the page scrolls), the dialog (`Tour`), and the flag in `localStorage` that it was shown (`tourSeen`, `markTourSeen`, per rater name) |
 | `js/review.js` | sortable table; scatter of composite against final label (inline SVG); subject view with marks and cluster centroids; a plain message when the server answers 403 because the rater still has subjects to rate |
-| `js/help.js` | the `?` overlay with the scale definitions and, when the session has any, the reference `examples` (tiles of calibration subjects) |
+| `js/help.js` | the `?` overlay with the scale definitions, a button that opens the tour and, when the session has any, the reference `examples` (tiles of calibration subjects) |
 
 ---
 

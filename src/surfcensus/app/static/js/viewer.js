@@ -141,6 +141,8 @@ export class Viewer {
     this.speed = DEFAULT_SPEED;
     this.zoomed = false;
     this.contoursHidden = false;
+    this.held = false;
+    this.resume = false;
     this.token = 0;
     this.current = new Set();
     this.aheadUrls = new Set();
@@ -420,7 +422,27 @@ export class Viewer {
     this.seek(this.frame + by);
   }
 
+  // While held nothing plays (a dialog covers the panels). What was playing, and what is
+  // asked to play meanwhile, plays again at the release.
+  hold() {
+    if (this.held) return;
+    this.resume = this.playing;
+    this.pause();
+    this.held = true;
+  }
+
+  release() {
+    if (!this.held) return;
+    this.held = false;
+    if (this.resume) this.play();
+    this.resume = false;
+  }
+
   play() {
+    if (this.held) {
+      this.resume = true;
+      return;
+    }
     if (this.playing || !this.render) return;
     this.playing = true;
     this.lastTick = null;

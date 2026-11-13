@@ -11,7 +11,9 @@ log of every request, which the tests read.
 It is not the server: the queue is a list, marks are not resolved to vertices (unless a
 ``resolve`` function is given), and nothing is checked that needs the catalog. The rules of
 a submission that the page mirrors (``rating.js``) are applied, so a rating that the page
-lets through and this server refuses shows a disagreement.
+lets through and this server refuses shows a disagreement. A skip follows the rule of
+``app/queue.py``: the subject keeps its assignment and comes back after every subject that
+was not shown yet, in the order of skipping.
 
     uv run python tests/frontend_mock.py MEDIA_DIR [MEDIA_DIR ...] [--port N] [--blind]
 
@@ -103,11 +105,23 @@ class MockState:
     """(status, field, message): the next submission is refused with it, once."""
     review_closed: bool = False
     """The unblinded routes answer 403, as while the rater has work left."""
+    fail_skips: int = 0
+    """How many skips are answered with status 503 before one is taken."""
     cache_media: bool = True
     resolve: Callable[[MockSubject, schemas.MarkIn], dict[str, Any]] | None = None
     """Gives the vertex fields of a stored mark; without it a mark has none."""
 
-    position: int = 0
+    order: list[int] | None = None
+    """The subjects without a rating, as positions in ``subjects``, in the order they are
+    shown: those not shown yet, then the skipped ones in the order of skipping. The first
+    is the one on the page. Read it through ``queue``, which fills it from ``subjects`` at
+    the first request, so that a test can change the subjects before."""
+    skipped: set[int] = field(default_factory=set)
+    """The positions in ``queue`` that were skipped and wait."""
+    left: list[int] = field(default_factory=list)
+    """The positions the rater left, by a rating or by a skip, in that order."""
+    skips: list[schemas.SkipIn] = field(default_factory=list)
+    """Every skip that was taken; one that was sent twice is here once."""
     completed: list[Completed] = field(default_factory=list)
     requests: list[tuple[str, str]] = field(default_factory=list)
     """(method, path with query) of every request, in order."""
@@ -115,6 +129,12 @@ class MockState:
     events: list[schemas.EventsIn] = field(default_factory=list)
     hosts: set[str] = field(default_factory=set)
     """The Host header of every request."""
+
+    @property
+    def queue(self) -> list[int]:
+        if self.order is None:
+            self.order = list(range(len(self.subjects)))
+        return self.order
 
     def paths(self, prefix: str = "") -> list[str]:
         return [path for _, path in self.requests if path.startswith(prefix)]
@@ -161,6 +181,8 @@ class _Mock:
             done_today=done,
             done_total=done,
             remaining=len(state.subjects) - done,
+            # the subject on the page does not wait
+            skipped=len(state.skipped - set(state.queue[:1])),
             rendered=0 if state.rendering_polls else len(state.subjects),
             n_subjects=len(state.subjects),
         )
@@ -180,7 +202,10 @@ class _Mock:
             previous=previous,
         )
 
-    def prefetch(self, position: int) -> tuple[schemas.PrefetchOut, ...]:
+    def prefetch(self) -> tuple[schemas.PrefetchOut, ...]:
+        """The two subjects that follow the one on the page."""
+        state = self.state
+        ahead = [state.subjects[position] for position in state.queue[1:3]]
         return tuple(
             schemas.PrefetchOut(
                 subject_uid=subject.subject_uid,
@@ -189,7 +214,7 @@ class _Mock:
                 n_slices={name: len(panel.slices) for name, panel in subject.info.panels.items()},
                 tiles=subject.info.tiles,
             )
-            for subject in self.state.subjects[position + 1 : position + 3]
+            for subject in ahead
         )
 
     def next(self) -> schemas.NextOut:
@@ -197,14 +222,39 @@ class _Mock:
         if state.rendering_polls > 0:
             state.rendering_polls -= 1
             return schemas.NextOut(status="rendering", retry_after_s=0.2, progress=self.progress())
-        if state.position >= len(state.subjects):
+        if not state.queue:
             return schemas.NextOut(status="done", progress=self.progress())
+        # a skipped subject that is given back does not wait any more
+        state.skipped.discard(state.queue[0])
         return schemas.NextOut(
             status="assignment",
-            assignment=self.assignment(state.position),
-            prefetch=self.prefetch(state.position),
+            assignment=self.assignment(state.queue[0]),
+            prefetch=self.prefetch(),
             progress=self.progress(),
         )
+
+    def position_of(self, assignment_id: int) -> int | None:
+        position = assignment_id - FIRST_ASSIGNMENT
+        return position if 0 <= position < len(self.state.subjects) else None
+
+    def skip(self, skip: schemas.SkipIn) -> JSONResponse:
+        state = self.state
+        if state.fail_skips > 0:
+            state.fail_skips -= 1
+            return _errors(503, "request", "the server is busy")
+        position = self.position_of(skip.assignment_id)
+        if position is None:
+            return _errors(404, "assignment_id", "there is no such assignment")
+        if position not in state.queue:
+            return _errors(409, "assignment_id", "the assignment has a rating and is not open")
+        if skip not in state.skips:
+            # a request that is sent again is the same skip
+            state.skips.append(skip)
+            state.queue.remove(position)
+            state.queue.append(position)
+            state.skipped.add(position)
+            state.left.append(position)
+        return _json(self.next())
 
     def previous(self, done: Completed) -> schemas.PreviousOut:
         marks = tuple(
@@ -261,18 +311,19 @@ class _Mock:
             status, where, message = state.refuse_rating
             state.refuse_rating = None
             return _errors(status, where, message)
-        open_id = self.assignment_id(state.position)
+        position = self.position_of(rating.assignment_id)
         last = state.completed[-1] if state.completed else None
-        is_open = state.position < len(state.subjects) and rating.assignment_id == open_id
+        # the subject on the page, or a skipped one that the rater went back to
+        is_open = position is not None and position in state.queue
         is_revision = last is not None and rating.assignment_id == last.assignment_id
-        if not is_open and not is_revision:
+        if position is None or not (is_open or is_revision):
             return _errors(404, "assignment_id", "no such assignment is open")
         if rating.protocol_version != state.protocol.version:
             return _errors(409, "protocol_version", "the protocol changed since the page loaded")
         refused = self.refuse(rating)
         if refused is not None:
             return _errors(422, *refused)
-        subject = state.subjects[state.position] if is_open else state.completed[-1].subject
+        subject = state.subjects[position]
         saved = []
         for number, mark in enumerate(rating.marks):
             try:
@@ -292,7 +343,9 @@ class _Mock:
         state.ratings.append(rating)
         if is_open:
             state.completed.append(Completed(rating.assignment_id, subject, rating, saved, 1))
-            state.position += 1
+            state.queue.remove(position)
+            state.skipped.discard(position)
+            state.left.append(position)
         else:
             previous = state.completed[-1]
             state.completed[-1] = Completed(
@@ -505,15 +558,21 @@ def create_mock_app(state: MockState) -> FastAPI:
 
     @app.get("/api/back")
     def back() -> Response:
-        if not state.completed:
-            return _errors(404, "request", "there is no completed assignment")
-        done = state.completed[-1]
-        position = state.subjects.index(done.subject)
+        if not state.left:
+            return _errors(404, "request", "there is no earlier assignment")
+        position = state.left[-1]
+        done = [entry for entry in state.completed if entry.subject is state.subjects[position]]
+        # a skipped subject comes back as it is, without a rating
+        previous = mock.previous(done[0]) if done else None
+        progress = mock.progress()
+        if not done:
+            waiting = len(state.skipped - {position})
+            progress = progress.model_copy(update={"skipped": waiting})
         return _json(
             schemas.NextOut(
                 status="assignment",
-                assignment=mock.assignment(position, mock.previous(done)),
-                progress=mock.progress(),
+                assignment=mock.assignment(position, previous),
+                progress=progress,
             )
         )
 
@@ -524,6 +583,14 @@ def create_mock_app(state: MockState) -> FastAPI:
         except ValidationError as exc:
             return _invalid(exc)
         return mock.store(body)
+
+    @app.post("/api/skip")
+    async def skip(request: Request) -> Response:
+        try:
+            body = schemas.SkipIn.model_validate_json(await request.body())
+        except ValidationError as exc:
+            return _invalid(exc)
+        return mock.skip(body)
 
     @app.post("/api/events")
     async def events(request: Request) -> Response:

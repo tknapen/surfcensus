@@ -51,6 +51,7 @@ from surfcensus.app.schemas import (
     SavedMark,
     SavedOut,
     SessionOut,
+    SkipIn,
     StatsOut,
     media_base,
     render_out,
@@ -61,7 +62,14 @@ from surfcensus.render.model import RenderInfo, TileFiles, read_render
 from surfcensus.store import PublicCatalog, media_dir
 
 MARK = {"client_id": "m1", "class": "A", "panel": "sagittal", "slice": 3, "px": 30.5, "py": 28.25}
-PROGRESS = {"done_today": 0, "done_total": 0, "remaining": 0, "rendered": 0, "n_subjects": 0}
+PROGRESS = {
+    "done_today": 0,
+    "done_total": 0,
+    "remaining": 0,
+    "skipped": 0,
+    "rendered": 0,
+    "n_subjects": 0,
+}
 
 
 def rating(**changes: object) -> dict[str, object]:
@@ -104,6 +112,7 @@ def test_the_examples_cover_every_route_shape() -> None:
         "NextOut",
         "RatingIn",
         "RatingOut",
+        "SkipIn",
         "EventsIn",
         "EventsOut",
         "ReviewQuery",
@@ -127,6 +136,8 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         ("GET", "/api/next"): Route("GET", "/api/next", NextOut),
         ("GET", "/api/back"): Route("GET", "/api/back", NextOut),
         ("POST", "/api/rating"): Route("POST", "/api/rating", RatingOut, RatingIn),
+        # a skip is answered like a request for the next subject
+        ("POST", "/api/skip"): Route("POST", "/api/skip", NextOut, SkipIn),
         ("POST", "/api/events"): Route("POST", "/api/events", schemas.EventsOut, EventsIn),
         ("GET", "/api/review"): Route(
             "GET", "/api/review", schemas.ReviewOut, ReviewQuery, unblinded=True
@@ -137,7 +148,7 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         ("GET", "/api/stats"): Route("GET", "/api/stats", StatsOut, unblinded=True),
         ("GET", "/api/export"): Route("GET", "/api/export", unblinded=True),
     }
-    assert len(ROUTES) == 14  # no route twice
+    assert len(ROUTES) == 15  # no route twice
     # what is unblinded is the review page and everything under its API, and nothing a
     # rating page calls
     unblinded = {route.path for route in ROUTES if route.unblinded}
@@ -542,7 +553,58 @@ def test_a_batch_of_events_has_its_limits() -> None:
     assert EventIn.model_validate({"ts": "t", "type": "load"}).payload == {}
     with pytest.raises(ValidationError, match="type"):
         EventIn.model_validate(event | {"type": ""})
-    assert "frames" in schemas.EVENT_TYPES and len(set(schemas.EVENT_TYPES)) == 14
+    assert "frames" in schemas.EVENT_TYPES and len(set(schemas.EVENT_TYPES)) == 16
+    assert {"tour_open", "tour_close"} <= set(schemas.EVENT_TYPES)
+
+
+def test_a_page_cannot_send_the_event_that_the_server_writes_for_a_skip() -> None:
+    # how often a rater skips is read from these events: only the server writes them
+    assert schemas.SKIP_EVENT == "skip" and schemas.SERVER_EVENT_TYPES == ("skip",)
+    assert not set(schemas.SERVER_EVENT_TYPES) & set(schemas.EVENT_TYPES)
+    event = {"ts": "2026-11-12T14:03:12Z", "type": "skip", "payload": {"n": 9}}
+    with pytest.raises(ValidationError, match="stored by the server"):
+        EventIn.model_validate(event)
+    with pytest.raises(ValidationError, match="stored by the server"):
+        EventsIn.model_validate({"assignment_id": 1, "events": [event]})
+    assert EventIn.model_validate(event | {"type": "skipped"}).type == "skipped"
+
+
+# --- a skip ---------------------------------------------------------------------------------
+
+
+def test_a_skip_names_its_assignment_and_its_time_and_nothing_of_a_rating() -> None:
+    skip = SkipIn.model_validate(load_api_examples()["skip_in"])
+    assert (skip.assignment_id, skip.client_ts, skip.ms_on_subject) == (
+        12,
+        "2026-11-12T14:03:22.120Z",
+        9400,
+    )
+    # what was entered stays in the page: the shape has no place for it
+    assert set(SkipIn.model_fields) == {"assignment_id", "client_ts", "ms_on_subject"}
+    body = {"assignment_id": 12, "client_ts": "2026-11-12T14:03:22.120Z", "ms_on_subject": 0}
+    assert SkipIn.model_validate(body).ms_on_subject == 0
+    for stray in ("values", "marks", "note", "unratable"):
+        with pytest.raises(ValidationError, match=stray):
+            SkipIn.model_validate(body | {stray: {}})
+    # the time names the skip, so that a request sent twice is one skip: it is needed
+    for change in ({"client_ts": ""}, {"client_ts": None}, {"client_ts": "x" * 65}):
+        with pytest.raises(ValidationError, match="client_ts"):
+            SkipIn.model_validate(body | change)
+    with pytest.raises(ValidationError, match="client_ts"):
+        SkipIn.model_validate({key: value for key, value in body.items() if key != "client_ts"})
+    with pytest.raises(ValidationError, match="ms_on_subject"):
+        SkipIn.model_validate(body | {"ms_on_subject": -1})
+
+
+def test_the_progress_line_counts_the_skipped_subjects_that_wait() -> None:
+    progress = schemas.ProgressOut.model_validate(PROGRESS | {"remaining": 5, "skipped": 2})
+    assert (progress.remaining, progress.skipped) == (5, 2)
+    without = {key: value for key, value in PROGRESS.items() if key != "skipped"}
+    with pytest.raises(ValidationError, match="skipped"):
+        schemas.ProgressOut.model_validate(without)
+    after = NextOut.model_validate(load_api_examples()["next_after_skip"])
+    assert after.assignment is not None and after.assignment.previous is None
+    assert after.progress.skipped == 2
 
 
 # --- media ----------------------------------------------------------------------------------

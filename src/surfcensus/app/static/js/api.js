@@ -12,6 +12,7 @@ export const ROUTES = {
   next: ["GET", "/api/next"],
   back: ["GET", "/api/back"],
   rating: ["POST", "/api/rating"],
+  skip: ["POST", "/api/skip"],
   events: ["POST", "/api/events"],
   review: ["GET", "/api/review"],
   subject: ["GET", "/api/review/{subject_uid}"],
@@ -164,6 +165,20 @@ export async function submitRating(body, { onRetry = null, sleep = pause } = {})
         forgetUnsent();
         throw failure;
       }
+      if (onRetry) onRetry(attempt, failure);
+      await sleep(Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * 2 ** (attempt - 1)));
+    }
+  }
+}
+
+// POST /api/skip: the NextOut of the subject that comes next. Sent again, like a rating,
+// until the server answers; the server counts a skip once however often it arrives.
+export async function skipAssignment(body, { onRetry = null, sleep = pause } = {}) {
+  for (let attempt = 1; ; attempt += 1) {
+    try {
+      return await request("skip", { body });
+    } catch (failure) {
+      if (failure instanceof ApiError && failure.status < 500) throw failure;
       if (onRetry) onRetry(attempt, failure);
       await sleep(Math.min(RETRY_MAX_MS, RETRY_FIRST_MS * 2 ** (attempt - 1)));
     }

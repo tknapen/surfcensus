@@ -114,8 +114,10 @@ def test_the_keyboard_map_of_the_docs_is_fixed() -> None:
         "o",
         "n",
         "Enter",
+        "k",
         "Backspace",
         "?",
+        "t",
     }
     assert len(set(FIXED_KEYS)) == len(FIXED_KEYS)
 
@@ -198,7 +200,9 @@ def test_keys_are_unique_across_the_file(
     assert where in detail and message in detail
 
 
-@pytest.mark.parametrize("key", ["m", "z", "h", "s", "u", "o", "n", "?", "[", "]", "M", "S"])
+@pytest.mark.parametrize(
+    "key", ["m", "z", "h", "s", "u", "o", "n", "?", "[", "]", "M", "S", "k", "K", "t", "T"]
+)
 def test_a_key_of_the_fixed_keyboard_map_is_refused(content: dict[str, Any], key: str) -> None:
     content["criteria"][0]["mark_key"] = key
     detail = refused(content)

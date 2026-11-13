@@ -59,6 +59,7 @@ JS_FILES = (
     "rate.js",
     "rating.js",
     "review.js",
+    "tour.js",
     "viewer.js",
 )
 """The modules of docs/dev/contract.md, section 7.9."""
@@ -70,6 +71,7 @@ USED_ROUTES = {
     ("GET", "/api/next"),
     ("GET", "/api/back"),
     ("POST", "/api/rating"),
+    ("POST", "/api/skip"),
     ("POST", "/api/events"),
     ("GET", "/api/review"),
     ("GET", "/api/review/{subject_uid}"),
@@ -112,6 +114,7 @@ NAMES: dict[str, type[BaseModel] | tuple[type[BaseModel], ...] | frozenset[str]]
 
 SHAPES: dict[str, type[BaseModel]] = {
     "RatingIn": schemas.RatingIn,
+    "SkipIn": schemas.SkipIn,
     "MarkIn": schemas.MarkIn,
     "EventsIn": schemas.EventsIn,
     "EventIn": schemas.EventIn,
@@ -430,7 +433,7 @@ def test_every_route_the_javascript_calls_is_a_route_of_the_schemas() -> None:
     assert set(routes.values()) == USED_ROUTES
     # a body goes to a route that takes one, and to no other
     takes_body = {(route.method, route.path) for route in schemas.ROUTES if route.method == "POST"}
-    assert {routes["rating"], routes["events"]} == takes_body
+    assert {routes["rating"], routes["skip"], routes["events"]} == takes_body
 
 
 def test_requests_are_made_in_api_js_only_and_by_the_names_of_its_table() -> None:
@@ -500,12 +503,26 @@ def test_every_field_the_javascript_reads_exists_in_its_shape() -> None:
     assert problems == []
     # the check saw the code: these are read somewhere, by these names
     expected = {
-        "SessionOut": {"protocol", "settings", "require_marks", "examples", "protocol_sha256"},
+        "SessionOut": {
+            "protocol",
+            "settings",
+            "require_marks",
+            "examples",
+            "protocol_sha256",
+            "rater",
+        },
         "NextOut": {"status", "assignment", "prefetch", "progress", "retry_after_s"},
         "AssignmentOut": {"assignment_id", "previous"},
         "PreviousOut": {"values", "unratable", "other", "note", "marks"},
         "PrefetchOut": {"tiles", "n_slices", "media_base", "render_key"},
-        "ProgressOut": {"done_today", "done_total", "remaining", "rendered", "n_subjects"},
+        "ProgressOut": {
+            "done_today",
+            "done_total",
+            "remaining",
+            "skipped",
+            "rendered",
+            "n_subjects",
+        },
         "RenderOut": {"panels", "modes", "tiles", "config", "volume"},
         "PanelInfo": {
             "slices",
@@ -607,6 +624,9 @@ def test_the_events_the_page_logs_are_the_event_types_of_the_schemas() -> None:
     logged |= set(re.findall(r'this\.onState\(\s*"(\w+)"', sources["viewer.js"]))
     logged |= set(re.findall(r'this\.add\(\s*"(\w+)"', sources["events.js"]))
     assert logged == set(schemas.EVENT_TYPES)
+    # the event of a skip is the server's to write: no page sends one
+    assert not logged & set(schemas.SERVER_EVENT_TYPES)
+    assert {"tour_open", "tour_close"} <= logged
 
 
 # --- pages -----------------------------------------------------------------------------------
@@ -1080,6 +1100,8 @@ def test_the_keyboard_map_has_every_fixed_key_and_the_keys_of_the_protocol(
     assert actions[" "] == {"type": "toggle_play"} and actions["Enter"] == {"type": "submit"}
     assert actions["s"] == {"type": "hide_contours", "hold": True}
     assert actions["h"] == {"type": "hide_marks", "hold": True}
+    assert actions["k"] == {"type": "skip"} and actions["t"] == {"type": "tour"}
+    assert actions["Backspace"] == {"type": "back"}
 
 
 KEY_CASES: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]] = [
@@ -1122,6 +1144,34 @@ KEY_CASES: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]] = 
     ({"key": "Escape"}, {"dialog": "help"}, {"type": "help"}),
     ({"key": "Enter"}, {"dialog": "help"}, None),
     ({"key": "1"}, {"dialog": "help"}, None),
+    ({"key": "k"}, {"dialog": "help"}, None),
+    # skip and the tour, on the rating screen
+    ({"key": "k"}, {}, {"type": "skip"}),
+    ({"key": "K", "shiftKey": True}, {}, {"type": "skip"}),
+    ({"key": "t"}, {}, {"type": "tour"}),
+    ({"key": "k", "ctrlKey": True}, {}, None),
+    ({"key": "k"}, {"text": True}, None),
+    ({"key": "t"}, {"text": True}, None),
+    ({"key": "k"}, {"dialog": "unratable"}, None),
+    ({"key": "t"}, {"dialog": "unratable"}, None),
+    # the help screen leads to the tour
+    ({"key": "t"}, {"dialog": "help"}, {"type": "tour"}),
+    # the tour takes its own keys and lets nothing through to the rating screen
+    ({"key": "Enter"}, {"dialog": "tour"}, {"type": "tour_step", "by": 1}),
+    ({"key": "ArrowRight"}, {"dialog": "tour"}, {"type": "tour_step", "by": 1}),
+    ({"key": "ArrowRight", "shiftKey": True}, {"dialog": "tour"}, {"type": "tour_step", "by": 1}),
+    ({"key": "ArrowLeft"}, {"dialog": "tour"}, {"type": "tour_step", "by": -1}),
+    ({"key": "Escape"}, {"dialog": "tour"}, {"type": "tour_close"}),
+    ({"key": "t"}, {"dialog": "tour"}, {"type": "tour_close"}),
+    ({"key": "Escape"}, {"dialog": "tour", "text": True}, {"type": "tour_close"}),
+    *[
+        ({"key": key}, {"dialog": "tour"}, None)
+        for key in (" ", "1", "5", "9", "a", "x", "k", "u", "o", "n", "m", "z", "s", "h", "?")
+    ],
+    ({"key": "Backspace"}, {"dialog": "tour"}, None),
+    ({"key": "Delete"}, {"dialog": "tour"}, None),
+    ({"key": "z", "ctrlKey": True}, {"dialog": "tour"}, None),
+    ({"key": "Enter", "ctrlKey": True}, {"dialog": "tour"}, None),
 ]
 
 
@@ -1205,6 +1255,66 @@ def test_enter_is_held_back_by_the_rules_of_a_submission(
     assert out["empty"] == {"values": {}, "unratable": None, "other": False, "note": ""}
     assert out["positive"] == [value in shipped_protocol.positive_values() for value in (0, 1, 2)]
     assert out["previous"] == {"values": {"A": 1}, "unratable": None, "other": True, "note": "x"}
+
+
+LACKING_CASES: list[tuple[dict[str, Any], dict[str, int], bool, dict[str, str]]] = [
+    # (rating, mark counts, marks required, criterion -> what its row lacks)
+    ({"values": {}}, {}, False, {"A": "value", "B": "value", "C": "value"}),
+    ({"values": {"A": 0, "C": 1}}, {}, False, {"B": "value"}),
+    ({"values": {"A": 0, "C": 1}}, {}, True, {"B": "value", "C": "mark"}),
+    ({"values": {"A": 2, "B": 1, "C": 0}}, {"B": 1, "X": 4}, True, {"A": "mark"}),
+    ({"values": {"A": 2, "B": 1, "C": 0}}, {"A": 1, "B": 2}, True, {}),
+    ({"values": {"A": 2, "B": 1, "C": 0}}, {}, False, {}),
+    # an unratable subject lacks nothing in its rows
+    ({"values": {"A": 2}, "unratable": "missing surface"}, {}, True, {}),
+]
+
+
+@needs_node
+def test_a_refused_enter_names_the_rows_that_hold_it_back(
+    js_copy: Path, shipped_protocol: Protocol
+) -> None:
+    cases = [
+        [{"unratable": None, "other": False, "note": "", **rating}, counts, required]
+        for rating, counts, required, _ in LACKING_CASES
+    ]
+    out = run_js(
+        js_copy,
+        """
+        import { blockers, rowsLacking } from "./js/rating.js";
+        output(input.cases.map(([rating, counts, required]) => ({
+          lacking: rowsLacking(input.protocol, rating, counts, required),
+          blockers: blockers(input.protocol, rating, counts, required),
+        })));
+        """,
+        {"protocol": shipped_protocol.model_dump(mode="json"), "cases": cases},
+    )
+    for (rating, counts, required, lacking), got in zip(LACKING_CASES, out, strict=True):
+        assert got["lacking"] == lacking, (rating, counts, required)
+        # a row is named exactly when a rule about the rows holds the rating back
+        assert bool(got["lacking"]) == bool(got["blockers"]), (rating, got)
+
+
+@needs_node
+def test_the_body_of_a_skip_is_a_skip_in_and_holds_nothing_of_the_rating(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        """
+        import { skipBody } from "./js/rating.js";
+        const assignment = { assignment_id: 12, subject_uid: "3f9a1c07d2e4b8a1", previous: null };
+        output([
+          skipBody(assignment, 9400.4, "2026-11-12T14:03:22.120Z"),
+          skipBody(assignment, -3, "2026-11-12T14:03:23.000Z"),
+        ]);
+        """,
+    )
+    assert out[0] == {
+        "assignment_id": 12,
+        "client_ts": "2026-11-12T14:03:22.120Z",
+        "ms_on_subject": 9400,
+    }
+    first, second = (schemas.SkipIn.model_validate(body) for body in out)
+    assert first.ms_on_subject == 9400 and second.ms_on_subject == 0
 
 
 @needs_node
@@ -1446,6 +1556,46 @@ def test_a_rating_is_sent_again_until_the_server_answers_and_kept_meanwhile(js_c
 
 
 @needs_node
+def test_a_skip_is_sent_again_with_the_same_body_until_the_server_answers(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        API_STUB
+        + """
+        import * as api from "./js/api.js";
+        const body = { assignment_id: 12, client_ts: "2026-11-12T14:03:22.120Z", ms_on_subject: 7 };
+        const busy = { errors: [{ field: "request", message: "busy" }] };
+        const following = { status: "done", progress: {} };
+        answers = ["down", { status: 503, body: busy }, { status: 200, body: following }];
+        const retries = [];
+        const next = await api.skipAssignment(body, {
+          sleep,
+          onRetry: (attempt, failure) =>
+            retries.push([attempt, failure.name, failure.status ?? null]),
+        });
+        const stale = { errors: [{ field: "assignment_id", message: "not open" }] };
+        answers = [{ status: 409, body: stale }];
+        let refused = null;
+        try { await api.skipAssignment(body, { sleep }); } catch (failure) {
+          refused = { name: failure.name, status: failure.status, message: failure.message };
+        }
+        output({ next, calls, retries, sleeps, refused, unsent: api.unsentRating() });
+        """,
+    )
+    assert out["next"] == {"status": "done", "progress": {}}
+    assert [call[:2] for call in out["calls"]] == [["POST", "/api/skip"]] * 4
+    # the same body every time: its client_ts is how the server knows the skip again
+    bodies = [json.loads(call[2]) for call in out["calls"]]
+    assert bodies[0] == bodies[1] == bodies[2]
+    assert schemas.SkipIn.model_validate(bodies[0]).client_ts == "2026-11-12T14:03:22.120Z"
+    assert out["retries"] == [[1, "NetworkError", None], [2, "ApiError", 503]]
+    assert out["sleeps"] == [1000, 2000]
+    # a skip the server refuses is not sent again
+    assert out["refused"] == {"name": "ApiError", "status": 409, "message": "not open"}
+    # and a skip is no rating: nothing is kept for a reloaded page to send
+    assert out["unsent"] is None
+
+
+@needs_node
 def test_next_is_asked_again_while_nothing_is_rendered(js_copy: Path) -> None:
     rendering = {"status": "rendering", "retry_after_s": 2, "progress": {"rendered": 0}}
     out = run_js(
@@ -1516,3 +1666,280 @@ def test_the_review_page_helpers(js_copy: Path) -> None:
     frames = render["modes"]["sync"]["frames"]
     assert frames[out["own"]][1] == 50
     assert out["free"] == 17 and frames[out["none"]] == [3, 3, 3]
+
+
+# --- the tour ---------------------------------------------------------------------------------
+
+TOUR_STEPS = ("views", "rating", "marks", "moving", "help")
+
+
+def tour_of(js_copy: Path, protocol: Protocol) -> list[dict[str, Any]]:
+    return run_js(
+        js_copy,
+        """
+        import { buildKeyMap } from "./js/keys.js";
+        import { tourSteps } from "./js/tour.js";
+        output(tourSteps(input, buildKeyMap(input)));
+        """,
+        protocol.model_dump(mode="json"),
+    )
+
+
+def keys_named(step: dict[str, Any]) -> list[str]:
+    return [
+        key
+        for paragraph in step["text"]
+        for part in paragraph
+        if isinstance(part, dict)
+        for key in part["keys"]
+    ]
+
+
+def words_of(step: dict[str, Any]) -> str:
+    return " ".join(
+        part if isinstance(part, str) else " ".join(part["keys"])
+        for paragraph in step["text"]
+        for part in paragraph
+    )
+
+
+@needs_node
+def test_the_tour_has_five_short_steps_each_about_a_part_of_the_rating_page(
+    js_copy: Path, shipped_protocol: Protocol, pages: dict[str, str]
+) -> None:
+    steps = tour_of(js_copy, shipped_protocol)
+    assert tuple(step["id"] for step in steps) == TOUR_STEPS
+    assert len(steps) <= 5
+    present = set(re.findall(r'\bid="([\w-]+)"', pages["/"]))
+    for step in steps:
+        assert step["title"] and step["targets"] and 1 <= len(step["text"]) <= 3
+        for selector in step["targets"]:
+            # every part it points at is of the rating page or built into it by a module
+            named = re.findall(r"#([\w-]+)", selector)
+            assert named and set(named) <= present, selector
+        text = words_of(step)
+        assert len(text) <= 330, (step["id"], len(text))
+        for sentence in re.split(r"(?<=[.:;]) ", text):
+            assert len(sentence.split()) <= 22, sentence
+    # what each step says, in the words a rater needs
+    by_id = {step["id"]: step for step in steps}
+    assert keys_named(by_id["views"]) == ["Space", "←", "→", "s"]
+    assert "none, minor or major" in words_of(by_id["rating"])
+    assert keys_named(by_id["rating"]) == [str(n) for n in range(1, 10)]
+    assert keys_named(by_id["marks"]) == ["a", "b", "c", "x"]
+    assert "minor or major" in words_of(by_id["marks"])
+    moving = words_of(by_id["moving"])
+    assert keys_named(by_id["moving"]) == ["Enter", "u", "k", "Backspace"]
+    assert "every row has a value" in moving and "next subject" in moving
+    assert "nothing is stored" in moving and "comes back later" in moving
+    assert keys_named(by_id["help"]) == ["?", "t"]
+    assert "this tour" in words_of(by_id["help"])
+
+
+@needs_node
+def test_the_tour_names_the_keys_of_the_protocol_of_the_session(
+    js_copy: Path, shipped_protocol: Protocol
+) -> None:
+    content = shipped_protocol.model_dump(mode="json")
+    for criterion, keys, mark_key in zip(
+        content["criteria"], (["q", "w", "e"], ["r", "y", "i"], ["f", "g", "j"]), "abd", strict=True
+    ):
+        criterion["keys"] = keys
+        criterion["mark_key"] = mark_key
+    content["other_mark_key"] = "p"
+    content["scale"][1]["label"] = "slight"
+    content["scale"][2]["label"] = "gross"
+    other = Protocol.model_validate(content)
+    by_id = {step["id"]: step for step in tour_of(js_copy, other)}
+    assert keys_named(by_id["rating"]) == ["q", "w", "e", "r", "y", "i", "f", "g", "j"]
+    assert keys_named(by_id["marks"]) == ["a", "b", "d", "p"]
+    assert "none, slight or gross" in words_of(by_id["rating"])
+    assert "slight or gross" in words_of(by_id["marks"])
+    everything = " ".join(words_of(step) for step in by_id.values())
+    for key in "123456789cx":
+        assert not re.search(rf"(?<![\w]){key}(?![\w])", everything), key
+    # the fixed keys are those of the keyboard map
+    assert keys_named(by_id["moving"]) == ["Enter", "u", "k", "Backspace"]
+
+
+def test_the_tour_writes_no_key_into_its_text() -> None:
+    # every key it shows comes from the key map: the source has no <kbd> text of a rating key
+    code = js_sources()["tour.js"]
+    steps = code[code.index("export function tourSteps") : code.index("function html")]
+    assert "keysFor(map" in steps
+    assert not re.search(r'keys:\s*\[\s*"', steps), "a key written out in the steps"
+    for literal in re.findall(r'"([^"]*)"', blank_free(steps)):
+        assert not re.fullmatch(r"[a-z0-9?]|Enter|Backspace|Space|Esc", literal), literal
+
+
+def blank_free(code: str) -> str:
+    """``code`` without its comments, with the strings as they are."""
+    return re.sub(r"^\s*//.*$", "", code, flags=re.M)
+
+
+@needs_node
+def test_the_card_of_the_tour_lies_beside_its_part_and_inside_the_window(js_copy: Path) -> None:
+    card = {"width": 380, "height": 200}
+    wide = {"width": 1400, "height": 900}
+    narrow = {"width": 400, "height": 700}
+    cases = {
+        # under the part when there is room
+        "under": [{"left": 10, "top": 10, "right": 1390, "bottom": 470}, card, wide],
+        # over it when the part is at the bottom
+        "over": [{"left": 1100, "top": 770, "right": 1380, "bottom": 800}, card, wide],
+        # no room either way: at the far end of the window from the part
+        "top_part": [{"left": 0, "top": 0, "right": 400, "bottom": 600}, card, narrow],
+        "bottom_part": [{"left": 0, "top": 150, "right": 400, "bottom": 700}, card, narrow],
+        # a part at the right edge: the card stays inside the window
+        "right": [{"left": 1300, "top": 100, "right": 1395, "bottom": 130}, card, wide],
+        "left": [{"left": 2, "top": 100, "right": 40, "bottom": 130}, card, wide],
+        # a window smaller than the card
+        "tiny": [
+            {"left": 0, "top": 0, "right": 300, "bottom": 50},
+            card,
+            {"width": 300, "height": 150},
+        ],
+        # no part on the page: in the middle
+        "none": [None, card, wide],
+    }
+    out = run_js(
+        js_copy,
+        """
+        import { placeCard, unionBox } from "./js/tour.js";
+        const placed = {};
+        for (const [name, [spot, card, view]] of Object.entries(input)) {
+          placed[name] = placeCard(spot, card, view);
+        }
+        const box = (left, top, width, height) =>
+          ({ left, top, right: left + width, bottom: top + height, width, height });
+        output({
+          placed,
+          union: unionBox([box(10, 20, 30, 40), box(100, 5, 50, 10), box(0, 0, 0, 0)]),
+          nothing: unionBox([box(5, 5, 0, 0)]),
+          empty: unionBox([]),
+        });
+        """,
+        cases,
+    )
+    placed = out["placed"]
+    assert placed["under"] == {"left": 510, "top": 480}
+    assert placed["over"]["top"] == 770 - 10 - 200
+    assert placed["top_part"]["top"] == 700 - 8 - 200  # the part is at the top: card at the bottom
+    assert placed["bottom_part"]["top"] == 8
+    assert placed["right"]["left"] == 1400 - 8 - 380 and placed["left"]["left"] == 8
+    assert placed["none"] == {"left": 510, "top": 350}
+    for name, (_, size, view) in cases.items():
+        spot = placed[name]
+        assert spot["left"] >= 8 and spot["top"] >= 8, name
+        if name != "tiny":
+            assert spot["left"] + size["width"] <= view["width"] - 8, name
+            assert spot["top"] + size["height"] <= view["height"] - 8, name
+    assert placed["tiny"] == {"left": 8, "top": 8}
+    assert out["union"] == {
+        "left": 10,
+        "top": 5,
+        "right": 150,
+        "bottom": 60,
+        "width": 140,
+        "height": 55,
+    }
+    assert out["nothing"] is None and out["empty"] is None
+
+
+@needs_node
+def test_a_page_that_scrolls_is_scrolled_so_that_the_part_and_the_card_fit(js_copy: Path) -> None:
+    # (spot top, bottom), card height, window height, (scrolled to, can scroll to) -> scroll by
+    cases = [
+        # on screen with room under it: nothing
+        ((8, 132), 250, 800, (0, 300), 0),
+        # on screen with room over it only: nothing
+        ((500, 590), 250, 800, (0, 300), 0),
+        # under the window: to the top of the window, the card under it
+        ((900, 970), 250, 800, (0, 2000), 900 - 12),
+        # the page cannot scroll that far, but far enough for the card over it
+        ((900, 970), 250, 800, (0, 300), 970 - (800 - 12)),
+        # above the window (the rater scrolled down): back up
+        ((-300, -210), 250, 800, (400, 900), -312),
+        # on screen, but the card fits neither under nor over it: to the top
+        ((180, 250), 240, 400, (0, 500), 168),
+        # the same at the end of the page: to the bottom, the card over it
+        ((180, 250), 240, 400, (220, 220), 250 - 388),
+        # nowhere to scroll: nothing
+        ((180, 250), 240, 400, (0, 0), 0),
+    ]
+    out = run_js(
+        js_copy,
+        """
+        import { scrollFor } from "./js/tour.js";
+        output(input.map(([[top, bottom], card, view, [at, max]]) =>
+          scrollFor({ top, bottom }, card, view, { at, max })));
+        """,
+        [list(case[:4]) for case in cases],
+    )
+    assert out == [case[4] for case in cases]
+    # after the scroll the part is in the window with room for the card, in every case but
+    # the last, where the page cannot move
+    for ((top, bottom), card, view, (at, most), by), got in zip(cases[:-1], out, strict=False):
+        assert 0 <= at + got <= most
+        top, bottom = top - by, bottom - by
+        assert 0 <= top and bottom <= view
+        assert bottom + 10 + card <= view - 8 or top - 10 - card >= 8, (top, bottom)
+
+
+@needs_node
+def test_the_tour_is_remembered_per_rater_and_opens_again_without_storage(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        """
+        import { markTourSeen, tourSeen } from "./js/tour.js";
+        const result = {};
+        // no storage at all (Node has none): never seen, and marking it does not throw
+        result.none = [tourSeen("local"), (markTourSeen("local"), tourSeen("local"))];
+        const store = new Map();
+        globalThis.localStorage = {
+          getItem: (key) => (store.has(key) ? store.get(key) : null),
+          setItem: (key, value) => store.set(key, String(value)),
+        };
+        result.before = tourSeen("local");
+        markTourSeen("local");
+        result.after = [tourSeen("local"), tourSeen("second rater")];
+        result.keys = [...store.keys()];
+        // a storage that refuses every access, as a browser with storage blocked does
+        const refuse = () => { throw new Error("denied"); };
+        globalThis.localStorage = { getItem: refuse, setItem: refuse };
+        markTourSeen("local");
+        result.blocked = tourSeen("local");
+        Object.defineProperty(globalThis, "localStorage", { get: refuse, configurable: true });
+        markTourSeen("local");
+        result.absent = tourSeen("local");
+        output(result);
+        """,
+    )
+    assert out["none"] == [False, False]
+    assert out["before"] is False and out["after"] == [True, False]
+    assert out["keys"] == ["surfcensus.tour.seen:local"]
+    assert out["blocked"] is False and out["absent"] is False
+
+
+@needs_node
+def test_a_key_is_written_as_the_screen_shows_it(js_copy: Path, shipped_protocol: Protocol) -> None:
+    out = run_js(
+        js_copy,
+        """
+        import { buildKeyMap, keyLabel, keysFor } from "./js/keys.js";
+        const map = buildKeyMap(input);
+        output({
+          labels: [" ", "ArrowLeft", "ArrowRight", "Escape", "Enter", "k"].map(keyLabel),
+          play: keysFor(map, (action) => action.type === "toggle_play"),
+          values: keysFor(map, (action) => action.type === "value" && action.criterion === "B"),
+          none: keysFor(map, (action) => action.type === "nothing"),
+        });
+        """,
+        shipped_protocol.model_dump(mode="json"),
+    )
+    assert out == {
+        "labels": ["Space", "←", "→", "Esc", "Enter", "k"],
+        "play": ["Space"],
+        "values": ["4", "5", "6"],
+        "none": [],
+    }

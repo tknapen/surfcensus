@@ -10,8 +10,11 @@ three are needed.
 
 What is tested is what a rater does: every key of the keyboard map of docs/rater_app.md,
 click marks and where they land, the note field, the unratable reasons, the help screen,
-submit, back, a server that is away, and what the page asks the server for. The test of the
-page on the real server is ``tests/test_browser.py``.
+submit, skip, back, the tour of the screen, a server that is away, and what the page asks
+the server for. The test of the page on the real server is ``tests/test_browser.py``.
+
+A page of these tests belongs to a rater who was shown the tour before (``SEEN_TOUR``), so
+that it does not open over every test; the tests of the tour say otherwise.
 """
 
 from __future__ import annotations
@@ -51,6 +54,10 @@ pytestmark = pytest.mark.browser
 
 MEDIA_ENV = "SURFCENSUS_FRONTEND_MEDIA"
 WIDE = {"width": 1400, "height": 900}
+NARROW = {"width": 400, "height": 800}
+SEEN_TOUR = "try { localStorage.setItem('surfcensus.tour.seen:local', '1'); } catch (e) {}"
+"""Run before the scripts of a page: the rater of the mock server has seen the tour."""
+TOUR = ("views", "rating", "marks", "moving", "help")
 
 
 @pytest.fixture(scope="module")
@@ -103,10 +110,12 @@ def server(state: MockState) -> Iterator[MockHandle]:
 class Rater:
     """A page on the mock server, and what a test asks of it."""
 
-    def __init__(self, page: Any, server: MockHandle) -> None:
+    def __init__(self, page: Any, server: MockHandle, *, seen_tour: bool = True) -> None:
         self.page = page
         self.server = server
         self.state = server.state
+        if seen_tour:
+            page.add_init_script(SEEN_TOUR)
         self.console: list[str] = []
         self.failed: list[str] = []
         self.requested: list[str] = []
@@ -156,6 +165,49 @@ class Rater:
     @property
     def page_state(self) -> str:
         return self.page.get_attribute("#rate", "data-state")
+
+    @property
+    def refusal(self) -> str:
+        """What the page says beside the submit button after a refused Enter; empty when it
+        says nothing."""
+        return self.page.inner_text("#refusal") if self.page.is_visible("#refusal") else ""
+
+    def lacking(self) -> dict[str, str]:
+        """Criterion -> what its row is marked as lacking."""
+        found = self.page.eval_on_selector_all(
+            ".criterion[data-lacking]:not([data-lacking=''])",
+            "all => all.map((row) => [row.dataset.criterion, row.dataset.lacking])",
+        )
+        return dict(found)
+
+    @property
+    def tour_step(self) -> str | None:
+        """The step the tour shows, or None when it is closed."""
+        if self.page.is_hidden("#tour"):
+            return None
+        return self.page.get_attribute("#tour", "data-step")
+
+    def box(self, selector: str) -> dict[str, float]:
+        return self.page.locator(selector).first.bounding_box()
+
+    @property
+    def progress(self) -> str:
+        return self.page.inner_text("#progress-line")
+
+    def wait_skips(self, n: int) -> None:
+        for _ in range(200):
+            if len(self.state.skips) >= n:
+                return
+            self.page.wait_for_timeout(25)
+        raise AssertionError(f"{len(self.state.skips)} skips arrived, {n} were expected")
+
+    def events_of(self, kind: str) -> list[dict[str, Any]]:
+        return [
+            event.payload
+            for batch in self.state.events
+            for event in batch.events
+            if event.type == kind
+        ]
 
     def seek(self, frame: int) -> None:
         self.page.evaluate(
@@ -462,7 +514,7 @@ def test_a_focused_control_does_not_take_a_key_twice(rater: Rater) -> None:
     # Enter on a focused button is submit (here refused: no values), not a press of the button
     rater.page.focus("#mode")
     rater.press("Enter")
-    assert rater.viewer["mode"] == "sync" and "Not submitted" in rater.hint
+    assert rater.viewer["mode"] == "sync" and "Not submitted" in rater.refusal
     # the buttons do what their keys do
     rater.page.click("#mode")
     assert rater.viewer["mode"] == "seq"
@@ -716,7 +768,7 @@ def test_the_criterion_keys_set_values_and_enter_submits_when_all_are_set(
     assert "no value yet for A, B, C" in rater.hint
     rater.press("Enter")
     rater.page.wait_for_timeout(150)
-    assert state.ratings == [] and "Not submitted" in rater.hint
+    assert state.ratings == [] and "Not submitted" in rater.refusal
     rater.press("3")
     assert rater.pressed() == {"A": 2} and rater.page.is_disabled("#submit")
     assert "no value yet for B, C" in rater.hint
@@ -1216,8 +1268,10 @@ def test_the_help_screen_has_the_scale_the_criteria_and_the_keys(
         "o",
         "n",
         "Enter",
+        "k",
         "Backspace",
         "?",
+        "t",
     ):
         assert key in keys, key
     for criterion in state.protocol.criteria:
@@ -1703,3 +1757,708 @@ def test_the_review_page_says_in_words_that_it_is_closed(rater: Rater, state: Mo
     assert "you still have subjects to rate" in message
     assert rater.page.is_hidden("#review-body")
     assert rater.page.get_attribute("#rate-link", "href") == "/"
+
+
+# --- skip ------------------------------------------------------------------------------------
+
+
+def _enter_something(rater: Rater) -> None:
+    """A value, a mark and a note for the subject on screen."""
+    rater.seek(30)
+    rater.press("3")
+    rater.click_tile("sagittal", 120.0, 130.0)
+    rater.press("n")
+    rater.page.keyboard.type("come back to this")
+    rater.press("Escape")
+
+
+def test_k_skips_and_the_subject_comes_back_after_the_others_with_what_was_entered(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    assert rater.page.inner_text("#skip") == "k skip"
+    # the skip button stands next to the back button, in the rating bar
+    back, skip = rater.box("#back"), rater.box("#skip")
+    assert skip["y"] == back["y"] and 0 < skip["x"] - (back["x"] + back["width"]) < 20
+    assert rater.page.locator("#rating #skip").count() == 1
+    _enter_something(rater)
+    rater.press("k")
+    rater.paused(1)
+    rater.wait_skips(1)
+    skipped = state.skips[0]
+    assert skipped.assignment_id == FIRST_ASSIGNMENT and 0 < skipped.ms_on_subject < 60_000
+    # nothing of what was entered went to the server: no rating, and the skip has no place for it
+    assert state.ratings == [] and state.completed == []
+    assert state.paths("/api/rating") == [] and state.paths("/api/skip") == ["/api/skip"]
+    # the next subject starts clean, and the page says what happened
+    assert rater.pressed() == {} and rater.counts()["A"] == 0
+    assert rater.page.input_value("#note") == "" and rater.page.is_hidden("#note-box")
+    assert "Skipped" in rater.hint and "nothing was stored" in rater.hint
+    assert rater.progress == "0 done today · 0 done in total · 3 remaining · 1 skipped, waiting"
+    assert rater.page.get_attribute("#progress-line", "data-skipped") == "1"
+    rater.press("1", "4", "7", "Enter")
+    rater.paused(2)
+    assert "1 skipped, waiting" in rater.progress
+    rater.press("1", "4", "7", "Enter")
+    # every other subject was shown: the skipped one is back, as it was left
+    rater.paused(0)
+    assert rater.pressed() == {"A": 2} and rater.counts()["A"] == 1
+    assert rater.page.input_value("#note") == "come back to this"
+    assert rater.page.is_visible("#note-box")
+    assert rater.progress == "2 done today · 2 done in total · 1 remaining"
+    rater.seek(30)
+    mark = rater.marks("sagittal")[0]
+    near = rater.screen_pixel()
+    assert mark["px"] == pytest.approx(120.0, abs=near) and mark["cls"] == "A"
+    rater.press("4", "7", "Enter")
+    rater.page.wait_for_selector("#rate[data-state='done']")
+    assert [rating.assignment_id for rating in state.ratings] == [
+        FIRST_ASSIGNMENT + 1,
+        FIRST_ASSIGNMENT + 2,
+        FIRST_ASSIGNMENT,
+    ]
+    last = state.ratings[-1]
+    assert last.values == {"A": 2, "B": 0, "C": 0} and last.note == "come back to this"
+    assert len(last.marks) == 1 and len(state.skips) == 1
+    # the time of the rating is of the visit that ended with it, not of the page since it loaded
+    assert 0 < last.ms_on_subject < 60_000
+    assert rater.console == [] and rater.failed == []
+
+
+def test_the_skip_button_does_what_the_key_does_and_skip_goes_round(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    rater.press("2")
+    rater.page.click("#skip")
+    rater.paused(1)
+    rater.page.click("#skip")
+    rater.paused(2)
+    assert "2 skipped, waiting" in rater.progress
+    rater.press("k")
+    # only skipped subjects are left: skip goes round them, in the order of skipping
+    rater.paused(0)
+    assert rater.pressed() == {"A": 1}
+    assert "2 skipped, waiting" in rater.progress and "3 remaining" in rater.progress
+    rater.press("k")
+    rater.paused(1)
+    rater.press("k")
+    rater.paused(2)
+    rater.wait_skips(5)
+    assert [skip.assignment_id - FIRST_ASSIGNMENT for skip in state.skips] == [0, 1, 2, 0, 1]
+    assert state.ratings == [] and rater.page_state == "rating"
+    # the page never says that nothing is left while a subject has no rating
+    assert rater.page.is_hidden("#message")
+    assert rater.console == []
+
+
+def test_the_last_subject_without_a_rating_cannot_be_skipped_away(
+    rater: Rater, state: MockState
+) -> None:
+    del state.subjects[1:]
+    rater.open().paused(0)
+    rater.press("5", "k")
+    rater.wait_skips(1)
+    rater.page.wait_for_function(
+        "document.getElementById('hint').textContent.includes('No other subject is left')"
+    )
+    rater.ready(0)
+    assert rater.page_state == "rating" and rater.pressed() == {"B": 1}
+    assert "skipped" not in rater.progress and "1 remaining" in rater.progress
+    rater.press("1", "7", "Enter")
+    rater.page.wait_for_selector("#rate[data-state='done']")
+    assert state.ratings[0].values == {"A": 0, "B": 1, "C": 0}
+
+
+def test_backspace_after_a_skip_goes_back_to_the_skipped_subject(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    _enter_something(rater)
+    rater.press("k")
+    rater.paused(1)
+    rater.press("6", "Backspace")
+    rater.ready(0)
+    # the skipped subject, with what was entered, and nothing that says it was rated
+    assert rater.pressed() == {"A": 2} and rater.counts()["A"] == 1
+    assert "was skipped" in rater.hint and "rated before" not in rater.hint
+    assert rater.page.input_value("#note") == "come back to this"
+    assert "skipped, waiting" not in rater.progress  # the one that waited is on the page
+    assert len(state.skips) == 1  # going back takes no skip away and adds none
+    rater.press("4", "7", "Enter")
+    rater.wait_ratings(1)
+    assert state.ratings[0].assignment_id == FIRST_ASSIGNMENT
+    assert state.ratings[0].values == {"A": 2, "B": 0, "C": 0}
+    # and on with the subject that was on the page, with what was entered for it
+    rater.ready(1)
+    assert rater.pressed() == {"B": 2} and "skipped" not in rater.progress
+    rater.press("1", "7", "Enter")
+    rater.ready(2)
+    assert [rating.assignment_id - FIRST_ASSIGNMENT for rating in state.ratings] == [0, 1]
+
+
+def test_a_skip_is_sent_again_while_the_server_is_away_and_counted_once(
+    rater: Rater, state: MockState
+) -> None:
+    state.fail_skips = 2
+    rater.open().paused(0)
+    rater.press("k")
+    rater.page.wait_for_function(
+        "document.getElementById('hint').textContent.includes('Not skipped yet')"
+    )
+    assert rater.page_state == "saving" and state.skips == []
+    rater.ready(1)
+    # three requests with one body, which the server takes as one skip
+    assert len(state.paths("/api/skip")) == 3 and len(state.skips) == 1
+    assert rater.page_state == "rating" and "Skipped" in rater.hint
+
+
+def test_a_skip_that_the_server_refuses_loads_the_subject_again(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    # the subject was rated in another window meanwhile
+    state.queue.remove(0)
+    rater.press("k")
+    rater.ready(1)
+    assert "Not skipped" in rater.hint and state.skips == []
+
+
+def test_skip_on_a_subject_that_is_shown_again_leaves_its_rating_as_it_was(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    rater.press("3", "4", "7", "Enter")
+    rater.paused(1)
+    rater.press("Backspace")
+    rater.ready(0)
+    assert rater.pressed() == {"A": 2, "B": 0, "C": 0}
+    rater.press("1", "k")
+    rater.ready(1)
+    assert "Left as it was" in rater.hint
+    # no skip of a rated subject, and no second rating
+    assert state.skips == [] and state.paths("/api/skip") == []
+    assert len(state.ratings) == 1 and state.ratings[0].values["A"] == 2
+
+
+# --- a refused Enter -------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("viewport", [WIDE, NARROW])
+def test_a_refused_enter_says_why_beside_the_submit_button_and_marks_the_rows(
+    browser: Any, server: MockHandle, state: MockState, viewport: dict[str, int]
+) -> None:
+    page = browser.new_page(viewport=viewport)
+    rater = Rater(page, server).open().paused(0)
+    assert rater.refusal == "" and rater.lacking() == {}
+    rater.press("Enter")
+    page.wait_for_selector("#refusal:not([hidden])")
+    assert state.ratings == []
+    text = rater.refusal
+    assert text.startswith("Not submitted.")
+    assert "A, B and C have no value yet" in text
+    # the same message names the way out: the skip key, and what a skip does
+    assert re.search(r"press\s+k\s*:", text) and "nothing is stored" in text
+    assert re.search(r"press\s+u\s+if the subject cannot be rated", text)
+    assert page.get_attribute("#refusal", "role") == "alert"
+    assert rater.lacking() == {"A": "value", "B": "value", "C": "value"}
+    labels = page.eval_on_selector_all(".criterion-need", "all => all.map((e) => e.textContent)")
+    assert labels == ["needs a value"] * 3
+    # where it is: on screen, directly under the submit button, its arrow pointing at it
+    box, button = rater.box("#refusal"), rater.box("#submit")
+    assert 0 <= box["x"] and box["x"] + box["width"] <= viewport["width"]
+    assert 0 <= box["y"] and box["y"] + box["height"] <= viewport["height"]
+    assert 0 <= box["y"] - (button["y"] + button["height"]) <= 16
+    arrow = box["x"] + float(
+        page.evaluate(
+            "parseFloat(getComputedStyle(document.getElementById('refusal'))"
+            ".getPropertyValue('--arrow'))"
+        )
+    )
+    assert button["x"] <= arrow <= button["x"] + button["width"]
+    # it cannot be overlooked: larger than the status line, in a colour of its own
+    look = page.evaluate(
+        """() => {
+            const style = (id) => getComputedStyle(document.getElementById(id));
+            const framed = document.querySelectorAll('.criterion[data-lacking=value] .levels');
+            return { size: parseFloat(style('refusal').fontSize),
+                     hint: parseFloat(style('hint').fontSize),
+                     back: style('refusal').backgroundColor,
+                     rating: style('rating').backgroundColor,
+                     frames: [...framed].map((e) => getComputedStyle(e).outlineStyle) };
+        }"""
+    )
+    assert look["size"] > look["hint"] and look["back"] != look["rating"]
+    assert look["frames"] == ["solid"] * 3
+    assert box["height"] >= 60 and box["width"] >= min(360, viewport["width"] - 40)
+
+    # a row that gets its value loses its mark, and the message follows
+    rater.press("3")
+    assert rater.lacking() == {"B": "value", "C": "value"}
+    assert "B and C have no value yet" in rater.refusal
+    rater.press("4")
+    assert "C has no value yet. Give it a value" in rater.refusal
+    rater.press("9")
+    assert rater.refusal == "" and rater.lacking() == {}
+    assert rater.hint == "Ready: Enter submits."
+    rater.press("Enter")
+    rater.ready(1)
+    assert len(state.ratings) == 1 and rater.refusal == "" and rater.lacking() == {}
+    assert rater.console == []
+    page.close()
+
+
+def test_a_click_on_a_submit_that_is_held_back_is_answered_too(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    # the button can be pressed while the rating is incomplete, and says so to a screen reader
+    assert rater.page.get_attribute("#submit", "aria-disabled") == "true"
+    assert rater.page.evaluate("document.getElementById('submit').disabled") is False
+    rater.page.locator("#submit").click(force=True)
+    rater.page.wait_for_selector("#refusal:not([hidden])")
+    assert "Not submitted." in rater.refusal and state.ratings == []
+    # skipping from there: the next subject starts without the refusal
+    rater.press("k")
+    rater.ready(1)
+    assert rater.refusal == "" and rater.lacking() == {}
+    rater.press("1", "4", "7")
+    assert rater.page.get_attribute("#submit", "aria-disabled") == "false"
+
+
+def test_a_refusal_names_the_mark_and_the_note_that_are_missing(
+    rater: Rater, state: MockState
+) -> None:
+    state.require_marks = True
+    rater.open().paused(0)
+    rater.press("3", "4", "7", "o", "Escape", "Enter")
+    rater.page.wait_for_selector("#refusal:not([hidden])")
+    text = rater.refusal
+    assert "A has no mark yet. Click on the error" in text
+    assert re.search(r"needs a note: press\s+n", text) and "no value yet" not in text
+    assert rater.lacking() == {"A": "mark"}
+    rater.click_tile("sagittal", 120.0, 130.0)
+    assert rater.lacking() == {} and "no mark yet" not in rater.refusal
+    assert "needs a note" in rater.refusal
+    rater.press("o")
+    assert rater.refusal == ""
+
+
+# --- the tour --------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def newcomer(browser: Any, server: MockHandle) -> Iterator[Rater]:
+    """A rater who was never shown the tour, at a wide window."""
+    context = browser.new_context(viewport=WIDE)
+    yield Rater(context.new_page(), server, seen_tour=False)
+    context.close()
+
+
+def test_the_tour_opens_on_a_first_visit_and_not_on_the_second(
+    newcomer: Rater, state: MockState
+) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    assert rater.tour_step == "views"
+    # playback waits behind it, and nothing of the rating was touched
+    assert rater.viewer["playing"] == "false" and rater.pressed() == {}
+    assert rater.page.evaluate("localStorage.getItem('surfcensus.tour.seen:local')") == "1"
+    rater.press("Escape")
+    assert rater.tour_step is None
+    # what was to play plays now
+    rater.page.wait_for_function("document.getElementById('viewer').dataset.playing === 'true'")
+    rater.page.reload()
+    rater.ready(0)
+    rater.page.wait_for_function("document.getElementById('viewer').dataset.playing === 'true'")
+    assert rater.tour_step is None
+    # nor on the next subject, nor in a new window of the same browser
+    rater.press("1", "4", "7", "Enter")
+    rater.ready(1)
+    assert rater.tour_step is None
+    second = rater.page.context.new_page()
+    second.goto(rater.server.url)
+    second.wait_for_selector("#viewer[data-ready='true']")
+    second.wait_for_function("document.getElementById('viewer').dataset.playing === 'true'")
+    assert second.is_hidden("#tour")
+    second.close()
+    opened = rater.wait_events(lambda types: "tour_close" in types)
+    assert opened.count("tour_open") == 1
+    assert rater.events_of("tour_open") == [{"how": "first"}]
+    assert rater.console == []
+
+
+def test_without_storage_the_tour_opens_once_per_load_and_the_page_works(
+    browser: Any, server: MockHandle, state: MockState
+) -> None:
+    page = browser.new_page(viewport=WIDE)
+    page.add_init_script(
+        """for (const name of ['localStorage', 'sessionStorage']) {
+             Object.defineProperty(window, name, {
+               get() { throw new DOMException('denied', 'SecurityError'); } });
+           }"""
+    )
+    rater = Rater(page, server, seen_tour=False).open().ready(0)
+    page.wait_for_selector("#tour:not([hidden])")
+    rater.press("Escape")
+    rater.paused(0)
+    # once per load: not again for the next subject
+    rater.press("k")
+    rater.paused(1)
+    assert rater.tour_step is None
+    rater.press("1", "4", "7", "Enter")
+    rater.ready(2)
+    assert rater.tour_step is None and len(state.ratings) == 1 and len(state.skips) == 1
+    page.reload()
+    rater.ready(2)
+    page.wait_for_selector("#tour:not([hidden])")
+    assert rater.console == []
+    page.close()
+
+
+@pytest.mark.parametrize(
+    "viewport",
+    [
+        WIDE,
+        NARROW,
+        # windows too low for the page, which scrolls: a phone on its side, a small laptop
+        {"width": 400, "height": 440},
+        {"width": 1366, "height": 560},
+    ],
+)
+def test_every_step_of_the_tour_lights_a_part_that_is_on_screen_with_its_text_beside_it(
+    browser: Any, server: MockHandle, state: MockState, viewport: dict[str, int]
+) -> None:
+    page = browser.new_page(viewport=viewport)
+    rater = Rater(page, server, seen_tour=False).open().ready(0)
+    page.wait_for_selector("#tour:not([hidden])")
+    width, height = viewport["width"], viewport["height"]
+    seen = []
+    for number, step in enumerate(TOUR, start=1):
+        assert rater.tour_step == step
+        seen.append(step)
+        assert page.inner_text(".tour-count") == f"{number} of {len(TOUR)}"
+        measured = page.evaluate(
+            """() => {
+                const rect = (element) => {
+                  const box = element.getBoundingClientRect();
+                  return [box.left, box.top, box.right, box.bottom];
+                };
+                return { spot: rect(document.querySelector('.tour-spot')),
+                         card: rect(document.querySelector('.tour-card')),
+                         scroll: [document.documentElement.scrollWidth, window.innerWidth] };
+            }"""
+        )
+        spot, card = measured["spot"], measured["card"]
+        # the part exists and is on screen, all of it
+        assert spot[2] - spot[0] >= 20 and spot[3] - spot[1] >= 20, step
+        # (the frame around it is 6 px wider than the part, which may touch an edge)
+        assert -6 <= spot[0] and spot[2] <= width + 6 and -6 <= spot[1] and spot[3] <= height + 6, (
+            step,
+            spot,
+        )
+        # the text is inside the window whatever its size, and beside the part: over none
+        # of it where there is room, and never over all of it
+        assert 0 <= card[0] and card[2] <= width and 0 <= card[1] and card[3] <= height, (
+            step,
+            card,
+        )
+        over = max(0.0, min(spot[2], card[2]) - max(spot[0], card[0])) * max(
+            0.0, min(spot[3], card[3]) - max(spot[1], card[1])
+        )
+        share = over / ((spot[2] - spot[0]) * (spot[3] - spot[1]))
+        assert share <= 0.5, (step, share)
+        if viewport == WIDE:
+            assert share == 0, (step, share)
+        # the window does not scroll sideways for it
+        assert measured["scroll"][0] <= measured["scroll"][1], step
+        # what is lit is what the step is about
+        lit = page.evaluate(
+            """([x, y]) => {
+                const tour = document.getElementById('tour');
+                tour.style.visibility = 'hidden';
+                const under = document.elementFromPoint(x, y);
+                tour.style.visibility = '';
+                return under ? [under.closest('#viewer') ? 'viewer' : '',
+                                under.closest('#criteria') ? 'criteria' : '',
+                                under.closest('.actions') ? 'actions' : ''].join('') : '';
+            }""",
+            [(spot[0] + spot[2]) / 2, (spot[1] + spot[3]) / 2],
+        )
+        assert (
+            lit
+            == {
+                "views": "viewer",
+                "rating": "criteria",
+                "marks": "criteria",
+                "moving": "actions",
+                "help": "actions",
+            }[step]
+        )
+        text = page.inner_text(".tour-card")
+        assert len(text) < 420 and "Esc closes" in text
+        rater.press("Enter")
+    assert seen == list(TOUR) and rater.tour_step is None
+    assert rater.console == []
+    page.close()
+
+
+def test_the_tour_says_how_one_gets_from_subject_to_subject_with_the_keys_of_the_session(
+    newcomer: Rater, state: MockState
+) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    texts = {}
+    keys = {}
+    for step in TOUR:
+        texts[step] = " ".join(rater.page.inner_text(".tour-text").split())
+        keys[step] = rater.page.eval_on_selector_all(
+            ".tour-text kbd", "all => all.map((key) => key.textContent)"
+        )
+        rater.press("ArrowRight")
+    assert keys["views"] == ["Space", "←", "→", "s"]
+    protocol = state.protocol
+    assert keys["rating"] == [key for criterion in protocol.criteria for key in criterion.keys]
+    assert keys["marks"] == [
+        *(criterion.mark_key for criterion in protocol.criteria),
+        protocol.other_mark_key,
+    ]
+    assert keys["moving"] == ["Enter", "u", "k", "Backspace"] and keys["help"] == ["?", "t"]
+    assert "Enter stores the rating and shows the next subject" in texts["moving"]
+    assert "once every row has a value" in texts["moving"]
+    assert "k skips: nothing is stored, and the subject comes back later" in texts["moving"]
+    assert "Backspace goes back" in texts["moving"]
+    assert "this tour" in texts["help"]
+    # nothing about the subject is in it
+    whole = " ".join(texts.values())
+    for subject in state.subjects:
+        assert subject.subject_uid not in whole and subject.render_key not in whole
+    assert not re.search(r"[0-9a-f]{16}|sub-|D-[0-9a-f]", whole)
+
+
+def test_no_key_and_no_click_reaches_the_rating_screen_while_the_tour_is_open(
+    newcomer: Rater, state: MockState
+) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    before = rater.frame
+    # (Space is the focused button of the card: a step of the tour, tested with its focus)
+    rater.press("3", "5", "u", "o", "n", "m", "z", "k", "Backspace", "a", "?", "]", "Delete")
+    rater.press("Control+z")
+    rater.page.keyboard.down("s")
+    assert rater.viewer["contours"] == "shown"
+    rater.page.keyboard.up("s")
+    # a click on a panel places no mark, and the buttons under the tour are not pressed
+    box = rater.stage("sagittal")
+    rater.page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    for control in ("#skip", "#submit", "#unratable", "#play", "#help-toggle"):
+        target = rater.box(control)
+        rater.page.mouse.click(
+            target["x"] + target["width"] / 2, target["y"] + target["height"] / 2
+        )
+    rater.page.wait_for_timeout(300)
+    assert rater.tour_step == "views"
+    viewer = rater.viewer
+    assert viewer["playing"] == "false" and viewer["mode"] == "sync" and viewer["zoom"] == "1"
+    assert viewer["speed"] == "1" and rater.frame == before
+    assert rater.pressed() == {} and rater.counts() == {"A": 0, "B": 0, "C": 0, "X": 0}
+    assert rater.page.is_hidden("#unratable-picker") and rater.page.is_hidden("#help")
+    assert rater.page.is_hidden("#note-box") and rater.refusal == ""
+    assert rater.page.get_attribute("#other", "aria-pressed") == "false"
+    assert rater.page.get_attribute("#active-class", "data-class") == ""
+    assert state.skips == [] and state.ratings == []
+    assert state.paths("/api/back") == [] and state.paths("/api/skip") == []
+    # closed, the same keys work
+    rater.press("Escape", "3", "k")
+    rater.wait_skips(1)
+    rater.ready(1)
+    assert rater.console == []
+
+
+def test_the_keys_of_the_tour_and_its_close_button(newcomer: Rater, state: MockState) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    assert rater.page.is_disabled(".tour-back")
+    rater.press("ArrowLeft")
+    assert rater.tour_step == "views"  # there is no step before the first
+    rater.press("Enter")
+    assert rater.tour_step == "rating"
+    rater.press("ArrowRight")
+    assert rater.tour_step == "marks"
+    rater.press("ArrowLeft")
+    assert rater.tour_step == "rating"
+    # the buttons of the card do the same
+    rater.page.click(".tour-next")
+    rater.page.click(".tour-next")
+    assert rater.tour_step == "moving"
+    rater.page.click(".tour-back")
+    assert rater.tour_step == "marks"
+    rater.page.click(".tour-close")
+    assert rater.tour_step is None
+    closed = rater.wait_events(lambda types: "tour_close" in types)
+    assert closed.count("tour_open") == closed.count("tour_close") == 1
+    (read,) = rater.events_of("tour_close")
+    # how far it was read: the fourth step was the last one shown, and it was not finished
+    assert (read["step"], read["steps"], read["finished"]) == (4, 5, False)
+    assert isinstance(read["ms"], int) and 0 <= read["ms"] < 60_000
+
+    # t opens it again, from the first step; Enter on the last step ends it
+    rater.press("t")
+    assert rater.tour_step == "views"
+    for _ in TOUR[:-1]:
+        rater.press("Enter")
+    assert rater.tour_step == "help"
+    assert "done" in rater.page.inner_text(".tour-next")
+    rater.press("Enter")
+    assert rater.tour_step is None
+    # t closes it too, and holding Enter does not run through it
+    rater.press("t")
+    rater.page.keyboard.down("Enter")
+    for _ in range(4):
+        rater.page.keyboard.down("Enter")  # the repeats of a key that is held
+    rater.page.keyboard.up("Enter")
+    assert rater.tour_step == "rating"
+    rater.press("t")
+    assert rater.tour_step is None
+    rater.wait_events(lambda types: types.count("tour_close") == 3)
+    assert rater.events_of("tour_open") == [{"how": "first"}, {"how": "key"}, {"how": "key"}]
+    reads = [(read["step"], read["finished"]) for read in rater.events_of("tour_close")]
+    assert reads == [(4, False), (5, True), (2, False)]
+    assert state.ratings == [] and rater.refusal == ""  # no Enter of the tour was a submit
+
+
+def test_the_help_screen_opens_the_tour_again(rater: Rater, state: MockState) -> None:
+    rater.open().paused(0)
+    assert rater.tour_step is None  # this rater has seen it
+    rater.press("?")
+    assert rater.page.is_visible("#help-tour")
+    assert "t show the tour" in rater.page.inner_text("#help-tour")
+    rater.page.click("#help-tour")
+    assert rater.tour_step == "views" and rater.page.is_hidden("#help")
+    rater.press("Escape")
+    # and its key works on the help screen as well
+    rater.press("?", "t")
+    assert rater.tour_step == "views" and rater.page.is_hidden("#help")
+    rater.press("Escape")
+    assert rater.tour_step is None and rater.page.is_hidden("#help")
+    rater.wait_events(lambda types: types.count("tour_close") == 2)
+    assert rater.events_of("tour_open") == [{"how": "help"}, {"how": "help"}]
+    # while a reason is being chosen it does not open over the reasons
+    rater.press("u", "t")
+    assert rater.tour_step is None and rater.page.is_visible("#unratable-picker")
+
+
+def test_the_tour_is_a_dialog_that_keeps_the_focus_and_gives_it_back(
+    rater: Rater, state: MockState
+) -> None:
+    rater.open().paused(0)
+    rater.page.focus("#frame")
+    rater.press("t")
+    card = rater.page.locator(".tour-card")
+    assert card.get_attribute("role") == "dialog" and card.get_attribute("aria-modal") == "true"
+    title = rater.page.locator(f"#{card.get_attribute('aria-labelledby')}")
+    assert title.inner_text() == "Three views of one brain"
+    assert rater.page.locator(f"#{card.get_attribute('aria-describedby')}").count() == 1
+    assert rater.page.get_attribute(".tour-close", "aria-label") == "Close the tour"
+    focused = "document.activeElement.className"
+    inside = "document.querySelector('.tour-card').contains(document.activeElement)"
+    assert rater.page.evaluate(inside) and "tour-next" in rater.page.evaluate(focused)
+    # Tab goes round the buttons of the card and never leaves it
+    visited = []
+    for _ in range(7):
+        rater.press("Tab")
+        assert rater.page.evaluate(inside)
+        visited.append(rater.page.evaluate(focused).split()[-1])
+    assert set(visited) == {"tour-close", "tour-next"}  # the back button is off on step one
+    rater.press("Enter", "Shift+Tab")
+    assert rater.page.evaluate(inside)
+    rater.press("Shift+Tab", "Shift+Tab")
+    assert rater.page.evaluate(inside)
+    # focus that is taken away comes back
+    rater.page.evaluate("document.activeElement.blur()")
+    rater.page.wait_for_function(inside)
+    rater.press("Escape")
+    assert rater.page.evaluate("document.activeElement.id") == "frame"
+    # Space on the button that has the focus is one step, not two
+    rater.press("t", " ")
+    assert rater.tour_step == "rating"
+
+
+def test_time_in_the_tour_is_not_time_on_the_subject(newcomer: Rater, state: MockState) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    rater.page.wait_for_timeout(2500)
+    rater.press("Escape", "1", "4", "7", "Enter")
+    rater.wait_ratings(1)
+    # the tour was open for 2.5 s of the subject's time on screen
+    assert state.ratings[0].ms_on_subject < 1500
+    (read,) = rater.events_of("tour_close")
+    assert read["ms"] >= 2400
+    # and the frame under the tour was not being looked at for that long
+    rater.wait_events(lambda types: "frames" in types)
+    viewed = sum(
+        ms
+        for batch in state.events
+        if batch.assignment_id == FIRST_ASSIGNMENT
+        for event in batch.events
+        if event.type == "frames"
+        for _, ms in event.payload["visits"]
+    )
+    assert viewed < 1500
+    # the same for a skip: its time is of the visit, without the tour
+    rater.ready(1)
+    rater.press("t")
+    rater.page.wait_for_timeout(1500)
+    rater.press("Escape", "k")
+    rater.wait_skips(1)
+    assert state.skips[0].ms_on_subject < 1200
+
+
+def test_the_tour_does_not_open_where_there_is_no_subject(rater: Rater, state: MockState) -> None:
+    del state.subjects[1:]
+    rater.open().paused(0)
+    rater.press("1", "4", "7", "Enter")
+    rater.page.wait_for_selector("#rate[data-state='done']")
+    rater.press("t")
+    assert rater.tour_step is None
+    rater.press("?")
+    assert rater.page.is_disabled("#help-tour")
+    rater.press("t")
+    assert rater.tour_step is None and rater.page.is_visible("#help")
+
+
+def test_a_rater_who_presses_only_enter_learns_from_the_screen_what_to_do(
+    newcomer: Rater, state: MockState
+) -> None:
+    rater = newcomer
+    rater.open().ready(0)
+    rater.page.wait_for_selector("#tour:not([hidden])")
+    read = []
+    for _ in TOUR:
+        read.append(" ".join(rater.page.inner_text(".tour-card").split()))
+        rater.press("Enter")
+    assert rater.tour_step is None
+    # the tour said it: Enter needs a value in every row, and k skips
+    told = " ".join(read)
+    assert "works once every row has a value" in told and "k skips" in told
+    # the next Enter is refused, and the screen says so where it cannot be missed
+    rater.press("Enter")
+    rater.page.wait_for_selector("#refusal:not([hidden])")
+    assert state.ratings == [] and "Not submitted." in rater.refusal
+    assert "have no value yet" in rater.refusal and re.search(r"press\s+k", rater.refusal)
+    assert rater.lacking() == {"A": "value", "B": "value", "C": "value"}
+    # one more Enter changes nothing but is answered again
+    rater.press("Enter")
+    assert rater.page.evaluate(
+        "document.getElementById('refusal').classList.contains('refusal-again')"
+    )
+    # doing what it says leads on: the app has more than one subject
+    rater.press("k")
+    rater.ready(1)
+    assert "Skipped" in rater.hint and "1 skipped, waiting" in rater.progress
+    assert rater.console == []

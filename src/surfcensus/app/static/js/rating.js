@@ -59,6 +59,32 @@ export function blockers(protocol, rating, counts, requireMarks) {
   return out;
 }
 
+// What a row of the rating bar lacks before Enter submits: criterion id -> "value" (no
+// value yet) or "mark" (a positive value without a mark, where marks are required). The
+// rows of `blockers`, so that a refused Enter can show where to look.
+export function rowsLacking(protocol, rating, counts, requireMarks) {
+  const lacking = {};
+  if (rating.unratable) return lacking;
+  for (const criterion of protocol.criteria) {
+    const value = rating.values[criterion.id];
+    if (value === undefined) lacking[criterion.id] = "value";
+    else if (requireMarks && isPositive(protocol, value) && !counts[criterion.id]) {
+      lacking[criterion.id] = "mark";
+    }
+  }
+  return lacking;
+}
+
+// The body of POST /api/skip: the subject is left without a rating. Nothing of what was
+// entered is in it.
+export function skipBody(assignment, msOnSubject, clientTs) {
+  return /* shape: SkipIn */ {
+    assignment_id: assignment.assignment_id,
+    client_ts: clientTs,
+    ms_on_subject: Math.max(0, Math.round(msOnSubject)),
+  };
+}
+
 // The body of POST /api/rating. An unratable subject is sent without values and marks.
 export function ratingBody(assignment, protocol, rating, marks, msOnSubject, clientTs) {
   const unratable = rating.unratable;
@@ -107,13 +133,17 @@ export class RatingBar {
     this.protocol = protocol;
     this.levels = [];
     this.classes = [];
+    this.rows = [];
     root.replaceChildren();
     for (const criterion of protocol.criteria) {
       const line = html("div", "criterion");
       line.dataset.criterion = criterion.id;
       const label = html("span", "criterion-label");
-      label.append(html("b", "", criterion.id), ` ${criterion.label}`);
+      // says what the row lacks after a refused Enter; empty otherwise
+      const need = html("span", "criterion-need");
+      label.append(html("b", "", criterion.id), need, ` ${criterion.label}`);
       label.title = criterion.question;
+      this.rows.push({ id: criterion.id, line, need });
       const levels = html("span", "levels");
       protocol.scale.forEach((level, position) => {
         const control = button("level", criterion.keys[position], level.label);
@@ -151,8 +181,15 @@ export class RatingBar {
     return wrap;
   }
 
-  update(rating, counts, activeClass) {
+  // `lacking` maps a criterion to what its row lacks ("value" or "mark"); those rows are
+  // marked. Empty unless Enter was refused.
+  update(rating, counts, activeClass, lacking = {}) {
     this.root.dataset.unratable = String(Boolean(rating.unratable));
+    for (const { id, line, need } of this.rows) {
+      const lacks = lacking[id] ?? "";
+      line.dataset.lacking = lacks;
+      need.textContent = lacks ? `needs a ${lacks}` : "";
+    }
     for (const control of this.levels) {
       const value = rating.values[control.dataset.criterion];
       const pressed = !rating.unratable && value === Number(control.dataset.value);

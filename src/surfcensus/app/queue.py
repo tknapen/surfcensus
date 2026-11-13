@@ -12,6 +12,18 @@ An assignment is tied to the render it shows (``render_key``). An open assignmen
 is no longer ready is left as it is, open and never completed, and the subject is offered
 again under its present render: a submission on the earlier tiles would be refused by the
 server, and returning the same assignment again would leave the page asking forever.
+
+A skip (``skip_assignment``) defers a subject and never drops it. The assignment stays
+open, with the time of the skip, and no other assignment is made for the subject. It
+*waits*: it is offered again after every subject the rater has not been shown yet, the one
+skipped longest ago first, so a rater who skips whatever comes goes round the skipped
+subjects in the order of skipping. While a render of the selection is awaited the rater
+waits for it, since that subject has not been shown either. The queue is done only when
+every subject has a submission. A skip is not a completed rating and gives the subject to
+nobody else: in a census a rater cannot avoid a subject by skipping it, which would bias
+who rates what. The team branch has to keep the same rule within each of its stages: a
+skipped calibration subject comes back after the calibration subjects not yet shown, and
+before the first main one.
 """
 
 from __future__ import annotations
@@ -22,11 +34,12 @@ from dataclasses import dataclass
 from typing import Literal
 
 import pandas as pd
+from sqlalchemy import func, or_
 from sqlmodel import Session, col, select
 
-from surfcensus.app.db import utc_now
+from surfcensus.app.db import record_skip, utc_now
 from surfcensus.app.models import Assignment, Rater
-from surfcensus.app.schemas import AppMode
+from surfcensus.app.schemas import AppMode, SkipIn
 from surfcensus.calibration import CalibrationSet
 from surfcensus.config import AppConfig
 from surfcensus.store import PublicCatalog, queue_order
@@ -68,7 +81,14 @@ class Next:
     status: Literal["assignment", "rendering", "done"]
     assignment: Assignment | None = None
     prefetch: tuple[tuple[str, str], ...] = ()
-    """The next two ready ``(subject_uid, render_key)`` after the assignment."""
+    """The next two ready ``(subject_uid, render_key)`` after the assignment: the subjects
+    not shown yet in queue order, then the skipped ones in the order of skipping."""
+
+
+class SkipRefused(ValueError):
+    """The assignment is not open for the rater, so it cannot be skipped: it has a
+    submission, it is another rater's, or its render is no longer the subject's. The
+    server answers 409 and the page asks for its next subject again."""
 
 
 def build_plan(
@@ -152,6 +172,18 @@ def build_plan(
 
 
 @dataclass(frozen=True)
+class _Open:
+    """An assignment without a submission."""
+
+    assignment_id: int
+    subject_uid: str
+    render_key: str
+    kind: str
+    seq: int
+    skipped_at: str | None
+
+
+@dataclass(frozen=True)
 class _History:
     """A rater's assignments, as far as the queue needs them."""
 
@@ -161,9 +193,8 @@ class _History:
     ``seq`` among them. Keyed by both: subjects with the same images have one key."""
     repeated: frozenset[tuple[str, str]]
     """``(subject_uid, render_key)`` of the completed ``repeat`` assignments."""
-    open: tuple[tuple[int, str, str], ...]
-    """``(assignment_id, subject_uid, render_key)`` of the assignments that are not
-    completed, the latest first."""
+    open: tuple[_Open, ...]
+    """The assignments that are not completed, the latest first."""
 
 
 def _rater_id(rater: Rater) -> int:
@@ -181,20 +212,21 @@ def _history(session: Session, rater_id: int) -> _History:
             Assignment.seq,
             Assignment.render_key,
             Assignment.completed_at,
+            Assignment.skipped_at,
         )
         .where(Assignment.rater_id == rater_id)
         .order_by(col(Assignment.seq))
     ).all()
     main: dict[tuple[str, str], int] = {}
     repeated: set[tuple[str, str]] = set()
-    still_open: list[tuple[int, str, str]] = []
+    still_open: list[_Open] = []
     last_seq = 0
-    for assignment_id, subject_uid, kind, seq, render_key, completed_at in rows:
+    for assignment_id, subject_uid, kind, seq, render_key, completed_at, skipped_at in rows:
         last_seq = seq
         shown = (subject_uid, render_key)
         if completed_at is None:
             assert assignment_id is not None
-            still_open.append((assignment_id, subject_uid, render_key))
+            still_open.append(_Open(assignment_id, subject_uid, render_key, kind, seq, skipped_at))
         elif kind == "main":
             main[shown] = seq
         elif kind == "repeat":
@@ -220,59 +252,101 @@ def _to_rate(history: _History, plan: QueuePlan) -> list[str]:
     ]
 
 
-def _servable(history: _History, plan: QueuePlan) -> tuple[int, str] | None:
-    """``(assignment_id, subject_uid)`` of the latest open assignment whose render is the
-    subject's ready one."""
-    for assignment_id, subject_uid, render_key in history.open:
-        if _current(plan, subject_uid) == (subject_uid, render_key):
-            return assignment_id, subject_uid
+def _is_servable(plan: QueuePlan, subject_uid: str, render_key: str) -> bool:
+    return _current(plan, subject_uid) == (subject_uid, render_key)
+
+
+def _servable(history: _History, plan: QueuePlan) -> _Open | None:
+    """The latest open assignment that was not skipped and whose render is the subject's
+    ready one: the one the page shows."""
+    for assignment in history.open:
+        if assignment.skipped_at is None and _is_servable(
+            plan, assignment.subject_uid, assignment.render_key
+        ):
+            return assignment
     return None
+
+
+def _waiting(history: _History, plan: QueuePlan) -> list[_Open]:
+    """The skipped assignments whose render is the subject's ready one, the one skipped
+    longest ago first; of two skipped at one time, the one made first."""
+    skipped = [
+        assignment
+        for assignment in history.open
+        if assignment.skipped_at is not None
+        and _is_servable(plan, assignment.subject_uid, assignment.render_key)
+    ]
+    return sorted(skipped, key=lambda assignment: (assignment.skipped_at, assignment.seq))
 
 
 def _repeat(history: _History, plan: QueuePlan, rng: random.Random, seq: int) -> str | None:
     """The subject to show again as assignment ``seq``, or None when the draw says no or no
     subject can be repeated: one whose completed ``main`` assignment of the present render
     lies at least ``repeat_gap`` assignments back and that was not repeated on that render.
+    A repeat that was skipped is open and waits; its subject gets no second one meanwhile.
     """
     if plan.repeat_rate <= 0 or rng.random() >= plan.repeat_rate:
         return None
+    waiting = {
+        (assignment.subject_uid, assignment.render_key)
+        for assignment in history.open
+        if assignment.kind == "repeat"
+    }
     candidates = sorted(
         uid
         for (uid, render_key), rated_seq in history.main.items()
         if _current(plan, uid) == (uid, render_key)
         and seq - rated_seq >= plan.repeat_gap
         and (uid, render_key) not in history.repeated
+        and (uid, render_key) not in waiting
     )
     return rng.choice(candidates) if candidates else None
 
 
 @dataclass(frozen=True)
 class _Decision:
-    """What the rater gets when there is no servable open assignment."""
+    """What the rater gets when no open assignment is on the page: a new assignment
+    (``subject_uid``), a skipped one that waited (``back``), or neither."""
 
     status: Literal["assignment", "rendering", "done"]
     kind: Literal["main", "repeat"] = "main"
     subject_uid: str | None = None
     seq: int = 0
+    back: _Open | None = None
 
 
-def _decide(history: _History, rater_id: int, plan: QueuePlan, to_rate: list[str]) -> _Decision:
+def _decide(
+    history: _History, rater_id: int, plan: QueuePlan, fresh: list[str], waiting: list[_Open]
+) -> _Decision:
+    """``fresh`` are the subjects to rate that the rater has not been shown, in queue
+    order; ``waiting`` the skipped assignments, in the order they come back."""
     seq = history.last_seq + 1
     # one generator per assignment, so the queue can be traced from the database
     rng = random.Random(f"{plan.seed}:{rater_id}:{seq}")
     repeat = _repeat(history, plan, rng, seq)
     if repeat is not None:
         return _Decision("assignment", "repeat", repeat, seq)
-    if to_rate:
-        return _Decision("assignment", "main", to_rate[0], seq)
+    if fresh:
+        return _Decision("assignment", "main", fresh[0], seq)
     if plan.pending + plan.outdated > 0:
+        # a subject that is still being rendered has not been shown either
         return _Decision("rendering")
+    if waiting:
+        return _Decision("assignment", back=waiting[0])
     return _Decision("done")
 
 
-def _prefetch(plan: QueuePlan, to_rate: list[str], shown: str) -> tuple[tuple[str, str], ...]:
-    upcoming = [uid for uid in to_rate if uid != shown][:PREFETCH]
-    return tuple((uid, plan.render_keys[uid]) for uid in upcoming)
+def _fresh(to_rate: list[str], waiting: list[_Open]) -> list[str]:
+    skipped = {assignment.subject_uid for assignment in waiting}
+    return [uid for uid in to_rate if uid not in skipped]
+
+
+def _prefetch(
+    plan: QueuePlan, to_rate: list[str], waiting: list[_Open], shown: str
+) -> tuple[tuple[str, str], ...]:
+    upcoming = _fresh(to_rate, waiting) + [assignment.subject_uid for assignment in waiting]
+    ahead = [uid for uid in upcoming if uid != shown][:PREFETCH]
+    return tuple((uid, plan.render_keys[uid]) for uid in ahead)
 
 
 def _local_only(plan: QueuePlan) -> None:
@@ -302,20 +376,30 @@ def next_assignment(session: Session, rater: Rater, plan: QueuePlan) -> Next:
     rater completed these tiles as ``main`` and has not repeated them. The draw for a
     repeat comes before the walk, so a repeat can be the last assignment before ``done``
     and can be given while renders are awaited.
+
+    A skipped assignment (see the module) is open and is not the one on the page. It is
+    returned when the rater has been shown everything else: no open assignment that was
+    not skipped, no repeat drawn, no subject left that the rater has not been shown, no
+    render awaited. Of several, the one skipped longest ago. No second assignment is made
+    for its subject while its render stays the same.
     """
     _local_only(plan)
     rater_id = _rater_id(rater)
     history = _history(session, rater_id)
     to_rate = _to_rate(history, plan)
+    waiting = _waiting(history, plan)
+
+    def existing(shown: _Open) -> Next:
+        assignment = session.get(Assignment, shown.assignment_id)
+        assert assignment is not None
+        return Next("assignment", assignment, _prefetch(plan, to_rate, waiting, shown.subject_uid))
 
     servable = _servable(history, plan)
     if servable is not None:
-        assignment_id, subject_uid = servable
-        assignment = session.get(Assignment, assignment_id)
-        assert assignment is not None
-        return Next("assignment", assignment, _prefetch(plan, to_rate, subject_uid))
-
-    decision = _decide(history, rater_id, plan, to_rate)
+        return existing(servable)
+    decision = _decide(history, rater_id, plan, _fresh(to_rate, waiting), waiting)
+    if decision.back is not None:
+        return existing(decision.back)
     if decision.subject_uid is None:
         return Next(decision.status)
     assignment = Assignment(
@@ -328,20 +412,74 @@ def next_assignment(session: Session, rater: Rater, plan: QueuePlan) -> Next:
     )
     session.add(assignment)
     session.flush()
-    return Next("assignment", assignment, _prefetch(plan, to_rate, decision.subject_uid))
+    prefetch = _prefetch(plan, to_rate, waiting, decision.subject_uid)
+    return Next("assignment", assignment, prefetch)
+
+
+def is_open_for(rater: Rater, assignment: Assignment, plan: QueuePlan) -> bool:
+    """Whether the assignment is one the rater can still rate for the first time, or skip:
+    it is the rater's, it has no submission, and its render is the subject's ready one."""
+    return (
+        assignment.rater_id == _rater_id(rater)
+        and assignment.completed_at is None
+        and _is_servable(plan, assignment.subject_uid, assignment.render_key)
+    )
+
+
+def skip_assignment(
+    session: Session,
+    rater: Rater,
+    assignment: Assignment,
+    skip: SkipIn,
+    plan: QueuePlan,
+    *,
+    now: str | None = None,
+) -> Next:
+    """The rater skips the assignment: what ``POST /api/skip`` does. Returns what
+    :func:`next_assignment` gives afterwards.
+
+    The skip is recorded on the assignment and as an event (``app.db.record_skip``); no
+    rating, mark or note is stored, and the assignment stays open and waits (see the
+    module). A request that was sent twice, with the same ``client_ts``, is recorded once
+    and answered alike. When the skipped assignment is the only thing left for the rater,
+    it is returned again. Flushed, not committed.
+
+    Raises :class:`SkipRefused`, with nothing stored, for an assignment that is not open
+    for the rater (:func:`is_open_for`), and ``ValueError`` for a skip that names another
+    assignment.
+    """
+    _local_only(plan)
+    if skip.assignment_id != assignment.assignment_id:
+        raise ValueError(
+            f"the skip is of assignment {skip.assignment_id}, not of {assignment.assignment_id}"
+        )
+    if not is_open_for(rater, assignment, plan):
+        raise SkipRefused(f"assignment {assignment.assignment_id} is not open for the rater")
+    record_skip(session, assignment, skip, now=now)
+    return next_assignment(session, rater, plan)
 
 
 def previous_assignment(session: Session, rater: Rater) -> Assignment | None:
-    """The rater's most recent completed assignment, the one ``Backspace`` goes back to.
+    """The assignment the rater left last, rated or skipped: the one ``Backspace`` goes
+    back to.
 
-    Most recent by ``completed_at``, the time of its first submission, which a revision
-    leaves; of two with one time, the one made later. Whether its render is still the
-    subject's is for the caller to check: this reads no plan.
+    An assignment is left when its first submission is stored (``completed_at``, which a
+    revision leaves) and when it is skipped (``skipped_at``); the later of the two counts.
+    Of two left at one time, the one made later. A skipped assignment comes back as it is:
+    open, without a submission, and its skips stay recorded. Whether its render is still
+    the subject's is for the caller to check: this reads no plan.
     """
+    left = func.max(
+        func.coalesce(col(Assignment.completed_at), ""),
+        func.coalesce(col(Assignment.skipped_at), ""),
+    )
     return session.exec(
         select(Assignment)
-        .where(Assignment.rater_id == _rater_id(rater), col(Assignment.completed_at).is_not(None))
-        .order_by(col(Assignment.completed_at).desc(), col(Assignment.seq).desc())
+        .where(
+            Assignment.rater_id == _rater_id(rater),
+            or_(col(Assignment.completed_at).is_not(None), col(Assignment.skipped_at).is_not(None)),
+        )
+        .order_by(left.desc(), col(Assignment.seq).desc())
         .limit(1)
     ).first()
 
@@ -351,22 +489,38 @@ def has_work_left(session: Session, rater: Rater, plan: QueuePlan) -> bool:
     or answer ``rendering``. While true, the unblinded routes are closed to the rater. It
     creates no assignment.
 
-    An open assignment counts while it is servable; one whose render changed or failed is
-    never returned again and closes nothing.
+    An open assignment counts while it is servable, skipped or not; one whose render
+    changed or failed is never returned again and closes nothing.
     """
     _local_only(plan)
     rater_id = _rater_id(rater)
     history = _history(session, rater_id)
     if _servable(history, plan) is not None:
         return True
-    return _decide(history, rater_id, plan, _to_rate(history, plan)).status != "done"
+    waiting = _waiting(history, plan)
+    fresh = _fresh(_to_rate(history, plan), waiting)
+    return _decide(history, rater_id, plan, fresh, waiting).status != "done"
 
 
 def subjects_left(session: Session, rater: Rater, plan: QueuePlan) -> int:
     """How many subjects of the plan the rater still has to rate, as far as the plan says:
     those that are ready and not done, and those whose render is pending or outdated. A
     subject whose render failed is never offered and is not counted; neither is a repeat.
-    The ``remaining`` of the progress line. It creates no assignment."""
+    A skipped subject is still to rate and is counted. The ``remaining`` of the progress
+    line. It creates no assignment."""
     _local_only(plan)
     history = _history(session, _rater_id(rater))
     return len(_to_rate(history, plan)) + plan.pending + plan.outdated
+
+
+def subjects_skipped(
+    session: Session, rater: Rater, plan: QueuePlan, shown: Assignment | None = None
+) -> int:
+    """How many subjects the rater skipped that wait to be offered again: the skipped
+    assignments whose render is the subject's ready one, without ``shown``, the assignment
+    that the answer puts on the page (it does not wait any more). The ``skipped`` of the
+    progress line. It creates no assignment."""
+    _local_only(plan)
+    waiting = _waiting(_history(session, _rater_id(rater)), plan)
+    on_page = None if shown is None else shown.assignment_id
+    return sum(assignment.assignment_id != on_page for assignment in waiting)

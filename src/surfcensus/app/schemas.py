@@ -4,10 +4,10 @@ The server and the frontend are both written against this module. It needs pydan
 and imports ``protocol.py`` and ``render/model.py``, nothing from the rest of ``app/``.
 
 Blindness is a property of these shapes: nothing a rating route returns (``SessionOut``,
-``NextOut``, ``RatingOut``) has a field for a dataset, a subject label, a score, a flag or
-another rater's rating, and the render a page receives (:class:`RenderOut`) is ``render.json``
-without the digests of its source files. The unblinded shapes are ``ReviewOut``,
-``SubjectOut`` and ``StatsOut``.
+``NextOut``, ``RatingOut``; a skip is answered with a ``NextOut``) has a field for a
+dataset, a subject label, a score, a flag or another rater's rating, and the render a page
+receives (:class:`RenderOut`) is ``render.json`` without the digests of its source files.
+The unblinded shapes are ``ReviewOut``, ``SubjectOut`` and ``StatsOut``.
 """
 
 from __future__ import annotations
@@ -74,9 +74,25 @@ EVENT_TYPES: tuple[str, ...] = (
     "mark_undo",
     "help",
     "back",
+    "tour_open",
+    "tour_close",
 )
 """The interaction events a page logs. ``frames`` is run-length encoded:
-``{"mode": "sync", "visits": [[frame, ms], ...]}``. An unknown type is stored as given."""
+``{"mode": "sync", "visits": [[frame, ms], ...]}``. ``tour_open`` says how the tour of the
+rating screen was opened (``{"how": "first" | "key" | "help"}``) and ``tour_close`` how far
+it was read (``{"step": the last step shown, from 1, "steps": how many there are,
+"finished": whether it was closed from the last one, "ms": how long it was open}``). An
+unknown type is stored as given."""
+SKIP_EVENT = "skip"
+"""The event the server stores when a rater skips a subject (``POST /api/skip``,
+``app.db.record_skip``): ``ts`` is the client's time of the skip, like the ``ts`` of the
+events a page sends, and the payload is ``{"server_ts": ..., "ms_on_subject": the time the
+subject was on a visible page in the visit that ended with the skip, "n": the number of
+the skip for its assignment, from 1}``."""
+SERVER_EVENT_TYPES: tuple[str, ...] = (SKIP_EVENT,)
+"""Events of an assignment that the server writes itself. A page cannot send one
+(:class:`EventIn` refuses the type), so that the skips in the events are the skips the
+server took."""
 RUN_EVENT_TYPES: tuple[str, ...] = ("config_change",)
 """Events of the run, stored without an assignment by the server side."""
 
@@ -334,12 +350,17 @@ class ProgressOut(_Shape):
     done_today: int
     done_total: int
     remaining: int
+    """Subjects the rater has still to rate, the skipped ones among them."""
+    skipped: int
+    """Subjects the rater skipped that wait to be offered again
+    (``app.queue.subjects_skipped``); the one on screen is not counted."""
     rendered: int
     n_subjects: int
 
 
 class NextOut(_Shape):
-    """``GET /api/next``, ``GET /api/back`` and the ``next`` of a stored rating."""
+    """``GET /api/next``, ``GET /api/back``, the answer to ``POST /api/skip`` and the
+    ``next`` of a stored rating."""
 
     status: Literal["assignment", "rendering", "done"]
     assignment: AssignmentOut | None = None
@@ -395,6 +416,28 @@ class RatingOut(_Shape):
     next: NextOut
 
 
+# --- a skip ---------------------------------------------------------------------------------
+
+
+class SkipIn(_Shape):
+    """``POST /api/skip``: the rater leaves the subject on screen without a rating. Nothing
+    of what was entered is sent: it stays in the page as the draft of the assignment. The
+    answer is a :class:`NextOut`, the subject that comes next.
+
+    The assignment stays open and is offered again after every subject the rater has not
+    been shown yet (``app.queue``). The server counts the skip on the assignment and stores
+    an event of type :data:`SKIP_EVENT`. A request that is sent again, with the same
+    ``client_ts``, is counted once."""
+
+    assignment_id: int
+    client_ts: str = Field(min_length=1, max_length=64)
+    """Client time of the skip, ISO 8601. With the assignment it names the skip: a second
+    request with the same two is the first one sent again."""
+    ms_on_subject: int = Field(ge=0)
+    """How long the subject was on a visible page in this visit. The ``ms_on_subject`` of
+    a later submission is the time of the visit that ends with the submission."""
+
+
 # --- events ---------------------------------------------------------------------------------
 
 
@@ -402,6 +445,13 @@ class EventIn(_Shape):
     ts: str
     type: str = Field(min_length=1, max_length=64)
     payload: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("type")
+    @classmethod
+    def _of_a_page(cls, value: str) -> str:
+        if value in SERVER_EVENT_TYPES:
+            raise ValueError(f"an event of type {value!r} is stored by the server, not sent")
+        return value
 
     @field_validator("payload")
     @classmethod
@@ -577,6 +627,7 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/api/next", NextOut),
     Route("GET", "/api/back", NextOut),
     Route("POST", "/api/rating", RatingOut, RatingIn),
+    Route("POST", "/api/skip", NextOut, SkipIn),
     Route("POST", "/api/events", EventsOut, EventsIn),
     Route("GET", "/api/review", ReviewOut, ReviewQuery, unblinded=True),
     Route("GET", "/api/review/{subject_uid}", SubjectOut, unblinded=True),
@@ -586,4 +637,8 @@ ROUTES: tuple[Route, ...] = (
 """Every route of the app in milestone 4 (local mode). The server serves these and no
 other, and the frontend calls none that is not here: ``/`` and ``/review`` are the pages,
 ``/static`` the frontend files, ``/media`` the files of a render that :data:`MEDIA_FILE`
-names, ``/api/export`` the ratings as CSV."""
+names, ``/api/export`` the ratings as CSV.
+
+``POST /api/skip`` answers 404 for an assignment that does not exist, 403 for another
+rater's, and 409 for one that is not open for the rater: one that has a submission, or
+whose render is no longer the subject's (``app.queue.SkipRefused``)."""

@@ -1,11 +1,11 @@
-// The rating page: session, next subject, the rating and its marks, submit, back, the
-// progress line. Everything about a subject arrives through the API; the page shows its
-// tiles and its geometry and nothing else about it.
+// The rating page: session, next subject, the rating and its marks, submit, skip, back, the
+// progress line, the tour of the screen. Everything about a subject arrives through the
+// API; the page shows its tiles and its geometry and nothing else about it.
 
 import * as api from "./api.js";
 import { EventLog } from "./events.js";
 import { Help } from "./help.js";
-import { buildKeyMap, installKeys } from "./keys.js";
+import { buildKeyMap, installKeys, keysFor } from "./keys.js";
 import { MarkLayer, MarkStore } from "./marks.js";
 import {
   RatingBar,
@@ -15,15 +15,21 @@ import {
   isPositive,
   ratingBody,
   ratingFromPrevious,
+  rowsLacking,
+  skipBody,
 } from "./rating.js";
+import { Tour, markTourSeen, tourSeen, tourSteps } from "./tour.js";
 import { Viewer } from "./viewer.js";
 
+// What is entered for a subject without a rating is kept per assignment, so that it is
+// there again after a reload and when a skipped subject comes back.
 const DRAFT_KEY = "surfcensus.draft";
 const byId = (id) => document.getElementById(id);
+const draftKey = (assignmentId) => `${DRAFT_KEY}.${assignmentId}`;
 
 function readDraft(assignmentId) {
   try {
-    const draft = JSON.parse(sessionStorage.getItem(DRAFT_KEY) ?? "null");
+    const draft = JSON.parse(sessionStorage.getItem(draftKey(assignmentId)) ?? "null");
     return draft && draft.assignment_id === assignmentId ? draft : null;
   } catch {
     return null;
@@ -32,7 +38,7 @@ function readDraft(assignmentId) {
 
 function writeDraft(draft) {
   try {
-    sessionStorage.setItem(DRAFT_KEY, JSON.stringify(draft));
+    sessionStorage.setItem(draftKey(draft.assignment_id), JSON.stringify(draft));
   } catch {
     // without storage a draft does not survive a reload; nothing else changes
   }
@@ -40,10 +46,22 @@ function writeDraft(draft) {
 
 function dropDraft(assignmentId) {
   try {
-    if (readDraft(assignmentId)) sessionStorage.removeItem(DRAFT_KEY);
+    sessionStorage.removeItem(draftKey(assignmentId));
   } catch {
     // nothing to drop
   }
+}
+
+function html(name, className = "", text = "") {
+  const element = document.createElement(name);
+  if (className) element.className = className;
+  if (text) element.textContent = text;
+  return element;
+}
+
+function words(names) {
+  if (names.length < 2) return names.join("");
+  return `${names.slice(0, -1).join(", ")} and ${names[names.length - 1]}`;
 }
 
 class RatePage {
@@ -54,13 +72,18 @@ class RatePage {
     this.noteBox = byId("note-box");
     this.note = byId("note");
     this.submitButton = byId("submit");
+    this.skipButton = byId("skip");
+    this.refusal = byId("refusal");
     this.session = null;
     this.assignment = null;
     this.rating = emptyRating();
     this.marks = new MarkStore();
     this.activeClass = null;
     this.notice = "";
+    // Enter was refused for the subject on screen and what it lacked is not all there yet
+    this.refused = false;
     this.busy = false;
+    this.tourOffered = false;
     this.turn = 0;
     this.visibleSince = null;
     this.visibleMs = 0;
@@ -100,7 +123,8 @@ class RatePage {
     const protocol = session.protocol;
     this.viewer = new Viewer(byId("viewer"), {
       onFrame: (frame, mode) => {
-        this.events.frame(mode, frame);
+        // what is on screen under the tour is not being looked at
+        if (!this.tour.open) this.events.frame(mode, frame);
         this.layer.draw();
       },
       onState: (name, payload) => this.events.add(name, payload),
@@ -124,7 +148,11 @@ class RatePage {
       },
       onCancel: () => this.changed(),
     });
-    this.help = new Help(byId("help"), session);
+    this.keys = buildKeyMap(protocol);
+    this.help = new Help(byId("help"), session, { onTour: () => this.openTour("help") });
+    this.tour = new Tour(byId("tour"), tourSteps(protocol, this.keys), {
+      onClose: (read) => this.tourClosed(read),
+    });
 
     const press = (id, action) =>
       byId(id).addEventListener("click", (event) => {
@@ -135,6 +163,7 @@ class RatePage {
     press("other", { type: "other" });
     press("note-toggle", { type: "note" });
     press("back", { type: "back" });
+    press("skip", { type: "skip" });
     press("help-toggle", { type: "help" });
     press("submit", { type: "submit" });
     this.note.addEventListener("input", () => {
@@ -148,15 +177,15 @@ class RatePage {
 
     installKeys(
       window,
-      buildKeyMap(protocol),
-      () => (this.help.open ? "help" : this.picker.open ? "unratable" : null),
+      this.keys,
+      () => {
+        if (this.tour.open) return "tour";
+        return this.help.open ? "help" : this.picker.open ? "unratable" : null;
+      },
       (action, down) => this.perform(action, down),
     );
-    document.addEventListener("visibilitychange", () => {
-      const visible = document.visibilityState === "visible";
-      this.events.visible(visible);
-      this.clock(visible);
-    });
+    document.addEventListener("visibilitychange", () => this.watched());
+    window.addEventListener("resize", () => this.pointRefusal());
     window.addEventListener("pagehide", () => this.events.leave());
   }
 
@@ -176,8 +205,8 @@ class RatePage {
     this.say(text);
   }
 
-  retrying(attempt) {
-    this.notice = `Not saved yet: the server does not answer (attempt ${attempt}). Trying again.`;
+  retrying(attempt, what = "saved") {
+    this.notice = `Not ${what} yet: the server does not answer (attempt ${attempt}). Trying again.`;
     this.refresh();
   }
 
@@ -187,6 +216,7 @@ class RatePage {
       `${progress.done_total} done in total`,
       `${progress.remaining} remaining`,
     ];
+    if (progress.skipped > 0) parts.push(`${progress.skipped} skipped, waiting`);
     if (progress.rendered < progress.n_subjects) {
       parts.push(`${progress.rendered} of ${progress.n_subjects} rendered`);
     }
@@ -195,15 +225,28 @@ class RatePage {
     line.dataset.doneToday = String(progress.done_today);
     line.dataset.doneTotal = String(progress.done_total);
     line.dataset.remaining = String(progress.remaining);
+    line.dataset.skipped = String(progress.skipped);
   }
 
-  // Time the subject was on a visible page.
-  clock(visible) {
+  // Whether the subject is being looked at: the page is visible and the tour is not over it.
+  watching() {
+    return document.visibilityState === "visible" && !(this.tour && this.tour.open);
+  }
+
+  // The page was hidden or shown, or the tour opened or closed.
+  watched() {
+    const watching = this.watching();
+    this.events.visible(watching);
+    this.clock(watching);
+  }
+
+  // Time the subject was looked at (`watching`), for `ms_on_subject`.
+  clock(watching) {
     const now = performance.now();
-    if (!visible && this.visibleSince !== null) {
+    if (!watching && this.visibleSince !== null) {
       this.visibleMs += now - this.visibleSince;
       this.visibleSince = null;
-    } else if (visible && this.visibleSince === null && this.assignment) {
+    } else if (watching && this.visibleSince === null && this.assignment) {
       this.visibleSince = now;
     }
   }
@@ -259,6 +302,7 @@ class RatePage {
     this.rating = emptyRating();
     this.marks.reset();
     this.activeClass = null;
+    this.refused = false;
     this.note.value = "";
     this.noteBox.hidden = true;
     this.picker.close();
@@ -279,12 +323,14 @@ class RatePage {
       this.marks.reset();
     }
     this.activeClass = null;
+    this.refused = false;
     this.note.value = this.rating.note;
     this.noteBox.hidden = !this.rating.note;
     this.picker.close();
     this.events.begin(assignment.assignment_id);
+    // of this visit: an earlier visit that ended with a skip was sent with the skip
     this.visibleMs = 0;
-    this.visibleSince = document.visibilityState === "visible" ? performance.now() : null;
+    this.visibleSince = this.watching() ? performance.now() : null;
     this.setState("rating");
     const started = performance.now();
     this.viewer.show(assignment, { autoplay: !assignment.previous }).then((result) => {
@@ -295,6 +341,37 @@ class RatePage {
         failed: result.failed,
       });
     });
+    this.refresh();
+    if (!this.tourOffered) {
+      // the first subject of this page: a rater who was never shown the tour gets it now
+      this.tourOffered = true;
+      if (!tourSeen(this.session.rater.name)) this.openTour("first");
+    }
+  }
+
+  // --- the tour ---------------------------------------------------------------------------
+
+  // Open the tour of the screen over the subject. `how`: "first" (by itself, on a rater's
+  // first subject), "key" or "help".
+  openTour(how) {
+    if (!this.assignment || this.busy || this.picker.open || this.tour.open) return;
+    if (this.help.open) {
+      this.help.close();
+      this.events.add("help", { open: false });
+    }
+    markTourSeen(this.session.rater.name);
+    this.events.add("tour_open", { how });
+    this.viewer.hold();
+    this.tour.show();
+    // from here until it closes, no time counts for the subject
+    this.watched();
+    this.refresh();
+  }
+
+  tourClosed(read) {
+    this.watched();
+    this.viewer.release();
+    this.events.add("tour_close", read);
     this.refresh();
   }
 
@@ -320,9 +397,18 @@ class RatePage {
     if (!this.bar) return;
     const rating = this.rating;
     const rated = Boolean(this.assignment);
-    this.bar.update(rating, this.counts(), this.activeClass);
     const blocked = rated ? this.blocked() : [];
-    this.submitButton.disabled = !rated || this.busy || blocked.length > 0;
+    // a refusal stands until what it named is there, or the subject changes
+    if (!blocked.length) this.refused = false;
+    const lacking = this.refused
+      ? rowsLacking(this.session.protocol, rating, this.counts(), this.session.require_marks)
+      : {};
+    this.bar.update(rating, this.counts(), this.activeClass, lacking);
+    // a blocked submit is not disabled: pressing it says what is missing
+    this.submitButton.disabled = !rated || this.busy;
+    this.submitButton.setAttribute("aria-disabled", String(!rated || this.busy || blocked.length > 0));
+    this.skipButton.disabled = !rated || this.busy;
+    this.showRefusal(blocked, lacking);
     const unratable = byId("unratable");
     unratable.setAttribute("aria-pressed", String(Boolean(rating.unratable)));
     byId("unratable-reason").textContent = rating.unratable ? `: ${rating.unratable}` : "";
@@ -341,7 +427,8 @@ class RatePage {
     }
     this.hint.textContent = text;
     this.hint.dataset.kind = this.notice ? "notice" : blocked.length ? "blocked" : "ready";
-    // what is entered for a new subject survives a reload, and a look back at the last one
+    // what is entered for a subject without a rating survives a reload, a look back at the
+    // last one, and a skip
     if (rated && !this.busy && !this.assignment.previous) {
       writeDraft({
         assignment_id: this.assignment.assignment_id,
@@ -351,8 +438,64 @@ class RatePage {
     }
   }
 
+  // Why Enter was refused, beside the submit button, and how to leave the subject without
+  // a rating. Hidden unless Enter was refused and the rating is still held back.
+  showRefusal(blocked, lacking) {
+    const box = this.refusal;
+    if (!this.refused || !blocked.length) {
+      box.hidden = true;
+      box.replaceChildren();
+      return;
+    }
+    const keys = (type) => keysFor(this.keys, (action) => action.type === type);
+    const kbd = (names) => names.flatMap((name, at) => [at ? " " : "", html("kbd", "", name)]);
+    const noValue = Object.keys(lacking).filter((id) => lacking[id] === "value");
+    const noMark = Object.keys(lacking).filter((id) => lacking[id] === "mark");
+    const reasons = html("ul", "refusal-reasons");
+    const reason = (...parts) => {
+      const item = html("li");
+      item.append(...parts);
+      reasons.append(item);
+    };
+    if (noValue.length) {
+      reason(
+        `${words(noValue)} ${noValue.length > 1 ? "have" : "has"} no value yet. Give ` +
+          `${noValue.length > 1 ? "each" : "it"} a value, or press `,
+        ...kbd(keys("unratable")),
+        " if the subject cannot be rated.",
+      );
+    }
+    if (noMark.length) {
+      reason(
+        `${words(noMark)} ${noMark.length > 1 ? "have" : "has"} no mark yet. Click on the ` +
+          "error in one of the views.",
+      );
+    }
+    if (this.rating.other && !this.rating.note.trim()) {
+      reason("The other problem needs a note: press ", ...kbd(keys("note")), ".");
+    }
+    const skip = html("p", "refusal-skip");
+    skip.append(
+      "To leave this subject for later, press ",
+      ...kbd(keys("skip")),
+      ": it comes back after the others, and nothing is stored.",
+    );
+    box.replaceChildren(html("strong", "refusal-title", "Not submitted."), reasons, skip);
+    box.hidden = false;
+    this.pointRefusal();
+  }
+
+  // The arrow of the refusal points at the submit button, wherever the window puts it.
+  pointRefusal() {
+    if (this.refusal.hidden) return;
+    const button = this.submitButton.getBoundingClientRect();
+    const box = this.refusal.getBoundingClientRect();
+    const at = button.left + button.width / 2 - box.left;
+    this.refusal.style.setProperty("--arrow", `${Math.max(16, Math.min(box.width - 16, at))}px`);
+  }
+
   clicked(click) {
-    if (!this.assignment || this.busy) return;
+    if (!this.assignment || this.busy || this.tour.open) return;
     this.viewer.pause();
     const hit = click.target.closest ? click.target.closest(".mark") : null;
     if (hit) {
@@ -381,6 +524,8 @@ class RatePage {
     const viewer = this.viewer;
     switch (action.type) {
       case "help":
+        // the tour is about the subject on screen: without one the help screen cannot open it
+        this.help.allowTour(Boolean(this.assignment) && !this.busy);
         this.events.add("help", { open: this.help.toggle() });
         return;
       case "reason":
@@ -401,9 +546,18 @@ class RatePage {
       case "back":
         this.back();
         return;
+      case "tour":
+        this.openTour(this.help.open ? "help" : "key");
+        return;
+      case "tour_step":
+        this.tour.step(action.by);
+        return;
+      case "tour_close":
+        this.tour.close();
+        return;
       default:
     }
-    if (!this.assignment || this.busy) return;
+    if (!this.assignment || this.busy || this.tour.open) return;
     switch (action.type) {
       case "toggle_play":
         viewer.toggle();
@@ -471,6 +625,9 @@ class RatePage {
       case "submit":
         this.submit();
         break;
+      case "skip":
+        this.skip();
+        break;
       default:
     }
   }
@@ -499,10 +656,8 @@ class RatePage {
 
   async submit() {
     if (!this.assignment || this.busy) return;
-    const blocked = this.blocked();
-    if (blocked.length) {
-      this.notice = `Not submitted: ${blocked.join(" · ")}`;
-      this.refresh();
+    if (this.blocked().length) {
+      this.refuse();
       return;
     }
     const assignment = this.assignment;
@@ -548,6 +703,65 @@ class RatePage {
     }
   }
 
+  // Enter was pressed and the rating is not complete: say so where it cannot be missed.
+  refuse() {
+    this.refused = true;
+    this.notice = "";
+    this.refresh();
+    // again at every refused Enter, so that a second press is answered too
+    this.refusal.classList.remove("refusal-again");
+    void this.refusal.offsetWidth;
+    this.refusal.classList.add("refusal-again");
+    this.refusal.scrollIntoView({ block: "nearest" });
+  }
+
+  // Leave the subject without a rating. One without a submission is skipped on the server:
+  // it comes back after the others, and what was entered stays here as its draft. One
+  // that is shown again for revision keeps the rating it has.
+  async skip() {
+    if (!this.assignment || this.busy) return;
+    const assignment = this.assignment;
+    if (assignment.previous) {
+      await this.again("Left as it was: the earlier rating stands.");
+      return;
+    }
+    const body = skipBody(assignment, this.msOnSubject(), new Date().toISOString());
+    this.busy = true;
+    this.notice = "";
+    this.viewer.pause();
+    this.setState("saving");
+    this.refresh();
+    this.events.closeFrames();
+    await this.events.flush().catch(() => {});
+    let next;
+    try {
+      next = await api.skipAssignment(body, { onRetry: (n) => this.retrying(n, "skipped") });
+    } catch (failure) {
+      this.busy = false;
+      if (!(failure instanceof api.ApiError)) {
+        this.fail(`The skip could not be sent: ${failure.message}. Reload the page.`);
+        return;
+      }
+      // 409, 403, 404: the page is behind the server
+      await this.again(`Not skipped (${failure.message}). The subject was loaded again.`);
+      return;
+    }
+    this.busy = false;
+    try {
+      await this.take(next);
+    } catch (failure) {
+      this.fail(`The next subject could not be fetched: ${failure.message}. Reload the page.`);
+      return;
+    }
+    if (!this.assignment) return;
+    const back = keysFor(this.keys, (action) => action.type === "back").join(" ");
+    this.notice =
+      this.assignment.assignment_id === assignment.assignment_id
+        ? "No other subject is left, so this one is here again. Rate it to finish."
+        : `Skipped: nothing was stored, and that subject comes back later. ${back} returns to it now.`;
+    this.refresh();
+  }
+
   // Fetch the session and the next subject again.
   async again(notice) {
     try {
@@ -582,8 +796,10 @@ class RatePage {
     this.events.add("back", {});
     this.notice = "";
     await this.take(next);
-    this.notice =
-      "This subject was rated before: change what is wrong, then Enter stores it again.";
+    if (!this.assignment) return;
+    this.notice = this.assignment.previous
+      ? "This subject was rated before: change what is wrong, then Enter stores it again."
+      : "This subject was skipped: rate it now, or skip it again.";
     this.refresh();
   }
 }

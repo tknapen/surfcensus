@@ -54,11 +54,14 @@ FIXED_KEYS: tuple[str, ...] = (
     "o",
     "n",
     "Enter",
+    "k",
     "Backspace",
     "?",
+    "t",
 )
 """The keys of the keyboard map of docs/rater_app.md that no protocol can move, as
-``KeyboardEvent.key`` gives them. The keys of a protocol must differ from all of them."""
+``KeyboardEvent.key`` gives them. The keys of a protocol must differ from all of them.
+``k`` skips the subject on screen, ``t`` opens the tour of the rating screen."""
 
 
 class ScaleLevel(_Frozen):

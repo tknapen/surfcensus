@@ -74,6 +74,9 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "ReviewQuery": None,
         "MEDIA_FILE": None,
         "EVENT_TYPES": None,
+        "SKIP_EVENT": None,
+        "SERVER_EVENT_TYPES": None,
+        "SkipIn": None,
         "render_out": ("info",),
         "media_base": ("subject_uid", "base_url"),
         "tile_name": ("pattern", "panel", "index"),
@@ -114,10 +117,12 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "calibration_sha256",
             "now",
         ),
+        "record_skip": ("session", "assignment", "skip", "now"),
     },
     "surfcensus.app.queue": {
         "QueuePlan": None,
         "Next": None,
+        "SkipRefused": None,
         "build_plan": (
             "public",
             "scores",
@@ -129,6 +134,10 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "next_assignment": ("session", "rater", "plan"),
         "previous_assignment": ("session", "rater"),
         "has_work_left": ("session", "rater", "plan"),
+        "is_open_for": ("rater", "assignment", "plan"),
+        "skip_assignment": ("session", "rater", "assignment", "skip", "plan", "now"),
+        "subjects_left": ("session", "rater", "plan"),
+        "subjects_skipped": ("session", "rater", "plan", "shown"),
     },
     "surfcensus.app.finalize": {
         "FinalizeReport": None,
@@ -199,6 +208,8 @@ COLUMNS: dict[str, tuple[str, ...]] = {
         "assigned_at",
         "completed_at",
         "consensus_served_at",
+        "skipped_at",
+        "skip_count",
     ),
     "submissions": (
         "submission_id",

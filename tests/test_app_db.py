@@ -1,8 +1,9 @@
-"""Tests of surfcensus/app/db.py: opening ``app.sqlite``, its schema version, and the two
-writes that more than one module makes (a rater, a submission)."""
+"""Tests of surfcensus/app/db.py: opening ``app.sqlite``, its schema version, and the
+writes that more than one module makes (a rater, a submission, a skip)."""
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import subprocess
@@ -26,10 +27,11 @@ from surfcensus.app.db import (
     app_db_path,
     get_or_create_rater,
     open_app_db,
+    record_skip,
     store_submission,
 )
-from surfcensus.app.models import Assignment, Mark, Rater, Rating, Submission
-from surfcensus.app.schemas import RatingIn, ResolvedMark
+from surfcensus.app.models import Assignment, Event, Mark, Rater, Rating, Submission
+from surfcensus.app.schemas import RatingIn, ResolvedMark, SkipIn
 from surfcensus.config import ConfigError
 from surfcensus.store import CATALOG_FILE, PublicCatalog
 
@@ -1200,3 +1202,140 @@ def test_a_value_outside_the_tables_vocabulary_stores_nothing_of_the_rating(
     for table in ("submissions", "ratings", "marks"):
         assert read(tmp_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
     assert read(tmp_path, "SELECT completed_at FROM assignments") == [(None,)]
+
+
+# --- skips ----------------------------------------------------------------------------------------
+
+
+def skip_of(
+    assignment: Assignment, client_ts: str = "2026-11-13T09:59:58.500Z", ms: int = 4200
+) -> SkipIn:
+    assert assignment.assignment_id is not None
+    return SkipIn(assignment_id=assignment.assignment_id, client_ts=client_ts, ms_on_subject=ms)
+
+
+def test_a_new_assignment_was_never_skipped(session: Session, tmp_path: Path) -> None:
+    assignment = new_assignment(session)
+    assert (assignment.skipped_at, assignment.skip_count) == (None, 0)
+    session.commit()
+    # also a row that a program wrote without naming the columns
+    connection = sqlite3.connect(app_db_path(tmp_path))
+    connection.execute(
+        "INSERT INTO assignments (rater_id, subject_uid, kind, seq, render_key, assigned_at) "
+        "VALUES (1, ?, 'main', 2, ?, ?)",
+        (UID, KEY, T1),
+    )
+    connection.commit()
+    connection.close()
+    assert read(tmp_path, "SELECT seq, skipped_at, skip_count FROM assignments ORDER BY seq") == [
+        (1, None, 0),
+        (2, None, 0),
+    ]
+
+
+def test_a_skip_is_counted_on_the_assignment_and_stored_as_an_event(
+    session: Session, tmp_path: Path
+) -> None:
+    assignment = new_assignment(session)
+    assert record_skip(session, assignment, skip_of(assignment), now=T2) is True
+    assert (assignment.skipped_at, assignment.skip_count) == (T2, 1)
+    # the assignment stays open, and nothing of a rating is stored
+    assert assignment.completed_at is None
+    session.commit()
+    for table in ("submissions", "ratings", "marks", "final_labels", "final_marks"):
+        assert read(tmp_path, f"SELECT COUNT(*) FROM {table}") == [(0,)]
+    assert read(tmp_path, "SELECT skipped_at, skip_count, completed_at FROM assignments") == [
+        (T2, 1, None)
+    ]
+    rows = read(tmp_path, "SELECT assignment_id, ts, type, payload_json FROM events")
+    assert len(rows) == 1
+    assignment_id, ts, kind, payload = rows[0]
+    # the event has the client's time, like every event of a page, and the server's in it
+    assert (assignment_id, ts, kind) == (
+        assignment.assignment_id,
+        "2026-11-13T09:59:58.500Z",
+        "skip",
+    )
+    assert payload == '{"ms_on_subject":4200,"n":1,"server_ts":"2026-11-13T10:00:02.000Z"}'
+
+    # a second skip, later: the latest time, both events
+    assert record_skip(
+        session, assignment, skip_of(assignment, "2026-11-13T10:02:00.000Z", 900), now=T3
+    )
+    assert (assignment.skipped_at, assignment.skip_count) == (T3, 2)
+    session.commit()
+    payloads = [json.loads(row[0]) for row in read(tmp_path, "SELECT payload_json FROM events")]
+    assert [(payload["n"], payload["ms_on_subject"]) for payload in payloads] == [
+        (1, 4200),
+        (2, 900),
+    ]
+
+
+def test_a_skip_that_is_sent_again_is_recorded_once(session: Session, tmp_path: Path) -> None:
+    assignment = new_assignment(session)
+    skip = skip_of(assignment)
+    assert record_skip(session, assignment, skip, now=T2) is True
+    for later in (T3, T3):
+        assert record_skip(session, assignment, skip, now=later) is False
+    assert (assignment.skipped_at, assignment.skip_count) == (T2, 1)
+    session.commit()
+    assert read(tmp_path, "SELECT COUNT(*) FROM events") == [(1,)]
+    # the same moment on another assignment is another skip
+    other = new_assignment(session, seq=2)
+    assert record_skip(session, other, skip_of(other), now=T3) is True
+    # and an event of the page with that time is no skip
+    session.add(
+        Event(assignment_id=other.assignment_id, ts="2026-11-13T10:05:00.000Z", type="pause")
+    )
+    session.flush()
+    assert record_skip(session, other, skip_of(other, "2026-11-13T10:05:00.000Z"), now=T3) is True
+    assert other.skip_count == 2
+
+
+def test_the_time_of_a_skip_is_the_present_unless_given(session: Session) -> None:
+    assignment = new_assignment(session)
+    before = db.utc_now()
+    record_skip(session, assignment, skip_of(assignment))
+    assert assignment.skipped_at is not None
+    assert before <= assignment.skipped_at <= db.utc_now()
+
+
+def test_a_skip_that_does_not_fit_its_assignment_stores_nothing(
+    session: Session, tmp_path: Path, api_examples: dict[str, Any]
+) -> None:
+    assignment = new_assignment(session)
+    rated = new_assignment(session, seq=2)
+    stored(session, rated, rating_of(api_examples["rating_in"], rated), [resolved()], now=T1)
+    session.commit()
+    unsaved = Assignment(rater_id=1, subject_uid=UID, seq=3, render_key=KEY, assigned_at=T1)
+    elsewhere = SkipIn(assignment_id=99, client_ts=T1, ms_on_subject=0)
+    cases = [
+        (unsaved, skip_of(assignment), "no id yet"),
+        (assignment, elsewhere, "99"),
+        # a subject that has a rating cannot be skipped any more
+        (rated, skip_of(rated), "has a submission"),
+    ]
+    for target, skip, message in cases:
+        with pytest.raises(ValueError, match=message):
+            record_skip(session, target, skip, now=T3)
+    session.commit()
+    assert read(tmp_path, "SELECT COUNT(*) FROM events") == [(0,)]
+    assert read(tmp_path, "SELECT skipped_at, skip_count FROM assignments") == [(None, 0)] * 2
+
+
+def test_a_rating_after_a_skip_leaves_the_skip_recorded(
+    session: Session, tmp_path: Path, api_examples: dict[str, Any]
+) -> None:
+    assignment = new_assignment(session)
+    record_skip(session, assignment, skip_of(assignment), now=T2)
+    rating = rating_of(api_examples["rating_in"], assignment, ms_on_subject=1500)
+    submission, _ = stored(session, assignment, rating, [resolved()], now=T3)
+    session.commit()
+    assert read(tmp_path, "SELECT skipped_at, skip_count, completed_at FROM assignments") == [
+        (T2, 1, T3)
+    ]
+    # the time of the submission is of the visit that ended with it; the earlier visit is
+    # in the event of the skip
+    assert submission.revision == 1 and submission.ms_on_subject == 1500
+    (payload,) = read(tmp_path, "SELECT payload_json FROM events WHERE type = 'skip'")
+    assert json.loads(payload[0])["ms_on_subject"] == 4200

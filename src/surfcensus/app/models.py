@@ -55,7 +55,8 @@ class Rater(SQLModel, table=True):
 
 
 class Assignment(SQLModel, table=True):
-    """A subject given to a rater. Open until ``completed_at`` is set."""
+    """A subject given to a rater. Open until ``completed_at`` is set; a skip leaves it
+    open."""
 
     __tablename__ = "assignments"
     __table_args__ = (UniqueConstraint("rater_id", "seq"), _one_of("kind", ASSIGNMENT_KINDS))
@@ -73,6 +74,14 @@ class Assignment(SQLModel, table=True):
     """When the first submission was stored; a revision leaves it."""
     consensus_served_at: str | None = None
     """Calibration: when the rater was shown the consensus, after which the rating is final."""
+    skipped_at: str | None = None
+    """When the rater last skipped the subject (server time); None when it was never
+    skipped. A skipped assignment stays open and is offered again (``app.queue``)."""
+    skip_count: int = Field(
+        default=0, sa_column=Column(Integer, nullable=False, server_default=text("0"))
+    )
+    """How many times the rater skipped it. Each skip is also an event of type ``skip``
+    (``app.db.record_skip``)."""
 
 
 class Submission(SQLModel, table=True):

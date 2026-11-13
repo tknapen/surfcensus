@@ -15,6 +15,11 @@ What the functions agree on:
   assignment of it, the one made last (``seq``), whatever render it shows. Calibration and
   repeat assignments are no ratings. The queue offers a subject again when its render
   changed, so once a rater has nothing left the latest rating is of the present render.
+- An assignment without a submission is no rating, completed or not. A skip stores no
+  submission and leaves the assignment open, so a subject that a rater skipped has, from
+  that rater, what the rater said of it before (on an earlier render), or nothing. A
+  subject that no rater has said anything about has no label from a rating, and gets
+  the label of a failed render like any other.
 - A subject with a label of method ``adjudicated`` belongs to the adjudicator: none of its
   labels and none of its final marks is written, changed or removed here.
 - The label that says why a render failed is for a subject that nobody rated. A subject
@@ -405,6 +410,26 @@ def _drop_per_submission(session: Session) -> None:
             session.delete(mark)
 
 
+def _drop_stale_consensus(session: Session, subject_uid: str, protocol: Protocol) -> None:
+    """Remove the ``consensus`` labels of a subject, and its final marks, when its ratings
+    no longer give them: a rater revised a rating after :func:`finalize`."""
+    labels, marks = _final_rows(session, subject_uid)
+    have, have_marks = labels.get(subject_uid, []), marks.get(subject_uid, [])
+    if _adjudicated(have) or not any(label.method == CONSENSUS for label in have):
+        return
+    rated = _ratings(session, subject_uid).get(subject_uid, [])
+    try:
+        agreed = _consensus(rated, protocol, subject_uid) if len(rated) > 1 else None
+    except ConfigError as exc:
+        get_logger().warning("the final label of %s is left as it is: %s", subject_uid, exc.detail)
+        return
+    if agreed is not None:
+        now = {label.criterion: (label.value, label.method) for label in have}
+        if (now, [_mark_row(mark) for mark in have_marks]) == (agreed[0], list(agreed[1])):
+            return
+    _set_final(session, subject_uid, {}, (), have, have_marks)
+
+
 def record_single(session: Session, subject_uid: str, protocol: Protocol) -> None:
     """What a submission does to the final tables, called in the transaction that stores it.
 
@@ -418,8 +443,10 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     A row of method ``single`` comes from a rating when its subject has one; the label of
     a subject that nobody rated says why its render failed and stays. With more than one
     rater this also removes the ``single`` rows that :func:`finalize` wrote for subjects
-    with one rating, and leaves its ``consensus`` rows: after a submission the labels are
-    those of ``finalize`` no longer, and it has to run again.
+    with one rating. Its ``consensus`` rows stay, but for those of ``subject_uid`` when
+    the subject's ratings no longer give them (a rating of it was revised): a label that
+    the ratings contradict is not left for review and export to read. Either way the
+    labels are those of ``finalize`` no longer after a submission, and it has to run again.
 
     Never raises for what an earlier rating holds. The rating that gives the label need not
     be the one that was just stored (a repeat of the subject was submitted, say), and it
@@ -430,6 +457,7 @@ def record_single(session: Session, subject_uid: str, protocol: Protocol) -> Non
     n_raters = session.exec(select(func.count()).select_from(Rater)).one()
     if n_raters > 1:
         _drop_per_submission(session)
+        _drop_stale_consensus(session, subject_uid, protocol)
         session.flush()
         return
     ratings = _ratings(session, subject_uid).get(subject_uid)

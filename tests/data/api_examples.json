@@ -27,7 +27,7 @@
     "render_key": "0a1b2c3d4e5f6a7b", "n_slices": {"sagittal": 7, "coronal": 6, "axial": 7},
     "tiles": {"gray": "tiles/{panel}_{index:03d}.webp", "contours": "tiles/{panel}_{index:03d}_c.webp"}}
   ],
-  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "rendered": 120, "n_subjects": 150}
+  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "skipped": 1, "rendered": 120, "n_subjects": 150}
  },
  "next_revision": {
   "status": "assignment",
@@ -46,15 +46,33 @@
    }
   },
   "prefetch": [],
-  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "rendered": 120, "n_subjects": 150}
+  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "skipped": 1, "rendered": 120, "n_subjects": 150}
  },
  "next_rendering": {
   "status": "rendering", "retry_after_s": 2,
-  "progress": {"done_today": 0, "done_total": 0, "remaining": 150, "rendered": 0, "n_subjects": 150}
+  "progress": {"done_today": 0, "done_total": 0, "remaining": 150, "skipped": 0, "rendered": 0, "n_subjects": 150}
  },
  "next_done": {
   "status": "done",
-  "progress": {"done_today": 12, "done_total": 150, "remaining": 0, "rendered": 150, "n_subjects": 150}
+  "progress": {"done_today": 12, "done_total": 150, "remaining": 0, "skipped": 0, "rendered": 150, "n_subjects": 150}
+ },
+ "skip_in": {"assignment_id": 12, "client_ts": "2026-11-12T14:03:22.120Z", "ms_on_subject": 9400},
+ "next_after_skip": {
+  "status": "assignment",
+  "assignment": {
+   "assignment_id": 13, "kind": "main", "subject_uid": "9b2e41c07d2e4b8a",
+   "media_base": "/media/9b2e41c07d2e4b8a/", "render_key": "0a1b2c3d4e5f6a7b",
+   "render": "@render_small.json", "has_vertex_map": true, "previous": null
+  },
+  "prefetch": [
+   {"subject_uid": "3f9a1c07d2e4b8a1", "media_base": "/media/3f9a1c07d2e4b8a1/",
+    "render_key": "5d0c1f2a9b7e4c31", "n_slices": {"sagittal": 7, "coronal": 6, "axial": 7},
+    "tiles": {"gray": "tiles/{panel}_{index:03d}.webp", "contours": "tiles/{panel}_{index:03d}_c.webp"}}
+  ],
+  "progress": {"done_today": 3, "done_total": 40, "remaining": 110, "skipped": 2, "rendered": 120, "n_subjects": 150}
+ },
+ "errors_409_skip": {
+  "errors": [{"field": "assignment_id", "message": "the assignment has a rating and cannot be skipped"}]
  },
  "rating_in": {
   "assignment_id": 12, "protocol_version": "0.1-draft",
@@ -81,7 +99,7 @@
   },
   "next": {
    "status": "done",
-   "progress": {"done_today": 4, "done_total": 41, "remaining": 0, "rendered": 41, "n_subjects": 41}
+   "progress": {"done_today": 4, "done_total": 41, "remaining": 0, "skipped": 0, "rendered": 41, "n_subjects": 41}
   }
  },
  "events_in": {

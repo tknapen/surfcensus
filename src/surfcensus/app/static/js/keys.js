@@ -21,10 +21,29 @@ export const FIXED_ACTIONS = {
   o: { type: "other" },
   n: { type: "note" },
   Enter: { type: "submit" },
+  k: { type: "skip" },
   Backspace: { type: "back" },
   "?": { type: "help" },
+  t: { type: "tour" },
   Escape: { type: "escape" },
 };
+
+// How a key is written on the screen.
+const KEY_LABELS = { " ": "Space", ArrowLeft: "←", ArrowRight: "→", Escape: "Esc" };
+
+export function keyLabel(key) {
+  return KEY_LABELS[key] ?? key;
+}
+
+// The keys of a key map whose action passes `test`, as they are written on the screen, in
+// the order of the map: the fixed keys first, then those of the protocol.
+export function keysFor(map, test) {
+  const found = [];
+  for (const [key, action] of map) {
+    if (test(action)) found.push(keyLabel(key));
+  }
+  return found;
+}
 
 // The keys of the viewer alone, for a page that shows subjects without rating them.
 export const VIEWER_KEYS = [" ", "ArrowLeft", "ArrowRight", "[", "]", "m", "z", "h", "s", "Escape"];
@@ -59,15 +78,24 @@ export function buildKeyMap(protocol = null, only = null) {
 
 // What a key press does, or null when the page leaves it to the browser. `context` is
 // {text, dialog}: `text` is true while a text field has the focus, `dialog` is null,
-// "help" or "unratable".
+// "help", "unratable" or "tour".
 export function keyAction(event, map, context) {
   const key = normalKey(event.key);
+  if (context.dialog === "tour") {
+    // the tour takes its own keys and lets no other through to the rating screen
+    if (event.ctrlKey || event.metaKey || event.altKey) return null;
+    if (key === "Enter" || key === "ArrowRight") return { type: "tour_step", by: 1 };
+    if (key === "ArrowLeft") return { type: "tour_step", by: -1 };
+    if (key === "Escape" || key === "t") return { type: "tour_close" };
+    return null;
+  }
   if (context.text) return key === "Escape" ? { type: "escape" } : null;
   if ((event.ctrlKey || event.metaKey) && !event.altKey && !event.shiftKey && key === "z") {
     return context.dialog ? null : { type: "undo_mark" };
   }
   if (event.ctrlKey || event.metaKey || event.altKey) return null;
   if (context.dialog === "help") {
+    if (key === "t") return { type: "tour" };
     return key === "Escape" || key === "?" ? { type: "help" } : null;
   }
   if (context.dialog === "unratable") {
