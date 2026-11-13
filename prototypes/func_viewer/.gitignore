@@ -1,0 +1,35 @@
+# Nothing that the scripts download or write belongs in the repository (README.md, "Rules that
+# bind this work"): EPI is not defaced, and listings and tables name datasets. The scripts take
+# their directories as arguments and the README puts them outside the repository; these patterns
+# are for the case that one is put inside this folder all the same. The folder itself holds
+# Python and shell scripts, README.md and REPORT.md only.
+
+# images and videos
+*.mp4
+*.png
+*.webp
+*.gif
+*.jpg
+
+# volumes, surfaces and arrays
+*.nii
+*.nii.gz
+*.mgz
+*.mgh
+*.gii
+*.npy
+*.npz
+*.part
+
+# listings, tables, logs and other text results
+*.json
+*.jsonl
+*.csv
+*.tsv
+*.txt
+*.toml
+*.html
+*.log
+
+# FreeSurfer and BIDS subject folders (surface files have no extension)
+sub-*/

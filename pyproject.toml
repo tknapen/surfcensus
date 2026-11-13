@@ -46,6 +46,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/surfcensus"]
 
+# prototypes/ holds research scripts kept beside the package (its README says what they are).
+# The wheel never had them; this keeps them out of the sdist as well.
+[tool.hatch.build.targets.sdist]
+exclude = ["/prototypes"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-m 'not network and not browser'"
@@ -65,3 +70,10 @@ ignore = ["F722"]
 
 [tool.ruff.lint.flake8-bugbear]
 extend-immutable-calls = ["typer.Option", "typer.Argument"]
+
+# Without this table pyrefly checks every Python file under the root with its "basic" preset.
+# The table names that preset, so the package and the tests are checked as before, and leaves
+# out prototypes/, whose scripts are run by path and import their siblings.
+[tool.pyrefly]
+preset = "basic"
+project-excludes = ["prototypes"]
