@@ -37,8 +37,8 @@ Where a pack lives::
         pre/ref.bin pre/mean.bin pre/sd.bin pre/c0000.bin ...
         traces.json                      framewise displacement, DVARS, non-steady-state volumes
 
-``<out>`` is ``epi/`` of a run directory from step 2, and the ``--out`` directory of
-``surfcensus epi-session`` in step 1. ``session.json`` and ``pack.json`` are never served as
+``<out>`` is ``epi/<participant_uid>/`` of a run directory from step 2, and the ``--out``
+directory of ``surfcensus epi-session`` in step 1. ``session.json`` and ``pack.json`` are never served as
 files; the page receives a shape built from them.
 """
 

@@ -946,3 +946,101 @@ def tree_bytes(root: Path) -> int:
     return sum(
         p.lstat().st_size for p in Path(root).rglob("*") if p.is_file() and not p.is_symlink()
     )
+
+
+# --- step 2: one folder that ``surfcensus review`` prepares for both interfaces --------------
+
+
+@dataclass(frozen=True)
+class FuncCounts:
+    """What the functional inventory of a run should find in a dataset of :data:`DESIGN`,
+    counted from the design (work package E2.0, for E2.B, E2.C and E2.Z)."""
+
+    participants: tuple[str, ...]
+    sessions: tuple[tuple[str, str | None], ...]
+    """``(participant, session)`` in stream order: participants by label, then no session
+    first, then the labels with numbers compared as numbers."""
+    runs: int
+    packable: int
+    """Runs without a reason in the design: what the pack phase packs."""
+    reasons: Mapping[str, int]
+    """Reason -> how many runs the design gives it."""
+    fs_subjects: tuple[str, ...]
+    """The FreeSurfer subjects the surface side reviews (inventory, metrics, render)."""
+
+
+def _session_sort(key: tuple[str, str | None]) -> tuple[str, int, tuple[int, str]]:
+    participant, session = key
+    if session is None:
+        return (participant, 0, (0, ""))
+    return (participant, 1, (int(session), "") if session.isdigit() else (1 << 30, session))
+
+
+def func_counts(dataset: SyntheticFuncDataset) -> FuncCounts:
+    """The counts of :class:`FuncCounts` for a dataset that :func:`write_review_folder` (or
+    :func:`write_func_dataset`) wrote."""
+    reasons: dict[str, int] = {}
+    for run in dataset.runs:
+        if run.design.reason is not None:
+            reasons[run.design.reason] = reasons.get(run.design.reason, 0) + 1
+    keys = sorted(
+        {(r.design.participant, r.design.session) for r in dataset.runs}, key=_session_sort
+    )
+    return FuncCounts(
+        participants=tuple(sorted({p for p, _ in keys})),
+        sessions=tuple(keys),
+        runs=len(dataset.runs),
+        packable=sum(1 for r in dataset.runs if r.packable),
+        reasons=reasons,
+        fs_subjects=tuple(sorted(dataset.subjects)),
+    )
+
+
+def write_review_folder(
+    root: Path,
+    *,
+    generation: Generation = "scanner-T1w",
+    without_fs: Sequence[str] = (),
+    annex: Kind | None = None,
+) -> SyntheticFuncDataset:
+    """A BIDS dataset root at ``<root>/ds`` that holds both kinds of data, for ``review`` on one
+    folder with both interfaces (step 2's exit check, E2.Z): the raw functional series, the
+    fMRIPrep derivative at ``derivatives/fmriprep`` and, in its ``sourcedata/freesurfer``, the
+    FreeSurfer subjects ``sub-01`` and ``sub-02`` that the surface side inventories, scores
+    (ranked as decision D16 says: no fsaverage, two subjects) and renders.
+
+    ``without_fs`` removes FreeSurfer subjects after writing, for a participant whose sessions
+    have no contours and no surface rating (``("sub-02",)``); the surface side then has one
+    subject. ``annex`` is that of :func:`write_func_dataset`.
+
+    Measured when this was written (one shared 4-core Linux machine, Python 3.13): writing
+    0.6 s; ``review(<root>/ds, serve=False)`` into a new run directory 9.6 s for the two
+    FreeSurfer subjects (the default render at 320 px, without video, one process), of which
+    rendering is most; ``func.api.epi_subject`` packs ``sub-01`` (two sessions) in 0.9 s and
+    ``sub-02`` (one session) in 0.5 s. The two FreeSurfer subjects are copies of one
+    ellipsoid subject (``sub-02`` is ``sub-01`` copied), so their renders differ only in
+    their ``subject_uid``.
+    """
+    dataset = write_func_dataset(root, generation=generation, annex=annex)
+    gone = set(without_fs)
+    unknown = gone - set(dataset.subjects)
+    if unknown:
+        raise ValueError(f"no FreeSurfer subject {', '.join(sorted(unknown))}")
+    for name in sorted(gone):
+        shutil.rmtree(dataset.fs_subjects_dir / name)
+    if not gone:
+        return dataset
+    kept = {name: s for name, s in dataset.subjects.items() if name not in gone}
+    return SyntheticFuncDataset(
+        root=dataset.root,
+        raw_root=dataset.raw_root,
+        deriv_root=dataset.deriv_root,
+        fs_subjects_dir=dataset.fs_subjects_dir,
+        generation=dataset.generation,
+        version=dataset.version,
+        runs=dataset.runs,
+        sessions=dataset.sessions,
+        subjects=kept,
+        placeholders=dataset.placeholders,
+        fsnative_files=dataset.fsnative_files,
+    )

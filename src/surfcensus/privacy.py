@@ -1,8 +1,10 @@
 """Keyed identifiers and the scrubbing of text (decision D10, docs/architecture.md).
 
 Nothing else in the package computes a dataset pseudonym, a ``subject_uid``, a
-``render_key`` or a cache name. All four are HMAC-SHA256 values: an unkeyed hash of an
-accession, or of the size and ETag of a public object, could be inverted by enumeration.
+``render_key`` or a cache name, nor, for the EPI interface in a run directory, a
+``participant_uid``, ``session_uid``, ``run_uid`` or ``pack_key``. All are HMAC-SHA256
+values: an unkeyed hash of an accession, or of the size and ETag of a public object, could
+be inverted by enumeration.
 
 Two secrets exist. The :class:`HashKey` of a run (the per-run salt of a local run, the
 dataset key of a census run) is hashed into pseudonyms and subject identifiers. The run
@@ -103,6 +105,77 @@ def render_key(run_secret: bytes, tile_hash: str, digests: Mapping[str, str]) ->
     """
     payload = canonical_json({"tiles": tile_hash, "inputs": dict(digests)})
     return _hmac_hex(run_secret, "render\x1f" + payload)[:16]
+
+
+def _func_message(prefix: str, *parts: str) -> str:
+    return prefix + "\x1f" + "\x1f".join(parts)
+
+
+def participant_uid(
+    key: HashKey, source: str, identity: str, connector: str, participant: str
+) -> str:
+    """16 hex characters that name the functional stream of one participant (decision D38:
+    every session of a subject, one after the other): the unit of the EPI page and of its
+    routes (``/epi/<participant_uid>``) and the directory ``epi/<participant_uid>/``.
+
+    Keyed like :func:`subject_uid`. ``identity`` is the identity of the derivative
+    (``FuncSourceRecord.deriv_identity``), ``connector`` its pipeline (``fmriprep``),
+    ``participant`` the BIDS label (``sub-01``). A participant is keyed the same whether or not
+    it has a FreeSurfer subject, so a participant without one has an identifier as well.
+    """
+    return _hmac_hex(
+        key.secret, _func_message("func-participant", source, identity, connector, participant)
+    )[:16]
+
+
+def session_uid(
+    key: HashKey,
+    source: str,
+    identity: str,
+    connector: str,
+    participant: str,
+    session: str | None,
+) -> str:
+    """16 hex characters that name one functional session: the unit of the one registration
+    (decision D36) and of the pack phase, and the directory
+    ``epi/<participant_uid>/<session_uid>/``. ``session`` is the ``ses-`` label without
+    ``ses-``, None in a dataset without sessions (hashed as the empty string)."""
+    return _hmac_hex(
+        key.secret,
+        _func_message("func-session", source, identity, connector, participant, session or ""),
+    )[:16]
+
+
+def run_uid(
+    key: HashKey,
+    source: str,
+    identity: str,
+    connector: str,
+    participant: str,
+    session: str | None,
+    run_key: str,
+) -> str:
+    """16 hex characters that name one functional run. ``run_key`` is ``func.bids.run_key``:
+    the entities of the run without the subject and the echo, the run index as a number, so
+    ``run-01`` and ``run-1`` give one identifier and the echoes of a multi-echo acquisition
+    are one run, as in step 1."""
+    return _hmac_hex(
+        key.secret,
+        _func_message("func-run", source, identity, connector, participant, session or "", run_key),
+    )[:16]
+
+
+def pack_key(run_secret: bytes, pack_hash: str, digests: Mapping[str, str]) -> str:
+    """16 hex characters that say which pack a page showed or a judgement was made on, the
+    counterpart of :func:`render_key`.
+
+    ``pack_hash`` is ``EpiConfig.pack_hash()`` and ``digests`` maps ``<base>:<role>`` of every
+    input of the pack (``PackInfo.inputs``: the run's files, the anchor's transform, the
+    fsnative transform, the FreeSurfer files of the contours) to its SHA-256. Keyed with the
+    run secret because the digests are those of public files (decision D20).
+    """
+    payload = canonical_json({"pack": pack_hash, "inputs": dict(digests)})
+    return _hmac_hex(run_secret, "pack\x1f" + payload)[:16]
 
 
 def cache_name(run_secret: bytes, bucket: str, key: str, etag: str) -> str:

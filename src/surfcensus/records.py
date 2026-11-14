@@ -16,12 +16,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from surfcensus.sources.base import FileRole, FuncRole, Hemi
+from surfcensus.sources.base import FileRef, FileRole, FuncRole, Hemi
 
 if TYPE_CHECKING:
     import pandas as pd
 
     from surfcensus.config import RunConfig
+    from surfcensus.func.model import PackInfo, SessionInfo
     from surfcensus.render.model import RenderInfo
     from surfcensus.store import PublicCatalog
 
@@ -164,6 +165,12 @@ class RunContext:
     """``render_key(tile_hash, digests)``: ``privacy.render_key`` with the run secret bound."""
     scrub: Callable[[str], str]
     """``privacy.scrub`` with this run's pseudonyms and roots."""
+    func_lease: Callable[[str], AbstractContextManager[SessionWork]] | None = None
+    """``func_lease(session_uid)``: the session made again from its files, with local paths,
+    while open (step 2 of the EPI interface; ``Run`` binds it). None where the run has no
+    functional source, and in a context made before step 2."""
+    pack_key: Callable[[str, Mapping[str, str]], str] | None = None
+    """``pack_key(pack_hash, digests)``: ``privacy.pack_key`` with the run secret bound."""
 
 
 # --- the EPI movie interface (docs/epi_interface.md) ----------------------------------------
@@ -615,3 +622,269 @@ class RunPackInput:
     ``xfm_anat_fsnative`` and the FreeSurfer files of the contours (``t1``, ``lh_white``,
     ``rh_white``, ``lh_pial``, ``rh_pial``). So a changed anchor or surface changes the pack's
     inputs and its content digest."""
+
+
+# --- step 2 of the EPI interface: the run directory (docs/epi_interface.md, "Step 2: the plan")
+#
+# Laid out by work package E2.0 before the catalog (E2.A), the functional inventory (E2.B), the
+# pack phase (E2.C) and the app in a run (E2.D) are written. The units are the participant
+# (the page: one continuous stream over all its sessions, decision D38), the session (the unit
+# of the one registration, decision D36, and of the pack phase) and the run (a row of
+# ``packs``).
+
+EPI_SESSION_PHASE = "epi_session"
+"""The phase of the ``work`` ledger whose unit is one functional session: its registration,
+frame check, contours, the packs of its runs and its ``session.json``. Its ``config_hash`` is
+``EpiConfig.session_hash()``; the runs have rows of their own in ``packs``."""
+
+FUNC_INVENTORY_PHASE = "func_inventory"
+"""The name of phase 2f in a :class:`PhaseReport` and in ``config.STAGE_SCHEMAS``. It has no
+ledger rows: its skip test is ``func_sessions.inventory_hash`` (decision D21), as the surface
+inventory's is ``subjects.inventory_hash``."""
+
+PACK_PHASE = "pack"
+"""The name of the pack phase in a :class:`PhaseReport` (``surfcensus pack``)."""
+
+
+def session_unit(session_uid: str) -> str:
+    """The unit of a session in the ``work`` ledger: ``session:<session_uid>``."""
+    return f"session:{session_uid}"
+
+
+RawFound = Literal["given", "dataset root", "sourcedata/raw"]
+"""How the raw dataset of a functional source was found (docs/epi_interface.md, "Which folders
+are found by rule"): ``--raw DIR``; the BIDS dataset whose ``derivatives/`` holds the
+derivative; ``sourcedata/raw/`` inside the derivative."""
+
+DerivFound = Literal["surface layout", "folder itself", "derivatives folder"]
+"""How the derivative was found (``func.discover.find_folders``): the fMRIPrep output that holds
+the FreeSurfer subjects the surface source found; the folder that was named; the first folder
+of ``derivatives/`` that a connector recognises."""
+
+
+def func_signature(
+    refs: Iterable[FuncFileRef],
+    freesurfer: Mapping[FileRole, FileRef] | None = None,
+    extra: Iterable[str] = (),
+) -> str:
+    """What a functional skip test compares: 16 hex characters that change when a listed file
+    does (decision D21), the counterpart of ``sources.base.input_signature``.
+
+    The SHA-256 of one line per functional file in the order given
+    (``f<TAB>base<TAB>role<TAB>location<TAB>size<TAB>etag_or_mtime``, with ``<TAB>variant`` for a
+    file that has one), then one line per FreeSurfer file in ``FileRole`` order
+    (``fs<TAB>role<TAB>location<TAB>size<TAB>etag_or_mtime[<TAB>variant]``), then one line per
+    ``extra`` string. Built from the listing alone, so deciding to skip opens no source file.
+    Private, like every input signature: it never leaves ``catalog.sqlite``. The caller puts
+    the refs in a fixed order (``FuncRole`` order within a run, runs in session order); the
+    function does not sort them, so that the anchor's transform can be told from the run's own.
+    """
+    lines = []
+    for ref in refs:
+        fields = ["f", ref.base, ref.role.value, ref.location, str(ref.size), ref.etag_or_mtime]
+        if ref.variant is not None:
+            fields.append(ref.variant)
+        lines.append("\t".join(fields))
+    fs = freesurfer or {}
+    for role in FileRole:
+        if role in fs:
+            item = fs[role]
+            fields = ["fs", role.value, item.location, str(item.size), item.etag_or_mtime]
+            if item.variant is not None:
+                fields.append(item.variant)
+            lines.append("\t".join(fields))
+    lines.extend(extra)
+    return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
+
+
+@dataclass(frozen=True)
+class FuncSourceRecord:
+    """The functional part of a dataset of a run: the derivative, the raw dataset, the
+    connector (a row of ``func_sources``). Private: roots and identity never leave the catalog
+    but as local paths inside a lease."""
+
+    connector: str
+    match: ConnectorMatch
+    deriv_root: str
+    """Absolute path of the derivative as found now."""
+    deriv_identity: str
+    """What is hashed into every ``participant_uid``, ``session_uid`` and ``run_uid``: the
+    resolved derivative root when the functional source was first stored, kept across
+    ``--relocate`` as a local identity is (decision D21). The raw root does not enter it."""
+    raw_root: str | None
+    """Absolute path of the raw dataset; None when none was found (runs: ``no raw series``)."""
+    deriv_found: DerivFound
+    raw_found: RawFound | None
+
+
+@dataclass(frozen=True)
+class FuncLeaseFacts:
+    """What the private side of a run knows of one session when the pack phase leases it
+    (``Catalog.func_lease_facts``): enough to list it again and plan it, by
+    ``func.inventory.session_work``. Private."""
+
+    source: FuncSourceRecord
+    participant_uid: str
+    session_uid: str
+    participant: str
+    session: str | None
+    run_ids: Mapping[str, str]
+    """Run key (``func.bids.run_key``) -> ``run_uid``, for every run of the session."""
+    fs_subjects_dir: str | None
+    fs_subject: str | None
+    """The FreeSurfer subject directory's name, or None (the session has no contours)."""
+    subject_uid: str | None
+    inventory_hash: str
+    """``func_sessions.inventory_hash`` as stored; the lease compares the listing with it and
+    raises ``SourceError("changed", ...)`` when they differ."""
+
+
+@dataclass(frozen=True)
+class ContourJob:
+    """What a pack worker needs to cut the contours of a session: the FreeSurfer subject
+    directory (a local path while the lease is open) and the point map from FreeSurfer's
+    scanner RAS to the anatomy's world (``Connector.anat_to_fsnative``)."""
+
+    fs_dir: Path
+    fs_subject: str
+    anat_to_fsnative: Matrix4
+
+
+@dataclass(frozen=True)
+class SessionWork:
+    """What the lease of a session hands a pack worker (``RunContext.func_lease``): the plan
+    made again from the leased files (the same listing as the inventory's, which the lease
+    checks), the inputs of every packable run, and the contour job. Local paths are valid
+    while the lease is open."""
+
+    session_uid: str
+    participant_uid: str
+    plan: SessionPlan
+    """Run ids are ``run_uid``s."""
+    inputs: tuple[RunPackInput, ...]
+    """For the runs of ``plan.runs`` without a reason whose inputs could be read."""
+    input_failures: Mapping[str, str]
+    """``run_uid`` -> the detail of a packable run whose inputs could not be read; it is
+    recorded as ``pack failure``."""
+    contours: ContourJob | None
+    contour_note: str
+    """What the command says of the contours: ``contours from sub-01`` or why there are none."""
+
+
+@dataclass(frozen=True)
+class SessionResult:
+    """What a pack worker returns for one session (``func.batch.pack_session_unit``)."""
+
+    session_uid: str
+    info: SessionInfo
+    """The ``session.json`` that was written."""
+    packs: Mapping[str, PackInfo]
+    """``run_uid`` -> the ``pack.json`` of every run that is packed now, kept or made."""
+    kept: tuple[str, ...]
+    """Runs whose pack was taken from disk because its ``packs`` row was current."""
+    failures: Mapping[str, tuple[str, str | None]]
+    """``run_uid`` -> reason and detail of a packable run whose pack failed (``pack failure``,
+    ``source changed``)."""
+    seconds: float
+
+
+@dataclass(frozen=True)
+class PackRow:
+    """A row of the ``packs`` table: the pack of one packable run, done or failed. A run that
+    cannot be packed has no row: its reason is ``func_runs.reason``."""
+
+    run_uid: str
+    session_uid: str
+    config_hash: str
+    """``EpiConfig.pack_hash()``."""
+    input_signature: str
+    """Private: ``PublicCatalog.pack_signature`` of the run when it was packed."""
+    status: Status
+    pack_key: str | None = None
+    """``privacy.pack_key``; None for a failed pack."""
+    reason: str | None = None
+    detail: str | None = None
+    """Private in a census run; scrubbed."""
+    path: str | None = None
+    """``epi/<participant_uid>/<session_uid>/<run_uid>``, relative to the run directory."""
+    n_volumes: int | None = None
+    bytes: int | None = None
+    """The compressed size of the pack's files."""
+    content_digest: str | None = None
+    """``PackInfo.content_digest``. Private: it covers the SHA-256 of the source files."""
+    anchor_run_uid: str | None = None
+    grid_key: str | None = None
+    packed_at: str | None = None
+    """UTC, ISO 8601. None in a row to be recorded: the catalog writes the current time."""
+
+
+@dataclass(frozen=True)
+class FuncRunRow:
+    """A functional run as phase 2f stores it (``Catalog.upsert_func_session``): what the
+    listing, the sidecars, the reports, the transforms and the headers say, and the place
+    the session's plan gives it. Private as a whole (``files``, ``entities``); the public view
+    ``public_func_runs`` leaves those out."""
+
+    run_uid: str
+    session_uid: str
+    run_key: str
+    name: str
+    """The BIDS name without the subject (``ses-1_task-rest_run-1``)."""
+    entities: RunEntities
+    session_order: int | None
+    """``SessionRunInfo.session_order``: the place among all runs of the session by the
+    anchor's rule; None when the session has no anchor."""
+    acquisition_order: int
+    """``SessionRunInfo.acquisition_order``: the place in the session's list (the packable
+    runs in acquisition order, then the others)."""
+    anchor: bool
+    selected: bool
+    """False: ``--epi-runs`` leaves it out (reason ``not selected``)."""
+    packable: bool
+    """No reason from the listing and the headers: the pack phase makes its pack."""
+    reason: str | None
+    detail: str | None
+    missing_roles: tuple[FuncRole, ...]
+    n_volumes: int | None
+    tr_s: float | None
+    echoes: int
+    display: Display
+    spaces: tuple[str, ...]
+    grid: Grid | None
+    """The display grid of a packable run; None otherwise."""
+    raw_affine: AffineChoice | None
+    reference_image: bool | None
+    rigid: bool | None
+    dof: int | None
+    corrections: Corrections | None
+    frame: FrameDisplacement | None
+    files: tuple[FuncFileRef, ...]
+    """Every listed file of the run (raw and derivative), in ``FuncRole`` order."""
+
+
+@dataclass(frozen=True)
+class FuncSessionRow:
+    """A functional session as phase 2f stores it, with its runs, in one transaction."""
+
+    session_uid: str
+    participant_uid: str
+    session: str | None
+    stream_order: int
+    """The place of the session in its participant's stream (``func.api.session_key``)."""
+    subject_uid: str | None
+    """The FreeSurfer subject of the session in the surface catalog, or None."""
+    fs_subject: str | None
+    anchor: Anchor | None
+    anchor_note: str | None
+    frame: FrameCheck | None
+    n_grids: int
+    problem: str | None
+    """``not fetched: ...`` for a session with placeholders, ``unreadable: ...`` for one whose
+    plan could not be made (then every run is ``pack failure``); None otherwise."""
+    inventory_hash: str
+    """:func:`func_signature` over the files of every run and of the session, the FreeSurfer
+    files of the contours, and ``EpiConfig.inventory_hash()``, the FreeSurfer subject's name
+    and the run ids as extra lines."""
+    files: tuple[FuncFileRef, ...]
+    """The session's own files (``xfm_anat_fsnative``)."""
+    runs: tuple[FuncRunRow, ...]

@@ -216,3 +216,17 @@ KEYS: dict[str, tuple[str, ...]] = {
     "intensity": ("subject_uid", "hemi"),
 }
 """Table name -> key columns: unique per row, and the order rows are written in."""
+
+
+# --- the EPI interface in a run directory (step 2) -------------------------------------------
+# The functional tables are tables of ``catalog.sqlite`` (migration 2 of ``store.py``), not
+# parquet tables; what follows is the vocabulary the catalog, ``status``, the app and (step 3)
+# the export share for them.
+
+PACK_STATES: tuple[str, ...] = ("packed", "pending", "failed", "cannot be packed", "not selected")
+"""The state of a functional run as ``status``, the subject page and the export say it:
+``packed`` (a ``packs`` row ``done`` for the present settings and listing, and the pack whole
+on disk), ``pending`` (packable and not packed now), ``failed`` (a ``packs`` row ``failed`` for
+the present settings and listing), ``cannot be packed`` (``func_runs.reason`` is a reason of
+``records.PACK_REASONS`` other than ``not selected``), ``not selected`` (``--epi-runs`` leaves
+it out)."""

@@ -809,6 +809,28 @@ class Run:
         located = update_native(context, template=template)
         return dataclasses.replace(report, notes=(*report.notes, *located.notes))
 
+    def func_inventory(self, *, force: bool = False) -> PhaseReport:
+        """Phase 2f, the functional inventory (``func.inventory.run_func_inventory``), after
+        :meth:`inventory`: a separate call so that the surface report keeps its numbers. A
+        run without a functional source, with ``--no-epi`` or of a census gives an empty
+        report. Work package E2.Z writes it."""
+        raise NotImplementedError("work package E2.Z: run.py")
+
+    def pack(
+        self,
+        *,
+        jobs: int = 1,
+        sessions: Collection[str] | None = None,
+        force: bool = False,
+        retry_failed: bool = False,
+        stop: Callable[[], bool] | None = None,
+    ) -> PhaseReport:
+        """Pack the pending functional sessions into ``epi/`` (``func.batch.run_pack``), with
+        the run's lease of a session bound into the context. Builds the sources only when
+        something is pending; refuses a census run (``ConfigError("invalid", ...)``). Work
+        package E2.Z writes it."""
+        raise NotImplementedError("work package E2.Z: run.py")
+
     def _subject_uids(self, names: Sequence[str]) -> list[str]:
         named = [names] if isinstance(names, str) else list(names)
         if self.config.mode != "local":

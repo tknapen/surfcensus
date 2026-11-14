@@ -160,7 +160,16 @@ def test_a_render_result_crosses_a_process_boundary(tmp_path: Path) -> None:
 
 
 def test_a_run_context_holds_the_public_side_of_a_run(tmp_path: Path) -> None:
-    assert names(RunContext) == ["run_dir", "config", "public", "lease", "render_key", "scrub"]
+    assert names(RunContext) == [
+        "run_dir",
+        "config",
+        "public",
+        "lease",
+        "render_key",
+        "scrub",
+        "func_lease",  # step 2 of the EPI interface (E2.0), None by default
+        "pack_key",
+    ]
     public = object()  # stands for a PublicCatalog, which this module names for the checker only
     context = RunContext(
         run_dir=tmp_path,
@@ -177,5 +186,5 @@ def test_a_run_context_holds_the_public_side_of_a_run(tmp_path: Path) -> None:
 
 
 def test_the_module_names_other_modules_types_for_the_checker_only() -> None:
-    for name in ("PublicCatalog", "RunConfig", "RenderInfo", "pd"):
+    for name in ("PublicCatalog", "RunConfig", "RenderInfo", "pd", "PackInfo", "SessionInfo"):
         assert not hasattr(records, name)

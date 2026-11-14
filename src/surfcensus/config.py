@@ -220,9 +220,11 @@ class AppConfig(_Frozen):
 class EpiConfig(_Frozen):
     """Settings of the EPI movie interface (docs/epi_interface.md, Configuration).
 
-    Step 1 (``surfcensus epi-session``) has no run directory and uses this model on its own;
-    the section ``epi`` of :class:`RunConfig` follows with the run directory (step 2), so that
-    no ``config.yaml`` written before then gains a key that an earlier version refuses.
+    Step 1 (``surfcensus epi-session``) has no run directory and uses this model on its own.
+    In a run directory (step 2) it is the section ``epi`` of :class:`RunConfig`, which is
+    written into ``config.yaml`` only once one of its options was given (``--raw``,
+    ``--no-epi``, ``--epi-runs``): a run without them writes the bytes it wrote before step 2,
+    which an earlier version still reads (:func:`dump_config`).
     """
 
     enabled: bool = True
@@ -239,6 +241,12 @@ class EpiConfig(_Frozen):
     """Decoded size that a chunk of a stream aims at."""
     max_gb: float | None = Field(default=None, gt=0)
     """Stop before packing when the estimate of the packs exceeds this; None: no limit."""
+    raw: str | None = None
+    """The raw BIDS dataset named with ``--raw DIR`` of a local run, absolute; stored like the
+    root of a source and read in place. None: found by rule (docs/epi_interface.md, "Which
+    folders are found by rule"). Not used by step 1, which takes ``--raw`` per call, and part
+    of no hash: it changes where files are read, and the listing of those files is what the
+    skip tests compare."""
 
     def pack_hash(self) -> str:
         """The config hash of a pack: the settings that change its bytes."""
@@ -251,6 +259,17 @@ class EpiConfig(_Frozen):
         payload = {name: getattr(self, name) for name in EPI_SESSION_FIELDS}
         return stage_hash("epi_session", STAGE_SCHEMAS["epi_session"], payload)
 
+    def inventory_hash(self) -> str:
+        """The stage hash of the functional inventory (phase 2f), a line of every
+        ``func_sessions.inventory_hash``: the settings that change what the inventory decides
+        from the listing (which runs are selected, which are flagged)."""
+        payload = {name: getattr(self, name) for name in EPI_INVENTORY_FIELDS}
+        return stage_hash("func_inventory", STAGE_SCHEMAS["func_inventory"], payload)
+
+
+EPI_INVENTORY_FIELDS: tuple[str, ...] = ("runs", "frame_limit_mm")
+"""Fields of :class:`EpiConfig` that change what phase 2f records of a session: the globs of
+``--epi-runs`` (``not selected``) and the frame limit (``flagged``)."""
 
 EPI_PACK_FIELDS: tuple[str, ...] = ("portable_voxel_map", "chunk_bytes")
 """Fields of :class:`EpiConfig` that change the bytes of a pack."""
@@ -295,10 +314,16 @@ class RunConfig(_Frozen):
     app: AppConfig
     remote: RemoteConfig = RemoteConfig()
     cache: CacheConfig = CacheConfig()
+    epi: EpiConfig | None = None
+    """The EPI interface of a local run (step 2). None: no option of it was given, and the
+    defaults hold (:func:`epi_settings`); :func:`dump_config` leaves the key out then."""
 
     @model_validator(mode="after")
     def _mode_fits_identity_and_sources(self) -> RunConfig:
         local = self.mode == "local"
+        if not local and self.epi is not None and (self.epi.enabled or self.epi.raw is not None):
+            # the EPI phases do not run in a census run (docs/epi_interface.md, The rules)
+            raise ValueError("a census run has no EPI interface")
         if (self.identity.kind == "local-salt") != local:
             raise ValueError(f"a {self.mode} run does not use identity kind {self.identity.kind!r}")
         for source in self.sources:
@@ -424,8 +449,24 @@ def load_config(run_dir: Path | str) -> RunConfig:
 
 
 def dump_config(config: RunConfig) -> str:
-    """The text of ``config.yaml``: keys sorted, so equal configs give equal bytes."""
-    return yaml.safe_dump(config.model_dump(mode="json"), sort_keys=True)
+    """The text of ``config.yaml``: keys sorted, so equal configs give equal bytes.
+
+    The section ``epi`` is left out while it is None, so a run without an option of the EPI
+    interface writes what it wrote before step 2 and an earlier version still reads it; a run
+    with one has the key, which an earlier version refuses (``epi: unknown key``)."""
+    data = config.model_dump(mode="json")
+    if config.epi is None:
+        del data["epi"]
+    return yaml.safe_dump(data, sort_keys=True)
+
+
+def epi_settings(config: RunConfig) -> EpiConfig:
+    """The settings of the EPI interface of a run: its section ``epi``, else the defaults,
+    which have the interface on in a local run and off in a census run (the EPI phases do
+    not run there)."""
+    if config.epi is not None:
+        return config.epi
+    return EpiConfig() if config.mode == "local" else EpiConfig(enabled=False)
 
 
 def write_config(run_dir: Path | str, config: RunConfig, *, exclusive: bool = False) -> None:
@@ -519,6 +560,7 @@ STAGE_SCHEMAS: dict[str, int] = {
     "intensity": 1,
     "pack": 1,  # the EPI interface: one functional run (docs/epi_interface.md)
     "epi_session": 1,  # the EPI interface: the registration, frame check and contours
+    "func_inventory": 1,  # the EPI interface in a run: phase 2f, func_sessions.inventory_hash
 }
 """Schema number of each stage: raised when the stage's output changes for equal settings."""
 

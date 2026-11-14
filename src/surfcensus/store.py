@@ -42,7 +42,16 @@ from surfcensus._io import atomic_path, canonical_json
 from surfcensus.config import ConfigError
 from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
-from surfcensus.records import Provenance, RenderRow, WorkRow
+from surfcensus.records import (
+    FuncLeaseFacts,
+    FuncSessionRow,
+    FuncSourceRecord,
+    PackRow,
+    Provenance,
+    RawFound,
+    RenderRow,
+    WorkRow,
+)
 from surfcensus.schemas import KEYS, SCHEMAS, split_flags
 from surfcensus.sources import base
 from surfcensus.sources.base import (
@@ -55,12 +64,18 @@ from surfcensus.sources.base import (
     DatasetRecord,
     FileRef,
     FileRole,
+    FuncRole,
     SubjectRecord,
 )
 
 SCHEMA_VERSION = 1
 CATALOG_FILE = "catalog.sqlite"
 MEDIA_DIR = "media"
+EPI_DIR = "epi"
+"""The display cache of the EPI interface in a run directory: ``epi/<participant_uid>/`` holds
+the ``stream.json`` of a participant and one session directory per session, the layout of the
+``--out`` directory of ``surfcensus epi-session`` (docs/epi_interface.md, "Step 2: the
+plan")."""
 CALIBRATION_REASON = "calibration"
 """The ``selection.reason``, and the stratum, of the subjects of a frozen calibration set
 (``app/finalize.py``). Such a row names an example, not a subject of the rating sample."""
@@ -218,6 +233,188 @@ CREATE VIEW public_subjects AS
 CREATE VIEW public_files AS
   SELECT subject_uid, role, variant FROM files;
 """
+
+_MIGRATION_2 = """
+CREATE TABLE func_sources (
+  func_id         INTEGER PRIMARY KEY,
+  dataset_id      INTEGER NOT NULL REFERENCES datasets(dataset_id),
+  connector       TEXT NOT NULL,
+  pipeline_version TEXT,
+  generation      TEXT NOT NULL CHECK (generation IN ('scanner-T1w','boldref-T1w')),
+  deriv_identity  TEXT NOT NULL,
+  deriv_root      TEXT NOT NULL,
+  deriv_found     TEXT NOT NULL
+                  CHECK (deriv_found IN ('surface layout','folder itself','derivatives folder')),
+  raw_root        TEXT,
+  raw_found       TEXT CHECK (raw_found IN ('given','dataset root','sourcedata/raw')),
+  present         INTEGER NOT NULL DEFAULT 1,
+  listed_at       TEXT NOT NULL,
+  UNIQUE (dataset_id, connector, deriv_identity)
+);
+
+CREATE TABLE func_participants (
+  participant_uid TEXT PRIMARY KEY,
+  func_id         INTEGER NOT NULL REFERENCES func_sources(func_id),
+  participant     TEXT NOT NULL,
+  session_order   TEXT NOT NULL,
+  n_sessions      INTEGER NOT NULL,
+  present         INTEGER NOT NULL DEFAULT 1,
+  listed_at       TEXT NOT NULL,
+  UNIQUE (func_id, participant)
+) WITHOUT ROWID;
+
+CREATE TABLE func_sessions (
+  session_uid     TEXT PRIMARY KEY,
+  participant_uid TEXT NOT NULL REFERENCES func_participants(participant_uid),
+  session_label   TEXT,
+  stream_order    INTEGER NOT NULL,
+  subject_uid     TEXT REFERENCES subjects(subject_uid),
+  fs_subject      TEXT,
+  anchor_run_uid  TEXT,
+  anchor_rule     TEXT CHECK (anchor_rule IN ('acquisition_time','name_order')),
+  anchor_why      TEXT,
+  anchor_note     TEXT,
+  frame_limit_mm  REAL,
+  shared_frame_plausible INTEGER,
+  anchor_is_outlier INTEGER,
+  n_runs          INTEGER NOT NULL,
+  n_packable      INTEGER NOT NULL,
+  n_grids         INTEGER NOT NULL,
+  problem         TEXT,
+  present         INTEGER NOT NULL DEFAULT 1,
+  inventory_hash  TEXT NOT NULL,
+  inventoried_at  TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE func_runs (
+  run_uid         TEXT PRIMARY KEY,
+  session_uid     TEXT NOT NULL REFERENCES func_sessions(session_uid),
+  run_key         TEXT NOT NULL,
+  name            TEXT NOT NULL,
+  entities        TEXT NOT NULL,
+  session_order   INTEGER,
+  acquisition_order INTEGER,
+  anchor          INTEGER NOT NULL DEFAULT 0,
+  selected        INTEGER NOT NULL,
+  packable        INTEGER NOT NULL,
+  reason          TEXT,
+  detail          TEXT,
+  missing_roles   TEXT NOT NULL DEFAULT '',
+  n_volumes       INTEGER,
+  tr_s            REAL,
+  echoes          INTEGER NOT NULL DEFAULT 1,
+  display_layout  TEXT CHECK (display_layout IN ('anat','native')),
+  display_space   TEXT,
+  spaces          TEXT NOT NULL DEFAULT '',
+  grid_key        TEXT,
+  grid_shape      TEXT,
+  voxel_mm        TEXT,
+  oblique_deg     REAL,
+  raw_affine      TEXT
+                  CHECK (raw_affine IN ('header','qform','reference','header, unchecked')),
+  reference_image INTEGER,
+  rigid           INTEGER,
+  dof             INTEGER,
+  corrections     TEXT,
+  motion_state    TEXT CHECK (motion_state IN ('applied','not applied','unknown')),
+  sdc             TEXT CHECK (sdc IN ('applied','not applied','unknown')),
+  sdc_method      TEXT,
+  slice_timing    TEXT CHECK (slice_timing IN ('applied','not applied','unknown')),
+  frame_mean_mm   REAL,
+  frame_max_mm    REAL,
+  frame_rotation_deg REAL,
+  frame_translation_mm REAL,
+  flagged         INTEGER,
+  present         INTEGER NOT NULL DEFAULT 1,
+  inventoried_at  TEXT NOT NULL,
+  UNIQUE (session_uid, run_key)
+) WITHOUT ROWID;
+
+CREATE TABLE func_files (
+  owner_kind      TEXT NOT NULL CHECK (owner_kind IN ('run','session')),
+  owner           TEXT NOT NULL,
+  role            TEXT NOT NULL,
+  base            TEXT NOT NULL CHECK (base IN ('raw','deriv')),
+  location        TEXT NOT NULL,
+  variant         TEXT,
+  size            INTEGER NOT NULL,
+  etag_or_mtime   TEXT NOT NULL,
+  sha256          TEXT,
+  PRIMARY KEY (owner_kind, owner, role)
+) WITHOUT ROWID;
+
+CREATE TABLE packs (
+  run_uid         TEXT PRIMARY KEY REFERENCES func_runs(run_uid),
+  session_uid     TEXT NOT NULL REFERENCES func_sessions(session_uid),
+  config_hash     TEXT NOT NULL,
+  input_signature TEXT NOT NULL,
+  pack_key        TEXT,
+  status          TEXT NOT NULL CHECK (status IN ('done','failed')),
+  reason          TEXT,
+  detail          TEXT,
+  path            TEXT,
+  n_volumes       INTEGER,
+  bytes           INTEGER,
+  content_digest  TEXT,
+  anchor_run_uid  TEXT,
+  grid_key        TEXT,
+  packed_at       TEXT NOT NULL
+) WITHOUT ROWID;
+
+CREATE VIEW public_func_sources AS
+  SELECT d.pseudonym AS dataset, f.connector, f.pipeline_version, f.generation, f.deriv_found,
+         f.raw_found, f.present
+  FROM func_sources f JOIN datasets d USING (dataset_id);
+
+CREATE VIEW public_func_participants AS
+  SELECT p.participant_uid, d.pseudonym AS dataset,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN p.participant END
+           AS participant,
+         p.session_order, p.n_sessions, p.present
+  FROM func_participants p JOIN func_sources f USING (func_id) JOIN datasets d USING (dataset_id);
+
+CREATE VIEW public_func_sessions AS
+  SELECT s.session_uid, s.participant_uid,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN s.session_label END
+           AS session_label,
+         s.stream_order, s.subject_uid,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN s.fs_subject END
+           AS fs_subject,
+         s.anchor_run_uid, s.anchor_rule,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN s.anchor_note END
+           AS anchor_note,
+         s.frame_limit_mm, s.shared_frame_plausible, s.anchor_is_outlier, s.n_runs, s.n_packable,
+         s.n_grids, s.problem, s.present
+  FROM func_sessions s;
+
+CREATE VIEW public_func_runs AS
+  SELECT r.run_uid, r.session_uid,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN r.name END AS name,
+         r.session_order, r.acquisition_order, r.anchor, r.selected, r.packable, r.reason,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN r.detail END
+           AS detail,
+         r.missing_roles, r.n_volumes, r.tr_s, r.echoes, r.display_layout, r.grid_key,
+         r.grid_shape, r.voxel_mm, r.oblique_deg, r.raw_affine, r.reference_image, r.rigid, r.dof,
+         r.corrections, r.motion_state, r.sdc, r.sdc_method, r.slice_timing, r.frame_mean_mm,
+         r.frame_max_mm, r.frame_rotation_deg, r.frame_translation_mm, r.flagged, r.present
+  FROM func_runs r;
+
+CREATE VIEW public_packs AS
+  SELECT run_uid, session_uid, config_hash, pack_key, status, reason,
+         CASE WHEN (SELECT value FROM meta WHERE key = 'mode') = 'local' THEN detail END
+           AS detail,
+         path, n_volumes, bytes, anchor_run_uid, grid_key, packed_at
+  FROM packs;
+"""
+"""Migration 2: the EPI interface in a run directory (docs/epi_interface.md, "Step 2: the
+plan"). Only ``CREATE TABLE`` and ``CREATE VIEW``. Written by work package E2.0 and applied by
+E2.A, which appends it to :data:`MIGRATIONS`, raises :data:`SCHEMA_VERSION` to 2 and lets a
+read-only opener read a catalog of schema 1 as one without functional data. Private columns,
+which no public view has: the roots and the identity of a source, ``inventory_hash``, the
+entities of a run (task labels come close to naming a dataset), file locations, sizes,
+modification times and digests, ``input_signature`` and ``content_digest`` of a pack; in a
+census run also labels, names and details (the EPI phases do not run there; the views follow
+the rule of ``public_subjects`` all the same)."""
 
 MIGRATIONS: tuple[str, ...] = (_MIGRATION_1,)
 """Migration ``n`` (1-based) brings a catalog from ``user_version`` ``n - 1`` to ``n``. The
@@ -1302,6 +1499,62 @@ class Catalog:
         )
         return _frame(_FAILURE_COLUMNS, [row for row in rows if phase in (None, row["phase"])])
 
+    # --- the EPI interface (step 2; work package E2.A writes these) -------------------------
+
+    def upsert_func_source(self, dataset_id: int, record: FuncSourceRecord) -> int:
+        """Insert or update the functional source of a dataset and return its ``func_id``.
+        A stored source keeps its ``deriv_identity`` (decision D21): a record whose identity
+        differs from the stored one of the same dataset and connector is
+        ``ConfigError("key", ...)``; roots and how they were found are replaced."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_source(self, dataset_id: int) -> FuncSourceRecord | None:
+        """The functional source of a dataset, or None (also on a catalog of schema 1)."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def upsert_func_participant(
+        self, func_id: int, participant_uid: str, participant: str, n_sessions: int
+    ) -> None:
+        """Insert or update a participant of a functional source; sets ``present``."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def upsert_func_session(self, row: FuncSessionRow) -> None:
+        """Store a session with its files and every one of its runs with theirs, in one
+        transaction: rows of runs that the session no longer has are removed (their
+        ``packs`` row as well, after the pack phase removed the pack: a run that left keeps
+        its row until then, marked ``present = 0``), a file that keeps its location, size and
+        modification time keeps its ``sha256``."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_inventory_hash(self, session_uid: str) -> str | None:
+        """``func_sessions.inventory_hash`` of a session, or None."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def mark_func_absent(
+        self, func_id: int, present_participants: Collection[str], present_sessions: Collection[str]
+    ) -> list[str]:
+        """Set ``present`` of the participants, sessions and runs of a functional source from
+        the listing, in both directions; returns the ``session_uid``s that became absent.
+        Rows, packs and their ledger rows stay (the pack phase removes the packs)."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def relocate_func(
+        self, func_id: int, deriv_root: str, raw_root: str | None, raw_found: RawFound | None
+    ) -> None:
+        """Replace the roots of a functional source and nothing else, so every identifier
+        stays (``--relocate``)."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_lease_facts(self, session_uid: str) -> FuncLeaseFacts:
+        """What the lease of a session needs (``records.FuncLeaseFacts``); KeyError for an
+        unknown session."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_participant_uids(self) -> dict[str, str]:
+        """``participant_uid`` -> participant label of every present participant, for the
+        lines that ``review`` and ``inventory`` print (local run)."""
+        raise NotImplementedError("work package E2.A: store.py")
+
     def public(self) -> PublicCatalog:
         """The public side on this catalog's connection; closing it leaves this one open."""
         return PublicCatalog(self._db)
@@ -1625,6 +1878,80 @@ class PublicCatalog:
                 values,
             )
 
+    # --- the EPI interface (step 2; work package E2.A writes these) -------------------------
+    #
+    # On a catalog of schema 1, opened read-only, each reader answers as for a run without
+    # functional data (an empty frame, False, None) and each writer raises ConfigError.
+
+    def has_func(self) -> bool:
+        """Whether the run has a functional source with a present participant."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_sources(self) -> pd.DataFrame:
+        """The view ``public_func_sources``, ordered by dataset pseudonym."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_participants(self) -> pd.DataFrame:
+        """The view ``public_func_participants``, ordered by ``participant_uid``;
+        ``participant`` is empty in a census run."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_sessions(self, participant_uid: str | None = None) -> pd.DataFrame:
+        """The view ``public_func_sessions``, of one participant or of all, ordered by
+        participant, then ``stream_order``."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def func_runs(self, session_uid: str | None = None) -> pd.DataFrame:
+        """The view ``public_func_runs``, of one session or of all, ordered by session, then
+        ``acquisition_order``."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def packs(self) -> pd.DataFrame:
+        """The view ``public_packs``, ordered by ``run_uid``; ``detail`` in a local run only."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def pack(self, run_uid: str) -> PackRow | None:
+        """The ``packs`` row of a run, with its input signature to pass back and without its
+        ``content_digest``; None when it has none."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def pack_signature(self, run_uid: str) -> str:
+        """The input signature of the pack of a run (``records.func_signature``), from the
+        listing alone: the run's own files in ``FuncRole`` order; then, for a run that is not
+        the anchor, the anchor's ``xfm_to_anat`` (written with the role
+        ``anchor_xfm_to_anat``); the session's files; the FreeSurfer files of the contours
+        (``t1``, ``lh_white``, ``rh_white``, ``lh_pial``, ``rh_pial`` of the session's
+        ``subject_uid``, with their variants); and the lines ``anchor\t<run_uid>``,
+        ``grid\t<grid_key>``, ``fs\t<subject_uid or ->``. A changed anchor, surface or grid
+        therefore changes it. May be passed back to :meth:`record_packs` and nothing else.
+        KeyError for an unknown or unpackable run."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def epi_session_signature(self, session_uid: str) -> str:
+        """The input signature of the session unit: ``inventory\t<inventory_hash>`` and the
+        :meth:`pack_signature` of every packable run in acquisition order, hashed as one
+        :func:`records.func_signature` of extra lines. May be passed back to
+        :meth:`work_done` and :meth:`record_work` and nothing else."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def record_packs(self, rows: Sequence[PackRow]) -> None:
+        """Record the outcome of packs, replacing their earlier rows, in one transaction. A
+        row without a time gets the current time."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def forget_packs(self, run_uids: Collection[str]) -> None:
+        """Remove the ``packs`` rows of runs whose packs were removed (a run that left, that
+        is no longer packable or no longer selected), in one transaction."""
+        raise NotImplementedError("work package E2.A: store.py")
+
+    def set_func_digests(
+        self, owner_kind: Literal["run", "session"], owner: str, digests: Mapping[FuncRole, str]
+    ) -> None:
+        """Store SHA-256 digests of functional files that a pack read in full
+        (``PackInfo.inputs``). Write-only; a role the owner does not have is ignored. The
+        FreeSurfer files go through :meth:`set_file_digests`."""
+        raise NotImplementedError("work package E2.A: store.py")
+
 
 # --- parquet tables -----------------------------------------------------------------------
 
@@ -1741,6 +2068,22 @@ def read_table(path: Path | str, schema: pa.Schema | None = None) -> pd.DataFram
 def media_dir(run_dir: Path | str, subject_uid: str) -> Path:
     """``media/<subject_uid>`` of a run directory: the render of one subject."""
     return Path(run_dir) / MEDIA_DIR / subject_uid
+
+
+def epi_participant_dir(run_dir: Path | str, participant_uid: str) -> Path:
+    """``epi/<participant_uid>`` of a run directory: the ``stream.json`` and the session
+    directories of one participant's stream (decision D38), laid out as the ``--out`` directory
+    of ``surfcensus epi-session`` so that ``app.epi.Packs`` reads it as it is."""
+    if not _UID.fullmatch(participant_uid):
+        raise ValueError(f"not a participant_uid: {participant_uid!r}")
+    return Path(run_dir) / EPI_DIR / participant_uid
+
+
+def epi_session_dir(run_dir: Path | str, participant_uid: str, session_uid: str) -> Path:
+    """``epi/<participant_uid>/<session_uid>``: the packs of one session."""
+    if not _UID.fullmatch(session_uid):
+        raise ValueError(f"not a session_uid: {session_uid!r}")
+    return epi_participant_dir(run_dir, participant_uid) / session_uid
 
 
 def table_path(run_dir: Path | str, table: str) -> Path:
