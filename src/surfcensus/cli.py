@@ -810,13 +810,14 @@ def _waiting_for_packs() -> None:
 def _print_pack_report(run: Run, report: PhaseReport) -> None:
     """The closing lines of ``pack``: counts, then one line per failure reason with the
     runs by name (a local run)."""
+    from surfcensus.func.status import unit_names
     from surfcensus.review import pack_line
 
     typer.echo(
         f"{report.phase}: {report.done} done, {report.skipped} skipped, {report.failed} failed, "
         f"{report.seconds:.1f} s"
     )
-    names = _run_names(run)
+    names = unit_names(run.public())
     by_reason: dict[str, list[str]] = {}
     for unit, reason in report.failures:
         by_reason.setdefault(reason, []).append(names.get(unit, unit))
@@ -837,26 +838,6 @@ def _print_pack_report(run: Run, report: PhaseReport) -> None:
         typer.echo("EPI packs: none; this run has no functional run that can be packed.")
 
 
-def _run_names(run: Run) -> dict[str, str]:
-    """``run_uid`` -> ``sub-01 ses-1_task-rest_run-1`` in a local run."""
-    public = run.public()
-    participants = dict(
-        zip(
-            public.func_participants()["participant_uid"],
-            public.func_participants()["participant"],
-            strict=True,
-        )
-    )
-    sessions = public.func_sessions()
-    owner = dict(zip(sessions["session_uid"], sessions["participant_uid"], strict=True))
-    runs = public.func_runs()
-    names = {}
-    for uid, session, name in zip(runs["run_uid"], runs["session_uid"], runs["name"], strict=True):
-        who = participants.get(owner.get(session))
-        names[uid] = f"{who} {name}" if isinstance(who, str) and isinstance(name, str) else uid
-    return names
-
-
 @app.command("status")
 def status(
     run_dir: Path = _RUN_DIR,
@@ -867,7 +848,8 @@ def status(
     ),
 ) -> None:
     """Say where a run stands: one line per phase, from its catalog."""
-    from surfcensus.records import ALL_METRIC_STAGES
+    from surfcensus.func.status import failure_rows, status_lines, unit_names
+    from surfcensus.records import ALL_METRIC_STAGES, EPI_SESSION_PHASE
     from surfcensus.render.batch import PHASE as RENDER
     from surfcensus.render.batch import render_failures, render_status
     from surfcensus.run import Run
@@ -899,6 +881,9 @@ def status(
                 typer.echo(f"metrics {name}: {len(ledger) - failed} done, {failed} failed")
         done, failed, pending = render_status(context)
         typer.echo(f"render: {done} done, {failed} failed, {pending} pending")
+        # functional data (step 3 of the EPI interface): no line for a run without any
+        for line in status_lines(context):
+            typer.echo(line)
         if failures:
             with Catalog(run_dir / CATALOG_FILE, readonly=True) as catalog:
                 frame = catalog.failures()
@@ -911,15 +896,18 @@ def status(
             listed = [
                 (row.unit, row.phase, row.reason, row.detail)
                 for row in frame.itertuples(index=False)
-                if row.phase != RENDER or row.unit in recorded
+                # a failed session is listed run by run below (decision D41)
+                if row.phase != EPI_SESSION_PHASE and (row.phase != RENDER or row.unit in recorded)
             ]
             listed += [
                 (uid, RENDER, reason, detail)
                 for uid, (reason, detail) in counted.items()
                 if detail is not None
             ]
+            listed += failure_rows(context)
+            functional = unit_names(public)
             for uid, phase, reason, detail in sorted(listed, key=lambda row: (row[1], row[0])):
-                name = _names(subjects, [uid])
+                name = functional.get(uid) or _names(subjects, [uid])
                 unit = uid if name == uid else f"{uid} ({name})"
                 text = f": {detail}" if isinstance(detail, str) else ""
                 typer.echo(f"{phase} {unit}: {reason}{text}")
