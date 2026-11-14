@@ -135,36 +135,65 @@ def test_step_1_uses_the_same_rules() -> None:
 # --- the places that are only read ----------------------------------------------------------
 
 
-def test_a_run_directory_in_the_derivative_or_the_raw_dataset_is_refused(
+def test_a_run_directory_in_a_participant_folder_is_refused_and_beside_them_not(
     tmp_path: Path, folder: SyntheticFuncDataset
 ) -> None:
+    # the participant folders of the derivative and of the raw dataset are read; the roots
+    # are not refused themselves, so that a run directory inside a dataset (asked for with
+    # --run-dir, or made there by an earlier version) works as decision D35 holds (E2.Z)
     fs = folder.fs_subjects_dir
     for inside in (
-        folder.raw_root / "surfcensus-run",  # the raw dataset
-        folder.deriv_root / "surfcensus-run",  # the derivative, beside sourcedata/
+        folder.raw_root / "sub-01" / "surfcensus-run",
+        folder.raw_root / "sub-02",
         folder.deriv_root / "sub-01" / "run",
+        folder.deriv_root / "sub-02" / "ses-1" / "run",
     ):
         with pytest.raises(ConfigError) as err:
             refuse_in_sources(inside, [fs], what="run")
         assert "only read" in err.value.detail, inside
-    refuse_in_sources(tmp_path / "surfcensus-run", [fs], what="run")  # beside the dataset
-    whats = [what for what, _ in functional_places(fs)]
-    assert whats == ["the derivative", "the raw dataset"]
+    for allowed in (
+        tmp_path / "surfcensus-run",  # beside the dataset
+        folder.raw_root / "surfcensus-run",  # inside the dataset root
+        folder.deriv_root / "surfcensus-run",  # inside the derivative, beside sourcedata/
+        folder.raw_root / "derivatives" / "surfcensus-run",
+    ):
+        refuse_in_sources(allowed, [fs], what="run")
+    whats = {what.split(" of ")[-1] for what, _ in functional_places(fs)}
+    assert whats == {"the derivative", "the raw dataset"}
+    names = {place.name for _, place in functional_places(fs)}
+    assert names == {"sub-01", "sub-02"}
 
 
-def test_a_link_at_the_top_of_the_raw_dataset_is_a_place(
+def test_epi_session_still_refuses_an_out_anywhere_in_the_folders(
+    folder: SyntheticFuncDataset,
+) -> None:
+    folders = discover.find_folders(folder.raw_root)
+    for inside in (
+        folder.raw_root / "out",
+        folder.deriv_root / "out",
+        folder.fs_subjects_dir / "out",
+    ):
+        with pytest.raises(ConfigError):
+            discover.refuse_out(inside, folders)
+
+
+def test_a_participant_link_of_the_raw_dataset_is_a_place(
     tmp_path: Path, folder: SyntheticFuncDataset
 ) -> None:
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "inside").mkdir(parents=True)
-    (folder.raw_root / "extra").symlink_to(elsewhere)
+    (folder.raw_root / "sub-09").symlink_to(elsewhere)
+    other = tmp_path / "other"
+    (other / "inside").mkdir(parents=True)
+    (folder.raw_root / "extra").symlink_to(other)  # not a participant folder
     with pytest.raises(ConfigError):
         refuse_in_sources(elsewhere / "inside", [folder.fs_subjects_dir], what="output")
+    refuse_in_sources(other / "inside", [folder.fs_subjects_dir], what="output")
     source = discover.func_source_of(_record(folder.raw_root))
     assert source is not None
     assert (
-        "the directory that extra in the raw dataset links to,",
-        elsewhere.resolve(),
+        "the directory that sub-09 in the raw dataset links to,",
+        folder.raw_root / "sub-09",
     ) in discover.read_places(source)
 
 
@@ -174,16 +203,18 @@ def test_the_commands_that_read_config_yaml_refuse_the_raw_dataset_given(
     ds = write_func_dataset(tmp_path / "data", raw_inside=False)
     config = new_local_config(ds.deriv_root)
     # without --raw the raw dataset beside the derivative is not one of its places
-    refuse_run_in_sources(ds.raw_root / "run", config)
+    refuse_run_in_sources(ds.raw_root / "sub-01" / "run", config)
     with pytest.raises(ConfigError):
-        refuse_run_in_sources(ds.deriv_root / "run", config)
+        refuse_run_in_sources(ds.deriv_root / "sub-01" / "run", config)
+    refuse_run_in_sources(ds.deriv_root / "run", config)  # the root itself is not refused
     named = config.model_copy(update={"epi": EpiConfig(raw=str(ds.raw_root))})
     with pytest.raises(ConfigError) as err:
-        refuse_run_in_sources(ds.raw_root / "run", named)
+        refuse_run_in_sources(ds.raw_root / "sub-01" / "run", named)
     assert "the raw dataset" in err.value.detail
+    refuse_run_in_sources(ds.raw_root / "run", named)
     places = discover.stored_read_places(named)
-    assert ("the raw dataset", ds.raw_root) in places
-    assert ("the derivative", ds.deriv_root) in places
+    assert ("sub-01 of the raw dataset", ds.raw_root / "sub-01") in places
+    assert ("sub-01 of the derivative", ds.deriv_root / "sub-01") in places
 
 
 def test_a_folder_without_functional_data_adds_no_place(tmp_path: Path) -> None:

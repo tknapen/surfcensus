@@ -487,12 +487,15 @@ def source_places(subjects_dir: Path | str) -> list[tuple[str, Path]]:
 
 
 def functional_places(subjects_dir: Path | str) -> list[tuple[str, Path]]:
-    """The derivative and the raw dataset that the functional side reads with the FreeSurfer
-    subjects of ``subjects_dir``, found by rule from it (``func.discover``, "Which folders are
-    found by rule"), as ``(what, directory)`` pairs, with what a link at their top level leads
-    to: an fMRIPrep output with functional runs that holds the subjects, and its raw BIDS
-    dataset. Empty when there is none. A run directory or an export there is refused like
-    one in the subjects directory (step 2 of the EPI interface; decision D35 extended)."""
+    """The participant folders (``sub-*``, and what such a link leads to) of the derivative
+    and the raw dataset that the functional side reads with the FreeSurfer subjects of
+    ``subjects_dir``, found by rule from it (``func.discover``, "Which folders are found by
+    rule"), as ``(what, directory)`` pairs: of an fMRIPrep output with functional runs that
+    holds the subjects, and of its raw BIDS dataset. Empty when there is none. A run directory
+    or an export there is refused like one in the subjects directory (step 2 of the EPI
+    interface; decision D35 extended). The roots themselves are not among them, as a place
+    beside the subjects directory inside an fMRIPrep output is not: a run that an earlier
+    version made inside a dataset is still used, and ``--run-dir`` may name one there."""
     from surfcensus.func.discover import places_of_subjects_dir
 
     return places_of_subjects_dir(subjects_dir)

@@ -294,10 +294,16 @@ def _open_run(
     video: bool | None,
     relocate: bool,
     force: bool,
+    epi: bool | None = None,
+    epi_runs: Sequence[str] | None = None,
+    raw: Path | str | None = None,
 ) -> tuple[Run, bool]:
     """The run of a review, made or opened, with the options that were given written into
     its configuration; and whether it is new. An option that is None keeps what the run
-    has."""
+    has; ``epi``, ``epi_runs`` and ``raw`` are those of ``run.epi_with``, and a glob of
+    ``epi_runs`` that matches no functional run is refused before anything is stored."""
+    from surfcensus.run import epi_run_stems, epi_with, refuse_unmatched_epi_runs
+
     if not (run_dir / "config.yaml").is_file():
         if relocate:
             raise ConfigError("missing", f"{run_dir} holds no run to relocate")
@@ -310,6 +316,12 @@ def _open_run(
         if require_marks is not None:
             app["require_marks"] = require_marks
         config = new_local_config(source.dataset.root, app=app, render_video=bool(video))
+        config = epi_with(config, enabled=epi, runs=epi_runs, raw=raw)
+        if epi_runs:
+            from surfcensus.config import epi_settings
+
+            stems = epi_run_stems([source], epi_settings(config).raw)
+            refuse_unmatched_epi_runs(stems, epi_runs)
         return Run(run_dir, source, config=config), True
 
     stored = load_config(run_dir)
@@ -360,6 +372,7 @@ def _open_run(
             run.config = changed
             if changed.app.blind != config.app.blind:
                 _record_blind(run, changed.app.blind)
+        run.set_epi(enabled=epi, runs=epi_runs, raw=raw)
     except BaseException:
         run.close()
         raise
@@ -518,6 +531,252 @@ def _say_failures(run: Run, report: PhaseReport, what: str) -> None:
         _say(f"  {note}")
 
 
+# --- the functional side (the EPI movie interface, step 2) ---------------------------------------
+
+
+def _shown_place(place: Path, base: Path | None) -> str:
+    """``place`` relative to ``base`` when it lies inside it (``.`` for ``base`` itself),
+    else as it is."""
+    if base is not None:
+        if place == base:
+            return "."
+        if place.is_relative_to(base):
+            return place.relative_to(base).as_posix()
+    return str(place)
+
+
+def _duration(seconds: float) -> str:
+    if seconds < 90:
+        return f"{max(1, round(seconds))} s"
+    return f"{round(seconds / 60)} min"
+
+
+def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    return [dict(zip(frame.columns, row, strict=True)) for row in frame.itertuples(index=False)]
+
+
+def _true(value: object) -> bool:
+    """A flag of a catalog frame (a bool, a numpy bool, or missing) as a bool."""
+    if value is None or value is pd.NA:
+        return False
+    try:
+        return bool(value)
+    except (TypeError, ValueError):
+        return False
+
+
+def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
+    """What ``review`` and ``inventory`` say about the functional runs of a run after the
+    functional inventory: where the derivative and the raw dataset were found, how many runs
+    of how many sessions and participants, how many can be packed and why the others cannot,
+    the sessions that could not be planned, what the one registration of each session finds
+    in the raw data (flagged runs, an anchor that is the outlier or is not packed: statements
+    about the raw data, as ``epi-session`` makes them), and the commands that fetch functional
+    files whose content is not there (after the surface fetch line).
+
+    Empty for a run without functional data and for a census run: a folder that holds no
+    functional data is told nothing (one line at info level). A run whose interface is off
+    (``--no-epi``, stored) gets one line that says so when it has functional data."""
+    from surfcensus.config import epi_settings
+    from surfcensus.func.inventory import session_text
+    from surfcensus.records import NOT_SELECTED
+
+    if run.config.mode != "local":
+        return []
+    public = run.public()
+    if not epi_settings(run.config).enabled:
+        if public.has_func():
+            return [
+                "Functional: the EPI interface is off for this run (--no-epi, stored); "
+                "--epi turns it on again."
+            ]
+        return []
+    if not public.has_func():
+        logger.info("no functional runs found (no fMRIPrep derivative with func/ series)")
+        return []
+    base = None if path is None else Path(path).resolve()
+    participants = {
+        row["participant_uid"]: row["participant"]
+        for row in _records(public.func_participants())
+        if _true(row["present"])
+    }
+    sessions = [
+        row
+        for row in _records(public.func_sessions())
+        if _true(row["present"]) and row["participant_uid"] in participants
+    ]
+    session_of = {row["session_uid"]: row for row in sessions}
+    runs = [
+        row
+        for row in _records(public.func_runs())
+        if _true(row["present"]) and row["session_uid"] in session_of
+    ]
+
+    def who(row: dict[str, Any]) -> str:
+        session = session_of[row["session_uid"]]
+        return f"{participants[session['participant_uid']]} {row['name']}"
+
+    places = []
+    for folder in run.func_folders():
+        deriv = _shown_place(Path(str(folder["deriv_root"])), base)
+        version = folder["pipeline_version"]
+        pipeline = "fMRIPrep" if folder["connector"] == "fmriprep" else str(folder["connector"])
+        pipeline += f" {version}" if isinstance(version, str) else ""
+        if folder["raw_root"] is None:
+            raw = "no raw dataset found (give it with --raw DIR)"
+        else:
+            raw = f"raw series in {_shown_place(Path(str(folder['raw_root'])), base)} (BIDS)"
+        places.append(f"{deriv} ({pipeline}), {raw}")
+    selected = [row for row in runs if _true(row["selected"])]
+    packable = [row for row in selected if _true(row["packable"])]
+    cannot = [row for row in selected if not _true(row["packable"])]
+    left_out = len(runs) - len(selected)
+    line = (
+        f"Functional: {_plural(len(runs), 'run')} in {_plural(len(sessions), 'session')} of "
+        f"{_plural(len(participants), 'participant')} in {'; '.join(places)}; "
+        f"{len(packable)} can be packed (T1w space)"
+    )
+    if cannot:
+        shown = ", ".join(f"{who(r)} ({r['reason']})" for r in cannot[:6])
+        more = f" and {len(cannot) - 6} more" if len(cannot) > 6 else ""
+        line += f", {len(cannot)} cannot: {shown}{more}"
+    if left_out:
+        line += f", {left_out} not selected (--epi-runs)"
+    lines = [line + "."]
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for row in runs:
+        by_session.setdefault(row["session_uid"], []).append(row)
+    for session in sessions:
+        text = session_text(participants[session["participant_uid"]], session["session_label"])
+        problem = session["problem"]
+        if isinstance(problem, str) and problem.startswith("unreadable"):
+            lines.append(f"  {text}: {problem}")
+        mine = by_session.get(session["session_uid"], [])
+        names = {r["run_uid"]: r["name"] for r in mine}
+        anchor_uid = session["anchor_run_uid"]
+        if not isinstance(anchor_uid, str):
+            continue
+        anchor = names.get(anchor_uid, anchor_uid)
+        note = session["anchor_note"]
+        if isinstance(note, str) and note:
+            lines.append(f"  {text}: {note}.")
+        anchor_row = next((r for r in mine if r["run_uid"] == anchor_uid), None)
+        packed_any = any(_true(r["packable"]) and _true(r["selected"]) for r in mine)
+        if (
+            anchor_row is not None
+            and packed_any
+            and not (_true(anchor_row["packable"]) and _true(anchor_row["selected"]))
+        ):
+            reason = anchor_row["reason"] if isinstance(anchor_row["reason"], str) else NOT_SELECTED
+            lines.append(
+                f"  {text}: the anchor {anchor} is not packed ({reason}); the raw stream of "
+                "every packed run is drawn through its stored registration."
+            )
+        limit = session["frame_limit_mm"]
+        for r in mine:
+            if not _true(r["flagged"]):
+                continue
+            lines.append(
+                f"  {text}: flagged (raw data): {r['name']}, drawn through the registration of "
+                f"the anchor {anchor}, lies up to {float(r['frame_max_mm']):.1f} mm (mean "
+                f"{float(r['frame_mean_mm']):.1f} mm) from where its own stored registration "
+                f"puts it, beyond the limit of {float(limit):g} mm."
+            )
+        if _true(session["anchor_is_outlier"]):
+            lines.append(
+                f"  {text}: the anchor {anchor} is the outlier (raw data): every other run is "
+                "flagged against it and they agree with each other, so the anchor, or its "
+                "stored registration, is the odd one."
+            )
+    lines += [f"  {line}" for line in run.func_fetch_lines()]
+    return lines
+
+
+def pack_counts(run: Run) -> tuple[int, int, int]:
+    """Packable runs of the run that are packed, failed and pending now
+    (``func.batch.pack_status``); zeros for a run without functional data or with the
+    interface off, and for a census run."""
+    from surfcensus.config import epi_settings
+    from surfcensus.func.batch import pack_status
+
+    if run.config.mode != "local" or not epi_settings(run.config).enabled:
+        return 0, 0, 0
+    if not run.public().has_func():
+        return 0, 0, 0
+    return pack_status(run.context())
+
+
+def viewable(run: Run) -> int:
+    """How many functional runs of the run are packed or can still be packed. With
+    :func:`rateable` 0 as well, the run has nothing to show, which is when ``surfcensus
+    review`` ends with exit code 1."""
+    done, _, pending = pack_counts(run)
+    return done + pending
+
+
+def pack_line(run: Run, *, behind: bool, after_renders: bool = False) -> str | None:
+    """``EPI packs: 0 of 11 made; they are made while the app runs, after the renders (about
+    20 s in one process, an estimate ...).``; None for a run without packable runs."""
+    from surfcensus.func.api import RATE_S_PER_VOLUME, RATE_VOXELS
+    from surfcensus.func.batch import pack_estimate
+
+    done, failed, pending = pack_counts(run)
+    total = done + failed + pending
+    if total == 0:
+        return None
+    line = f"EPI packs: {done} of {_plural(total, 'run')} made"
+    if failed:
+        line += f", {failed} failed"
+    if pending:
+        if behind:
+            line += f"; {pending} are made while the app runs"
+            line += ", after the renders" if after_renders else ""
+        else:
+            line += f"; {pending} to make"
+        seconds = pack_estimate(run.context())
+        if seconds > 0:
+            line += (
+                f" (about {_duration(seconds)} in one process, an estimate: "
+                f"{RATE_S_PER_VOLUME} s per volume of both streams on {RATE_VOXELS:,} voxels, "
+                "scaled by voxels)"
+            )
+    return line + "."
+
+
+def _say_pack_failures(run: Run, report: PhaseReport) -> None:
+    runs = {row["run_uid"]: row for row in _records(run.public().func_runs())}
+    sessions = {row["session_uid"]: row for row in _records(run.public().func_sessions())}
+    participants = {
+        row["participant_uid"]: row["participant"]
+        for row in _records(run.public().func_participants())
+    }
+    by_reason: dict[str, list[str]] = {}
+    for unit, reason in report.failures:
+        row = runs.get(unit)
+        name = unit
+        if row is not None and row["session_uid"] in sessions:
+            who = participants.get(sessions[row["session_uid"]]["participant_uid"], "")
+            name = f"{who} {row['name']}".strip()
+        by_reason.setdefault(reason, []).append(name)
+    for reason in sorted(by_reason):
+        names = sorted(by_reason[reason])
+        _say(f"  not packed, {reason}: {len(names)} ({_listed(names)})")
+    for note in report.notes:
+        _say(f"  {note}")
+
+
+def _first_sessions(run: Run, wanted: int) -> list[str] | None:
+    """The first ``wanted`` sessions to pack, in the order of the pack phase
+    (``func.batch.session_order``), among those pending; None for all (``wanted`` 0)."""
+    from surfcensus.func.batch import pack_pending, session_order
+
+    if wanted == 0:
+        return None
+    context = run.context()
+    pending = set(pack_pending(context))
+    return [uid for uid in session_order(context) if uid in pending][:wanted]
+
+
 # --- selection and render ------------------------------------------------------------------------
 
 
@@ -612,17 +871,27 @@ class ReviewApp:
     run_dir: Path
     seconds_to_app: float
     """From the start of the call to the moment the app accepted connections."""
+    epi: bool = False
+    """Whether the run has functional runs that are packed or to pack: the app then offers
+    the EPI index (``/epi``) beside the rating screen."""
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renderer: threading.Thread | None = field(default=None, repr=False)
     _problem: list[str] = field(default_factory=list, repr=False)
+    _packing: bool = field(default=False, repr=False)
 
     @property
     def url(self) -> str:
         return self.handle.url
 
     @property
+    def epi_url(self) -> str | None:
+        """The address of the EPI index, when the run has functional runs to show."""
+        return f"{self.handle.url.rstrip('/')}/epi" if self.epi else None
+
+    @property
     def rendering(self) -> bool:
-        """Whether the renderer behind the app is still at work."""
+        """Whether the worker behind the app (the renders, then the EPI packs) is still at
+        work."""
         return self._renderer is not None and self._renderer.is_alive()
 
     @property
@@ -643,40 +912,71 @@ class ReviewApp:
         self.handle.stop()
         self._stop.set()
         if self.rendering:
-            _say("Waiting for the renders in progress; the others are made at the next call.")
+            if self._packing:
+                _say("Waiting for the EPI packs in progress; the others are made at the next call.")
+            else:
+                _say("Waiting for the renders in progress; the others are made at the next call.")
         if self._renderer is not None:
             self._renderer.join()
 
 
 def _render_rest(
-    run_dir: Path, jobs: int, fsaverage: Path | str | None, app: ReviewApp, total: int
+    run_dir: Path,
+    jobs: int,
+    fsaverage: Path | str | None,
+    app: ReviewApp,
+    total: int,
+    render: bool = True,
+    pack: bool = False,
 ) -> None:
-    """The renderer behind the app: a ``Run`` of its own renders what is pending, in queue
+    """The worker behind the app: a ``Run`` of its own renders what is pending, in queue
     order, a batch of ``jobs`` subjects at a time so that each is offered soon after it is
-    made. A failure of the run or the machine ends it and is said; the app goes on."""
+    made, and then packs the functional sessions that are pending, a batch of ``jobs``
+    sessions at a time (the surfaces first, because a rater waits on them; D33 and the plan
+    of step 2 of the EPI interface). The stop request of the app ends either between two
+    batches. A failure of the run or the machine ends it and is said; the app goes on."""
     try:
         with Run(run_dir) as run:
             _with_fsaverage(run, fsaverage)
             cache = run.config.cache.model_dump() | {"batch_subjects": jobs}
             run.config = with_changes(run.config, cache=cache)
-            report = run.render(jobs=jobs, stop=app._stop.is_set)
-            if app._stop.is_set():
-                return
-            done, failed, _ = render_counts(run)
-            _say(f"All renders are made: {done} of {_plural(total, 'subject')} can be rated.")
-            if failed:
-                _say_failures(run, report, "not rendered")
+            if render:
+                report = run.render(jobs=jobs, stop=app._stop.is_set)
+                if app._stop.is_set():
+                    return
+                done, failed, _ = render_counts(run)
+                _say(f"All renders are made: {done} of {_plural(total, 'subject')} can be rated.")
+                if failed:
+                    _say_failures(run, report, "not rendered")
+            if pack:
+                app._packing = True
+                _pack_rest(run, jobs, app)
     except (ConfigError, SourceError, OSError, sqlite3.Error) as exc:
         problem = " ".join(str(exc).split())
         app._problem.append(problem)
+        made = "the runs that are packed" if app._packing else "the subjects that are rendered"
+        what = "Packing" if app._packing else "Rendering"
         _say(
-            f"Rendering stopped: {problem}. The app goes on with the subjects that are "
-            "rendered; run the same command again once the cause is gone."
+            f"{what} stopped: {problem}. The app goes on with {made}; run the same "
+            "command again once the cause is gone."
         )
     except Exception as exc:  # the thread must not die without a word
         app._problem.append(type(exc).__name__)
-        logger.exception("the renderer behind the app failed")
-        _say("Rendering stopped on an unexpected error (see above); the app goes on.")
+        logger.exception("the worker behind the app failed")
+        what = "Packing" if app._packing else "Rendering"
+        _say(f"{what} stopped on an unexpected error (see above); the app goes on.")
+
+
+def _pack_rest(run: Run, jobs: int, app: ReviewApp) -> None:
+    """The EPI packs behind the app, after the renders; the closing line when all are
+    made."""
+    report = run.pack(jobs=jobs, stop=app._stop.is_set)
+    if app._stop.is_set():
+        return
+    done, failed, _ = pack_counts(run)
+    _say(f"All EPI packs are made: {done} of {_plural(done + failed, 'run')} can be viewed.")
+    if failed:
+        _say_pack_failures(run, report)
 
 
 def _check(rater: str | None, jobs: int | None, serve_after: int | None, port: int) -> None:
@@ -709,11 +1009,15 @@ def open_review(
     serve_after: int | None = None,
     relocate: bool = False,
     force: bool = False,
+    epi: bool | None = None,
+    epi_runs: Sequence[str] | None = None,
+    raw: Path | str | None = None,
 ) -> tuple[Run, ReviewApp | None]:
     """Everything :func:`review` does up to the running app: the run, and the app with the
-    renderer behind it, which the caller stops (``ReviewApp.stop``) and whose run the
-    caller closes. The app is None with ``serve=False`` and when no subject of the run can
-    be rendered (:func:`rateable` is then 0). The options are those of :func:`review`.
+    worker behind it, which the caller stops (``ReviewApp.stop``) and whose run the caller
+    closes. The app is None with ``serve=False`` and when the run has nothing to show: no
+    subject can be rendered and no functional run packed (:func:`rateable` and
+    :func:`viewable` are then 0). The options are those of :func:`review`.
     """
     started = time.perf_counter()
     _check(rater, jobs, serve_after, port)
@@ -745,6 +1049,9 @@ def open_review(
         video=video,
         relocate=relocate,
         force=force,
+        epi=epi,
+        epi_runs=epi_runs,
+        raw=raw,
     )
     try:
         _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
@@ -752,6 +1059,11 @@ def open_review(
         _say_inventory(run, path)
         if report.failed:
             _say_failures(run, report, "not read")
+        # the functional inventory reads listings and small files only (D33: the time to the
+        # rating screen does not grow with the functional data); the packs come behind the app
+        run.func_inventory()
+        for line in functional_lines(run, path):
+            _say(line)
 
         _with_fsaverage(run, fsaverage)
         report = run.metrics(jobs=jobs)
@@ -778,13 +1090,39 @@ def open_review(
         _say(line + ".")
         if failed:
             _say_failures(run, rendered, "not rendered")
+        epi_done, _, epi_pending = pack_counts(run)
+        shown = epi_done + epi_pending
         if done + pending == 0:
             line = "No subject of this run can be rendered, so there is nothing to rate."
             if _fetch_said(run, path):
                 # the fetch line above is the remedy: say what comes after it
                 line += " Fetch the files as said above, then run the same command again."
+            if shown:
+                line += " The EPI movies of its functional runs are shown."
             _say(line)
-            return run, None
+            if shown == 0:
+                return run, None
+            # nothing to rate: the app opens at the first packed session (serve_after counts
+            # sessions then), and the rest is packed behind it
+            first = (
+                None
+                if not serve
+                else _first_sessions(
+                    run, DEFAULT_SERVE_AFTER if serve_after is None else serve_after
+                )
+            )
+            if first is None or first:
+                report = run.pack(jobs=jobs, sessions=first)
+                if report.failed:
+                    _say_pack_failures(run, report)
+        elif not serve and epi_pending:
+            report = run.pack(jobs=jobs)
+            if report.failed:
+                _say_pack_failures(run, report)
+        epi_done, _, epi_pending = pack_counts(run)
+        said = pack_line(run, behind=serve, after_renders=pending > 0)
+        if said is not None:
+            _say(said)
         if not serve:
             return run, None
 
@@ -793,11 +1131,11 @@ def open_review(
 
         install_protocol(run.run_dir)
         handle = start_server(run.run_dir, port=port, rater=rater)
-        app = ReviewApp(handle, run.run_dir, time.perf_counter() - started)
-        if pending:
+        app = ReviewApp(handle, run.run_dir, time.perf_counter() - started, epi=shown > 0)
+        if pending or epi_pending:
             thread = threading.Thread(
                 target=_render_rest,
-                args=(run.run_dir, jobs, fsaverage, app, len(uids)),
+                args=(run.run_dir, jobs, fsaverage, app, len(uids), pending > 0, epi_pending > 0),
                 name="surfcensus-renderer",
                 daemon=True,
             )
@@ -867,9 +1205,20 @@ def review(
     serve_after: int | None = None,
     relocate: bool = False,
     force: bool = False,
+    epi: bool | None = None,
+    epi_runs: Sequence[str] | None = None,
+    raw: Path | str | None = None,
 ) -> Run:
     """Inventory, score, select and render the subjects under ``path`` and open the rater
     app on them; returns the run.
+
+    The functional runs of the folder (an fMRIPrep derivative with its raw BIDS dataset,
+    found by rule, docs/epi_interface.md) are listed after the surface inventory and packed
+    into ``epi/`` behind the app, after the remaining renders; the app then offers the EPI
+    index at ``/epi``. ``epi`` (False: ``--no-epi``), ``epi_runs`` (``--epi-runs``) and
+    ``raw`` (``--raw``) are stored and hold until given again. When no subject can be
+    rendered and a run can be packed, the app opens when the first ``serve_after`` sessions
+    are packed; ``serve=False`` packs every session as well.
 
     Every option that maps to a stored value is tri-state: None keeps what the run has, and
     the defaults (not blind, marks not required, no video) apply only when the run is
@@ -903,6 +1252,9 @@ def review(
         serve_after=serve_after,
         relocate=relocate,
         force=force,
+        epi=epi,
+        epi_runs=epi_runs,
+        raw=raw,
     )
     if app is None:
         return run
@@ -952,6 +1304,8 @@ def serve_review(
     stop = StopFlag() if stop is None else stop
     try:
         _say(f"Rating app: {app.url} (Ctrl-C to stop)")
+        if app.epi_url is not None:
+            _say(f"EPI movies: {app.epi_url}")
         _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")
         if open_browser:
             with suppress(webbrowser.Error):
@@ -974,3 +1328,15 @@ def serve_review(
             f"{rated} rated, {left} to go. Run the same command to continue. "
             f"Export: surfcensus export --run-dir {run.run_dir}"
         )
+    if app.epi:
+        try:
+            done, failed, pending = pack_counts(run)
+        except Exception:  # as above: the work is saved
+            logger.debug("no EPI closing line", exc_info=True)
+        else:
+            line = f"EPI packs: {done} of {_plural(done + failed + pending, 'run')} made"
+            if failed:
+                line += f", {failed} failed"
+            if pending:
+                line += f"; {pending} are made at the next call"
+            _say(line + ".")

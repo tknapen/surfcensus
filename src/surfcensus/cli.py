@@ -42,6 +42,27 @@ _FSAVERAGE = typer.Option(
     help="The fsaverage directory to take the template from (any FreeSurfer install has one "
     "in subjects/). The run keeps the template it first used.",
 )
+_RAW = typer.Option(
+    None,
+    "--raw",
+    metavar="DIR",
+    help="The raw BIDS dataset of the functional runs, when it does not lie where the rules "
+    "look (the dataset whose derivatives/ holds the fMRIPrep output, or its sourcedata/raw). "
+    "Read in place; kept for later calls.",
+)
+_EPI = typer.Option(
+    None,
+    "--epi/--no-epi",
+    help="Prepare the EPI movie interface for the functional runs found (the default), or "
+    "not. Kept for later calls.",
+)
+_EPI_RUNS = typer.Option(
+    None,
+    "--epi-runs",
+    metavar="GLOB",
+    help="Only the functional runs whose BIDS name matches (*task-rest*). Repeatable; kept "
+    "for later calls.",
+)
 _MAX_NAMES = 10  # subjects named on one summary line
 _RELOCATE_ANY = "*"  # --relocate given without a pseudonym
 
@@ -332,9 +353,34 @@ def _open_for_inventory(
     subjects: list[str] | None,
     field_strength: float | None,
     relocate: bool | str,
+    epi: bool | None = None,
+    epi_runs: list[str] | None = None,
+    raw: Path | None = None,
 ) -> Run:
     """The run that ``inventory`` works on: a new local run on ``--source``, or the stored
-    one with the options that were given written into its configuration."""
+    one with the options that were given written into its configuration (the EPI options
+    through ``Run.set_epi``, after the run is open)."""
+    run = _open_for_inventory_run(
+        run_dir, source, subjects, field_strength, relocate, epi, epi_runs, raw
+    )
+    try:
+        run.set_epi(enabled=epi, runs=epi_runs, raw=raw)
+    except BaseException:
+        run.close()
+        raise
+    return run
+
+
+def _open_for_inventory_run(
+    run_dir: Path,
+    source: Path | None,
+    subjects: list[str] | None,
+    field_strength: float | None,
+    relocate: bool | str,
+    epi: bool | None,
+    epi_runs: list[str] | None,
+    raw: Path | None,
+) -> Run:
     from surfcensus.config import CONFIG_FILE, ConfigError, load_config, with_changes
     from surfcensus.run import Run
     from surfcensus.sources.local import LocalSource, detect_layout
@@ -348,7 +394,20 @@ def _open_for_inventory(
             raise ConfigError("missing", f"{run_dir} holds no run to relocate")
         made = LocalSource(source, subjects=subjects or (), field_strength=field_strength)
         made.subjects(made.dataset)  # a glob that matches nothing stops here, before a run exists
-        return Run(run_dir, made)
+        if epi is None and raw is None and not epi_runs:
+            return Run(run_dir, made)
+        from surfcensus.config import epi_settings, new_local_config
+        from surfcensus.run import epi_run_stems, epi_with, refuse_unmatched_epi_runs
+
+        # the EPI options are in the configuration a new run is made with, so that a glob
+        # that matches no run, or a run directory in the participant folders of --raw, is
+        # refused before anything is written
+        config = epi_with(
+            new_local_config(made.config().root or "."), enabled=epi, runs=epi_runs, raw=raw
+        )
+        if epi_runs:
+            refuse_unmatched_epi_runs(epi_run_stems([made], epi_settings(config).raw), epi_runs)
+        return Run(run_dir, made, config=config)
 
     if relocate and source is None:
         raise ConfigError("invalid", "--relocate needs --source PATH, where the data is now")
@@ -494,8 +553,12 @@ def inventory(
         help="The data moved to --source: keep the run, its subjects and their ratings. With "
         "several local sources, name the dataset that moved.",
     ),
+    raw: Path | None = _RAW,
+    epi: bool | None = _EPI,
+    epi_runs: list[str] | None = _EPI_RUNS,
 ) -> None:
-    """List the subjects of a source and record what each has (phase 2)."""
+    """List the subjects of a source and record what each has (phase 2), then the
+    functional runs of the folder (phase 2f)."""
     if relocate not in (None, _RELOCATE_ANY) and not re.fullmatch(r"D-[0-9a-f]+", relocate):
         raise typer.BadParameter(
             "takes a dataset pseudonym (D-xxxxxxxx) or nothing", param_hint="--relocate"
@@ -511,12 +574,36 @@ def inventory(
                 "invalid",
                 f"--field-strength is in tesla, positive and finite, not {field_strength}",
             )
-        run = _open_for_inventory(run_dir, source, subjects, field_strength, moved)
+        run = _open_for_inventory(
+            run_dir, source, subjects, field_strength, moved, epi, epi_runs, raw
+        )
         with run, _stops_at_signals():
             report = run.inventory(datasets=dataset or None, force=force)
             _print_inventory(run, source)
             _print_report(run, report)
-    raise typer.Exit(1 if report.failed else 0)
+            func_report = None
+            if dataset is None:  # the functional inventory covers the whole run
+                func_report = run.func_inventory(force=force)
+                _print_functional(run, source, func_report)
+    failed = report.failed or (func_report is not None and func_report.failed)
+    raise typer.Exit(1 if failed else 0)
+
+
+def _print_functional(run: Run, source: Path | None, report: PhaseReport) -> None:
+    """The functional lines of ``review`` (``review.functional_lines``), and the counts of
+    phase 2f when the run has functional data."""
+    from surfcensus.review import functional_lines
+
+    lines = functional_lines(run, source if source is not None else _stored_root(run))
+    for line in lines:
+        typer.echo(line)
+    if lines or report.done or report.failed:
+        _print_report(run, report)
+
+
+def _stored_root(run: Run) -> Path | None:
+    roots = [s.root for s in run.config.sources if s.kind == "local" and s.root is not None]
+    return Path(roots[0]) if len(roots) == 1 else None
 
 
 def _with_fsaverage(run: Run, fsaverage: Path | None) -> None:
@@ -669,6 +756,77 @@ def render(
                 )
             _print_report(run, report)
     raise typer.Exit(1 if report.failed else 0)
+
+
+@app.command("pack")
+def pack(
+    run_dir: Path = _RUN_DIR,
+    jobs: int = typer.Option(1, "--jobs", min=1, metavar="J", help="Worker processes."),
+    epi_runs: list[str] | None = _EPI_RUNS,
+    force: bool = typer.Option(False, "--force", help="Pack over what is there."),
+    retry_failed: bool = typer.Option(
+        False, "--retry-failed", help="Try the runs again that failed with these inputs."
+    ),
+) -> None:
+    """Pack the pending functional sessions of a run into epi/: the raw and the
+    preprocessed EPI series as moving pictures (step 2 of the EPI interface)."""
+    from surfcensus.run import Run
+
+    with _stops_with_exit_2():
+        with Run(run_dir) as run:
+            if epi_runs is not None and run.set_epi(runs=epi_runs):
+                # a changed selection is a matter of the inventory: what is not selected is
+                # listed as such, and the pack phase removes its pack
+                with _stops_at_signals():
+                    run.func_inventory()
+            with _stops_at_signals():
+                report = run.pack(jobs=jobs, force=force, retry_failed=retry_failed)
+            _print_pack_report(run, report)
+    raise typer.Exit(1 if report.failed else 0)
+
+
+def _print_pack_report(run: Run, report: PhaseReport) -> None:
+    """The closing lines of ``pack``: counts, then one line per failure reason with the
+    runs by name (a local run)."""
+    from surfcensus.review import pack_line
+
+    typer.echo(
+        f"{report.phase}: {report.done} done, {report.skipped} skipped, {report.failed} failed, "
+        f"{report.seconds:.1f} s"
+    )
+    names = _run_names(run)
+    by_reason: dict[str, list[str]] = {}
+    for unit, reason in report.failures:
+        by_reason.setdefault(reason, []).append(names.get(unit, unit))
+    for reason in sorted(by_reason):
+        listed = sorted(by_reason[reason])
+        more = f" and {len(listed) - _MAX_NAMES} more" if len(listed) > _MAX_NAMES else ""
+        typer.echo(f"  {reason}: {len(listed)} ({', '.join(listed[:_MAX_NAMES])}{more})")
+    for note in report.notes:
+        typer.echo(f"  {note}")
+    line = pack_line(run, behind=False)
+    if line is not None:
+        typer.echo(line)
+
+
+def _run_names(run: Run) -> dict[str, str]:
+    """``run_uid`` -> ``sub-01 ses-1_task-rest_run-1`` in a local run."""
+    public = run.public()
+    participants = dict(
+        zip(
+            public.func_participants()["participant_uid"],
+            public.func_participants()["participant"],
+            strict=True,
+        )
+    )
+    sessions = public.func_sessions()
+    owner = dict(zip(sessions["session_uid"], sessions["participant_uid"], strict=True))
+    runs = public.func_runs()
+    names = {}
+    for uid, session, name in zip(runs["run_uid"], runs["session_uid"], runs["name"], strict=True):
+        who = participants.get(owner.get(session))
+        names[uid] = f"{who} {name}" if isinstance(who, str) and isinstance(name, str) else uid
+    return names
 
 
 @app.command("status")
@@ -869,9 +1027,14 @@ def review_command(
     force: bool = typer.Option(
         False, "--force", help="Change --blind although the run has ratings; it is recorded."
     ),
+    raw: Path | None = _RAW,
+    epi: bool | None = _EPI,
+    epi_runs: list[str] | None = _EPI_RUNS,
 ) -> None:
     """Score, render and rate the FreeSurfer subjects under PATH: inventory, metrics,
-    render and the rating app in the browser, in one go. Run it again to continue."""
+    render and the rating app in the browser, in one go; with functional runs in the folder,
+    also the raw and preprocessed EPI movies, packed behind the app. Run it again to
+    continue."""
     from surfcensus import review as reviewing
 
     rater = _checked_rater(rater)
@@ -895,6 +1058,9 @@ def review_command(
                 serve_after=serve_after,
                 relocate=relocate,
                 force=force,
+                epi=epi,
+                epi_runs=epi_runs,
+                raw=raw,
             )
             if served is not None:
                 signals.serving = True  # from here SIGTERM stops the app in order
@@ -908,7 +1074,7 @@ def review_command(
                 )
                 signals.served()  # also for a serve_review that did not call it
         with run:
-            nothing = reviewing.rateable(run) == 0
+            nothing = reviewing.rateable(run) == 0 and reviewing.viewable(run) == 0
             if no_serve and not nothing:
                 typer.echo(f"Run directory: {run.run_dir}")
     raise typer.Exit(1 if nothing else 0)

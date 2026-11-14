@@ -12,12 +12,18 @@ folders for the same path. What this module adds for a run:
   searched again (decision D35), and the derivative of a run is the one that holds the run's
   FreeSurfer subjects, else the folder itself, else the first folder of ``derivatives/`` that a
   connector recognises.
-* :func:`read_places` and :func:`stored_read_places`: the derivative and the raw dataset as
-  places that are only read, so that a run directory or an export there is refused like one
-  in a FreeSurfer source (``sources.local.refuse_in_sources``; the rule of D35 extended), and
-  :func:`places_of_subjects_dir`, the same places found from a FreeSurfer subjects directory
-  alone, which ``sources.local.refuse_in_sources`` adds to the places of every subjects
-  directory it is given.
+* :func:`read_places` and :func:`stored_read_places`: the participant folders of the
+  derivative and of the raw dataset (``sub-*``, and what a ``sub-*`` link leads to) as places
+  that are only read, so that a run directory or an export there is refused like one in a
+  FreeSurfer subjects directory (``sources.local.refuse_in_sources``; the rule of D35
+  extended), and :func:`places_of_subjects_dir`, the same places found from a FreeSurfer
+  subjects directory alone, which ``sources.local.refuse_in_sources`` adds to the places of
+  every subjects directory it is given. The roots themselves are not such places, in parallel
+  with the FreeSurfer source, where a run directory beside the subjects directory inside an
+  fMRIPrep output is allowed: a run that an earlier version made inside a dataset is still
+  found and used, and ``--run-dir`` may name a place inside one (decision D35; E2.Z). The
+  ``--out`` of ``epi-session`` is refused anywhere inside the three folders
+  (:func:`refuse_out`), a new output with no earlier behaviour to keep.
 
 Private side of a run, like ``inventory/subjects.py``: it handles roots. It lists folders and
 reads ``dataset_description.json``; it opens no other file, fetches nothing and writes nothing.
@@ -286,26 +292,59 @@ def _places(roots: tuple[tuple[str, Path | None], ...]) -> list[tuple[str, Path]
 
 
 def _read_places(folders: FuncFolders) -> list[tuple[str, Path]]:
-    """The derivative and the raw dataset, and what a link at their top level leads to; the
-    places of the FreeSurfer subjects directory come from ``sources.local.source_places``."""
+    """The derivative and the raw dataset, and what a link at their top level leads to: the
+    places of :func:`refuse_out`. The places of the FreeSurfer subjects directory come from
+    ``sources.local.source_places``."""
     return _places((("the derivative", folders.deriv_root), ("the raw dataset", folders.raw_root)))
 
 
+def participant_places(roots: tuple[tuple[str, Path | None], ...]) -> list[tuple[str, Path]]:
+    """The participant folders of each root (``sub-*`` entries that are directories, also
+    through a link, whose target ``place_holding`` resolves), as ``(what, directory)``. A root
+    that cannot be listed gives no place."""
+    places: list[tuple[str, Path]] = []
+    for what, root in roots:
+        if root is None:
+            continue
+        try:
+            with os.scandir(root) as entries:
+                names = sorted(e.name for e in entries if e.name.startswith("sub-"))
+        except OSError:
+            continue
+        for name in names:
+            entry = root / name
+            try:
+                if not entry.is_dir():
+                    continue
+            except OSError:
+                continue
+            if entry.is_symlink():
+                places.append((f"the directory that {name} in {what} links to,", entry))
+            else:
+                places.append((f"{name} of {what}", entry))
+    return places
+
+
 def read_places(source: FuncSourceRecord) -> list[tuple[str, Path]]:
-    """The derivative and the raw dataset of ``source`` and what a link at their top level
-    leads to, as ``(what, directory)`` pairs for ``sources.local.refuse_in_sources(also=...)``.
-    The FreeSurfer subjects directory is a place of the surface source already."""
+    """The participant folders of the derivative and of the raw dataset of ``source``
+    (``<root>/sub-*``, and what such a link leads to), as ``(what, directory)`` pairs for
+    ``sources.local.refuse_in_sources(also=...)``. The roots themselves are not among them
+    (module docstring). The FreeSurfer subjects directory is a place of the surface source
+    already."""
     raw = None if source.raw_root is None else Path(source.raw_root)
-    return _places((("the derivative", Path(source.deriv_root)), ("the raw dataset", raw)))
+    return participant_places(
+        (("the derivative", Path(source.deriv_root)), ("the raw dataset", raw))
+    )
 
 
 def places_of_subjects_dir(subjects_dir: Path | str) -> list[tuple[str, Path]]:
-    """The derivative and the raw dataset that a FreeSurfer subjects directory is read with,
-    found by rule from it alone (the fMRIPrep output above ``sourcedata/freesurfer/`` or
-    ``fmriprep/`` beside ``freesurfer/``, when a connector recognises it as a derivative with
-    functional runs; the raw dataset of that derivative), as :func:`read_places` gives them;
-    empty when there is none or a folder cannot be examined. A raw dataset named with
-    ``--raw`` cannot be found from here: :func:`stored_read_places` adds it.
+    """The participant folders of the derivative and the raw dataset that a FreeSurfer
+    subjects directory is read with, found by rule from it alone (the fMRIPrep output above
+    ``sourcedata/freesurfer/`` or ``fmriprep/`` beside ``freesurfer/``, when a connector
+    recognises it as a derivative with functional runs; the raw dataset of that derivative),
+    as :func:`read_places` gives them; empty when there is none or a folder cannot be
+    examined. A raw dataset named with ``--raw`` cannot be found from here:
+    :func:`stored_read_places` adds it.
 
     A derivative with functional runs counts whatever the run's settings say (``--no-epi``):
     its files are a source of the tool, as every subject directory counts whatever the subject
@@ -318,9 +357,8 @@ def places_of_subjects_dir(subjects_dir: Path | str) -> list[tuple[str, Path]]:
             found = _detect(candidate)
             if found is None:
                 continue
-            return _read_places(
-                FuncFolders(candidate, found[1], _raw_dataset(candidate, None), subjects)
-            )
+            raw = _raw_dataset(candidate, None)
+            return participant_places((("the derivative", candidate), ("the raw dataset", raw)))
     except (SourceError, OSError):
         return []
     return []
@@ -331,7 +369,8 @@ def stored_read_places(config: RunConfig) -> list[tuple[str, Path]]:
     root and ``EpiConfig.raw`` by listings alone (no catalog), for the commands that refuse a
     run directory from ``config.yaml`` (``sources.local.refuse_run_in_sources``: the rater
     app, ``finalize``, ``calibration freeze``, ``export``). A root that is not there gives no
-    place. A raw dataset named with ``--raw`` is a place whether or not it can be used."""
+    place. The participant folders of a raw dataset named with ``--raw`` are places whether or
+    not it can be used."""
     from surfcensus.config import epi_settings
     from surfcensus.sources.local import detect_layout
 
@@ -350,7 +389,7 @@ def stored_read_places(config: RunConfig) -> list[tuple[str, Path]]:
         if source is not None:
             places += read_places(source)
     if raw is not None:
-        places += _places((("the raw dataset", _absolute(raw)),))
+        places += participant_places((("the raw dataset", _absolute(raw)),))
     return places
 
 

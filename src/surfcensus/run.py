@@ -12,8 +12,8 @@ import dataclasses
 import logging
 import os
 import sqlite3
-from collections.abc import Callable, Collection, Mapping, Sequence
-from contextlib import AbstractContextManager
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -33,7 +33,7 @@ from surfcensus.config import (
 )
 from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
-from surfcensus.records import METRIC_STAGES, PhaseReport, RunContext
+from surfcensus.records import FUNC_INVENTORY_PHASE, METRIC_STAGES, PhaseReport, RunContext
 from surfcensus.sources.base import HEMIS, DatasetRecord, FileRole, Hemi, Source, SourceError
 from surfcensus.store import (
     CATALOG_FILE,
@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     import numpy as np
     import pandas as pd
 
+    from surfcensus.records import SessionWork
     from surfcensus.templates import Template, TemplateNotFound
 
 
@@ -87,6 +88,90 @@ def other_root_hint(
         "which still holds its subjects, so this path is another dataset: give it a run "
         f"directory of its own with {new_run}"
     )
+
+
+def epi_with(
+    config: RunConfig,
+    *,
+    enabled: bool | None = None,
+    runs: Sequence[str] | None = None,
+    raw: Path | str | None = None,
+) -> RunConfig:
+    """``config`` with the options of the EPI interface that were given (``--epi/--no-epi``,
+    ``--epi-runs``, ``--raw``); None keeps what the run has, as for ``--subjects`` and
+    ``--video``. The section ``epi`` is written into ``config.yaml`` only when it then differs
+    from the defaults it stands for, so a call that gives no option, or one that gives
+    ``--epi`` to a run that never had the section, leaves the bytes of ``config.yaml`` as
+    they were (``config.dump_config``). ``raw`` is stored absolute, links resolved. Raises
+    ``ConfigError("invalid", ...)`` for a raw dataset that is not a directory and for a
+    census run with the interface on (``RunConfig`` refuses it)."""
+    from surfcensus.config import EpiConfig, epi_settings
+
+    if enabled is None and runs is None and raw is None:
+        return config
+    current = epi_settings(config)
+    update: dict[str, object] = {}
+    if enabled is not None:
+        update["enabled"] = enabled
+    if runs is not None:
+        update["runs"] = tuple(dict.fromkeys(runs))
+    if raw is not None:
+        place = Path(raw)
+        if not place.is_dir():
+            raise ConfigError("not found", f"--raw {raw}: no such directory")
+        update["raw"] = str(place.resolve())
+    try:
+        changed = EpiConfig.model_validate(current.model_dump() | update)
+    except ValueError as exc:
+        raise ConfigError("invalid", " ".join(str(exc).split())) from exc
+    if changed == current:
+        return config
+    return with_changes(config, epi=changed.model_dump())
+
+
+def epi_run_stems(sources: Sequence[Source], raw: Path | str | None) -> list[str] | None:
+    """The derivative stems (``sub-01_ses-1_task-rest_run-1``) of every functional run the
+    local ``sources`` give, from listings alone, for the check that an ``--epi-runs`` glob
+    matches a run before it is stored; None when no dataset has a functional part."""
+    from surfcensus.func import connectors as connectors_
+    from surfcensus.func.discover import folders_of, func_source_of
+    from surfcensus.func.inventory import list_participant, participants_of
+
+    stems: list[str] | None = None
+    for source in sources:
+        if source.kind != "local":
+            continue
+        for record in source.datasets():
+            func = func_source_of(record, None if raw is None else Path(raw))
+            if func is None:
+                continue
+            stems = [] if stems is None else stems
+            connector = connectors_.connector(func.connector)
+            folders = folders_of(func, Path(record.root) / record.fs_root)
+            for participant in participants_of(folders):
+                listing = list_participant(folders, connector, participant)
+                stems += [run.stem for run in listing.deriv_runs]
+    return stems
+
+
+def refuse_unmatched_epi_runs(stems: Sequence[str] | None, globs: Sequence[str]) -> None:
+    """``ConfigError("invalid", ...)`` when a glob of ``--epi-runs`` matches no run of
+    ``stems`` (:func:`epi_run_stems`), before it is stored, as for ``--subjects``."""
+    import fnmatch
+
+    if not globs:
+        return
+    if stems is None:
+        raise ConfigError(
+            "invalid", "--epi-runs: this folder has no functional runs (no fMRIPrep derivative)"
+        )
+    unmatched = [g for g in globs if not any(fnmatch.fnmatchcase(s, g) for s in stems)]
+    if unmatched:
+        raise ConfigError(
+            "invalid",
+            f"--epi-runs: no functional run matches {', '.join(unmatched)} (matched against "
+            "the BIDS name of the preprocessed series, sub-01_ses-1_task-rest_run-1)",
+        )
 
 
 @dataclass(frozen=True)
@@ -383,6 +468,7 @@ class Run:
                 found = [row["dataset_id"] for row in rows if row["pipeline"] == dataset.pipeline]
                 for dataset_id in found or ids:
                     self._catalog.relocate(dataset_id, dataset)
+                    self._relocate_func(dataset_id, dataset)
                 earlier = [dataset_id for dataset_id in ids if dataset_id not in found]
                 if found and earlier:
                     with self._catalog.write() as conn:
@@ -459,14 +545,66 @@ class Run:
             places.append(("the fsaverage directory", Path(self.config.metrics.fsaverage_dir)))
         return places
 
+    def _raw_places(self) -> list[tuple[str, Path]]:
+        """The participant folders of the raw dataset named with ``--raw`` (``epi.raw``),
+        which the functional side reads."""
+        from surfcensus.config import epi_settings
+        from surfcensus.func.discover import participant_places
+
+        raw = epi_settings(self.config).raw
+        if raw is None:
+            return []
+        return participant_places((("the raw dataset", Path(raw)),))
+
     def _refuse_inside(self, source: Source) -> None:
-        """Refuse a run directory that is, or lies inside, what ``source`` reads."""
+        """Refuse a run directory that is, or lies inside, what ``source`` reads, or the
+        participant folders of a raw dataset named with ``--raw``; and a raw dataset that
+        lies inside the run directory."""
+        from surfcensus.config import epi_settings
         from surfcensus.sources.local import refuse_in_sources
 
+        raw = epi_settings(self.config).raw
+        if raw is not None and Path(raw).resolve().is_relative_to(self.run_dir.resolve()):
+            raise ConfigError(
+                "invalid", f"--raw {raw} lies inside the run directory {self.run_dir}"
+            )
         subjects_dir = getattr(source, "subjects_dir", None)
         if not isinstance(subjects_dir, Path):
             return
-        refuse_in_sources(self.run_dir, [subjects_dir], what="run", also=self._template_places())
+        also = [*self._template_places(), *self._raw_places()]
+        refuse_in_sources(self.run_dir, [subjects_dir], what="run", also=also)
+
+    def set_epi(
+        self,
+        *,
+        enabled: bool | None = None,
+        runs: Sequence[str] | None = None,
+        raw: Path | str | None = None,
+    ) -> bool:
+        """Store the options of the EPI interface that were given (:func:`epi_with`) in
+        ``config.yaml``; returns whether it changed. A glob of ``runs`` that matches no
+        functional run is refused before it is stored (:func:`refuse_unmatched_epi_runs`),
+        and a raw dataset whose participant folders hold the run directory is refused."""
+        changed = epi_with(self.config, enabled=enabled, runs=runs, raw=raw)
+        if changed == self.config:
+            return False
+        from surfcensus.config import epi_settings
+
+        settings = epi_settings(changed)
+        if runs:
+            stems = epi_run_stems(self._sources(), settings.raw)
+            refuse_unmatched_epi_runs(stems, runs)
+        earlier = self.config
+        self.config = changed
+        try:
+            for index in range(len(self.config.sources)):
+                if index in self._built:
+                    self._refuse_inside(self._built[index])
+            write_config(self.run_dir, changed)
+        except BaseException:
+            self.config = earlier
+            raise
+        return True
 
     def refuse_output_in_sources(self, out: Path | str) -> None:
         """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory
@@ -811,10 +949,19 @@ class Run:
 
     def func_inventory(self, *, force: bool = False) -> PhaseReport:
         """Phase 2f, the functional inventory (``func.inventory.run_func_inventory``), after
-        :meth:`inventory`: a separate call so that the surface report keeps its numbers. A
-        run without a functional source, with ``--no-epi`` or of a census gives an empty
-        report. Work package E2.Z writes it."""
-        raise NotImplementedError("work package E2.Z: run.py")
+        :meth:`inventory`: a separate call so that the surface report keeps its numbers. It
+        reads listings, sidecars, reports, transforms, masks and the headers of the series,
+        never a volume. A run without a functional source, with ``--no-epi`` or of a census
+        gives an empty report and builds no source; otherwise a source that cannot be built
+        raises ``SourceError`` before anything is recorded."""
+        from surfcensus.config import epi_settings
+        from surfcensus.func.inventory import run_func_inventory
+
+        if self.config.mode != "local" or not epi_settings(self.config).enabled:
+            return PhaseReport(phase=FUNC_INVENTORY_PHASE, done=0, skipped=0, failed=0, failures=())
+        return run_func_inventory(
+            self._catalog, self._sources(), self.config, run_key(self.config), force=force
+        )
 
     def pack(
         self,
@@ -826,10 +973,102 @@ class Run:
         stop: Callable[[], bool] | None = None,
     ) -> PhaseReport:
         """Pack the pending functional sessions into ``epi/`` (``func.batch.run_pack``), with
-        the run's lease of a session bound into the context. Builds the sources only when
-        something is pending; refuses a census run (``ConfigError("invalid", ...)``). Work
-        package E2.Z writes it."""
-        raise NotImplementedError("work package E2.Z: run.py")
+        the run's lease of a session bound into the context (:meth:`context`).
+
+        ``sessions`` are ``session_uid``s. What is pending is decided from the catalog and the
+        run directory (``func.batch.pack_pending``) before any source is looked at, so a run
+        whose packs are all made needs no source and works while the data is not mounted.
+        When something is pending, the FreeSurfer sources and the derivative of every
+        functional source are looked for first, and a folder that is gone raises
+        ``SourceError("not found", ...)`` before anything is recorded: a missing disk is not
+        a property of its sessions. A census run is refused (``ConfigError("invalid", ...)``):
+        the EPI phases do not run there. ``stop`` is that of :meth:`render`."""
+        from surfcensus.config import epi_settings
+        from surfcensus.func.batch import pack_pending, run_pack
+
+        if self.config.mode != "local":
+            raise ConfigError("invalid", "a census run has no EPI interface; nothing is packed")
+        context = self.context()
+        if not epi_settings(self.config).enabled:
+            return run_pack(context, jobs=jobs, sessions=sessions)  # removes nothing, packs nothing
+        pending = pack_pending(context, sessions=sessions, force=force, retry_failed=retry_failed)
+        if pending:
+            self._sources()  # a source that is gone is not a property of its sessions
+            for root in self._func_roots():
+                if not Path(root).is_dir():
+                    raise SourceError(
+                        "not found",
+                        f"the derivative {root} of this run's functional sessions is not there",
+                    )
+        return run_pack(
+            context,
+            jobs=jobs,
+            sessions=sessions,
+            force=force,
+            retry_failed=retry_failed,
+            stop=stop,
+        )
+
+    def _func_roots(self) -> list[str]:
+        """The derivative roots of the run's present functional sources, from the catalog."""
+        rows = self._catalog.query(
+            "SELECT deriv_root FROM func_sources WHERE present = 1 ORDER BY func_id"
+        )
+        return [row["deriv_root"] for row in rows]
+
+    def func_folders(self) -> list[dict[str, object]]:
+        """The present functional sources of a local run with their roots, for the lines that
+        ``review`` and ``inventory`` print on the terminal of whoever has the data:
+        ``deriv_root``, ``raw_root``, ``raw_found``, ``connector`` and ``pipeline_version``.
+        Empty for a census run, whose roots stay in the catalog."""
+        if self.config.mode != "local" or not self.public().has_func():
+            return []
+        rows = self._catalog.query(
+            "SELECT deriv_root, raw_root, raw_found, connector, pipeline_version "
+            "FROM func_sources WHERE present = 1 ORDER BY func_id"
+        )
+        return [dict(row) for row in rows]
+
+    def func_fetch_lines(self) -> list[str]:
+        """``func.inventory.func_fetch_lines``: the functional runs with git-annex
+        placeholders and the commands that fetch their files; empty in a census run."""
+        from surfcensus.func.inventory import func_fetch_lines
+
+        if self.config.mode != "local" or not self.public().has_func():
+            return []
+        return func_fetch_lines(self._catalog)
+
+    def _relocate_func(self, dataset_id: int, dataset: DatasetRecord) -> None:
+        """Move the functional source of a dataset that moved (``relocate``): the derivative
+        and the raw dataset are found again by rule from the dataset at its new place and
+        their roots replace the stored ones; nothing else changes, so every
+        ``participant_uid``, ``session_uid`` and ``run_uid`` stays, since the derivative's
+        identity is kept (decision D21). A raw dataset named with ``--raw`` keeps its name. A
+        dataset whose functional part is not found at the new place is left as it is: the
+        next functional inventory marks its sessions absent."""
+        from surfcensus.config import epi_settings
+        from surfcensus.func.discover import func_source_of
+
+        if self.config.mode != "local":
+            return
+        stored = self._catalog.func_source(dataset_id)
+        if stored is None:
+            return
+        raw = epi_settings(self.config).raw
+        try:
+            found = func_source_of(dataset, None if raw is None else Path(raw))
+        except (SourceError, OSError):
+            found = None
+        if found is None or found.connector != stored.connector:
+            return
+        rows = self._catalog.query(
+            "SELECT func_id FROM func_sources WHERE dataset_id = ? AND connector = ?",
+            (dataset_id, stored.connector),
+        )
+        for row in rows:
+            self._catalog.relocate_func(
+                row["func_id"], found.deriv_root, found.raw_root, found.raw_found
+            )
 
     def _subject_uids(self, names: Sequence[str]) -> list[str]:
         named = [names] if isinstance(names, str) else list(names)
@@ -944,16 +1183,35 @@ class Run:
         return self._catalog.public()
 
     def context(self) -> RunContext:
-        """What phase functions receive in place of the run."""
+        """What phase functions receive in place of the run. In a local run it carries the
+        lease of a functional session (``func_lease``: ``func.inventory.session_work`` over
+        what the private catalog knows of the session, with the EPI settings of this
+        configuration) and ``pack_key`` with the run secret bound; a census run has neither,
+        since the EPI phases do not run there."""
         catalog = self._catalog
         secret = catalog.run_secret()
+        config = self.config
+        func_lease = None
+        if config.mode == "local":
+            from surfcensus.config import epi_settings
+
+            epi = epi_settings(config)
+
+            @contextmanager
+            def func_lease(session_uid: str) -> Iterator[SessionWork]:
+                from surfcensus.func.inventory import session_work
+
+                yield session_work(catalog.func_lease_facts(session_uid), epi)
+
         return RunContext(
             run_dir=self.run_dir,
-            config=self.config,
+            config=config,
             public=catalog.public(),
             lease=self._lease,
             render_key=lambda tile_hash, digests: privacy.render_key(secret, tile_hash, digests),
             scrub=lambda text: privacy.scrub_with(catalog, text),
+            func_lease=func_lease,
+            pack_key=lambda pack_hash, digests: privacy.pack_key(secret, pack_hash, digests),
         )
 
     def media_dir(self, subject_uid: str) -> Path:

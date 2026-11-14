@@ -9,6 +9,7 @@ stream is driven through the hooks of ``tests/test_epi_browser.py`` (``window.__
 
 from __future__ import annotations
 
+import os
 import shutil
 from collections.abc import Iterator
 from pathlib import Path
@@ -26,7 +27,10 @@ sync_api = pytest.importorskip("playwright.sync_api")
 
 pytestmark = pytest.mark.browser
 
-SHOTS = Path(__import__("os").environ.get("SURFCENSUS_SHOTS", "")) or None
+_SHOTS = os.environ.get("SURFCENSUS_SHOTS", "")
+SHOTS = Path(_SHOTS) if _SHOTS else None
+"""Where the tests leave screenshots for a reader, when ``SURFCENSUS_SHOTS`` names a place
+(outside the repository); none otherwise."""
 SEEN_TOUR = "try { localStorage.setItem('surfcensus.tour.seen:local', '1'); } catch (e) {}"
 
 

@@ -22,3 +22,9 @@ media/
 # the dataset key must never be committed (decision D10)
 *.key
 .hypothesis/
+
+# screenshots and other media that a test or a tool drops in the repository root
+/*.png
+/*.jpg
+/*.webp
+/*.mp4
