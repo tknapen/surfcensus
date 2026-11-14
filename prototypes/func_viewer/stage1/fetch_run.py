@@ -7,8 +7,9 @@ SELECTION  the directory of select_runs.py (selection.parquet)
 ID         a neutral id of the selection: H01 to H06, Q01, Q02
 OUT        a directory for the files; not in the repository. It gets:
              deriv/   the T1w-space series, brain masks, scanner-to-T1w transforms, confounds
-                      tables, BOLD-space reference images and derivative sidecars of the runs,
-                      and the fsnative transform
+                      tables, BOLD-space reference images, derivative sidecars and fMRIPrep's
+                      summary reports (figures/<stem>_desc-summary_bold.html, a few kB) of the
+                      runs, and the fsnative transform
              raw/     the raw series of the runs and their own sidecars, when they have one
              fs/      mri/T1.mgz and surf/{lh,rh}.{white,pial} (a pial variant such as
                       lh.pial.T1 is stored as lh.pial, the name pack_run.py reads)
@@ -31,6 +32,13 @@ MD5 (not for a multipart upload, whose ETag has a dash). A file that is in OUT w
 the listing and a matching MD5 in fetch_log.json is not fetched again; a partial download
 (<name>.part) is continued with a range request. Exit status 0 when every file is in place and
 checked, 1 when one is not, 2 for usage.
+
+A run whose BOLD-space reference image or summary report the listing lacks is named on
+standard error: without the reference image pack_run.py takes the raw header's img.affine
+unchecked, without the report it records distortion and slice-timing correction as unknown (or
+distortion correction as applied when the listing has the run's distortion-correction figure,
+figures/<stem>_desc-sdc_bold.svg). fetch_log.json records, under "_session", which runs were not
+fetched and, per run, whether that figure is listed; pack_run.py reads both.
 
 The last line on standard output is JSON with the counts and names nothing: runs, files, bytes
 transferred in this call, requests and seconds.
@@ -60,6 +68,8 @@ RETRY_STATUS = (500, 502, 503, 504)
 DERIV = "https://openneuro-derivatives.s3.amazonaws.com"
 RAW = "https://s3.amazonaws.com/openneuro.org"
 PREPROC = "_space-T1w_desc-preproc_bold.nii.gz"
+SUMMARY = "_desc-summary_bold.html"
+SDC_FIGURE = "_desc-sdc_bold.svg"
 BLOCK = 1 << 20
 
 _slots = threading.BoundedSemaphore(MAX_REQUESTS)
@@ -129,10 +139,44 @@ def download(url, dest, size, etag):
     return {"ok": False, "error": str(last)}
 
 
+def figures_index(listing):
+    """{file name: (key, size, etag)} of the derivative's figures/ folders in the listing."""
+    out = {}
+    for key, size, etag in listing.get("deriv", []):
+        parts = key.rsplit("/", 2)
+        if len(parts) == 3 and parts[1] == "figures":
+            out[parts[2]] = (key, size, etag)
+    return out
+
+
+def run_stem(preproc_key):
+    return preproc_key.rsplit("/", 1)[1][: -len(PREPROC)]
+
+
+def missing_per_run(rows, listing):
+    """[(run_id, what)] of the reference images and summary reports that the listing lacks."""
+    keys = {key for key, _, _ in listing.get("deriv", [])}
+    figures = figures_index(listing)
+    out = []
+    for row in rows.itertuples():
+        if row.preproc_key[: -len(PREPROC)] + "_boldref.nii.gz" not in keys:
+            out.append((row.run_id, "no BOLD-space reference image"))
+        if run_stem(row.preproc_key) + SUMMARY not in figures:
+            out.append((row.run_id, "no summary report"))
+    return out
+
+
+def sdc_figures_listed(rows, listing):
+    """{stem: whether figures/<stem>_desc-sdc_bold.svg is in the listing} for every row."""
+    figures = figures_index(listing)
+    return {run_stem(k): run_stem(k) + SDC_FIGURE in figures for k in rows.preproc_key}
+
+
 def plan_files(rows, listing, fs_dir_name="fs"):
     """{local path relative to OUT: (base, key, size, etag)} for the given rows of one session."""
     files = {}
     deriv_index = {key: (size, etag) for key, size, etag in listing.get("deriv", [])}
+    figures = figures_index(listing)
     for row in rows.itertuples():
         for kind in ("preproc", "mask", "xfm", "confounds"):
             key = getattr(row, f"{kind}_key")
@@ -150,6 +194,12 @@ def plan_files(rows, listing, fs_dir_name="fs"):
             if key in deriv_index:
                 size, etag = deriv_index[key]
                 files["deriv/" + key.rsplit("/", 1)[1]] = (DERIV, key, size, etag)
+        # fMRIPrep's summary report of the run: whether distortion and slice-timing correction
+        # were applied to the preprocessed series (pack_inputs.preprocessing_of)
+        summary = run_stem(row.preproc_key) + SUMMARY
+        if summary in figures:
+            key, size, etag = figures[summary]
+            files["deriv/" + summary] = (DERIV, key, int(size), etag)
         files["raw/" + row.raw_key.rsplit("/", 1)[1]] = (
             RAW,
             row.raw_key,
@@ -304,6 +354,8 @@ def main():
         f"{'; not fetched ' + ', '.join(rows.run_id[i] for i in left) if left else ''};"
         f" {len(files)} files, {total / 1e6:.1f} MB"
     )
+    for run_id, what in missing_per_run(take, listing):
+        print(f"{run_id}: the listing has {what} of this run", file=sys.stderr)
     if not plan_only:
         failed += fetch_all(out, files, log)
     log["_session"] = {
@@ -313,6 +365,8 @@ def main():
         "fetched_run_ids": run_ids,
         "left_out_run_ids": [rows.run_id[i] for i in left],
         "pial_variants": [rows.fs_lh_pial_variant[0], rows.fs_rh_pial_variant[0]],
+        "sdc_figure_listed": sdc_figures_listed(rows, listing),
+        "missing_per_run": [list(x) for x in missing_per_run(take, listing)],
     }
     log_path.write_text(json.dumps(log, indent=1, sort_keys=True))
     summary = {

@@ -4,8 +4,11 @@ usage: fetch.py OUT
 
 The worked example is ds000102 sub-01 (two runs of the flanker task): the raw series from the
 OpenNeuro bucket, and from the OpenNeuroDerivatives bucket the T1w-space preprocessed series,
-reference images, masks, confounds and transforms of fMRIPrep 21.0.2. 29 files, 133 MB. A file
-that is already in OUT is not fetched again. OUT/fetch_log.json lists the files and their sizes.
+reference images, masks, confounds and transforms of fMRIPrep 21.0.2, and fMRIPrep's summary
+report of each run (figures/, a few kB; stage1/pack_run.py reads from it whether distortion and
+slice-timing correction were applied). 31 files, 133 MB (29 before the reports were added on
+2026-11-14). A file that is already in OUT is not fetched again. OUT/fetch_log.json lists the
+files and their sizes.
 """
 
 import json
@@ -48,6 +51,7 @@ def file_list():
         files[f"raw/run-{run}_events.tsv"] = R + f"{S}/func/{p}events.tsv"
         for name in PER_RUN:
             files[f"deriv/run-{run}_{name}"] = D + f"func/{p}{name}"
+        files[f"deriv/run-{run}_desc-summary_bold.html"] = D + f"figures/{p}desc-summary_bold.html"
     for name in ANAT:
         files[f"deriv/anat_{name}"] = D + f"anat/{S}_{name}"
     files["raw/task_bold.json"] = R + "task-flanker_bold.json"

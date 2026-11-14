@@ -11,6 +11,11 @@ session_fetch.py names them for another subject:
   deriv/<stem>_desc-confounds_timeseries.tsv          framewise displacement, standardised DVARS
   deriv/<stem>_space-T1w_desc-preproc_bold.json       RepetitionTime (else the NIfTI header)
   deriv/*from-T1w_to-fsnative_mode-image_xfm.txt      for the surfaces (one file)
+  deriv/<stem>_boldref.nii.gz                         BOLD-space reference image: which affine
+                                                      of the raw header (session.raw_affine)
+  deriv/<stem>_desc-summary_bold.html                 fMRIPrep's summary report of the run:
+                                                      distortion and slice-timing correction
+  fetch_log.json                                      of fetch_run.py: the runs not fetched
   raw/<stem>_bold.nii.gz                              the raw series
   raw/<stem>_bold.json                                its sidecar, when the dataset has one
 
@@ -19,7 +24,9 @@ example). A raw run and a derivative run are the same run when session.run_key o
 equal, so run-01 and run-1 match.
 """
 
+import html
 import json
+import re
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -43,6 +50,17 @@ MASK = "_space-T1w_desc-brain_mask.nii.gz"
 XFM = "_from-scanner_to-T1w_mode-image_xfm.txt"
 FSNATIVE = "*from-T1w_to-fsnative_mode-image_xfm.txt"
 NON_STEADY = "non_steady_state_outlier"
+SUMMARY = "_desc-summary_bold.html"
+
+# the states that the manifest records for a correction (preprocessing_of)
+APPLIED, NOT_APPLIED, UNKNOWN = "applied", "not applied", "unknown"
+SOURCE_REPORT = "fMRIPrep's summary report of the run"
+SOURCE_LISTING = "the listing only: fMRIPrep's distortion-correction figure of the run is listed"
+SOURCE_NONE = "not recorded: no summary report of the run under deriv/"
+MOTION_SOURCE = (
+    "fMRIPrep applies head-motion correction to every preprocessed series; its summary report"
+    " does not state it per run"
+)
 
 
 class InputError(ValueError):
@@ -196,3 +214,88 @@ def read_confounds(path):
     flags = [c for c in table.columns if c.startswith(NON_STEADY)]
     non_steady = sorted({int(i) for c in flags for i in table.index[table[c] == 1]})
     return column("framewise_displacement"), column("std_dvars"), non_steady
+
+
+def _report_line(text, label):
+    """The text after '<label>:' in an <li> of fMRIPrep's summary report, tags removed."""
+    m = re.search(r"<li>\s*" + re.escape(label) + r"\s*:\s*(.*?)</li>", text, re.S | re.I)
+    if not m:
+        return None
+    value = html.unescape(re.sub(r"<[^>]+>", "", m.group(1)))
+    return " ".join(value.split())[:160] or None
+
+
+def report_facts(text):
+    """What fMRIPrep's per-run summary report (figures/<stem>_desc-summary_bold.html) says about
+    two corrections of the preprocessed series. Returns a dict:
+
+      sdc            'applied', 'not applied' or 'unknown' (the line 'Susceptibility distortion
+                     correction: ...'; 'None' is not applied, any other value applied)
+      sdc_method     the report's words for the method when applied, e.g. 'FLB ("fieldmap-less",
+                     SyN-based)' or 'FMB (fieldmap-based) - phase-difference map'; else None
+      slice_timing   'applied', 'not applied' or 'unknown' (the line 'Slice timing correction:
+                     ...'; 'Not applied' is not applied, a value that starts with 'Applied' is
+                     applied, anything else unknown)
+    """
+    sdc_text = _report_line(text, "Susceptibility distortion correction")
+    if sdc_text is None:
+        sdc, method = UNKNOWN, None
+    elif sdc_text.lower() == "none":
+        sdc, method = NOT_APPLIED, None
+    else:
+        sdc, method = APPLIED, sdc_text
+    stc_text = _report_line(text, "Slice timing correction")
+    if stc_text is None:
+        stc = UNKNOWN
+    elif stc_text.lower().startswith("not applied"):
+        stc = NOT_APPLIED
+    elif stc_text.lower().startswith("applied"):
+        stc = APPLIED
+    else:
+        stc = UNKNOWN
+    return {"sdc": sdc, "sdc_method": method, "slice_timing": stc}
+
+
+def read_fetch_log(data):
+    """The '_session' entry of DATA/fetch_log.json that fetch_run.py writes, or {} (the worked
+    example's fetch_log.json of pipeline/fetch.py has none)."""
+    try:
+        log = json.loads((Path(data) / "fetch_log.json").read_text())
+    except (OSError, ValueError):
+        return {}
+    entry = log.get("_session") if isinstance(log, dict) else None
+    return entry if isinstance(entry, dict) else {}
+
+
+def preprocessing_of(run, session_log):
+    """What the pipeline did to the preprocessed series of a run, as the manifest records it:
+    head-motion correction (always, by fMRIPrep's design), and whether it corrected for
+    susceptibility distortion (and by which method) and for slice timing (see report_facts for
+    the values). The raw stream has none of these; the page states them so that a difference
+    between the two streams can be read as the effect of these steps.
+
+    The source is the run's summary report, deriv/<stem>_desc-summary_bold.html, which
+    fetch_run.py fetches with the run. Without it, a run whose distortion-correction figure
+    (figures/<stem>_desc-sdc_bold.svg) the listing has counts as applied with an unknown method;
+    otherwise both are 'unknown'. 'sdc_figure_listed' is that listing fact as fetch_run.py
+    recorded it (None when not recorded), kept beside the report's statement as a cross-check.
+    """
+    listed = (session_log.get("sdc_figure_listed") or {}).get(run.stem)
+    listed = bool(listed) if listed is not None else None
+    report = run.preproc.parent / (run.stem + SUMMARY)
+    if report.is_file():
+        facts = report_facts(report.read_text(errors="replace"))
+        source = SOURCE_REPORT
+    elif listed:
+        facts = {"sdc": APPLIED, "sdc_method": None, "slice_timing": UNKNOWN}
+        source = SOURCE_LISTING
+    else:
+        facts = {"sdc": UNKNOWN, "sdc_method": None, "slice_timing": UNKNOWN}
+        source = SOURCE_NONE
+    return {
+        "motion_correction": APPLIED,
+        "motion_correction_source": MOTION_SOURCE,
+        **facts,
+        "source": source,
+        "sdc_figure_listed": listed,
+    }

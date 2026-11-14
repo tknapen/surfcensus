@@ -12,12 +12,14 @@
 # Steps: check_session.py (the anchor run is the per-run stream bit for bit; the session stream
 # is deterministic; the between-run displacement), select_runs.py --self-check (the selection
 # rule on made-up tables), pack_run.py twice and pack_digest.py (two packs are the same bytes),
-# check_player.py (exactness, frame rate, scrubbing, markers, screenshots). The pack carries the
-# neutral id W01. At the end it prints the command that serves the pack.
+# check_geometry.py (the raw stream recomputed with code that shares nothing with the pack's,
+# and where it sits on the anatomy), check_player.py (the page shows the pack's values; frame
+# rate, scrubbing, markers, screenshots). The pack carries the neutral id W01. At the end it
+# prints the command that serves the pack.
 set -euo pipefail
 
 usage() {
-    sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 [ $# -ge 3 ] || usage
@@ -55,6 +57,7 @@ step "pack" "$WORK/pack.txt" "${PY[@]}" "$S/pack_run.py" "$DATA" "$FS" "$WORK/pa
 step "pack again" "$WORK/pack2.txt" "${PY[@]}" "$S/pack_run.py" "$DATA" "$FS" "$WORK/pack2" --id W01
 step "pack_digest: the two packs are the same bytes" "$WORK/digest.txt" "${PY[@]}" "$S/pack_digest.py" "$WORK/pack" "$WORK/pack2"
 rm -rf "$WORK/pack2"
+step "check_geometry: independent placement of the raw stream" "$WORK/check_geometry.txt" "${PY[@]}" "$S/check_geometry.py" "$WORK/pack" "$WORK/map.tsv" "$DATA" --json "$WORK/check_geometry.json"
 if [ $BROWSER = 1 ]; then
     step "check_player" "$WORK/check_player.txt" "${PY[@]}" "$S/check_player.py" "$WORK/pack" "$WORK/map.tsv" "$DATA" "$WORK/check"
 fi

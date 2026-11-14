@@ -25,7 +25,9 @@
     <button type="button" id="help-button"><kbd>?</kbd> help</button>
   </header>
   <p id="run-note"></p>
+  <p id="session-note"></p>
   <p id="warning" role="alert" hidden></p>
+  <p id="corrections" role="note"></p>
   <main id="views"></main>
   <p id="legend"><span id="legend-text"></span> <canvas id="legend-bar" width="255" height="10" hidden></canvas></p>
   <section id="controls" aria-label="controls">
@@ -56,18 +58,30 @@
   <div id="help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
     <div class="sheet">
       <h1 id="help-title">What this page shows</h1>
-      <p>One session of functional MRI, run by run, in the anatomy. Two streams of every run lie on the same slices:</p>
+      <p>One session of functional MRI, run by run, in the anatomy. The page serves two kinds of quality control at
+        once (Tomas Knapen, 2026-11-14): of the <b>raw data</b>, and of the <b>preprocessing pipeline</b>. Two streams
+        of every run lie on the same slices, with the white and pial surfaces of FreeSurfer as contours:</p>
       <ul>
-        <li><b>raw</b>: the series as it was acquired, each volume resampled once into the anatomy through
-          <b>one rigid registration for the whole session</b> (that of the session's anchor run). Nothing is corrected:
-          no motion correction, no slice timing, no distortion correction. So everything that moved within the session,
-          within a run and between runs, is still in it. Distortion and the bright fluid band of EPI are in it by
-          construction. It is the reference for what preprocessing changed, not the thing to be judged.</li>
-        <li><b>preprocessed</b>: the series as fMRIPrep stored it.</li>
+        <li><b>raw</b>: the raw BIDS series with nothing done to it but one rigid placement into the anatomy for the
+          whole session (the stored registration of the session's anchor run). No motion, slice-timing or distortion
+          correction, and no other processing. For the raw data it shows head motion within a run, artefacts confined
+          to single volumes, distortion and dropout as acquired, and how far the head moved between runs.</li>
+        <li><b>preprocessed</b>: the series as fMRIPrep stored it. For the pipeline it shows what remains after its
+          corrections, and how the corrected series conforms to the contours.</li>
       </ul>
-      <p>A run that is not the anchor is drawn through the anchor's registration. How far that puts it from where its
-        own stored registration would is written under the run buttons. A run beyond <span id="help-limit"></span> mm
-        is flagged: it may not share the anchor's scanner frame.</p>
+      <p><b>The difference</b> between the two streams, and the raw stream's misfit to the contours, are what the page
+        exists to show: the effect of the preprocessing of that run, and the state of the raw data. The line under the
+        run buttons says what the pipeline did to the run (head-motion correction; distortion correction and its
+        method, or none; slice-timing correction or none), as fMRIPrep's summary report of the run states it, so that a
+        difference can be read as the effect of those steps. Where distortion correction was applied, the raw stream
+        shows the distortion as acquired against the contours, and the preprocessed stream how well the correction
+        brought the series onto them. Brain within half a voxel of the edge of the raw field of view is black in the
+        raw stream.</p>
+      <p>A run that is not the anchor is drawn through the anchor's registration, so the raw stream shows how far the
+        head moved since the anchor run (raw data). How far that puts it from where its own stored registration would
+        is written under the run buttons. A run beyond <span id="help-limit"></span> mm is flagged: that is a statement
+        about the raw data under one registration (the head, or the subject, moved that much, or a stored registration
+        failed), not a fault of the page.</p>
       <p><b>Exact values.</b> Every voxel on screen is the stored 8-bit value, one block per voxel, no smoothing.
         <span id="help-window"></span> The stills (mean, SD) are computed before the 8 bits; the SD has a window of its own.</p>
       <p><b>Difference</b> is raw minus preprocessed of the two 8-bit values. Red to yellow: raw is higher. Blue to cyan:

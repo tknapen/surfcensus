@@ -86,9 +86,9 @@ function stateKey(s) {
 function groupLabels() {
   const what = { series: '', mean: 'temporal mean: ', sd: 'temporal SD: ' }[state.kind];
   return {
-    raw: `${what}raw, session registration`,
-    pre: `${what}preprocessed, as stored`,
-    diff: `${what}raw minus preprocessed`,
+    raw: `${what}raw, one placement per session (the raw data)`,
+    pre: `${what}preprocessed, as stored (the pipeline's result)`,
+    diff: `${what}raw minus preprocessed (what preprocessing changed)`,
   };
 }
 
@@ -260,8 +260,8 @@ function writeRun() {
   const warnings = [];
   if (f.flagged) {
     warnings.push(
-      `${r.id} is FLAGGED: somewhere in the brain it lies more than ${reg.limit_mm} mm from where its own registration puts it. ` +
-        'It may not share the scanner frame of the anchor run, or a registration may have failed. Its raw stream is not in register with the anatomy.',
+      `${r.id} is FLAGGED (raw data): drawn through the session's one registration, it lies more than ${reg.limit_mm} mm somewhere in the brain from where its own registration puts it. ` +
+        'The head moved that much since the anchor run, the run may not share its scanner frame, or a stored registration failed. Its raw stream is not in register with the anatomy.',
     );
   }
   if (reg.anchor_is_outlier) {
@@ -271,6 +271,61 @@ function writeRun() {
   }
   $('warning').hidden = warnings.length === 0;
   $('warning').textContent = warnings.join(' ');
+  $('session-note').textContent = sessionNote(manifest);
+  writeCorrections();
+}
+
+// How many qualifying runs of the session are not in this pack (fields of 2026-11-14; a pack
+// made before has no runs_not_fetched, and the worked example records none).
+function sessionNote(m) {
+  const packed = m.runs.length;
+  const here = Number.isInteger(m.runs_left_out) ? m.runs_left_out : 0;
+  if (!Number.isInteger(m.runs_not_fetched)) {
+    const extra = here ? ` ${here} run(s) under the pack's input lacked a file and are not in it.` : '';
+    return `Whether this session has further qualifying runs that are not in this pack is not recorded.${extra}`;
+  }
+  const missing = m.runs_not_fetched + here;
+  if (missing === 0) return `All ${packed} qualifying run(s) of this session are in this pack.`;
+  return (
+    `This session has ${packed + missing} qualifying runs; ${missing} of them are not in this pack ` +
+    `(${m.runs_not_fetched} not fetched, ${here} lacking a file). R1, R2, ... number the packed runs only.`
+  );
+}
+
+// What the pipeline did to this run (run.preprocessing, 2026-11-14), as information: the
+// difference between the streams is the effect of these steps, and of the state of the raw data.
+function correctionsText(r) {
+  const p = r.preprocessing;
+  if (!p) {
+    return {
+      level: 'unknown',
+      text:
+        `Preprocessing of ${r.id}: head-motion correction and fMRIPrep's own registration; whether distortion or ` +
+        'slice-timing correction was applied is not recorded in this pack. The raw stream has none of these.',
+    };
+  }
+  const steps = ['head-motion correction'];
+  if (p.sdc === 'applied') steps.push(`distortion correction, ${p.sdc_method || 'method not recorded'}`);
+  else if (p.sdc === 'not applied') steps.push('no distortion correction');
+  else steps.push('distortion correction not recorded');
+  if (p.slice_timing === 'applied') steps.push('slice-timing correction');
+  else if (p.slice_timing === 'not applied') steps.push('no slice-timing correction');
+  else steps.push('slice-timing correction not recorded');
+  let text = `Preprocessing of ${r.id}: ${steps.join('; ')}. The raw stream has none of these, only the session's one placement.`;
+  if (p.sdc === 'applied') {
+    text +=
+      ' So the raw stream shows the distortion as acquired against the contours, and the preprocessed stream how well ' +
+      'the correction brought the series onto them.';
+  }
+  return { level: p.sdc === 'unknown' ? 'unknown' : 'known', text };
+}
+
+function writeCorrections() {
+  const { level, text } = correctionsText(run());
+  const box = $('corrections');
+  box.textContent = text;
+  box.dataset.level = level;
+  box.dataset.strong = String(state.view !== 'pre'); // the views that show what preprocessing changed
 }
 
 function writeLegend() {
@@ -282,7 +337,7 @@ function writeLegend() {
   const bar = $('legend-bar');
   if (state.view === 'diff') {
     text =
-      `Difference raw minus preprocessed: the colour saturates at ${state.diffScale} gray levels of 255 ` +
+      `Difference raw minus preprocessed, the effect of preprocessing on this run: the colour saturates at ${state.diffScale} gray levels of 255 ` +
       `(${((state.diffScale * span) / 255).toFixed(0)} units of ${what}; window ${win[0].toFixed(0)} to ${win[1].toFixed(0)}). ` +
       'Blue: raw lower. Red: raw higher.';
     const ctx = bar.getContext('2d');
@@ -359,6 +414,7 @@ function setView(view) {
   if (view === 'raw' || view === 'pre') lastFlip = view === 'raw' ? 'pre' : 'raw';
   state.view = view;
   writeLegend();
+  writeCorrections();
   views.layout();
   render('other');
 }
@@ -619,7 +675,7 @@ function buildControls() {
 }
 
 function availableHeight() {
-  const used = ['bar', 'run-note', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
+  const used = ['bar', 'run-note', 'session-note', 'corrections', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
   const warn = $('warning').hidden ? 0 : $('warning').offsetHeight;
   const tr = state.traces ? $('traces').offsetHeight : 0;
   // In a narrow window the views take most of its height and the controls are reached by

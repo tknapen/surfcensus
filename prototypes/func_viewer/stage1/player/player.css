@@ -88,6 +88,7 @@ input:focus-visible {
 }
 
 #run-note,
+#session-note,
 #legend,
 #status {
   margin: 6px 0;
@@ -102,6 +103,21 @@ input:focus-visible {
   color: #fff;
   background: #4a1616;
   font-weight: 600;
+}
+
+#corrections {
+  margin: 6px 0;
+  padding: 4px 10px;
+  border-left: 4px solid #5a8fd0;
+  color: var(--dim);
+}
+
+#corrections[data-strong='true'] {
+  color: #fff;
+}
+
+#corrections[data-level='unknown'] {
+  border-left-color: #c98a00;
 }
 
 #views {

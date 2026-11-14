@@ -239,8 +239,15 @@ _INSIDE = {}
 def resample_voxels(vol, vox, grid_shape, order=3):
     """`vol` at the voxel centres of the display grid, given the voxel map of voxel_map.
 
-    The interpolation of pipeline/geom.py's resample: B-spline of the given order (cubic), edge
-    value up to half a voxel beyond the outermost voxel centres, 0 outside the field of view.
+    The interpolation of pipeline/geom.py's resample: a B-spline of the given order (cubic) with
+    the edge values repeated (scipy mode "nearest"), then 0 wherever the point lies outside the
+    outermost voxel centres of `vol` along any axis, that is outside [0, n - 1] in its voxel
+    coordinates (an order-0 lookup of a volume of ones with scipy mode "constant"). So a point
+    of the display grid within half a voxel of the edge of the raw field of view, beyond the
+    outermost voxel centre, is 0: brain voxels there are black in the raw stream. (Until
+    2026-11-14 this docstring said "edge value up to half a voxel beyond the outermost voxel
+    centres", which the code never did; the review of stage 1 found the difference. The code is
+    kept, since the packs and the bit identity with the feasibility study rest on it.)
     """
     out = ndimage.affine_transform(
         vol,
@@ -313,25 +320,40 @@ def raw_affine(raw_path, img=None):
     img.affine when they agree (to 1e-4), else the qform when that agrees, else the reference
     image's affine. Without a reference image, or with one on another grid, img.affine.
 
-    Added in the integration of stage 1 (2026-11-14). Of the 15 raw series of the selected
-    sessions, five store a qform and an sform (code 2) that differ by 4 to 25 mm: in four of one
-    session fMRIPrep's reference image has the qform, in one of another session the sform. Through
-    img.affine alone the raw stream of the first session lay about 22 mm from the anatomy
-    (temporal-mean r 0.27 against fMRIPrep's series). The worked example's headers agree.
+    Added in the integration of stage 1 (2026-11-14). Of the 19 qualifying raw series of the
+    selected sessions (16 were packed), five store a qform and an sform (code 2) that differ by
+    4 to 25 mm: in four of one session fMRIPrep's reference image has the qform, in one of
+    another session the sform. Through img.affine alone the raw stream of the first session lay
+    about 22 mm from the anatomy (temporal-mean r 0.27 against fMRIPrep's series). The worked
+    example's headers agree. raw_affine_choice also says which affine was taken, and whether a
+    reference image was there at all; pack_run.py writes both into the manifest.
     """
+    return raw_affine_choice(raw_path, img)[0]
+
+
+# what raw_affine_choice reports as the affine it took
+AFFINE_HEADER = "header"  # img.affine, and the reference image agrees with it
+AFFINE_QFORM = "qform"  # the qform, which the reference image agrees with; img.affine does not
+AFFINE_REFERENCE = "reference"  # neither agrees: the reference image's own affine
+AFFINE_UNCHECKED = "header, unchecked"  # img.affine; no reference image, or one on another grid
+
+
+def raw_affine_choice(raw_path, img=None):
+    """(affine, which, reference) of raw_affine: the affine, one of the AFFINE_* names above,
+    and whether a BOLD-space reference image was found beside the run (bool)."""
     img = nib.load(raw_path) if img is None else img
     ref = reference_of(raw_path)
     if ref is None:
-        return img.affine
+        return img.affine, AFFINE_UNCHECKED, False
     ref_img = nib.load(ref)
     if tuple(ref_img.shape[:3]) != tuple(img.shape[:3]):
-        return img.affine
+        return img.affine, AFFINE_UNCHECKED, True
     if np.allclose(ref_img.affine, img.affine, atol=1e-4):
-        return img.affine
+        return img.affine, AFFINE_HEADER, True
     qform = img.header.get_qform()
     if np.allclose(ref_img.affine, qform, atol=1e-4):
-        return qform
-    return ref_img.affine
+        return qform, AFFINE_QFORM, True
+    return ref_img.affine, AFFINE_REFERENCE, True
 
 
 def raw_volumes(raw_path):

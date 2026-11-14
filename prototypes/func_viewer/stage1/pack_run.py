@@ -28,6 +28,16 @@ session_stream; decision of Tomas Knapen of 2026-11-13 as read there). No motion
 slice-timing correction, no distortion correction. Every run's own stored transform is compared
 with the anchor's (session.check_frame) and the result is in the manifest.
 
+What the two streams are for (Tomas Knapen, 2026-11-14): quality control of the raw data and of
+the preprocessing pipeline at the same time. So the raw stream gets nothing but the one
+placement, and the difference between the streams, and the raw stream's misfit to the contours,
+are the effect of the preprocessing of the run and the state of the raw data. To read them as
+such, the manifest records per run what the pipeline did: head-motion correction, distortion
+correction and its method or none, slice-timing correction or none, from fMRIPrep's summary
+report of the run (pack_inputs.preprocessing_of), and the page states it near the views. Where
+distortion correction was applied, the raw stream shows the distortion as acquired against the
+contours, and the preprocessed stream how well the correction brought the series onto them.
+
 THE PACK (format 'func-viewer-pack' version 1). Every .bin file is a zlib stream.
 
   manifest.json                    everything the page needs but the voxels; the rules as text
@@ -36,6 +46,18 @@ THE PACK (format 'func-viewer-pack' version 1). Every .bin file is a zlib stream
   runs/<run>/<stream>/mean.bin     temporal mean, 8 bit, the window of the run
   runs/<run>/<stream>/sd.bin       temporal SD, 8 bit, the SD window of the run
   runs/<run>/<stream>/cNNNN.bin    chunk N: volumes N * chunk_volumes and following
+
+Fields added on 2026-11-14 after the review of stage 1, within version 1: a manifest without
+them is a pack of before that day, and the page opens it and says that the facts are not
+recorded. Per run, "preprocessing" (motion_correction: applied, with
+its source; sdc: applied, not applied or unknown; sdc_method: the report's words or null;
+slice_timing: likewise; source: where that came from; sdc_figure_listed: the cross-check from
+the listing, or null) and "raw_header" (reference_image: whether fMRIPrep's
+BOLD-space reference image of the run was under deriv/; affine: which affine of the raw header
+the raw stream used, one of session.AFFINE_*). At the top, "runs_not_fetched": the number of
+qualifying runs of the session that fetch_run.py did not fetch (the default of at most four
+runs, or --runs), from DATA/fetch_log.json, or null when DATA has no such record. The older
+"runs_left_out" counts only runs under DATA that lack a file.
 
 A volume is nx * ny * nz bytes, the voxel (i, j, k) at i + nx * (j + ny * k). A chunk holds its
 volumes one after the other as RESIDUALS: (value - ref) mod 256 per voxel, where ref is the
@@ -66,8 +88,22 @@ sys.path.append(str(Path(__file__).resolve().parent))  # the sibling modules, al
 sys.path.append(str(Path(__file__).resolve().parent.parent / "pipeline"))
 from geom import surfaces_in_t1w
 from pack_contours import PLANES, SURFACES, UNIT, session_contours
-from pack_inputs import InputError, find_session, read_confounds, repetition_time
-from session import FRAME_LIMIT_MM, check_frame, read_itk_ras, session_stream
+from pack_inputs import (
+    InputError,
+    find_session,
+    preprocessing_of,
+    read_confounds,
+    read_fetch_log,
+    repetition_time,
+)
+from session import (
+    AFFINE_UNCHECKED,
+    FRAME_LIMIT_MM,
+    check_frame,
+    raw_affine_choice,
+    read_itk_ras,
+    session_stream,
+)
 
 HERE = Path(__file__).resolve().parent
 FORMAT, VERSION = "func-viewer-pack", 1
@@ -298,6 +334,7 @@ def pack(data, fs_dir, out, pack_id, session=None, chunk=None, portable=False, c
     nib.arrayproxy.KEEP_FILE_OPEN_DEFAULT = True  # a series is read front to back, not re-opened
     t_start = time.perf_counter()
     ses = find_session(data, session)
+    session_log = read_fetch_log(data)
     if contours and ses.fsnative is None:
         raise InputError("deriv/ has no from-T1w_to-fsnative transform (or use --no-contours)")
     shape, affine = grid = grid_of(ses.runs)
@@ -328,6 +365,11 @@ def pack(data, fs_dir, out, pack_id, session=None, chunk=None, portable=False, c
             "portable_voxel_map": bool(portable),
         },
         "runs_left_out": len(ses.left_out),
+        "runs_not_fetched": (
+            len(session_log["left_out_run_ids"])
+            if isinstance(session_log.get("left_out_run_ids"), list)
+            else None
+        ),
         "contours": None,
         "runs": [],
     }
@@ -349,11 +391,14 @@ def pack(data, fs_dir, out, pack_id, session=None, chunk=None, portable=False, c
         entry, seconds = pack_one_run(
             run, grid, transforms[anchor.id], manifest["chunk_volumes"], writer, portable
         )
+        _, which, has_reference = raw_affine_choice(run.raw)
         manifest["runs"].append(
             {
                 "id": run.id,
                 "anchor": run.anchor,
                 "frame": frame_entry(frame["runs"][run.id]),
+                "preprocessing": preprocessing_of(run, session_log),
+                "raw_header": {"reference_image": has_reference, "affine": which},
                 **entry,
             }
         )
@@ -433,8 +478,11 @@ def main():
         write_map(options["--map"], options["--id"], ses)
     reg = manifest["registration"]
     print(f"pack {manifest['id']}: {len(manifest['runs'])} runs, grid {manifest['grid']['shape']}")
+    not_fetched = manifest["runs_not_fetched"]
     print(
         f"anchor {reg['anchor']} by rule {reg['rule']}; {manifest['runs_left_out']} runs left out"
+        " here for a missing file; qualifying runs of the session not fetched: "
+        + ("not recorded" if not_fetched is None else str(not_fetched))
     )
     for run in manifest["runs"]:
         f, t = run["frame"], timings["runs"][run["id"]]
@@ -445,6 +493,26 @@ def main():
             f" raw {t['bytes_raw'] / 1e6:.2f} MB, pre {t['bytes_pre'] / 1e6:.2f} MB,"
             f" {t['seconds']:.1f} s"
         )
+        pre, hdr = run["preprocessing"], run["raw_header"]
+        method = f" ({pre['sdc_method']})" if pre["sdc_method"] else ""
+        print(
+            f"{run['id']}: distortion correction {pre['sdc']}{method}; slice timing"
+            f" {pre['slice_timing']}; from {pre['source']}; raw affine: {hdr['affine']}"
+        )
+        if (
+            pre["sdc_figure_listed"] is not None
+            and (pre["sdc"] == "applied") != (pre["sdc_figure_listed"])
+        ):
+            print(
+                f"WARNING {run['id']}: the listing's distortion-correction figure"
+                f" ({'listed' if pre['sdc_figure_listed'] else 'not listed'}) disagrees with"
+                f" '{pre['sdc']}'"
+            )
+        if not hdr["reference_image"] or hdr["affine"] == AFFINE_UNCHECKED:
+            print(
+                f"WARNING {run['id']}: no usable BOLD-space reference image under deriv/; the raw"
+                " stream takes the raw header's img.affine unchecked (session.raw_affine)"
+            )
     if not reg["shared_frame_plausible"]:
         print("a run is flagged: the page shows it with a warning, not as sharing the frame")
     print(json.dumps(timings, sort_keys=True))
