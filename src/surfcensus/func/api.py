@@ -962,7 +962,8 @@ def epi_subject(
     # what was found, and an estimate
     n_runs = sum(len(s.plan.runs) for s in planned)
     n_ready = sum(len(s.inputs) for s in planned)
-    cannot = [(s, r) for s in planned for r in s.plan.runs if r.reason is not None]
+    cannot = [(s, r) for s in planned for r in s.plan.runs if r.reason not in (None, NOT_SELECTED)]
+    n_left_out = sum(r.reason == NOT_SELECTED for s in planned for r in s.plan.runs)
     if raw_root is None:
         raw_said = "no raw dataset found (give it with --raw DIR)"
     else:
@@ -980,6 +981,8 @@ def epi_subject(
             f" and {len(cannot) - 6} more" if len(cannot) > 6 else ""
         )
         line += f", {len(cannot)} cannot: {shown}"
+    if n_left_out:
+        line += f", {n_left_out} not selected (--epi-runs)"
     say(line + ".")
     for line in _registration_lines(planned, participant):
         say(line)

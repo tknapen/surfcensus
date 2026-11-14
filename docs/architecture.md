@@ -213,7 +213,7 @@ surfcensus export --run-dir DIR [--out DIR] [--format csv|parquet] [--release]
 surfcensus render-subject SUBJECT_DIR --out DIR [--fsaverage DIR | --no-template]
     # one subject, no run directory; the CLI form of sc.render.three_plane
 surfcensus epi-session PATH --subject LABEL --out DIR [--session LABEL]... [--raw DIR]
-                       [--epi-runs GLOB]... [--serve] [--port N] [--no-browser]
+                       [--epi-runs GLOB]... [--serve] [--port N] [--no-browser] [--force]
     # the EPI movies of one subject, no run directory (docs/epi_interface.md, Step 1 as built)
 ```
 

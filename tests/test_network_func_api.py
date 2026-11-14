@@ -140,7 +140,7 @@ def test_the_worked_example_from_the_dataset_root(
     assert read_info(out / STREAM_JSON, StreamInfo) == stream and len(stream.sessions) == 1
     assert lines[0].startswith(
         "Functional: 2 runs in 1 session of sub-01 in derivatives/fmriprep (fMRIPrep 21.0.2),"
-        " raw series in . (BIDS); 2 can be packed (T1w space)"
+        f" raw series in {ds} (BIDS); 2 can be packed (T1w space)"
     )
     info = read_info(out / stream.sessions[0] / SESSION_JSON, SessionInfo)
     assert info is not None and info.registration is not None
@@ -199,6 +199,28 @@ def test_the_worked_example_from_the_dataset_root(
             theirs = list(stream_bytes(direct_dir, direct, stream_name))
             assert len(ours) == len(theirs) == 146
             assert [t for t in range(146) if ours[t] != theirs[t]] == [], (n, stream_name)
+
+    # data review F1: with --epi-runs '*run-2*', run-2 is still drawn through run-1's transform,
+    # the session's anchor; its pack equals that of the full session, value for value
+    alone = tmp_path / "run-2"
+    api.epi_subject(ds, "sub-01", alone, config=config, runs=["*run-2*"])
+    (sid,) = read_info(alone / STREAM_JSON, StreamInfo).sessions  # pyrefly: ignore[missing-attribute]
+    filtered = read_info(alone / sid / SESSION_JSON, SessionInfo)
+    assert filtered is not None and filtered.registration is not None
+    first = next(r for r in filtered.runs if r.name == "task-flanker_run-1")
+    second = next(r for r in filtered.runs if r.name == "task-flanker_run-2")
+    assert (
+        first.anchor and first.reason == "not selected" and not filtered.registration.anchor_packed
+    )
+    assert second.frame == info.runs[1].frame
+    theirs = read_info(session_dir / info.runs[1].run / PACK_JSON, PackInfo)
+    ours = read_info(alone / sid / second.run / PACK_JSON, PackInfo)
+    assert theirs is not None and ours is not None
+    assert ours.anchor_run == first.run and ours.content_digest == theirs.content_digest
+    for stream_name in ("raw", "pre"):
+        assert list(stream_bytes(alone / sid, ours, stream_name)) == list(
+            stream_bytes(session_dir, theirs, stream_name)
+        )
 
 
 def _deriv_run(found: api.FuncFolders, connector: fmriprep.FmriprepConnector, n: int) -> DerivRun:
