@@ -20,7 +20,7 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut, SubjectPageOut, SubjectsOut
 from surfcensus.protocol import CriterionId, MarkClass, Protocol
 from surfcensus.render.model import (
     BoxInfo,
@@ -510,7 +510,11 @@ class ReviewOut(_Shape):
     display order: ``subject_uid``, in a local run ``subject_label``, ``dataset``,
     ``fs_version``, ``render_status``, ``render_reason``, the columns of the primary row of
     ``scores.parquet``, ``final_A``, ``final_B``, ``final_C``, ``final_method``,
-    ``unratable_reason``, ``n_ratings``, ``n_marks``."""
+    ``unratable_reason``, ``n_ratings``, ``n_marks``; in a local run whose EPI interface is on
+    and that has functional data, also ``func_sessions`` (the present functional sessions
+    whose FreeSurfer subject is the row's) and ``func_packed`` (the ``packed`` runs of them,
+    ``func.batch.recorded_states``), after ``n_marks`` (step 3 of docs/epi_interface.md,
+    work package E3.A)."""
 
     total: int
     """Rows that pass the filter, before ``offset`` and ``limit``."""
@@ -668,3 +672,20 @@ run are answered as before step 2.
 ``POST /api/skip`` answers 404 for an assignment that does not exist, 403 for another
 rater's, and 409 for one that is not open for the rater: one that has a submission, or
 whose render is no longer the subject's (``app.queue.SkipRefused``)."""
+
+SUBJECT_ROUTES: tuple[Route, ...] = (
+    Route("GET", "/subjects", unblinded=True),
+    Route("GET", "/subject/{key}", unblinded=True),
+    Route("GET", "/api/subjects", SubjectsOut, unblinded=True),
+    Route("GET", "/api/subjects/{key}", SubjectPageOut, unblinded=True),
+)
+"""The routes of the subject pages of a run (step 3 of docs/epi_interface.md, "Step 3: the
+plan (E3.0)"). Not yet among :data:`ROUTES`: the server answers them from work package E3.A
+on, which appends them to :data:`ROUTES` in the same change, since :data:`ROUTES` lists what
+the server answers and no other. ``/subjects`` is the list of every subject of the run with
+its surface state and its functional sessions, ``/subject/<key>`` the page of one row of it
+(``key`` a ``subject_uid``, or the ``participant_uid`` of a participant whose sessions have
+no FreeSurfer subject). They are unblinded and answer, like the EPI routes, only in a local
+run with functional data whose EPI interface is on; otherwise as a route that does not
+exist (404). Their paths hold no ``epi``, so that the routes of the EPI pages stay those
+whose path starts with ``/epi`` or ``/api/epi``."""

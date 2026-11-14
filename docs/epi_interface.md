@@ -1,6 +1,6 @@
 # EPI movie interface
 
-Specification of the second interface of the tool: the raw and the preprocessed EPI series of every functional run of a session, as moving pictures on the same slices with the FreeSurfer white and pial surfaces as contours, served by the same app and prepared by the same command as the surface interface. Written on 2026-11-14 from the prototype of stage 1 (`prototypes/func_viewer/`), its independent review, the code of the package and the sources of fMRIPrep on PyPI. Step 1 of its build order is built (2026-11-14; section "Step 1 as built"); steps 2 and 3 are not, and the shared names of step 2 are laid out (section "Step 2: the plan (E2.0)"). Where this document and `prototypes/func_viewer/README.md` disagree about the package, this document holds; the README remains the record of what stage 1 built and measured.
+Specification of the second interface of the tool: the raw and the preprocessed EPI series of every functional run of a session, as moving pictures on the same slices with the FreeSurfer white and pial surfaces as contours, served by the same app and prepared by the same command as the surface interface. Written on 2026-11-14 from the prototype of stage 1 (`prototypes/func_viewer/`), its independent review, the code of the package and the sources of fMRIPrep on PyPI. Steps 1 and 2 of its build order are built (2026-11-14; sections "Step 1 as built" and "Step 2 as built"); step 3 is not, and its shared names are laid out (section "Step 3: the plan (E3.0)"). Where this document and `prototypes/func_viewer/README.md` disagree about the package, this document holds; the README remains the record of what stage 1 built and measured.
 
 ## Why, in his words
 
@@ -381,6 +381,165 @@ His words, after the order of the sessions: "also, i want the maximum frame rate
 - What the page says. Beside the rate, while volumes are left out, a short text in amber: `every 5th volume shown`, or for a share above a half `70% of volumes shown` (`logic.skipNote`), from the volumes the stream advanced per volume painted over the last second, written at most once a second and kept near a rounding boundary, so that it does not flicker. Its box keeps one size, so that nothing on the page moves when it appears (the browser test of boxes covers a change of rate). The status line says the volumes per second asked, played (stream time) and painted. Under the statement of what the streams are, always visible: above 60 volumes per second, faster than most displays refresh, not every volume is put on screen, and an artefact in a single volume can be missed; at 60 or slower, and stepping with the arrow keys, every volume is shown. The help says the same at more length. The limit matters because the page is a tool for quality control of single-volume artefacts among other things (D36).
 - Measured in headless Chromium 153 on one shared 4-core Linux machine, side by side view, the page at 60 frames a second (59.9 measured), at 1400 by 900 and at 400 by 800 px alike. On the synthetic stream of the tests (two sessions, two grids, 192 volumes): at 12 and 60 per second every volume painted (12.0, 59.8 to 60.0 per second); at 120, 200 and 300 the stream advanced 119.9 to 120.0, 200.0 to 200.1 and 300.0 volumes per second, 59.2 to 60.0 painted, no stall, and the page said every 2nd, 3rd and 5th volume shown. On a real subject with ten runs in two sessions (1,518 volumes on a 4 mm grid), with the whole stream loaded: the same (120.0, 200.0 to 200.1 and 300.0 per second advanced, 59.2 to 60.0 painted, no stall); played from the opening of the page, before the stream was loaded, one stall at the start and none after, and a whole loop of the 1,518 volumes in 5.1 s at 300 per second. Single frames of up to about 80 ms left up to 24 volumes out at once at 300. Headless Chromium on a shared machine is not a laptop with a GPU: these numbers bound nothing on another machine.
 - Not checked: a display of 120 or 144 frames a second, a machine that paints fewer than 60, any browser but Chromium, a stream larger than the memory limit at 300 per second, a person looking at it.
+
+## Step 3: the plan (E3.0)
+
+Work package E3.0 laid out on 2026-11-14 what the packages of step 3 share, before they are written side by side, as E2.0 did for step 2 (D40). Step 3 is navigation (a subjects page and a page per subject, linked from the rating screen, the review screen and the EPI pages), functional data in `surfcensus status`, and functional tables in `surfcensus export`. The names, fields, Literals, routes, columns and constants below are pinned in `tests/test_func_step3_interfaces.py`. Where this section and the older sections below disagree, this section holds until step 3 is built; what it changes in them is listed at its end. The decision entry is D44.
+
+### Two readings of "packed"
+
+The code of step 2 has two:
+
+- `func.batch.pack_status` and `pack_failures` say what `surfcensus pack` would do now: a `packs` row for the present settings and the present pack signature, and the pack whole on disk.
+- `func.batch.recorded_states(public, pack_hash)` (new, complete) says what the catalog records under the present settings: a `packs` row `done` (`packed`) or `failed` (`failed`) whose `config_hash` is `EpiConfig.pack_hash()`.
+
+`surfcensus status` keeps the first. The subject pages, the index of the EPI pages and the export use the second, so an outdated pack, which the page still plays, is `packed` on the pages and in the export and pending in `status`. The docs and the subject page say so ("recorded"). The index of the EPI pages (`/api/epi`) now counts through `recorded_states` (a pure refactoring of `_App.epi_index` and `_epi_counts`; every test of the index passes as before).
+
+`recorded_states` gives, for every present run, in the order of `PublicCatalog.func_runs` (session, `acquisition_order`, `run_uid`), a `RecordedState(state, reason, detail)`:
+
+| `state` | When | `reason`, `detail` |
+|---|---|---|
+| `not selected` | `func_runs.selected` is false (`--epi-runs`) | `func_runs.reason` (`not selected`), its detail |
+| `cannot be packed` | `func_runs.packable` is false | `func_runs.reason` and `detail` |
+| `packed` | a `packs` row `done` under the present `pack_hash` | None |
+| `failed` | a `packs` row `failed` under it | `packs.reason` and `packs.detail` |
+| `pending` | otherwise (no row, a row of other settings, a row of another status) | None |
+
+The five values are `schemas.PACK_STATES`, which step 2 laid down; `app.epi_schemas.RunState` and `func.batch.RecordedStateName` hold the same values.
+
+### Who appears where
+
+- Every present FreeSurfer subject of the run has a row on `/subjects`, keyed by its `subject_uid`, with the sessions whose `func_sessions.subject_uid` is that subject. A subject without functional data has a row with 0 sessions; its page says "no functional runs".
+- A participant with sessions that have no FreeSurfer subject gets one row keyed by its `participant_uid`, with only those sessions, and the surface state `none`.
+- So every present session is on exactly one row. In `tests/epi_run_fixture.py` participant `FULL` appears twice by default: under `sub-001` for its first session, and as its own row for its second.
+- A `/subject/{key}` is looked up among the subjects first, then among the participants. The two identifiers come from HMACs with different prefixes; a collision of 64 bits is not checked anywhere.
+- The order of the sessions of a participant is the stored `func_sessions.stream_order`, which follows acquisition dates when every session has one and labels otherwise (D42). The rule that applied (`func_participants.session_order`: `acquisition time` or `session label`) is shown with the sessions (`FuncSessionOut.stream_rule`) and exported (`func_sessions.stream_rule`); no date is.
+- All of step 3 in the app is there only where `epi_offered()` is true (a local run whose EPI interface is on and that has functional data). In a census run, with `--no-epi` and in a run without functional data, the four new routes answer as no route (404), the review columns are absent, and the rating screen is as before.
+
+### Routes
+
+`app.schemas.SUBJECT_ROUTES` (complete). They are not yet among `app.schemas.ROUTES`, because `ROUTES` is what the server answers and no other (`tests/test_server.py` compares the two exactly, `tests/test_app_schemas.py` pins the table and asks an example of every shape of every route). E3.A appends them to `ROUTES` in the change that makes the server answer them, with those two tests and `tests/app_examples.py` (examples of `SubjectsOut` and `SubjectPageOut`).
+
+| Method | Route | Answers with | Unblinded |
+|---|---|---|---|
+| GET | `/subjects` | page `subjects.html` | yes |
+| GET | `/subject/{key}` | page `subject.html`, with `data-key="{{ key }}"` | yes |
+| GET | `/api/subjects` | `SubjectsOut` | yes |
+| GET | `/api/subjects/{key}` | `SubjectPageOut` | yes |
+
+How the server answers them (E3.A):
+
+- First `epi_available()` (404 as no route), then the gate: a new `_CLOSED["subjects"]` reads "you still have subjects to rate; the subject pages open when none is left", and a browser gets it as a page through `_closed_page("subjects", ...)`.
+- Then a `key` that is not 16 lower-case hex characters, or is neither a present subject nor a participant with sessions without a subject, is 404 with field `key` and "there is no such subject".
+- The paths hold no `epi`: `tests/test_epi_run_app.py` takes the routes of the EPI pages as those whose path starts with `/epi` or `/api/epi`.
+- The app never redirects, so `/epi` stays as it is beside `/subjects`; the index gets one link to `/subjects`, and `epi.html` one link in `#epi-nav` under `{% if subjects_url is defined %}`, so the page of `epi-session --serve` (`app/epi.py`) renders as before.
+
+### Shapes
+
+In `app/epi_schemas.py`, under "the subject pages of a run directory (step 3)" (complete). All are frozen and forbid extra fields, and every field is required.
+
+Literals:
+
+- `SurfaceState`: `rated`, `unratable`, `rendered`, `render failed`, `not rendered`, `none`; from `export.tables.subjects_frame`, the first that holds: `unratable` (`unratable_reason` set), `rated` (`n_ratings` above 0), `render failed` (`render_status` `failed`), `rendered` (`render_status` `done`), `not rendered` (any other subject); `none` for a participant row.
+- `RunState`: the five values of `schemas.PACK_STATES` (above).
+- `StreamRule`: `acquisition time`, `session label` (`store.SESSION_ORDERS`).
+- `RowKind`: `subject`, `participant`.
+
+| Shape | Fields, in order |
+|---|---|
+| `SubjectRowOut` | `key: str`; `kind: RowKind`; `subject_uid: str \| None`; `participant_uid: str \| None`; `label: str \| None` (the subject label, or the participant label; None outside a local run); `dataset: str`; `surface: SurfaceState`; `surface_reason: str \| None` (`unratable_reason`, else `render_reason`); `n_sessions`, `n_runs`, `n_packable`, `n_packed`, `n_pending`, `n_failed`, `n_flagged: int` (at least 0); `url: str` (`/subject/<key>`); `epi_url: str \| None` (`/epi/<participant_uid>` when the row has a session) |
+| `SubjectsOut` | `subjects: tuple[SubjectRowOut, ...]` (subject rows by label, then participant rows by label); `n_pending: int` |
+| `FuncFrameOut` | `mean_mm`, `max_mm`, `rotation_deg`, `translation_mm: float`; `flagged: bool \| None` |
+| `FuncRunOut` | `run_uid: str`; `name: str \| None`; `acquisition_order`, `session_order: int \| None`; `anchor`, `selected: bool`; `n_volumes: int \| None`; `tr_s: float \| None`; `echoes: int` (at least 1); `grid_key: str \| None`; `grid_shape: tuple[int, int, int] \| None`; `voxel_mm: tuple[float, float, float] \| None`; `oblique_deg: float \| None`; `raw_affine: AffineChoice \| None`; `reference_image`, `rigid: bool \| None`; `dof: int \| None`; `corrections: CorrectionsInfo \| None` (`func_runs.corrections` parsed); `frame: FuncFrameOut \| None`; `state: RunState`; `reason`, `detail: str \| None` (from `recorded_states`); `epi_url: str \| None` (`/epi/<participant_uid>#run=<run_uid>`, only for a `packed` run of a session the stream shows) |
+| `FuncSessionOut` | `session_uid`, `participant_uid: str`; `participant: str \| None` (the BIDS label in a local run); `label: str` (without `ses-`, empty for none); `stream_order: int`; `stream_rule: StreamRule`; `subject_uid`, `fs_subject`, `anchor_run_uid`, `anchor_name: str \| None`; `anchor_rule: AnchorRule \| None`; `anchor_note: str \| None`; `anchor_packed: bool`; `frame_limit_mm: float \| None`; `shared_frame_plausible`, `anchor_is_outlier: bool \| None`; `n_grids: int`; `problem: str \| None`; `shown: bool` (`app.epi.Packs.shown_sessions`); `runs: tuple[FuncRunOut, ...]` (by `acquisition_order`, then `run_uid`) |
+| `SubjectPageOut` | `subject: SubjectRowOut`; `review_url: str \| None` (`/review#subject=<subject_uid>`, None for a participant row); `rate_url: str` (`/`); `index_url: str` (`/subjects`); `epi_index_url: str` (`/epi`); `sessions: tuple[FuncSessionOut, ...]` (by participant label, then `stream_order`) |
+
+The rating routes get nothing: `SessionOut` and `AssignmentOut` keep exactly the fields they have (pinned).
+
+### The pages (E3.A)
+
+- The rating screen. `rate.html` gets, in `.links`, `<a id="subject-link" class="epi-link" href="/subjects" hidden>functional runs of this subject</a>` (the `href` must be a path of the route table). `rate.js` shows it under the rule of the existing `#epi-link` (`session.epi_url` not null) while an assignment is open, with the `href` `routePath("subjectPage", {key: assignment.subject_uid})`, a uid the media URLs carry already (D6), and hides it in `leave()` and on `done`. It is on every subject, also one without sessions, whose page then says so.
+- The review screen. When `epi_offered()`, `get_review` adds `func_sessions` (present sessions with the row's `subject_uid`) and `func_packed` (their `packed` runs) after `n_marks`; `ReviewOut`'s docstring names both already (complete), so `tests/test_frontend.py` knows them. `review.js` renders the `func_sessions` cell as a link to the subject page whose click does not open the row, and opens `#subject=<uid>` once at load. Nothing is added to `subjects_frame`, so the export's `subjects` table does not change.
+- `api.js` route names: `subjectsPage` (`GET /subjects`), `subjectPage` (`GET /subject/{key}`), `subjects` (`GET /api/subjects`), `subjectInfo` (`GET /api/subjects/{key}`). Run links come as `epi_url` values from the server.
+- `subjects.js` (new) draws both pages through `api.request` and asks again every `EPI_POLL_S` while `n_pending` is above 0.
+- The EPI page starts at a run named by the hash, `#run=<run_uid>`: no change to the server or the template, and the reload that the growth notice offers keeps it. `logic.js` gains `segmentOfRun(timeline, sessions, runUid) -> k | -1`, pure and tested under Node. In `start()` (today about line 1209 of `js/epi/epi.js`; it calls `gridOf(0)`, `enterSegment(0)` and `store.stills(0)`), `k0` is read from `new URLSearchParams(location.hash.slice(1)).get('run')`, default 0, and used in place of 0, with `state.g = segment(k0).first`. A run that is not in the stream starts at 0 and `#status` says "the run asked for is not in the stream now". `window.__epi.page.startRun` gives the run found, or null. The page has the playback rates up to 300 (D43) and the elements `#rate-note` and `#rate-limit`; the link and the start at a run touch neither, and the browser test that measures boxes at boundaries must still pass.
+
+### `surfcensus status` (E3.B, `func/status.py`)
+
+`func.status` is laid down as stubs that raise `NotImplementedError("work package E3.B: func/status.py")`, with its constants complete:
+
+- `status_lines(ctx: RunContext) -> list[str]`: three lines after `render:`, for a local run whose catalog has a present functional source (`PublicCatalog.func_sources()` not empty), each starting with one of `STATUS_PREFIXES = ("func_inventory:", "pack:", "func checks:")`; empty otherwise, also on a catalog of schema 1 (no line printed, no byte changed):
+
+  ```
+  func_inventory: 3 sessions of 2 participants, 19 runs: 11 can be packed, 8 cannot (multi-echo 1, native space only 1, no brain mask 1, no preprocessed series 1, no raw series 1, no transform to the anatomy 1, not fetched 2)
+  pack: 11 done, 0 failed, 0 pending
+  func checks: 2 runs flagged, 0 raw affines unchecked, 1 session with the anchor the outlier
+  ```
+
+  The reasons are those of present runs that are not packable or not selected (`not selected` is one of them), sorted by name; nouns follow the count, as `review._plural` does. When sessions have a `problem` that does not start with `not fetched: `, the first line ends with `; 1 session could not be planned`. The second line is `func.batch.pack_status(ctx)`; with the interface off and rows stored it is `pack: off (--no-epi, stored)`. The third counts runs with `flagged` true, runs with `raw_affine` `header, unchecked`, and sessions with `anchor_is_outlier` true.
+- `failure_rows(ctx: RunContext) -> list[FailureRow]`, `FailureRow = tuple[str, str, str, str | None]` (`unit, phase, reason, detail`), merged into the listing of `status --failures` before its sort: `pack` rows from `pack_failures(ctx)`; `func_inventory` rows for every present run that cannot be packed; `func_inventory` rows `session:<session_uid>` for a session `problem` that is not a fetch problem. The `work` rows of phase `epi_session` are dropped from the listing: D41 records a whole-session failure on each of its runs.
+- `unit_names(public: PublicCatalog) -> dict[str, str]`: `run_uid` -> `sub-01 ses-1_task-rest_run-1` and `session:<session_uid>` -> `sub-01 ses-1` in a local run, which replaces `cli._run_names`.
+- `status` keeps `Run(run_dir, migrate=False)`. The lines that `tests/test_cli_run.py` pins for a run without functional data stay as they are.
+
+### `surfcensus export` (E3.B, `export/tables.py`)
+
+Constants laid down (complete): `FUNC_TABLES = ("func_sessions", "func_runs")`, `FUNC_SESSIONS_COLUMNS`, `FUNC_RUNS_COLUMNS`, `EPI_MANIFEST_KEY = "epi"`. `EXPORT_TABLES` stays the ten and `MANIFEST_SCHEMA_VERSION` stays 1.
+
+- Written in the profile `analysis` of a local run whose EPI interface is on and whose `has_func()` is true, after the ten; the paths returned are the ten, the two, then `manifest.json`. `_EXPORT_FILE` matches both tuples, so a later export without functional data removes the files an earlier manifest lists. Never in `--release` or a census export (O28).
+- `func_sessions`: `dataset, participant_uid, participant, session_uid, session_label, stream_order, stream_rule, subject_uid, fs_subject, anchor_run_uid, anchor_rule, anchor_note, frame_limit_mm, shared_frame_plausible, anchor_is_outlier, n_runs, n_packable, n_grids, problem, present, n_packed, n_failed, n_pending`, sorted by `participant_uid, stream_order, session_uid`; the counts by `recorded_states`.
+- `func_runs`: every column of the view `public_func_runs` in its order (the `corrections` JSON and its three states included), then `participant_uid, pack_state, pack_reason, pack_detail, pack_n_volumes, pack_bytes, packed_at`, sorted by `session_uid, acquisition_order, run_uid`. No trace, no `pack_key`, no `content_digest`, no `input_signature`; `pack.json`, `traces.json` and the chunks are not read.
+- Both get fixed parquet schemas in `_PARQUET_SCHEMAS`.
+- The manifest gains, only when these tables are written, `"epi": {"config_hashes": {"pack": EpiConfig.pack_hash(), "epi_session": session_hash(), "func_inventory": inventory_hash()}, "sources": [{"dataset", "connector", "pipeline_version", "generation"} per row of func_sources()]}`. So the export of a run without functional data has the files, rows and manifest bytes of before.
+
+### `review`
+
+Unchanged: it prints `EPI movies: <url>epi` and no line for the subjects page (open default 4).
+
+### Fixtures (complete)
+
+- `tests/epi_run_fixture.py`: `add_epi(run_dir, packed, *, subject_uid=None, subject_uids=None)`, where `subject_uids` maps a session id to its `subject_uid` (or None) and the sessions it does not name keep the rule of `subject_uid` (the first session of `FULL`); a session id the fixture does not make is refused. `session_ids(packed)` gives the ids of the sessions of `FULL` and `HALF` before the call. Every run now carries `CORRECTIONS` (distortion correction applied, slice timing not applied, registration by bbregister with 6 degrees of freedom), `rigid` true, `dof` 6, and the raw affine `header`, but for the first run of each session in acquisition order, whose raw affine is `header, unchecked` (`UNCHECKED`) and which has no reference image. The flags are those of step 1's packs, the same in `FULL` and `HALF` (a flag in one only would change what the index test of step 2 pins).
+- `tests/synth_func.py`: `write_review_folder(..., extra_fs=("sub-03",))` adds FreeSurfer subjects without functional data, each a copy of `sub-01`; a name that is a subject or a participant already is refused. `func_counts` then lists the extra subject among `fs_subjects` and leaves every functional count as it was.
+
+### The work packages
+
+One owner per file. E3.A and E3.B are written side by side against the names above.
+
+| Package | Files it owns | Depends on | Exit check |
+|---|---|---|---|
+| E3.0 (done) | `app/epi_schemas.py` (the shapes and Literals); `app/schemas.py` (`SUBJECT_ROUTES`, the `ReviewOut` docstring); `schemas.py` (the docstring of `PACK_STATES`); `func/batch.py` (`recorded_states`, `RecordedState`, `RecordedStateName`); `app/server.py` (the index through `recorded_states` only); the stub module `func/status.py`; in `export/tables.py` the four constants only; `tests/epi_run_fixture.py`, `tests/synth_func.py`; `tests/test_func_step3_interfaces.py`; this section | step 2 | every earlier test passes; the names are pinned |
+| E3.A pages | `app/server.py` (the four routes; methods `subjects_out`, `subject_page_out`, `subjects_page`; the review columns; `_CLOSED["subjects"]`; `subjects_url` into `epi.html` and `epi_index.html`), `app/schemas.py` (`ROUTES` gains `*SUBJECT_ROUTES`), `app/templates/subjects.html` and `subject.html` (new), `rate.html`, `epi_index.html`, `epi.html` (one link each), `app/static/js/subjects.js` (new), `api.js`, `rate.js`, `review.js`, `js/epi/epi.js`, `js/epi/logic.js`, the `.subjects` section of `app.css`; tests `tests/test_subjects_app.py`, `tests/test_subjects_browser.py` (marker `browser`), and the edits of `tests/test_frontend.py` (`JS_FILES`, the templates, `USED_ROUTES`, `NAMES`), `tests/test_epi_frontend.py` (`segmentOfRun`), `tests/test_server.py` and `tests/test_app_schemas.py` (the routes), `tests/app_examples.py` and `tests/data/api_examples.json` (examples of the two shapes) | E3.0 | the blindness table below as tests; the shapes validate; the browser path from the rating screen to a run and back, with the draft kept; `test_frontend`, `test_epi_frontend`, `test_epi_run_app` green |
+| E3.B status and export | `func/status.py` (the three functions), `export/tables.py` (the writing of the two tables, the manifest key, `_EXPORT_FILE`, the parquet schemas); tests `tests/test_func_status.py`, `tests/test_export_func.py`, and the removal of the stub test in `tests/test_func_step3_interfaces.py` | E3.0 | the lines on `write_review_folder` before and after `pack` and with a failed pack; schema 1 unchanged; the export against the catalog and `recorded_states`; no trace; release and census without; an export without functional data unchanged |
+| E3.Z integrator (last) | `cli.py` (`func.status` in `status`; `unit_names` in place of `_run_names`; the help of `export`), `docs/epi_interface.md` ("Step 3 as built"), `docs/decisions.md` (D45), `docs/dev/contract.md` 7.9, `README.md`, `CLAUDE.md`; `tests/test_cli_status_func.py` | all | `status` and `export` on `write_review_folder`; the whole path in Chromium on the worked example (network, browser); the bytes of `status` and `export` on a run without functional data compared with the commit before step 3; review |
+
+The blindness table, as E3.A's tests:
+
+| Run | The four routes | `epi_url` and the link | Review columns |
+|---|---|---|---|
+| local, not blind, one rater | 200 | `/epi`; `#subject-link` in the page, hidden until an assignment is open | present |
+| blind, with work left | 403 (JSON; a page with a link back for a browser, without a uid) | null | `/api/review` 403 |
+| blind, everything rated | 200 | `/epi` | present |
+| a second rater with work left, or done | 403, or 200 | null, or `/epi` | 403, or present |
+| census | 404 as no route | null | absent |
+| `EpiConfig(enabled=False)` | 404 | null | absent |
+| no functional data | 404 | null | the body of `/api/review` as before |
+
+### Open defaults
+
+Built as proposed, each Tomas's to change:
+
+1. The link on the rating screen is on every subject being rated, and the rating answers gain nothing. Otherwise: only on subjects with functional sessions, which puts one fact per subject into `AssignmentOut`.
+2. The subject pages and the review columns exist only in a run with functional data. Otherwise: a subjects page in every local run, and the four routes answer in runs that have no functional data.
+3. In a blind or multi-rater run the link follows the gate of the routes, so it appears once the rater has nothing left to rate. Otherwise: never in such a run.
+4. `review` prints no line for the subjects page. Otherwise: a line `Subjects: <url>subjects` beside `EPI movies:`.
+
+### What this changes in the sections below
+
+- "Pages": the subject page is `/subject/{key}` (a `subject_uid`, or the `participant_uid` of a participant without a FreeSurfer subject), not a session-only identifier; the EPI page is `/epi/{participant_uid}` (D40) and starts at a run with `#run=<run_uid>`, not `?run=`; previous and next session links are moot, since a participant is one stream.
+- "Pages": the subjects page lists present subjects only, with the surface state `render failed` beside the others and the reason in `surface_reason`; the rating-screen link is on every subject (open default 1) and follows the gate of the routes (open default 3).
+- "Blindness": holds literally: the rating routes answer nothing new; the link is made by `rate.js`.
+- "Routes and shapes": the routes are those of `SUBJECT_ROUTES`, the shapes those above; `EpiSessionOut` of that section is step 2's `EpiStreamOut`.
+- "Commands, exit codes, status, export": `status` counts by `pack_status`, the pages and the export by `recorded_states`; the manifest adds the `epi` key only when the functional tables are written; the status logic lives in `func/status.py`, not in `cli.py`.
+- "What it prints": unchanged, `EPI movies: <url>epi` and no subjects line (open default 4).
 
 ## Scope
 

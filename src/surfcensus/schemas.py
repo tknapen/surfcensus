@@ -224,9 +224,12 @@ KEYS: dict[str, tuple[str, ...]] = {
 # the export share for them.
 
 PACK_STATES: tuple[str, ...] = ("packed", "pending", "failed", "cannot be packed", "not selected")
-"""The state of a functional run as ``status``, the subject page and the export say it:
-``packed`` (a ``packs`` row ``done`` for the present settings and listing, and the pack whole
-on disk), ``pending`` (packable and not packed now), ``failed`` (a ``packs`` row ``failed`` for
-the present settings and listing), ``cannot be packed`` (``func_runs.reason`` is a reason of
+"""The state of a functional run: ``packed``, ``pending`` (packable and selected and not
+packed), ``failed``, ``cannot be packed`` (``func_runs.packable`` false: a reason of
 ``records.PACK_REASONS`` other than ``not selected``), ``not selected`` (``--epi-runs`` leaves
-it out)."""
+it out). Two readings of ``packed`` and ``failed`` (step 3, decision D44): ``surfcensus
+status`` counts what ``pack`` would find now (a ``packs`` row for the present settings and
+listing, and the pack whole on disk: ``func.batch.pack_status``); the subject pages and the
+export say what is recorded (a ``packs`` row ``done`` or ``failed`` for the present settings:
+``func.batch.recorded_states``), so an outdated pack, which the page still plays, is
+``packed`` there and pending in ``status``. ``app.epi_schemas.RunState`` holds these values."""

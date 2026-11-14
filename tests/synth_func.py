@@ -1001,6 +1001,7 @@ def write_review_folder(
     *,
     generation: Generation = "scanner-T1w",
     without_fs: Sequence[str] = (),
+    extra_fs: Sequence[str] = (),
     annex: Kind | None = None,
 ) -> SyntheticFuncDataset:
     """A BIDS dataset root at ``<root>/ds`` that holds both kinds of data, for ``review`` on one
@@ -1011,7 +1012,10 @@ def write_review_folder(
 
     ``without_fs`` removes FreeSurfer subjects after writing, for a participant whose sessions
     have no contours and no surface rating (``("sub-02",)``); the surface side then has one
-    subject. ``annex`` is that of :func:`write_func_dataset`.
+    subject. ``extra_fs`` adds FreeSurfer subjects that have no functional data, each a copy
+    of ``sub-01`` (``("sub-03",)``, for a subject page without sessions; step 3, E3.0); their
+    names must be new and must not be a participant of the functional data. ``annex`` is that
+    of :func:`write_func_dataset`.
 
     Measured when this was written (one shared 4-core Linux machine, Python 3.13): writing
     0.6 s; ``review(<root>/ds, serve=False)`` into a new run directory 9.6 s for the two
@@ -1026,11 +1030,20 @@ def write_review_folder(
     unknown = gone - set(dataset.subjects)
     if unknown:
         raise ValueError(f"no FreeSurfer subject {', '.join(sorted(unknown))}")
+    extra = set(extra_fs)
+    taken = extra & (set(dataset.subjects) | {r.design.participant for r in dataset.runs})
+    if taken:
+        raise ValueError(f"not a new FreeSurfer subject: {', '.join(sorted(taken))}")
+    added: dict[str, SyntheticSubject] = {}
+    for name in sorted(extra):
+        shutil.copytree(dataset.subjects["sub-01"].path, dataset.fs_subjects_dir / name)
+        added[name] = _moved(dataset.subjects["sub-01"], dataset.fs_subjects_dir / name)
     for name in sorted(gone):
         shutil.rmtree(dataset.fs_subjects_dir / name)
-    if not gone:
+    if not gone and not added:
         return dataset
-    kept = {name: s for name, s in dataset.subjects.items() if name not in gone}
+    kept = {name: s for name, s in dataset.subjects.items() if name not in gone} | added
+    kept = dict(sorted(kept.items()))
     return SyntheticFuncDataset(
         root=dataset.root,
         raw_root=dataset.raw_root,

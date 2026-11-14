@@ -14,6 +14,13 @@ run directory by itself, from step 1's packs (``tests/epi_packs.py``):
   every run of ``session.json`` with its reason, a ``done`` pack for every packed run that is on
   disk, and in the second session of ``HALF`` one ``failed`` pack and the others none.
 
+Step 3 (work package E3.0) added what the subject pages read: ``subject_uids`` gives each
+session its FreeSurfer subject (:func:`session_ids` names the sessions before the call), and
+every run carries the corrections of :data:`CORRECTIONS`, a rigid registration of 6 degrees of
+freedom and the raw affine ``header``, but for the first run of each session in acquisition
+order, whose raw affine is ``header, unchecked`` (:data:`UNCHECKED`). The flags are those of
+step 1's packs, the same in ``FULL`` and ``HALF``.
+
 The ids of the packs are 16 hex characters already (step 1's ``func_id``), so they serve as
 ``session_uid`` and ``run_uid``; the catalog rows are the facts the page and the index read,
 not what an inventory of the synthetic folder would give (no files, no anchor, no frame check
@@ -26,6 +33,7 @@ from __future__ import annotations
 import hashlib
 import re
 import shutil
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +44,7 @@ from surfcensus.func import STREAM_JSON
 from surfcensus.func.model import SessionInfo, StreamInfo, info_text, read_info
 from surfcensus.records import (
     ConnectorMatch,
+    Corrections,
     Display,
     FrameDisplacement,
     FuncRunRow,
@@ -44,7 +53,9 @@ from surfcensus.records import (
     Grid,
     PackRow,
     RunEntities,
+    Statement,
 )
+from surfcensus.sources.base import FuncRole
 from surfcensus.store import EPI_DIR, Catalog, PublicCatalog
 
 FULL = "f0" * 8
@@ -53,6 +64,20 @@ HALF = "a5" * 8
 """The participant whose second session is still to be packed: ``stream.json`` lists it, the
 run directory has no ``session.json`` of it, its runs have no pack or a failed one."""
 LABELS = {FULL: "sub-01", HALF: "sub-07"}
+
+CORRECTIONS = Corrections(
+    motion=Statement("applied", None, None),
+    sdc=Statement("applied", "FLB (fieldmap-less, SyN-based)", FuncRole.SUMMARY_REPORT),
+    sdc_method="FLB (fieldmap-less, SyN-based)",
+    slice_timing=Statement("not applied", "Not applied", FuncRole.SUMMARY_REPORT),
+    registration=Statement("applied", "FreeSurfer bbregister", FuncRole.SUMMARY_REPORT),
+    dof=6,
+    sdc_figure_listed=True,
+)
+"""The corrections of every run of the fixture, as the summary report would state them."""
+UNCHECKED = "header, unchecked"
+"""The raw affine of the first run of each session in acquisition order; the others have
+``header``."""
 
 _HEX = re.compile(r"\b[0-9a-f]{16}\b")
 
@@ -100,8 +125,15 @@ def _copy_stream(
     )
 
 
+def session_ids(packed: PackedStream) -> dict[str, tuple[str, ...]]:
+    """Participant -> the ids its sessions get from :func:`add_epi`, in stream order, so that
+    a test can pass ``subject_uids`` before the call."""
+    return {FULL: tuple(packed.sessions), HALF: tuple(_other(s) for s in packed.sessions)}
+
+
 def _runs(info: SessionInfo) -> tuple[FuncRunRow, ...]:
     rows = []
+    first = min((run.acquisition_order for run in info.runs), default=None)
     for run in info.runs:
         packable = run.reason is None
         frame = None
@@ -148,11 +180,11 @@ def _runs(info: SessionInfo) -> tuple[FuncRunRow, ...]:
                         (0.0, 0.0, 0.0, 1.0),
                     ),
                 ),
-                raw_affine=None,
-                reference_image=None,
-                rigid=None,
-                dof=None,
-                corrections=None,
+                raw_affine=UNCHECKED if run.acquisition_order == first else "header",
+                reference_image=run.acquisition_order != first,
+                rigid=True,
+                dof=6,
+                corrections=CORRECTIONS,
                 frame=frame,
                 files=(),
             )
@@ -160,9 +192,21 @@ def _runs(info: SessionInfo) -> tuple[FuncRunRow, ...]:
     return tuple(rows)
 
 
-def add_epi(run_dir: Path, packed: PackedStream, *, subject_uid: str | None = None) -> EpiRun:
+def add_epi(
+    run_dir: Path,
+    packed: PackedStream,
+    *,
+    subject_uid: str | None = None,
+    subject_uids: Mapping[str, str | None] | None = None,
+) -> EpiRun:
     """Write the EPI interface of two participants into a local run directory (see the
-    module). ``subject_uid`` is the FreeSurfer subject of the first session of ``FULL``."""
+    module). ``subject_uid`` is the FreeSurfer subject of the first session of ``FULL``;
+    ``subject_uids`` (session id -> ``subject_uid`` or None) gives the sessions it names
+    their FreeSurfer subject instead, the others keeping the rule of ``subject_uid``."""
+    known = {s for ids in session_ids(packed).values() for s in ids}
+    unknown = set(subject_uids or {}) - known
+    if unknown:
+        raise ValueError(f"no such session: {', '.join(sorted(unknown))}")
     epi = run_dir / EPI_DIR
     full_ids = {s: s for s in packed.sessions}
     for info in packed.infos.values():
@@ -217,7 +261,10 @@ def add_epi(run_dir: Path, packed: PackedStream, *, subject_uid: str | None = No
                         participant_uid=participant,
                         session=label,
                         stream_order=order,
-                        subject_uid=subject_uid if (participant == FULL and order == 0) else None,
+                        subject_uid=(subject_uids or {}).get(
+                            info.session,
+                            subject_uid if (participant == FULL and order == 0) else None,
+                        ),
                         fs_subject=None,
                         anchor=None,
                         anchor_note=None,

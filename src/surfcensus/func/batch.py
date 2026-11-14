@@ -42,12 +42,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from surfcensus.func import ID_PATTERN, SESSION_JSON, STREAM_JSON
 from surfcensus.log import get_logger
 from surfcensus.records import (
     EPI_SESSION_PHASE,
+    NOT_SELECTED,
     PACK_FAILURE,
     PACK_PHASE,
     SOURCE_CHANGED,
@@ -65,6 +66,7 @@ if TYPE_CHECKING:
 
     from surfcensus.config import EpiConfig
     from surfcensus.func.model import PackInfo
+    from surfcensus.store import PublicCatalog
 
 # Nothing here imports numpy, pandas or nibabel at import time (the module is imported by the
 # commands that only plan): the pack, the contours, the catalog's helpers and the
@@ -445,6 +447,60 @@ def pack_status(ctx: RunContext) -> tuple[int, int, int]:
 def pack_failures(ctx: RunContext) -> dict[str, tuple[str, str | None]]:
     """``run_uid`` -> reason and detail of the runs counted as failed by :func:`pack_status`."""
     return dict(pack_plan(ctx).failed)
+
+
+# --- the recorded state of a run (step 3) ----------------------------------------------------
+
+RecordedStateName = Literal["packed", "pending", "failed", "cannot be packed", "not selected"]
+"""``schemas.PACK_STATES``, as :class:`RecordedState` holds them."""
+
+
+@dataclass(frozen=True)
+class RecordedState:
+    """What the catalog records of one present run under the present pack settings, as the
+    subject pages, the index of the EPI pages and the export say it (decision D44)."""
+
+    state: RecordedStateName
+    reason: str | None
+    """``func_runs.reason`` of a run that cannot be packed or is not selected, ``packs.reason``
+    of a failed pack; None otherwise."""
+    detail: str | None
+    """The detail beside that reason (in a local run only, as the public views give it)."""
+
+
+def recorded_states(public: PublicCatalog, pack_hash: str) -> dict[str, RecordedState]:
+    """``run_uid`` -> :class:`RecordedState` of every present run, in the order of
+    ``PublicCatalog.func_runs`` (session, then ``acquisition_order``, then ``run_uid``).
+
+    A run that is not selected is ``not selected``, one that is not packable ``cannot be
+    packed``, each with the reason and detail of ``func_runs``; of the rest, a ``packs`` row
+    ``done`` under ``pack_hash`` (``EpiConfig.pack_hash()``) makes it ``packed``, a ``failed``
+    row ``failed`` with the reason and detail of the row, and no such row ``pending``. This is
+    what is recorded, decided from the catalog alone; :func:`pack_status` says what ``pack``
+    would do now, which also asks the pack signature and the disk, so an outdated pack is
+    ``packed`` here and pending there. Empty for a catalog without functional data."""
+    recorded: dict[str, dict[str, Any]] = {}
+    for row in _records(public.packs()):
+        if row.get("config_hash") == pack_hash and row.get("status") in ("done", "failed"):
+            recorded[str(row["run_uid"])] = row
+    out: dict[str, RecordedState] = {}
+    for row in _records(public.func_runs()):
+        if not _true(row.get("present")):
+            continue
+        uid = str(row["run_uid"])
+        reason, detail = _text(row.get("reason")), _text(row.get("detail"))
+        if not _true(row.get("selected")):
+            out[uid] = RecordedState("not selected", reason or NOT_SELECTED, detail)
+        elif not _true(row.get("packable")):
+            out[uid] = RecordedState("cannot be packed", reason, detail)
+        elif uid in recorded and recorded[uid].get("status") == "done":
+            out[uid] = RecordedState("packed", None, None)
+        elif uid in recorded:
+            pack = recorded[uid]
+            out[uid] = RecordedState("failed", _text(pack.get("reason")), _text(pack.get("detail")))
+        else:
+            out[uid] = RecordedState("pending", None, None)
+    return out
 
 
 def _voxels(shape: object) -> int | None:

@@ -93,6 +93,7 @@ from surfcensus.app.schemas import AppMode
 from surfcensus.calibration import CalibrationSet, load_calibration, validate_calibration
 from surfcensus.config import ConfigError, epi_settings, load_config
 from surfcensus.export.tables import frame_csv, marks_frame, ratings_frame, subjects_frame
+from surfcensus.func.batch import RecordedState, recorded_states
 from surfcensus.log import get_logger
 from surfcensus.privacy import scrub
 from surfcensus.protocol import install_protocol, load_protocol, marks_required
@@ -1489,12 +1490,7 @@ class _App:
         participants = self.epi_participants()
         sessions = self.public.func_sessions()
         runs = self.public.func_runs()
-        packs = self.public.packs()
-        pack_hash = epi_settings(self.config).pack_hash()
-        state: dict[str, str] = {}
-        for row in _records(packs):
-            if row.get("config_hash") == pack_hash and row.get("status") in ("done", "failed"):
-                state[str(row["run_uid"])] = str(row["status"])
+        state = recorded_states(self.public, epi_settings(self.config).pack_hash())
         runs_of: dict[str, list[dict[str, Any]]] = {}
         for row in _records(runs):
             if _true(row.get("present")):
@@ -1702,12 +1698,15 @@ def _true(value: object) -> bool:
     return bool(value)
 
 
-def _epi_counts(runs: Sequence[Mapping[str, Any]], state: Mapping[str, str]) -> dict[str, int]:
+def _epi_counts(
+    runs: Sequence[Mapping[str, Any]], state: Mapping[str, RecordedState]
+) -> dict[str, int]:
     """The counts of :class:`EpiIndexSessionOut` of the present runs of a session; ``state``
-    is the status of the pack of each run that has one under the present settings."""
+    is ``func.batch.recorded_states`` of the run."""
     packable = [r for r in runs if _true(r.get("packable")) and _true(r.get("selected"))]
-    packed = sum(state.get(str(r["run_uid"])) == "done" for r in packable)
-    failed = sum(state.get(str(r["run_uid"])) == "failed" for r in packable)
+    states = [state.get(str(r["run_uid"])) for r in packable]
+    packed = sum(s is not None and s.state == "packed" for s in states)
+    failed = sum(s is not None and s.state == "failed" for s in states)
     return {
         "n_runs": len(runs),
         "n_packable": len(packable),

@@ -75,6 +75,101 @@ EXPORT_TABLES: tuple[str, ...] = (
     "skips",
 )
 """Each is written as ``<name>.csv`` or ``<name>.parquet``."""
+
+FUNC_TABLES: tuple[str, ...] = ("func_sessions", "func_runs")
+"""The functional tables (step 3 of docs/epi_interface.md; work package E3.B writes them):
+written after :data:`EXPORT_TABLES`, in the profile ``analysis`` of a local run whose EPI
+interface is on and whose catalog has functional data, and never in a release or a census
+export (O28). An export without them has the files, rows and manifest of before step 3."""
+
+FUNC_SESSIONS_COLUMNS: tuple[str, ...] = (
+    "dataset",
+    "participant_uid",
+    "participant",
+    "session_uid",
+    "session_label",
+    "stream_order",
+    "stream_rule",
+    "subject_uid",
+    "fs_subject",
+    "anchor_run_uid",
+    "anchor_rule",
+    "anchor_note",
+    "frame_limit_mm",
+    "shared_frame_plausible",
+    "anchor_is_outlier",
+    "n_runs",
+    "n_packable",
+    "n_grids",
+    "problem",
+    "present",
+    "n_packed",
+    "n_failed",
+    "n_pending",
+)
+"""``func_sessions``: one row per session of ``PublicCatalog.func_sessions``, with the dataset,
+the participant label and the rule of its stream order (``stream_rule``,
+``func_participants.session_order``: ``acquisition time`` or ``session label``, decision D42)
+of its participant, and the counts of its runs by ``func.batch.recorded_states``. Sorted by
+``participant_uid``, ``stream_order``, ``session_uid``."""
+
+FUNC_RUNS_COLUMNS: tuple[str, ...] = (
+    # every column of the view public_func_runs, in its order
+    "run_uid",
+    "session_uid",
+    "name",
+    "session_order",
+    "acquisition_order",
+    "anchor",
+    "selected",
+    "packable",
+    "reason",
+    "detail",
+    "missing_roles",
+    "n_volumes",
+    "tr_s",
+    "echoes",
+    "display_layout",
+    "grid_key",
+    "grid_shape",
+    "voxel_mm",
+    "oblique_deg",
+    "raw_affine",
+    "reference_image",
+    "rigid",
+    "dof",
+    "corrections",
+    "motion_state",
+    "sdc",
+    "sdc_method",
+    "slice_timing",
+    "frame_mean_mm",
+    "frame_max_mm",
+    "frame_rotation_deg",
+    "frame_translation_mm",
+    "flagged",
+    "present",
+    # then the participant and the recorded pack
+    "participant_uid",
+    "pack_state",
+    "pack_reason",
+    "pack_detail",
+    "pack_n_volumes",
+    "pack_bytes",
+    "packed_at",
+)
+"""``func_runs``: one row per run of ``PublicCatalog.func_runs``, then its participant and its
+pack as recorded (``pack_state`` one of ``schemas.PACK_STATES``, by
+``func.batch.recorded_states``; ``pack_reason`` and ``pack_detail`` its reason and detail; the
+volumes, bytes and time of a ``done`` row of ``packs``). Sorted by ``session_uid``,
+``acquisition_order``, ``run_uid``. No trace, no pack key, no content digest and no input
+signature: ``pack.json``, ``traces.json`` and the chunks are not read (O28)."""
+
+EPI_MANIFEST_KEY = "epi"
+"""The key of ``manifest.json`` that holds, only when :data:`FUNC_TABLES` are written,
+``{"config_hashes": {"pack", "epi_session", "func_inventory"}, "sources": [{"dataset",
+"connector", "pipeline_version", "generation"}, ...]}``. ``MANIFEST_SCHEMA_VERSION`` stays 1."""
+
 MANIFEST = "manifest.json"
 MANIFEST_SCHEMA_VERSION = 1
 

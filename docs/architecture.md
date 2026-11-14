@@ -136,7 +136,7 @@ surfcensus/
       api.py               # three_plane(), render_subject()
       batch.py             # phase 6 for a run: pending subjects, the renders table, the check sample
       freeview.py          # optional backend, wraps the original gist approach
-    func/                  # the EPI movie interface, steps 1 and 2 (docs/epi_interface.md)
+    func/                  # the EPI movie interface, steps 1 to 3 (docs/epi_interface.md)
       bids.py              # BIDS entities, run keys, raw series, sidecar inheritance
       itk.py               # ITK text transforms as RAS matrices
       connectors/          # what is specific to a pipeline; fmriprep.py is the one built
@@ -149,7 +149,9 @@ surfcensus/
       api.py               # epi_subject, epi_session (surfcensus epi-session)
       discover.py          # step 2: the derivative and the raw dataset of a run, the places that are read
       inventory.py         # step 2: phase 2f (the functional inventory), the lease of a session, fetch lines
-      batch.py             # step 2: the pack phase of a run (epi/), its skip rule and its rows
+      batch.py             # step 2: the pack phase of a run (epi/), its skip rule and its rows;
+                           # step 3: recorded_states, the recorded state of a run
+      status.py            # step 3: the functional lines of `surfcensus status` (stubs until E3.B)
     app/
       __init__.py          # the name of app.sqlite and of its tables, for code that reads it without the app's packages
       schemas.py           # the shapes of the API (pydantic only); RenderOut, the render a page receives
