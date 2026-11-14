@@ -101,7 +101,7 @@ PROFILES: tuple[Profile, ...] = ("analysis", "release")
 T1, T2, T3 = (f"2026-11-13T10:00:0{n}.000Z" for n in (1, 2, 3))
 VALUES = {"A": 2, "B": 0, "C": 1}
 NONE = {"A": 0, "B": 0, "C": 0}
-BLOCK_APP_EXTRA = "import sys\n" + "".join(
+BLOCK_APP_PACKAGES = "import sys\n" + "".join(
     f"sys.modules[{name!r}] = None\n"
     for name in ("fastapi", "uvicorn", "sqlmodel", "sqlalchemy", "jinja2", "starlette")
 )
@@ -1662,16 +1662,16 @@ def test_a_local_run_has_no_release_profile(run: Path, tmp_path: Path) -> None:
     assert not (tmp_path / "out").exists()
 
 
-# --- a core install -------------------------------------------------------------------------------
+# --- without the packages of the app --------------------------------------------------------------
 
 
-def test_the_export_works_without_the_app_extra(
+def test_the_export_works_without_the_packages_of_the_app(
     run: Path, engine: Engine, uids: list[str], tmp_path: Path
 ) -> None:
     fill(run, engine, uids)
     engine.dispose()
     export_run(run, tmp_path / "here")
-    code = BLOCK_APP_EXTRA + (
+    code = BLOCK_APP_PACKAGES + (
         "from surfcensus.export.tables import export_run, ratings_frame, subjects_frame\n"
         f"paths = export_run({str(run)!r}, {str(tmp_path / 'there')!r})\n"
         f"print(len(paths), len(ratings_frame({str(run)!r})), len(subjects_frame({str(run)!r})))\n"

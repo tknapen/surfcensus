@@ -149,7 +149,8 @@ def test_review_without_the_app_prepares_the_run_and_says_what_it_did(study: Pat
     lines = result.stderr.splitlines()
     assert lines[0] == f"Run directory: {run_dir} (new)"
     assert lines[1] == (
-        "Found 3 subjects (fMRIPrep layout). 1 cannot be rendered: sub-03 (no surf/lh.pial)."
+        "Found 3 subjects in sourcedata/freesurfer (fMRIPrep layout). 1 cannot be rendered: "
+        "sub-03 (no surf/lh.pial)."
     )
     assert "Scores: " in result.stderr
     assert "Rendered: 2 of 3 subjects, 1 cannot be rated." in lines
@@ -212,21 +213,64 @@ def test_review_refuses_to_change_blind_under_ratings_without_force(
     assert cli("review", study, "--no-serve").exit_code == 0 and load_config(run_dir).app.blind
 
 
+def lacks(package: str) -> str:
+    """The line for an installation that lacks ``package``. The app's packages are
+    dependencies of the package itself, so the line names no extra."""
+    return (
+        f"missing: the rater app needs the package {package}, which this installation "
+        "lacks; `pip install surfcensus` installs what is missing"
+    )
+
+
+def without(monkeypatch: pytest.MonkeyPatch, package: str) -> None:
+    """Make ``import package`` fail as it does where the package is not installed, and the
+    server module import its packages anew."""
+    for name in [name for name in sys.modules if name.startswith("surfcensus.app.server")]:
+        monkeypatch.delitem(sys.modules, name)
+    monkeypatch.setitem(sys.modules, package, None)
+
+
 def test_review_without_the_packages_of_the_app_says_how_to_get_them(
     study: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    for name in [name for name in sys.modules if name.startswith("surfcensus.app.server")]:
-        monkeypatch.delitem(sys.modules, name)
-    monkeypatch.setitem(sys.modules, "fastapi", None)
+    without(monkeypatch, "fastapi")
     result = cli("review", study, "--no-browser")
     assert result.exit_code == 2
-    assert result.stderr.strip() == (
-        "missing: the rater app needs the package fastapi; install it with "
-        'pip install "surfcensus[app]"'
-    )
+    assert result.stderr.strip() == lacks("fastapi")
     # nothing was done before the refusal, and without the app the command works
     assert not (study.parent / DEFAULT_RUN_DIR).exists()
     assert cli("review", study, "--no-serve", "--jobs", 1).exit_code == 0
+
+
+@pytest.mark.parametrize("package", ["uvicorn", "sqlmodel", "jinja2"])
+def test_review_names_whichever_package_of_the_app_is_missing(
+    study: Path, monkeypatch: pytest.MonkeyPatch, package: str
+) -> None:
+    # every one of them is a dependency of the package (pyproject.toml), so this is an
+    # installation that was stripped or is broken; no extra would repair it
+    without(monkeypatch, package)
+    result = cli("review", study, "--no-browser")
+    assert result.exit_code == 2
+    assert result.stderr.strip() == lacks(package)
+    assert "[app]" not in result.stderr and "extra" not in result.stderr
+    assert not (study.parent / DEFAULT_RUN_DIR).exists()
+
+
+@pytest.mark.parametrize(
+    ("command", "package"),
+    [(("serve",), "uvicorn"), (("finalize",), "sqlmodel"), (("serve", "--no-browser"), "fastapi")],
+)
+def test_serve_and_finalize_say_the_same_of_a_missing_package(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, command: tuple[str, ...], package: str
+) -> None:
+    before = snapshot_tree(run_dir)
+    without(monkeypatch, package)
+    result = cli(*command, "--run-dir", run_dir)
+    assert result.exit_code == 2
+    assert result.stderr.strip() == lacks(package)
+    assert snapshot_tree(run_dir) == before
+    # the export reads the database of the app without any of these packages
+    assert cli("export", "--run-dir", run_dir).exit_code == 0
 
 
 # --- review with the app, as a process ------------------------------------------------------------

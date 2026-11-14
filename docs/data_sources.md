@@ -32,6 +32,8 @@ Raw datasets live in `s3://openneuro.org/dsXXXXXX/` (anonymous HTTPS listing ret
 
 This pool answers a different question: what the community actually ships. Report it separately from OpenNeuroDerivatives, never pooled.
 
+On disk. A copy of such a dataset (downloaded, or cloned) is read by the local source when its root is given: the subjects are looked for below `derivatives/`, first in `derivatives/freesurfer/`, then in the folders of `derivatives/` that hold subject directories themselves (`derivatives/freesurfer-7.3.2/`), then in `derivatives/<folder>/sourcedata/freesurfer/`, then in `derivatives/<folder>/freesurfer/`, whatever the folder is called (`architecture.md`, Sources). The idiosyncratic paths are not found; the folder that holds the subjects is then given as the path. The rule was written from the three path forms named above and tried on synthetic trees and on two real subjects linked into `derivatives/fmriprep/sourcedata/freesurfer/` of a made-up dataset root (2026-11-14); no real OpenNeuro dataset with embedded FreeSurfer output was listed or downloaded for it.
+
 Dataset enumeration: the OpenNeuro GraphQL API (endpoint `https://openneuro.org/crn/graphql`, to verify) lists datasets and snapshots. Fallback: list the top level of `s3://openneuro.org/` with a delimiter and probe each `dsXXXXXX/derivatives/` prefix.
 
 Snapshot pinning: record the snapshot tag for each raw dataset and the git commit of each OpenNeuroDerivatives dataset (from the `.datalad` metadata or the GitHub mirror in the OpenNeuroDerivatives organization). The S3 bucket reflects the latest state; the recorded refs make the census reproducible in principle.

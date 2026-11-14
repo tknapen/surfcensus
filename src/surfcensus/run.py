@@ -909,4 +909,6 @@ def from_config(
         subjects=config.subjects,
         identity=identity if identity is not None else config.identity,
         field_strength=config.field_strength,
+        # a stored root is the folder that was found: it is not searched below derivatives/
+        nested=False,
     )

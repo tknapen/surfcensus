@@ -26,3 +26,17 @@ jobs:
       - run: uv run ruff format --check .
       - run: uv run pyrefly check
       - run: uv run pytest
+
+  # The quick start as a user gets it (tests/test_install.py): the wheel is built and
+  # installed into a fresh environment with whatever the package index gives for its
+  # dependencies today, and `surfcensus review` runs there up to a stored rating. It needs
+  # the index, so it is not in the matrix above. One cell: Linux, the oldest supported Python.
+  install:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: "3.11"
+      - run: uv sync --all-extras --group dev
+      - run: uv run pytest -m install -s tests/test_install.py

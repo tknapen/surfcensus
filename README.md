@@ -8,23 +8,36 @@ Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the s
 
 Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
 
+## Quick start
+
+One line, with [uv](https://docs.astral.sh/uv/), and nothing to install first:
+
+```
+uvx --from git+https://github.com/tknapen/surfcensus surfcensus review /path/to/SUBJECTS_DIR
+```
+
+Or install the package into an environment of yours (Python 3.11 or later) and run the command:
+
+```
+pip install git+https://github.com/tknapen/surfcensus
+surfcensus review /path/to/SUBJECTS_DIR
+```
+
+The package is not on PyPI yet, so both lines name the repository and need `git`. Once it is, they are `uvx surfcensus review PATH` and `pip install surfcensus`.
+
+That is the whole install: the rating app is part of the package and needs no extra. (`pip install "surfcensus[app]"`, the line these docs gave earlier, still works and installs the same.) No FreeSurfer installation or licence is needed. Your data is only read: nothing is written into a subject directory or into the directory that holds your subjects.
+
+What to expect, measured on 2026-11-14 on one 4-core Linux machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
+
 ## What works today
-
-Install from a clone with [uv](https://docs.astral.sh/uv/):
-
-```
-uv sync --extra app
-```
-
-(`uv sync` alone installs everything but the rating app.) No FreeSurfer installation or licence is needed. Your data is only read: nothing is written into a subject directory or into the directory that holds your subjects.
 
 ### Look at your subjects and rate them
 
 ```
-uv run surfcensus review /path/to/SUBJECTS_DIR
+surfcensus review /path/to/SUBJECTS_DIR
 ```
 
-`PATH` is a FreeSurfer `SUBJECTS_DIR`, an fMRIPrep output folder, a BIDS derivatives folder with `freesurfer/`, or one subject directory. The command lists the subjects, scores them, renders the first one and opens the rating app in your browser at `http://127.0.0.1:8765/`; the other subjects are rendered while you rate. It keeps its work in a run directory, `surfcensus-run` next to `PATH` (or `--run-dir DIR`), and says on the terminal what it found, which subjects cannot be rendered and why, and how long it took to get to the app (about 11 s for two real subjects on a 4-core machine, under 1 s when you come back). Ctrl-C stops it; the same command again continues where you were.
+`PATH` is a FreeSurfer `SUBJECTS_DIR`, an fMRIPrep output folder, a BIDS derivatives folder with `freesurfer/`, one subject directory, or the root of a BIDS dataset whose FreeSurfer subjects lie below `derivatives/` (`derivatives/freesurfer/`, `derivatives/fmriprep/sourcedata/freesurfer/` and the like are found without naming them). The command lists the subjects, scores them, renders the first one and opens the rating app in your browser at `http://127.0.0.1:8765/`; the other subjects are rendered while you rate. It keeps its work in a run directory, `surfcensus-run` next to `PATH` (next to the BIDS dataset when the subjects lie in one, never inside it; or `--run-dir DIR`), and says on the terminal what it found, which subjects cannot be rendered and why, and how long it took to get to the app (about 11 s for two real subjects on a 4-core machine, under 1 s when you come back). Ctrl-C stops it; the same command again continues where you were.
 
 - The rating screen shows three views that sweep through the back of the brain. A first visit starts with a short tour. You give each of three questions (sagittal sinus and falx, tentorium and transverse sinus, white surface) a value with the number keys, click on an error to mark where it is, and press Enter for the next subject. `k` skips a subject, which then comes back after the others; `Backspace` goes back; `?` shows the definitions and every key.
 - Subjects come worst-scoring first. `--blind` offers them in a random order and keeps the review screen closed until all are rated. `--rater NAME` says who is rating; two people can rate the same run one after the other, and `surfcensus finalize --run-dir DIR` then writes the labels they agree on and lists the subjects they do not.
@@ -32,7 +45,7 @@ uv run surfcensus review /path/to/SUBJECTS_DIR
 - `--no-browser` does not open a browser, `--no-serve` prepares everything and stops, `--serve-after 0` renders every subject before the app opens, `--fsaverage DIR` names the template (see `metrics` below).
 
 ```
-uv run surfcensus export --run-dir /path/to/surfcensus-run
+surfcensus export --run-dir /path/to/surfcensus-run
 ```
 
 writes `export/` in the run directory: `subjects`, `scores`, `selection`, `ratings`, `marks`, `final_marks`, `clusters`, `datasets`, `behaviour` and `skips` as CSV (`--format parquet` for parquet), and a `manifest.json` with the checksum of each. CSV has no types: read identifiers such as `subject_uid` as text (`pd.read_csv(path, dtype={"subject_uid": str})`), or use parquet.
@@ -54,10 +67,10 @@ The app listens on your own machine only and loads nothing from the internet.
 `review` runs these commands for you. To run them one at a time, point `inventory` at the same kinds of folder and give it a run directory outside your subjects directory to write to:
 
 ```
-uv run surfcensus inventory --run-dir runs/mystudy --source /path/to/SUBJECTS_DIR
-uv run surfcensus metrics --run-dir runs/mystudy --jobs 4
-uv run surfcensus render --run-dir runs/mystudy --jobs 4
-uv run surfcensus status --run-dir runs/mystudy
+surfcensus inventory --run-dir runs/mystudy --source /path/to/SUBJECTS_DIR
+surfcensus metrics --run-dir runs/mystudy --jobs 4
+surfcensus render --run-dir runs/mystudy --jobs 4
+surfcensus status --run-dir runs/mystudy
 ```
 
 - `inventory` lists the subjects, without opening their images, and reads each subject's build stamp and recon-all logs. It prints which layout it found, how many subjects can be rendered, their FreeSurfer versions, and which subjects lack which files. `--subjects 'sub-0*'` restricts the run to matching directory names.
@@ -88,7 +101,7 @@ Tested on synthetic subjects with planted thick patches and on real subjects fro
 ### One subject
 
 ```
-uv run surfcensus render-subject /path/to/SUBJECTS_DIR/sub-01 --out media/sub-01
+surfcensus render-subject /path/to/SUBJECTS_DIR/sub-01 --out media/sub-01
 ```
 
 This reads `mri/T1.mgz`, `surf/?h.white` and `surf/?h.pial` (and `mri/brainmask.mgz` if present) and writes to `media/sub-01`:
@@ -112,10 +125,10 @@ The renderer's frames have not yet been compared by eye with Freeview. Details a
 ## Planned
 
 - The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.
-- A one-line install without a clone, and `review` on a downloaded OpenNeuro dataset without naming its subfolder.
+- `pip install surfcensus` from PyPI, and `review` on a downloaded OpenNeuro dataset without naming its subfolder.
 - A normative reference to score small sets against, built from rated census subjects.
 - The OpenNeuro census: the same pipeline over FreeSurfer outputs in public OpenNeuro derivatives, to measure how common these errors are and how often quantitative checks miss them. See `docs/phases.md`.
 
 ## Development
 
-`just setup`, `just test` and `just lint`; the `justfile` shows the `uv` commands behind them. The code is licensed BSD-3-Clause.
+From a clone: `just setup`, `just test` and `just lint`; the `justfile` shows the `uv` commands behind them, and `uv run surfcensus ...` runs the command of the clone. `just test-install` builds the wheel, installs it into a fresh environment and rates a synthetic subject through `surfcensus review` there; it needs the package index. The code is licensed BSD-3-Clause.

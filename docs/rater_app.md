@@ -12,7 +12,7 @@ Team (`surfcensus serve --host 0.0.0.0`): same app, several raters, run on a lab
 
 Offline export (optional, later): `surfcensus static-export` writes a self-contained static site with a manifest. Ratings are kept in the browser and downloaded as a JSON file at the end. For a collaborator who cannot reach the server. Browser storage is fragile, so the app autosaves a downloadable backup every 50 ratings.
 
-The frontend is plain HTML, CSS and JavaScript with no build step, shipped inside the wheel, so `pip install` is all a user needs.
+The frontend is plain HTML, CSS and JavaScript with no build step, shipped inside the wheel, and the packages the server needs (`fastapi`, `uvicorn`, `sqlmodel`, `jinja2`) are dependencies of the package, so `pip install surfcensus` is all a user needs: no extra, no second step (decision O20; `architecture.md`, Dependencies).
 
 ## Rating screen
 
@@ -209,7 +209,14 @@ Measured 2026-11-13 on one machine (4 processors, local disk, Chromium 153 headl
 
 On the 26 subjects of `ds000102` with Tier A and B files only (no T1, no surfaces), `review` took 35 s, said which files every subject lacks, scored them, and ended with exit code 1 and `No subject of this run can be rendered, so there is nothing to rate.`; `export` then lists each with `render_reason` `missing surface`. On a synthetic set of 32 subjects the app offered the two subjects that could not be fully scored first, then the others in the order of `primary_rank` (the three with a planted patch first); with `--blind` it offered them in the seeded shuffle, and the position in the queue had a rank correlation of 0.07 with the score.
 
-Not measured: a network between server and browser, a slow disk, more than 32 subjects in a queue, any browser but Chromium, a screen reader, a touch screen.
+From an installation that is new (measured 2026-11-14, same machine, the wheel installed with its dependencies from the package index, the command run from another directory; two synthetic 1 mm subjects of 160 voxels a side without an fsaverage, which are lighter than real ones: `review` is at the app in about 3.5 s for them, where the two real subjects above took 11 s. So these times say what the install and the start cost, not what real subjects take):
+
+- `pip install` of the wheel in a `python -m venv` environment: 28 s on Python 3.13 (pip 26.2.2) and 29 s on 3.11 (pip 24.0) on a fast connection, 50 and 51 packages. Then `surfcensus review PATH --no-browser` named the address 4.6 and 4.7 s after the command was given; the command's own clock, which starts after its imports, said 3.4 and 3.6 s.
+- `uv venv` and `uv pip install` with the wheels in uv's cache: under 1 s. The first `review` then took 8.0 s (3.13) and 8.3 s (3.11) to the address, of which the command counted 4.7 and 4.8 s: uv does not compile the packages at install, so the first import of each does. The same command again on the finished run: 1.9 and 2.0 s to the address (0.8 s by the command's clock), so starting Python and importing takes about 1.1 s of any call.
+- `uvx --from WHEEL surfcensus review PATH --no-browser`, which makes the environment itself: 8.9 s to the address with the wheels in uv's cache, 1.7 s the second time. `uvx --from git+file://COPY`, a git repository made of a copy of the working tree, which is the form of the line that names the repository: 8.0 s.
+- In each of these the page and `/api/next` answered, and SIGTERM ended the command with exit code 0 and its closing line, also through `uvx`.
+
+Not measured: an install over a slow connection or with an empty pip cache on a home line (227 MB of wheels), macOS and Windows, a network between server and browser, a slow disk, more than 32 subjects in a queue, any browser but Chromium, a screen reader, a touch screen.
 
 ## Throughput budget
 

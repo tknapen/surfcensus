@@ -4,7 +4,7 @@ and ``app.sqlite``. See docs/phases.md, phase 8.
 Datasets appear by pseudonym and subjects by ``subject_uid``; a local run also names its
 subjects. Nothing here can reach what is private (decision D20): the catalog is opened as a
 ``PublicCatalog``, and ``app.sqlite`` is read with the standard library, by the names of
-``surfcensus.app``, so the export works on a core install.
+``surfcensus.app``, so the export loads no package of the rater app.
 
 Missing values. In the frames returned here a text column holds ``None``, a count or a flag
 ``pd.NA`` and a measurement ``NaN``. A parquet file holds a null for each of them, a CSV
@@ -246,8 +246,8 @@ RELEASE_LEFT_OUT: dict[str, tuple[str, ...]] = {
 
 APP_SCHEMA_READ = 1
 """The schema of ``app.sqlite`` (``app_meta.schema_version``) whose tables this module
-reads. ``app.db.APP_SCHEMA_VERSION`` is not imported, since that module needs the app
-extra; a test keeps the two equal."""
+reads. ``app.db.APP_SCHEMA_VERSION`` is not imported, since that module imports
+``sqlmodel``; a test keeps the two equal."""
 
 _BUSY_S = 30.0
 _APP_TABLES_READ = (
@@ -275,7 +275,7 @@ _SORT_KEYS: dict[str, tuple[str, ...]] = {
     "behaviour": ("assignment_id",),
     "skips": ("assignment_id", "n"),
 }
-_SKIP_EVENT = "skip"  # app.schemas.SKIP_EVENT, which is not imported: this module needs no extra
+_SKIP_EVENT = "skip"  # app.schemas.SKIP_EVENT, not imported: this module stays off the app
 _CONFIG_CHANGE = "config_change"  # app.events.CONFIG_CHANGE, likewise
 _BLIND_SETTING = "blind"
 _COUNTED_EVENTS = {

@@ -23,15 +23,26 @@ dependencies = [
   "pyyaml",
   "jaxtyping",
   "tqdm",
+  # The rater app. Core dependencies since `surfcensus review PATH` is the quick start
+  # (decisions D33 and O20): one `pip install surfcensus` is enough. uvicorn without its
+  # `standard` extra: the server runs on h11 and asyncio whatever else is installed.
+  "fastapi",
+  "uvicorn",
+  "sqlmodel",
+  "jinja2",
 ]
 
 [project.optional-dependencies]
-app = ["fastapi", "uvicorn[standard]", "sqlmodel", "jinja2"]
+# Empty. The app's packages were an extra until they moved into the core; the name stays so
+# that `pip install "surfcensus[app]"`, the line the docs gave then, still installs.
+app = []
 analysis = ["marimo", "statsmodels", "scikit-learn", "krippendorff"]
 all = ["surfcensus[app,analysis]"]
 
 [dependency-groups]
-dev = ["pytest", "ruff", "pyrefly", "beartype", "hypothesis"]
+# uvicorn[standard] adds httptools and uvloop, which the server must not pick up: the default
+# tests run with them installed, the install test (tests/test_install.py) without them.
+dev = ["pytest", "ruff", "pyrefly", "beartype", "hypothesis", "uvicorn[standard]"]
 # The browser test of the rater app (tests/test_browser.py, `just test-browser`). It drives a
 # browser that is already installed: the executable named by SURFCENSUS_BROWSER, else Chrome.
 browser = ["playwright"]
@@ -53,10 +64,11 @@ exclude = ["/prototypes"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-m 'not network and not browser'"
+addopts = "-m 'not network and not browser and not install'"
 markers = [
   "network: test needs internet access to public buckets",
   "browser: test drives the rater app in a real browser (needs the browser dependency group)",
+  "install: test builds the wheel and installs it into a fresh environment (needs the package index)",
 ]
 
 [tool.ruff]

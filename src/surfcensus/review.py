@@ -41,7 +41,14 @@ from surfcensus.config import (
 from surfcensus.log import get_logger
 from surfcensus.run import Run
 from surfcensus.sources.base import RENDER_ROLES, SourceError
-from surfcensus.sources.local import LocalSource, detect_layout, refuse_in_sources
+from surfcensus.sources.local import (
+    LAYOUT_WORDS,
+    LocalSource,
+    dataset_holding,
+    detect_layout,
+    refuse_in_sources,
+    where_subjects_lie,
+)
 from surfcensus.sources.patterns import ROLE_CANDIDATES
 from surfcensus.store import queue_order, queue_scores
 
@@ -66,12 +73,6 @@ SELECTION_REASON = "all"
 
 _MAX_NAMES = 10  # subjects named on one line
 _BY_SUBJECT = 3  # incomplete subjects that are each named with what they lack
-_LAYOUTS = {
-    "subjects_dir": "a subjects directory",
-    "fmriprep": "fMRIPrep layout",
-    "fmriprep_legacy": "older fMRIPrep layout",
-    "bids_derivatives": "BIDS derivatives layout",
-}
 
 
 def _say(text: str) -> None:
@@ -95,10 +96,21 @@ def default_run_dir(path: Path | str) -> Path:
     A run directory may not lie inside the directory the subjects are read from. When
     ``path`` is one subject directory, its parent is that directory, and the run goes
     beside it: ``<subjects directory>/../surfcensus-run``, also when the subject directory
-    is a link to another place. Raises ``SourceError`` as
-    :func:`surfcensus.sources.local.detect_layout` does.
+    is a link to another place.
+
+    Subjects that lie below the ``derivatives/`` folder of a BIDS dataset
+    (``sources.local.dataset_holding``): the run goes beside the dataset,
+    ``<dataset>/../surfcensus-run``, never into it, whether ``path`` is the dataset or a
+    folder inside it; a dataset, which may be a DataLad dataset, gets no files unless a run
+    directory in it is asked for. A run of this data that an earlier version made inside
+    the dataset, beside the folder that was named, is still found and used. When the
+    place beside the dataset cannot be written to, the run goes to ``./surfcensus-run``,
+    and when the current directory lies inside the dataset the call is refused
+    (``ConfigError("invalid", ...)``), since only ``run_dir`` can then say where.
+
+    Raises ``SourceError`` as :func:`surfcensus.sources.local.detect_layout` does.
     """
-    record, implied = detect_layout(path)
+    record, implied = detect_layout(path, quiet=True)
     subjects_dir = Path(record.root) / record.fs_root
     if implied:
         # one subject directory, which may be a link: the run goes beside the directory that
@@ -108,10 +120,43 @@ def default_run_dir(path: Path | str) -> Path:
         beside, inside = Path(path).resolve().parent, subjects_dir.resolve()
         if beside == inside or inside in beside.parents:
             beside = inside.parent
-    candidate = beside / DEFAULT_RUN_DIR
-    if (candidate / "config.yaml").is_file() or os.access(beside, os.W_OK | os.X_OK):
+    dataset = dataset_holding(record, path)
+    if dataset is None:
+        candidate = beside / DEFAULT_RUN_DIR
+        if (candidate / "config.yaml").is_file() or os.access(beside, os.W_OK | os.X_OK):
+            return candidate
+        return Path.cwd() / DEFAULT_RUN_DIR
+
+    candidate = dataset.parent / DEFAULT_RUN_DIR
+    if (candidate / "config.yaml").is_file():
         return candidate
-    return Path.cwd() / DEFAULT_RUN_DIR
+    # where the rule above put the run of this folder before datasets were known: beside
+    # the path, or beside the folder that holds the subjects
+    for earlier in dict.fromkeys((beside, Path(record.root).parent, Path(record.root))):
+        if _holds_run_of(earlier / DEFAULT_RUN_DIR, record.root):
+            return earlier / DEFAULT_RUN_DIR
+    if os.access(dataset.parent, os.W_OK | os.X_OK):
+        return candidate
+    here = Path.cwd().resolve()
+    if here == dataset or dataset in here.parents:
+        raise ConfigError(
+            "invalid",
+            f"no place for the run directory: {dataset.parent} cannot be written to, and "
+            f"the current directory lies inside the dataset {dataset}, which gets no files "
+            "of a run unless asked; say where the run goes with --run-dir DIR",
+        )
+    return here / DEFAULT_RUN_DIR
+
+
+def _holds_run_of(run_dir: Path, root: str) -> bool:
+    """Whether ``run_dir`` holds a local run with a source at ``root``."""
+    if not (run_dir / "config.yaml").is_file():
+        return False
+    try:
+        stored = load_config(run_dir)
+    except (ConfigError, OSError):
+        return False
+    return stored.mode == "local" and _stored_source(stored, root) is not None
 
 
 # --- the run ------------------------------------------------------------------------------------
@@ -180,7 +225,7 @@ def _open_run(
             f"{run_dir} holds a census run; review works on a local run (surfcensus serve "
             "opens the app of a census run)",
         )
-    record, implied = detect_layout(path)
+    record, implied = detect_layout(path, quiet=True)  # the source below says what it found
     known = _stored_source(stored, record.root)
     if known is None and relocate and len(stored.sources) == 1:
         known = stored.sources[0]
@@ -279,12 +324,14 @@ def _listed(names: Sequence[str]) -> str:
     return ", ".join(names[:_MAX_NAMES]) + more
 
 
-def _say_inventory(run: Run) -> None:
-    """``Found 48 subjects (fMRIPrep layout, FreeSurfer 7.3.2). 2 cannot be rendered: ...``"""
+def _say_inventory(run: Run, path: Path | str | None = None) -> None:
+    """``Found 48 subjects in sourcedata/freesurfer (fMRIPrep layout, FreeSurfer 7.3.2). 2
+    cannot be rendered: ...``. Where the subjects lie is said relative to ``path``, the
+    folder that was named, and left out when they lie in that folder itself."""
     public = run.public()
     subjects = public.subjects()
     present = subjects[subjects["present"].to_numpy(dtype=bool)]
-    layouts = [_LAYOUTS.get(str(name), str(name)) for name in public.datasets()["layout"]]
+    layouts = [LAYOUT_WORDS.get(str(name), str(name)) for name in public.datasets()["layout"]]
     versions = sorted({v for v in present["fs_version"] if isinstance(v, str)})
     described = list(dict.fromkeys(layouts))
     if versions:
@@ -293,7 +340,9 @@ def _say_inventory(run: Run) -> None:
     if globs:
         # a subject set that is narrower than the directory is said, since it is kept
         described.append("of the subjects matching " + ", ".join(globs))
-    line = f"Found {_plural(len(present), 'subject')} ({', '.join(described)})."
+    where = where_subjects_lie(run.config, path)
+    line = f"Found {_plural(len(present), 'subject')}{f' in {where}' if where else ''}"
+    line += f" ({', '.join(described)})."
     lacking: list[tuple[str, str]] = []
     for row in present.sort_values("subject_label").itertuples(index=False):
         if bool(row.complete):
@@ -544,7 +593,8 @@ def open_review(
     started = time.perf_counter()
     _check(rater, jobs, serve_after, port)
     if serve:
-        # before the work, not after it: a core install has no rater app to open
+        # before the work, not after it: an installation that lacks a package of the app
+        # (a stripped or broken one) has no rater app to open
         import surfcensus.app.server  # noqa: F401
     if field_strength is not None and not 0 < field_strength < math.inf:
         raise ConfigError(
@@ -569,7 +619,7 @@ def open_review(
     try:
         _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
         report = run.inventory()
-        _say_inventory(run)
+        _say_inventory(run, path)
         if report.failed:
             _say_failures(run, report, "not read")
 

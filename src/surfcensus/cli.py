@@ -254,7 +254,7 @@ def _open_for_inventory(
     # the options that were given replace the stored ones
     target = None
     if source is not None:
-        root = detect_layout(source)[0].root
+        root = detect_layout(source, quiet=True)[0].root
         roots = [s.root for s in stored.sources]
         if root not in roots:
             Run(run_dir, LocalSource(source), relocate=relocate).close()  # or "other root"
@@ -285,13 +285,36 @@ def _open_for_inventory(
     return Run(run_dir, config=config)
 
 
-def _print_inventory(run: Run) -> None:
-    """What the run now holds: the layout found, subject counts, FreeSurfer versions, and
-    the subjects that lack something, grouped by what they lack."""
+def _print_inventory(run: Run, source: Path | None = None) -> None:
+    """What the run now holds: the layout found and where the subjects lie, subject counts,
+    FreeSurfer versions, and the subjects that lack something, grouped by what they lack.
+
+    A local run with one source says where its subjects were found, relative to ``source``
+    (the folder named with ``--source``) or else to the stored root:
+    ``D-3f9a1c07: FreeSurfer subjects found in derivatives/fmriprep/sourcedata/freesurfer
+    (fMRIPrep layout, fMRIPrep 21.0.2)``. Any other run names layout and pipeline as the
+    catalog has them; a census run keeps where its subjects lie in the catalog."""
+    from surfcensus.sources.local import LAYOUT_WORDS, where_subjects_lie
+
     public = run.public()
-    for row in public.datasets().itertuples(index=False):
+    datasets = public.datasets()
+    plain = run.config.mode == "local" and len(run.config.sources) == 1
+    for row in datasets.itertuples(index=False):
         version = f" {row.pipeline_version}" if isinstance(row.pipeline_version, str) else ""
-        typer.echo(f"{row.pseudonym}: layout {row.layout}, pipeline {row.pipeline}{version}")
+        try:
+            listed = int(row.n_subjects_listed)
+        except (TypeError, ValueError):  # a count that is missing
+            listed = 0
+        if not plain or listed == 0:
+            # also the row of an earlier pipeline at the same root, whose subjects are absent
+            typer.echo(f"{row.pseudonym}: layout {row.layout}, pipeline {row.pipeline}{version}")
+            continue
+        where = where_subjects_lie(run.config, source)
+        words = LAYOUT_WORDS.get(str(row.layout), str(row.layout))
+        if version:  # the only pipeline whose version a local source reads
+            words += f", fMRIPrep{version}"
+        found = f" in {where}" if where else ""
+        typer.echo(f"{row.pseudonym}: FreeSurfer subjects found{found} ({words})")
     subjects = public.subjects()
     present = subjects[subjects["present"]]
     typer.echo(
@@ -323,8 +346,9 @@ def inventory(
         None,
         "--source",
         metavar="PATH",
-        help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder or one subject "
-        "directory. Creates a local run when DIR holds none.",
+        help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder, a BIDS dataset "
+        "with FreeSurfer subjects below derivatives/, or one subject directory. Creates a "
+        "local run when DIR holds none.",
     ),
     subjects: list[str] | None = typer.Option(
         None,
@@ -367,7 +391,7 @@ def inventory(
         run = _open_for_inventory(run_dir, source, subjects, field_strength, moved)
         with run, _interrupted_is_exit_130(), _terminated_like_interrupted():
             report = run.inventory(datasets=dataset or None, force=force)
-            _print_inventory(run)
+            _print_inventory(run, source)
             _print_report(run, report)
     raise typer.Exit(1 if report.failed else 0)
 
@@ -600,8 +624,13 @@ app.add_typer(calibration_app, name="calibration")
 
 @contextmanager
 def _app_stops_with_exit_2() -> Iterator[None]:
-    """:func:`_stops_with_exit_2` for the commands of the rater app: also for a core
-    install without the app's packages and for a database of the app that stays locked."""
+    """:func:`_stops_with_exit_2` for the commands of the rater app: also for an
+    installation that lacks one of the app's packages and for a database of the app that
+    stays locked.
+
+    The app's packages are dependencies of the package (decision O20), so an installation
+    lacks one only when it is broken or was stripped (``pip install --no-deps``, a package
+    removed by hand). The line names the package and the command that puts it back."""
     from surfcensus.config import ConfigError
 
     with _stops_with_exit_2():
@@ -612,8 +641,8 @@ def _app_stops_with_exit_2() -> Iterator[None]:
                 raise
             raise ConfigError(
                 "missing",
-                f"the rater app needs the package {exc.name}; install it with "
-                'pip install "surfcensus[app]"',
+                f"the rater app needs the package {exc.name.split('.')[0]}, which this "
+                "installation lacks; `pip install surfcensus` installs what is missing",
             ) from exc
         except Exception as exc:
             # sqlalchemy is imported by the app only, so its error is named by its module
@@ -642,15 +671,16 @@ def review_command(
     path: Path = typer.Argument(
         ...,
         metavar="PATH",
-        help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder or one subject "
-        "directory. It is read and never changed.",
+        help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder, a BIDS dataset "
+        "with FreeSurfer subjects below derivatives/, or one subject directory. It is read "
+        "and never changed.",
     ),
     run_dir: Path | None = typer.Option(
         None,
         "--run-dir",
         metavar="DIR",
-        help="The run directory. Default: surfcensus-run next to PATH, else in the current "
-        "directory.",
+        help="The run directory. Default: surfcensus-run next to PATH (next to the BIDS "
+        "dataset that holds the subjects, never in it), else in the current directory.",
     ),
     subjects: list[str] | None = typer.Option(
         None,

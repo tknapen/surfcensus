@@ -1,8 +1,11 @@
 """The local source: FreeSurfer subjects in a directory, read in place.
 
 A path is recognized as one of the layouts of docs/architecture.md: a ``SUBJECTS_DIR``, an
-fMRIPrep output (new and old layout), a BIDS derivatives root, or one subject directory.
-Subjects are listed with ``stat()`` only; their files are handed out where they are.
+fMRIPrep output (new and old layout), a BIDS derivatives root, or one subject directory. The
+root of a BIDS dataset is no layout of its own: its ``derivatives/`` folder is searched for
+a folder in one of those layouts, and the source is the one that folder gives when it is
+named itself (:func:`detect_layout`). Subjects are listed with ``stat()`` only; their files
+are handed out where they are.
 
 Read-only by construction: nothing here opens for writing, creates or removes.
 """
@@ -10,6 +13,7 @@ Read-only by construction: nothing here opens for writing, creates or removes.
 from __future__ import annotations
 
 import dataclasses
+import logging
 import math
 import os
 import re
@@ -48,8 +52,20 @@ from surfcensus.sources.patterns import (
 TEMPLATE_NAME = "fsaverage"
 """The directory next to the subjects that can serve as the template."""
 
+DERIVATIVES = "derivatives"
+"""The folder of a BIDS dataset that holds what pipelines made of it."""
+
+LAYOUT_WORDS: dict[str, str] = {
+    "subjects_dir": "a subjects directory",
+    "fmriprep": "fMRIPrep layout",
+    "fmriprep_legacy": "older fMRIPrep layout",
+    "bids_derivatives": "BIDS derivatives layout",
+}
+"""Each layout in the words of the lines that ``review`` and ``inventory`` print."""
+
 _DESCRIPTION = "dataset_description.json"
 _MAX_NAMES = 10  # names listed when a glob matches nothing
+_Notes = list[tuple[int, str]]  # what a detection has to say: logging level, message
 
 
 def _strerror(exc: OSError) -> str:
@@ -238,11 +254,72 @@ def stored_subjects_dirs(config: RunConfig) -> list[Path]:
         if stored.kind != "local" or stored.root is None:
             continue
         try:
-            record, _ = detect_layout(stored.root)
+            record, _ = detect_layout(stored.root, nested=False, quiet=True)
             places.append(Path(record.root) / record.fs_root)
         except SourceError:
             places.append(Path(stored.root))
     return places
+
+
+def found_in(record: DatasetRecord, given: Path | str | None = None) -> str | None:
+    """Where the subjects of ``record`` lie, for the line that says what was found: the
+    subjects directory relative to ``given``, the folder a user named, when it lies below
+    that folder (``derivatives/fmriprep/sourcedata/freesurfer`` for a dataset root), else
+    relative to the record's root (``sourcedata/freesurfer``). None when the subjects
+    directory is that folder itself, or holds it (one subject directory as path)."""
+    subjects_dir = Path(record.root) / record.fs_root
+    if given is not None:
+        try:
+            below = subjects_dir.resolve().relative_to(Path(given).resolve())
+        except (ValueError, OSError):
+            below = None
+        if below is not None and below.parts:
+            return below.as_posix()
+    return None if record.fs_root == "." else record.fs_root
+
+
+def where_subjects_lie(config: RunConfig, given: Path | str | None = None) -> str | None:
+    """:func:`found_in` for the source of a local run with one local source, from the root
+    in its ``config.yaml``; None for any other run and when the root holds no subjects now.
+    A census run keeps its roots, and where the subjects lie under them, in the catalog."""
+    stored = [s for s in config.sources if s.kind == "local" and s.root is not None]
+    if config.mode != "local" or len(stored) != 1 or stored[0].root is None:
+        return None
+    try:
+        record, _ = detect_layout(stored[0].root, nested=False, quiet=True)
+    except SourceError:
+        return None
+    return found_in(record, given)
+
+
+def dataset_holding(record: DatasetRecord, given: Path | str | None = None) -> Path | None:
+    """The BIDS dataset in whose ``derivatives/`` folder the subjects of ``record`` lie, or
+    None: the outermost directory with a ``dataset_description.json`` that has the
+    subjects directory below its ``derivatives/``, or ``given``, the folder a user named,
+    when the subjects were found below its ``derivatives/`` (rule 6 of
+    :func:`detect_layout`), whatever else it holds. A run directory is not made inside it
+    unless it is asked for (``review.default_run_dir``)."""
+    subjects_dir = (Path(record.root) / record.fs_root).resolve()
+    found = None
+    for folder in (subjects_dir, *subjects_dir.parents):  # from the inside out
+        if folder.name != DERIVATIVES:
+            continue
+        try:
+            if is_file(folder.parent / _DESCRIPTION):
+                found = folder.parent
+        except OSError:
+            continue
+    if given is not None:
+        asked = Path(given).resolve()
+        try:
+            below = _is_dir(asked / DERIVATIVES) and subjects_dir.is_relative_to(
+                (asked / DERIVATIVES).resolve()
+            )
+        except OSError:
+            below = False
+        if below and (found is None or asked in found.parents):
+            found = asked
+    return found
 
 
 def refuse_run_in_sources(run_dir: Path | str, config: RunConfig) -> None:
@@ -292,7 +369,9 @@ def _record(root: Path, fs_root: str, layout: Layout) -> DatasetRecord:
     )
 
 
-def detect_layout(path: Path | str) -> tuple[DatasetRecord, tuple[str, ...]]:
+def detect_layout(
+    path: Path | str, *, nested: bool = True, quiet: bool = False
+) -> tuple[DatasetRecord, tuple[str, ...]]:
     """The dataset record of ``path`` and the subject globs its layout implies.
 
     The first rule that matches decides (a subject candidate is a directory with ``mri/``
@@ -306,16 +385,40 @@ def detect_layout(path: Path | str) -> tuple[DatasetRecord, tuple[str, ...]]:
     4. ``path`` is named ``fmriprep`` and ``path/../freesurfer`` holds one:
        ``fmriprep_legacy`` rooted at the parent.
     5. A child of ``path`` is a candidate: ``subjects_dir``.
+    6. ``path`` is the root of a BIDS dataset, which is to say it has a ``derivatives/``
+       folder, or it is that folder (by its name, or the name of what it links to). The
+       record is the one that rules 2 to 5 give for a folder below, as if that folder had
+       been named: ``derivatives/`` itself first (so ``derivatives/freesurfer/``), then
+       the folders of ``derivatives/`` that hold subjects themselves
+       (``derivatives/freesurfer-7.3.2/``), then those with ``sourcedata/freesurfer/``
+       (``derivatives/fmriprep/sourcedata/freesurfer/``), then those with ``freesurfer/``
+       (``derivatives/fmriprep/freesurfer/``), each group in name order.
+
+    Rule 6 is a way to find a folder, not a layout: root, identity, layout and pipeline are
+    those of the folder found, so the dataset root and that folder name the same source
+    with the same ``subject_uid``. Nothing deeper is looked at (three folders below
+    ``derivatives/`` at most), nor a pipeline folder that is itself a subject or is named
+    like a template. When subjects lie in more than one of these places, also beside a
+    match of rules 2 to 5, the first is used and a warning names the others with the
+    folder to give for each. A folder below ``derivatives/`` that cannot be examined is
+    passed over with a warning, unless nothing else holds a subject.
+
+    ``nested=False`` leaves rule 6 out. A source that is rebuilt from the root a run
+    stores is read that way: the stored root is the folder that was found, and a run whose
+    subjects are gone from it stops with ``layout`` and does not go on with other subjects
+    that lie below. ``quiet=True`` logs nothing, for a caller that only asks where the
+    subjects are.
 
     The record's ``root`` is resolved and its ``identity`` is that root. Raises
     :class:`SourceError`: ``not found`` when ``path`` is not a directory, ``unreadable`` when
-    it or one of the places above cannot be listed, ``layout`` when no rule matches, and
-    ``invalid`` when the root is not valid UTF-8: a run stores it, and hashes it into the
-    pseudonym and every ``subject_uid``, as text.
+    it or one of the places of rules 2 to 5 cannot be listed, ``layout`` when no rule
+    matches, and ``invalid`` when the root is not valid UTF-8: a run stores it, and hashes
+    it into the pseudonym and every ``subject_uid``, as text.
     """
     given = _keeping_name(path)
+    notes: _Notes = []
     try:
-        record, implied = _detect(given)
+        record, implied = _detect(given, notes, nested)
     except OSError as exc:
         where = exc.filename if isinstance(exc.filename, str) else str(given)
         raise SourceError("unreadable", f"{where}: {_strerror(exc)}") from exc
@@ -325,18 +428,81 @@ def detect_layout(path: Path | str) -> tuple[DatasetRecord, tuple[str, ...]]:
             f"the path {record.root!r} is not valid UTF-8; the root of a source is stored "
             "and hashed as text",
         )
+    if not quiet:
+        log = get_logger()
+        for level, message in notes:
+            log.log(level, "%s", message)
     return record, implied
 
 
-def _detect(given: Path) -> tuple[DatasetRecord, tuple[str, ...]]:
-    log = get_logger()
+def _detect(given: Path, notes: _Notes, nested: bool) -> tuple[DatasetRecord, tuple[str, ...]]:
     if not _is_dir(given):
         raise SourceError("not found", f"{given} is not a directory")
     if is_subject_candidate(given):
-        log.info("%s is one FreeSurfer subject directory", given)
+        notes.append((logging.INFO, f"{given} is one FreeSurfer subject directory"))
         return _record(given.parent, ".", "subjects_dir"), (_escape(given.name),)
 
     base = given.resolve()
+    record = _direct(base, (given, base), notes)
+    derivatives = None
+    if nested:
+        try:
+            derivatives = _derivatives_of(given, base)
+        except OSError:
+            if record is None:
+                raise
+    if derivatives is None:
+        if record is None:
+            raise SourceError("layout", _nothing_found(base, bids=nested))
+        return record, ()
+
+    searched = _Searched()
+    found = _below(derivatives, searched, itself=derivatives != base)
+    if record is not None:
+        found.insert(0, (record, []))
+    seen: dict[Path, tuple[DatasetRecord, _Notes]] = {}
+    for candidate, said in found:  # one subjects directory can be reached from two folders
+        seen.setdefault(_subjects_dir(candidate).resolve(), (candidate, said))
+    for place, why in searched.unread.items():
+        if seen:  # with nothing found, the error names them
+            notes.append(
+                (
+                    logging.WARNING,
+                    f"{_shown(place, base)} could not be examined ({why}) and was not "
+                    "searched for FreeSurfer subjects",
+                )
+            )
+    if not seen:
+        raise SourceError("layout", _nothing_below(base, derivatives, searched))
+    (used, said), *others = seen.values()
+    if used is not record:
+        notes.extend(said)
+        notes.append(
+            (
+                logging.INFO,
+                f"{base} is a BIDS dataset with FreeSurfer subjects in "
+                f"{_shown(_subjects_dir(used), base)}",
+            )
+        )
+    if others:
+        unused = "; ".join(
+            f"{_shown(_subjects_dir(other), base)} (to use it, give {other.root} as the path)"
+            for other, _ in others[:_MAX_NAMES]
+        )
+        notes.append(
+            (
+                logging.WARNING,
+                f"FreeSurfer subjects lie in more than one place under {base}: using "
+                f"{_shown(_subjects_dir(used), base)}, not {unused}",
+            )
+        )
+    return used, ()
+
+
+def _direct(base: Path, names: Sequence[Path], notes: _Notes) -> DatasetRecord | None:
+    """Rules 2 to 5 of :func:`detect_layout` for the folder ``base``, which is resolved;
+    ``names`` are the folder as it was named and as it resolves. None when no rule matches.
+    Raises OSError when one of the places cannot be listed."""
     new, old = base / "sourcedata" / "freesurfer", base / "freesurfer"
     if _has_candidate(new):
         try:
@@ -344,40 +510,202 @@ def _detect(given: Path) -> tuple[DatasetRecord, tuple[str, ...]]:
         except OSError:  # a folder that is not used need not be readable
             both = False
         if both:
-            log.warning(
-                "%s and %s both hold FreeSurfer subjects; using the first and ignoring %s",
-                new,
-                old,
-                old,
+            notes.append(
+                (
+                    logging.WARNING,
+                    f"{new} and {old} both hold FreeSurfer subjects; using the first and "
+                    f"ignoring {old}",
+                )
             )
-        log.info("%s is an fMRIPrep output with subjects in sourcedata/freesurfer", base)
-        return _record(base, "sourcedata/freesurfer", "fmriprep"), ()
+        notes.append(
+            (logging.INFO, f"{base} is an fMRIPrep output with subjects in sourcedata/freesurfer")
+        )
+        return _record(base, "sourcedata/freesurfer", "fmriprep")
     if _has_candidate(old):
         legacy = _is_dir(base / "fmriprep")
-        log.info(
-            "%s holds subjects in freesurfer/ (%s)",
-            base,
-            "next to an fmriprep/ folder" if legacy else "BIDS derivatives",
-        )
-        return _record(base, "freesurfer", "fmriprep_legacy" if legacy else "bids_derivatives"), ()
+        beside = "next to an fmriprep/ folder" if legacy else "BIDS derivatives"
+        notes.append((logging.INFO, f"{base} holds subjects in freesurfer/ ({beside})"))
+        return _record(base, "freesurfer", "fmriprep_legacy" if legacy else "bids_derivatives")
     # the folder as the user named it, then what it links to
-    for folder in dict.fromkeys((given, base)):
+    for folder in dict.fromkeys(names):
         if folder.name == "fmriprep" and _has_candidate(folder.parent / "freesurfer"):
-            log.info("%s is an fMRIPrep folder next to freesurfer/", folder)
-            return _record(folder.parent, "freesurfer", "fmriprep_legacy"), ()
+            notes.append((logging.INFO, f"{folder} is an fMRIPrep folder next to freesurfer/"))
+            return _record(folder.parent, "freesurfer", "fmriprep_legacy")
     if _has_candidate(base):
-        log.info("%s is a FreeSurfer subjects directory", base)
-        return _record(base, ".", "subjects_dir"), ()
+        notes.append((logging.INFO, f"{base} is a FreeSurfer subjects directory"))
+        return _record(base, ".", "subjects_dir")
+    return None
 
+
+# --- the root of a BIDS dataset: the search below derivatives/ (rule 6) ---------------------------
+
+
+@dataclasses.dataclass
+class _Searched:
+    """What the search below ``derivatives/`` went through, for what is said about it."""
+
+    folders: list[str] = dataclasses.field(default_factory=list)
+    """The folders of ``derivatives/`` that were searched, by name."""
+    unread: dict[Path, str] = dataclasses.field(default_factory=dict)
+    """Places that could not be examined, each with the system's reason."""
+
+    def failed(self, folder: Path, exc: OSError) -> None:
+        """Note that ``folder`` could not be searched: under the place the error names,
+        when it names one, since that may be a folder inside it."""
+        place = Path(exc.filename) if isinstance(exc.filename, str) else folder
+        self.unread.setdefault(place, _strerror(exc))
+
+
+_ORDER = {".": 0, "sourcedata/freesurfer": 1, "freesurfer": 2}
+"""The order of the folders of ``derivatives/``, by where each keeps its subjects."""
+
+
+def _subjects_dir(record: DatasetRecord) -> Path:
+    return Path(record.root) / record.fs_root
+
+
+def _shown(place: Path, base: Path) -> str:
+    """``place`` relative to ``base`` where it lies below it, for a message; else as it is."""
+    try:
+        below = place.relative_to(base)
+    except ValueError:
+        return str(place)
+    return below.as_posix() if below.parts else "the folder itself"
+
+
+def _derivatives_of(given: Path, base: Path) -> Path | None:
+    """The ``derivatives/`` folder that rule 6 searches: that of ``base``, or ``base`` when
+    it is that folder itself, by the name it was given under or the name of what that
+    links to; None when there is none. Raises OSError when it cannot be examined."""
+    folder = base / DERIVATIVES
+    if _is_dir(folder):
+        return folder.resolve()
+    if DERIVATIVES in (given.name, base.name):
+        return base
+    return None
+
+
+def _below(
+    derivatives: Path, searched: _Searched, *, itself: bool
+) -> list[tuple[DatasetRecord, _Notes]]:
+    """The records that rules 2 to 5 give for ``derivatives`` (with ``itself``) and for each
+    of its folders, in the order of rule 6, each with what its detection has to say. A
+    folder that is a subject candidate, is named like a template or has a name that is not
+    valid UTF-8 is not searched; one that cannot be examined goes to ``searched.unread``.
+    """
+
+    def probe(folder: Path, names: Sequence[Path]) -> list[tuple[DatasetRecord, _Notes]]:
+        said: _Notes = []
+        try:
+            record = _direct(folder, names, said)
+        except OSError as exc:
+            searched.failed(folder, exc)
+            return []
+        return [] if record is None else [(record, said)]
+
+    found = probe(derivatives, (derivatives,)) if itself else []
+    try:
+        names = _names(derivatives) or []
+    except OSError as exc:
+        searched.failed(derivatives, exc)
+        names = []
+    folders = []
+    for name in names:
+        folder = derivatives / name
+        try:
+            if (
+                not _is_dir(folder)
+                or not _is_text(name)
+                or is_template_name(name)
+                or is_subject_candidate(folder)
+            ):
+                continue
+            searched.folders.append(name)
+            folders.extend(probe(folder.resolve(), (folder, folder.resolve())))
+        except OSError as exc:
+            searched.failed(folder, exc)
+    # names are sorted, and the sort keeps their order within one kind of folder
+    folders.sort(key=lambda item: _ORDER[item[0].fs_root])
+    return found + folders
+
+
+def _looks_like_bids(base: Path) -> bool:
+    """Whether ``base`` has the two marks of a BIDS dataset: ``dataset_description.json``
+    and a ``sub-*`` folder."""
+    try:
+        if not is_file(base / _DESCRIPTION):
+            return False
+        return any(n.startswith("sub-") and _is_dir(base / n) for n in _names(base) or ())
+    except OSError:
+        return False
+
+
+def _without_subjects(derivatives: Path, folders: Sequence[str]) -> list[tuple[Path, bool]]:
+    """The folders below ``derivatives`` that are there for FreeSurfer output and hold no
+    subject, for the message of a search that found none: ``sourcedata/freesurfer`` and
+    ``freesurfer`` in it and in each of ``folders``, and a folder whose own name starts
+    with ``freesurfer``; each with whether it is empty. An empty one is what a DataLad
+    subdataset that is not installed looks like."""
+    places = []
+    for folder in (derivatives, *(derivatives / name for name in folders)):
+        places += [folder / "sourcedata" / "freesurfer", folder / "freesurfer"]
+        if folder != derivatives and folder.name.lower().startswith("freesurfer"):
+            places.append(folder)
+    found: dict[Path, bool] = {}
+    for place in places:
+        try:
+            names = _names(place)
+        except OSError:
+            continue
+        if names is not None:
+            found.setdefault(place, not names)
+    return list(found.items())
+
+
+def _nothing_found(base: Path, *, bids: bool) -> str:
+    """The detail of ``layout`` for a path without a ``derivatives/`` folder."""
+    if bids and _looks_like_bids(base):
+        return (
+            f"no FreeSurfer output found in {base}: it looks like a BIDS dataset without "
+            "derivatives. Looked for subjects (directories with mri/ and surf/) in "
+            f"{DERIVATIVES}/ (there is no such folder), sourcedata/freesurfer/, freesurfer/ "
+            "and the dataset's own folders; if they are elsewhere, give that folder as the path"
+        )
     unreadable = _unexaminable(base)
-    raise SourceError(
-        "layout",
+    return (
         f"no FreeSurfer subject found at {base}. A subject is a directory with mri/ and "
         "surf/ that is not a template; looked at the path itself, the folders in "
         "sourcedata/freesurfer/, in freesurfer/, in ../freesurfer/ (when the path is named "
         "fmriprep) and the path's own folders"
-        + (f". Could not be examined: {', '.join(unreadable)}" if unreadable else ""),
+        + (f". Could not be examined: {', '.join(unreadable)}" if unreadable else "")
     )
+
+
+def _nothing_below(base: Path, derivatives: Path, searched: _Searched) -> str:
+    """The detail of ``layout`` for a dataset root, or a ``derivatives/`` folder, in which
+    the search of rule 6 found no subject."""
+    where = "the path" if derivatives == base else f"{DERIVATIVES}/"
+    listed = ", ".join(searched.folders[:_MAX_NAMES]) or "none"
+    more = len(searched.folders) - _MAX_NAMES
+    detail = (
+        f"no FreeSurfer subject found in {base}. A subject is a directory with mri/ and "
+        f"surf/ that is not a template; looked in {where} and its folders ({listed}"
+        f"{f' and {more} more' if more > 0 else ''}), in each for subject directories, "
+        "sourcedata/freesurfer/ and freesurfer/"
+    )
+    if derivatives != base:
+        detail += ", and at the path's own sourcedata/freesurfer/, freesurfer/ and folders"
+    bare = [
+        f"{_shown(place, base)}{' (empty)' if empty else ''}"
+        for place, empty in _without_subjects(derivatives, searched.folders)
+    ]
+    if bare:
+        detail += f". Without a subject: {', '.join(bare[:_MAX_NAMES])}"
+    unread = [f"{_shown(place, base)} ({why})" for place, why in searched.unread.items()]
+    unread += _unexaminable(base)
+    if unread:
+        detail += f". Could not be examined: {', '.join(unread[:_MAX_NAMES])}"
+    return detail
 
 
 def _unexaminable(directory: Path) -> list[str]:
@@ -394,11 +722,16 @@ class LocalSource:
     """A directory of FreeSurfer subjects in one of the layouts of docs/architecture.md.
 
     ``path`` is what the user passes: a ``SUBJECTS_DIR``, an fMRIPrep output, a BIDS
-    derivatives root, or one subject directory. ``subjects`` are globs on directory names
+    derivatives root, one subject directory, or the root of a BIDS dataset with one of
+    these below its ``derivatives/`` folder. ``subjects`` are globs on directory names
     (a union; empty means all). ``identity`` is given when a stored source is rebuilt, so
     that subjects keep their ``subject_uid`` after the data moved; otherwise it is the
-    resolved root. Raises ``SourceError`` when the path is not a directory (``not found``),
-    cannot be listed (``unreadable``) or matches no layout (``layout``).
+    resolved root. ``nested`` says whether the path is searched below ``derivatives/``
+    (rule 6 of :func:`detect_layout`); by default it is unless an ``identity`` is given. A
+    source that is rebuilt from the root a run stores is not searched (``run.from_config``
+    says so): that root is the folder that was found. Raises ``SourceError`` when the path
+    is not a directory (``not found``), cannot be listed (``unreadable``) or matches no
+    layout (``layout``).
 
     When ``path`` is one subject directory the source is its parent directory restricted to
     that name; ``subjects``, if given as well, must match the name.
@@ -414,6 +747,7 @@ class LocalSource:
         subjects: Sequence[str] = (),
         identity: str | None = None,
         field_strength: float | None = None,
+        nested: bool | None = None,
     ) -> None:
         if field_strength is not None and not 0 < field_strength < math.inf:
             raise ValueError(
@@ -424,7 +758,8 @@ class LocalSource:
         for glob in globs:
             if not _is_text(glob):  # a run stores the globs of its source as text
                 raise SourceError("invalid", f"the subject glob {glob!r} is not valid UTF-8")
-        record, implied = detect_layout(path)
+        searched = identity is None if nested is None else nested
+        record, implied = detect_layout(path, nested=searched)
         if implied:
             name = _keeping_name(path).name
             if globs and not any(fnmatchcase(name, glob) for glob in globs):

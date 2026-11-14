@@ -23,7 +23,11 @@ import pandas as pd
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_tierb import SyntheticCohort  # pyrefly: ignore[missing-import]
-from synth_tree import write_linked_tree, write_tree  # pyrefly: ignore[missing-import]
+from synth_tree import (  # pyrefly: ignore[missing-import]
+    write_bids_dataset,
+    write_linked_tree,
+    write_tree,
+)
 
 pytest.importorskip("fastapi")
 pytest.importorskip("sqlmodel")
@@ -489,7 +493,10 @@ def test_an_incomplete_subject_is_named_selected_and_never_offered(
     run_dir = tmp_path / "run"
     with review(tree, run_dir=run_dir, serve=False, jobs=1) as run:
         said = capsys.readouterr().err
-        assert "Found 2 subjects (fMRIPrep layout). 1 cannot be rendered: sub-02 (no " in said
+        assert (
+            "Found 2 subjects in sourcedata/freesurfer (fMRIPrep layout). 1 cannot be "
+            "rendered: sub-02 (no "
+        ) in said
         assert "surf/lh.pial" in said
         assert "Rendered: 1 of 2 subjects, 1 cannot be rated." in said
         assert "  not rendered, missing surface: 1 (sub-02)" in said
@@ -584,6 +591,137 @@ def test_the_default_run_directory_does_not_follow_a_subject_link(tmp_path: Path
         assert render_counts(run) == (1, 0, 0)
     assert snapshot_tree(tmp_path / "shared") == before
     assert sorted(path.name for path in (tmp_path / "shared").iterdir()) == ["store"]
+
+
+def _bids_dataset(root: Path, labels: tuple[str, ...] = ("sub-01", "sub-02")) -> Path:
+    """A BIDS dataset with an fMRIPrep output of light subjects below ``derivatives/``."""
+    dataset = write_bids_dataset(root, labels)
+    write_tree(dataset / "derivatives" / "fmriprep", "fmriprep", labels)
+    return dataset
+
+
+def test_the_default_run_directory_is_beside_a_dataset_never_inside_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    dataset = _bids_dataset(tmp_path / "data" / "ds000001")
+    inner = dataset / "derivatives" / "fmriprep"
+    beside = tmp_path / "data" / DEFAULT_RUN_DIR
+    # the dataset, and every folder inside it that names the subjects, give one place
+    paths = (
+        dataset,
+        dataset / "derivatives",
+        inner,
+        inner / "sourcedata" / "freesurfer",
+        inner / "sourcedata" / "freesurfer" / "sub-01",
+    )
+    for path in paths:
+        assert default_run_dir(path) == beside, path
+    # without a description, the folder that was named and searched is the dataset
+    bare = tmp_path / "other" / "study"
+    write_tree(bare / "derivatives" / "fmriprep", "fmriprep", ["sub-01"])
+    assert default_run_dir(bare) == tmp_path / "other" / DEFAULT_RUN_DIR
+    # and a folder inside it is beside the data as it always was
+    assert default_run_dir(bare / "derivatives" / "fmriprep") == (
+        bare / "derivatives" / DEFAULT_RUN_DIR
+    )
+
+    # the place beside the dataset cannot be written to: the current directory
+    elsewhere = tmp_path / "cwd"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)
+    real_access = os.access
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: Path(path) != tmp_path / "data" and real_access(path, mode)
+    )
+    for path in paths:
+        assert default_run_dir(path) == elsewhere / DEFAULT_RUN_DIR, path
+    # unless that lies inside the dataset: then only --run-dir can say where
+    for inside in (dataset, inner / "sourcedata" / "freesurfer"):
+        monkeypatch.chdir(inside)
+        for path in (".", dataset, inner):
+            with pytest.raises(ConfigError) as refused:
+                default_run_dir(path)
+            assert refused.value.reason == "invalid"
+            assert refused.value.detail == (
+                f"no place for the run directory: {tmp_path / 'data'} cannot be written to, "
+                f"and the current directory lies inside the dataset {dataset}, which gets no "
+                "files of a run unless asked; say where the run goes with --run-dir DIR"
+            )
+    # a run beside the dataset is used wherever the call is made from
+    beside.mkdir()
+    (beside / CONFIG_FILE).write_text("")
+    assert default_run_dir(".") == beside
+
+
+def test_a_run_made_inside_a_dataset_by_an_earlier_version_is_still_found(
+    tmp_path: Path,
+) -> None:
+    """Before dataset roots were read, ``review DATASET/derivatives/fmriprep`` put its run
+    in ``DATASET/derivatives/surfcensus-run``. That run is the run of this data, for the
+    folder and for the dataset root; a run of other data at that place is not."""
+    dataset = _bids_dataset(tmp_path / "ds")
+    inner = dataset / "derivatives" / "fmriprep"
+    earlier = dataset / "derivatives" / DEFAULT_RUN_DIR
+    review(inner, run_dir=earlier, serve=False, jobs=1).close()
+    before = uids_by_label(earlier)
+    for path in (dataset, dataset / "derivatives", inner):
+        assert default_run_dir(path) == earlier, path
+    with review(dataset, serve=False, jobs=1) as run:
+        assert run.run_dir == earlier
+        assert render_counts(run) == (2, 0, 0)
+    assert uids_by_label(earlier) == before
+
+    # a run of another root at that place is not the run of this data
+    other = _bids_dataset(tmp_path / "other")
+    foreign = other / "derivatives" / DEFAULT_RUN_DIR
+    shutil.copytree(earlier, foreign)
+    for path in (other, other / "derivatives" / "fmriprep"):
+        assert default_run_dir(path) == tmp_path / DEFAULT_RUN_DIR
+    # nor is a directory with something else under the name of a configuration
+    (foreign / CONFIG_FILE).write_text("not: [a configuration\n")
+    assert default_run_dir(other) == tmp_path / DEFAULT_RUN_DIR
+    # once there is a run beside the dataset, it is the one
+    (tmp_path / DEFAULT_RUN_DIR).mkdir()
+    (tmp_path / DEFAULT_RUN_DIR / CONFIG_FILE).write_text("")
+    assert default_run_dir(dataset) == tmp_path / DEFAULT_RUN_DIR
+
+
+def test_review_of_a_dataset_root_finds_the_subjects_below_derivatives(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], rendered: list[Path]
+) -> None:
+    dataset = _bids_dataset(tmp_path / "data" / "ds000001")
+    inner = dataset / "derivatives" / "fmriprep"
+    before = snapshot_tree(dataset)
+    with review(dataset, serve=False, jobs=1) as run:
+        assert run.run_dir == tmp_path / "data" / DEFAULT_RUN_DIR
+        assert run.config.sources[0].root == str(inner.resolve())
+        assert render_counts(run) == (2, 0, 0)
+    said = capsys.readouterr().err.splitlines()
+    assert said[0] == f"Run directory: {tmp_path / 'data' / DEFAULT_RUN_DIR} (new)"
+    assert said[1] == (
+        "Found 2 subjects in derivatives/fmriprep/sourcedata/freesurfer (fMRIPrep layout)."
+    )
+    uids = uids_by_label(tmp_path / "data" / DEFAULT_RUN_DIR)
+    assert len(rendered) == 2
+
+    # the folder that was found, the derivatives folder and the dataset are one run: the
+    # same directory, the same subjects, nothing made again
+    for path, where in (
+        (inner, "sourcedata/freesurfer"),
+        (dataset / "derivatives", "fmriprep/sourcedata/freesurfer"),
+        (dataset, "derivatives/fmriprep/sourcedata/freesurfer"),
+    ):
+        rendered.clear()
+        with review(path, serve=False, jobs=1) as run:
+            assert run.run_dir == tmp_path / "data" / DEFAULT_RUN_DIR
+            assert render_counts(run) == (2, 0, 0)
+        said = capsys.readouterr().err.splitlines()
+        assert said[0].endswith("(continued)")
+        assert said[1] == f"Found 2 subjects in {where} (fMRIPrep layout)."
+        assert rendered == [] and uids_by_label(run.run_dir) == uids
+    # the dataset got no file
+    assert snapshot_tree(dataset) == before
+    assert {path.name for path in (tmp_path / "data").iterdir()} == {DEFAULT_RUN_DIR, "ds000001"}
 
 
 def test_a_review_with_its_run_in_a_linked_subject_leaves_nothing(tmp_path: Path) -> None:

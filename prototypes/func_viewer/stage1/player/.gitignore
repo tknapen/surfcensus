@@ -1,0 +1,3 @@
+# The folder's .gitignore keeps downloads and results out of the index, *.html among them.
+# The page of the player is source, not a result.
+!index.html

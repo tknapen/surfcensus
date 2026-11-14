@@ -15,6 +15,7 @@ import asyncio
 import dataclasses
 import hashlib
 import http.client
+import importlib.util
 import io
 import itertools
 import json
@@ -2689,6 +2690,24 @@ def accepts(port: int) -> bool:
     with socket.socket() as probe:
         probe.settimeout(1)
         return probe.connect_ex(("127.0.0.1", port)) == 0
+
+
+def test_the_server_runs_on_h11_and_asyncio_although_faster_ones_are_installed(
+    app_run: Path,
+) -> None:
+    # uvicorn takes httptools and uvloop by itself where it finds them. The environment of
+    # the tests has both (`uvicorn[standard]` in the dev group); an install of the package
+    # has neither (tests/test_install.py). The server is the same one in both.
+    assert importlib.util.find_spec("httptools") is not None, "the dev group installs httptools"
+    handle = start_server(app_run, port=0)
+    try:
+        assert handle._server is not None
+        config = handle._server.config
+        assert (config.http, config.loop) == ("h11", "asyncio")
+        assert config.http_protocol_class.__name__ == "H11Protocol"
+        assert fetch(handle.url + "healthz")[0] == 200
+    finally:
+        handle.stop()
 
 
 def test_a_started_server_answers_on_the_port_it_says_and_stops(app_run: Path) -> None:

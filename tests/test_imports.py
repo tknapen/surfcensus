@@ -7,11 +7,15 @@ order the test session happened to import things in.
 from __future__ import annotations
 
 import ast
+import json
+import os
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 import pytest
+from synth_tree import write_tree  # pyrefly: ignore[missing-import]
 
 import surfcensus
 
@@ -80,22 +84,39 @@ def test_the_modules_of_this_milestone_are_found() -> None:
         assert expected in names
 
 
-APP_EXTRA = ("fastapi", "uvicorn", "sqlmodel", "sqlalchemy", "jinja2")
-"""What the ``app`` extra installs. Only modules under ``app/`` may need it."""
-CORE_APP_MODULES = ("surfcensus.app", "surfcensus.app.schemas")
-"""The modules under ``app/`` that a core install imports."""
+APP_DEPENDENCIES = ("fastapi", "uvicorn", "sqlmodel", "jinja2")
+"""The packages of the rater app that ``pyproject.toml`` names. They are dependencies of the
+package (decision O20) and are imported by the modules under ``app/`` alone."""
+APP_PACKAGES = (*APP_DEPENDENCIES, "sqlalchemy", "starlette")
+"""Those, and the two they bring that the app imports by name."""
+LIGHT_APP_MODULES = ("surfcensus.app", "surfcensus.app.schemas")
+"""The modules under ``app/`` that the rest of the package imports."""
 
 
-def needs_app_extra(module: str) -> bool:
-    return module.startswith("surfcensus.app.") and module not in CORE_APP_MODULES
+def imports_the_app_packages(module: str) -> bool:
+    return module.startswith("surfcensus.app.") and module not in LIGHT_APP_MODULES
 
 
 @pytest.mark.parametrize("module", module_names())
 def test_every_module_imports_in_a_fresh_interpreter(module: str) -> None:
-    if needs_app_extra(module):
-        pytest.importorskip("fastapi")
-        pytest.importorskip("sqlmodel")
     run_python(f"import {module}")
+
+
+def test_the_packages_of_the_app_are_dependencies_and_are_installed() -> None:
+    # `pip install surfcensus` is the whole install: no extra holds the app. The tests of
+    # the app skip where fastapi or sqlmodel cannot be imported, so an environment that
+    # lacks one must fail here and not pass with those tests skipped.
+    project = tomllib.loads((PACKAGE_DIR.parents[1] / "pyproject.toml").read_text())["project"]
+    names = [requirement.split(";")[0].strip() for requirement in project["dependencies"]]
+    for package in APP_DEPENDENCIES:
+        assert package in names, f"{package} is no dependency of the package"
+    # the extra stays as a name, so that the line the docs gave before still installs
+    assert project["optional-dependencies"]["app"] == []
+    assert project["optional-dependencies"]["all"] == ["surfcensus[app,analysis]"]
+    out = run_python(
+        "".join(f"import {package}\n" for package in APP_PACKAGES) + "print('installed')"
+    )
+    assert out.strip() == "installed"
 
 
 def test_the_modules_of_milestone_4_are_found() -> None:
@@ -119,19 +140,113 @@ def test_the_modules_of_milestone_4_are_found() -> None:
         assert expected in names
 
 
-BLOCK_APP_EXTRA = "import sys\n" + "".join(f"sys.modules[{name!r}] = None\n" for name in APP_EXTRA)
+BLOCK_APP_PACKAGES = "import sys\n" + "".join(
+    f"sys.modules[{name!r}] = None\n" for name in APP_PACKAGES
+)
 
 
-@pytest.mark.parametrize("module", [name for name in module_names() if not needs_app_extra(name)])
-def test_only_the_app_needs_the_app_extra(module: str) -> None:
-    # `surfcensus export`, the protocol, the calibration set and the shapes of the API work
-    # on a core install: a None in sys.modules makes the import of that name fail
+@pytest.mark.parametrize(
+    "module", [name for name in module_names() if not imports_the_app_packages(name)]
+)
+def test_only_the_app_imports_the_packages_of_the_app(module: str) -> None:
+    # `surfcensus export`, the protocol, the calibration set and the shapes of the API load
+    # none of them, and work in an installation that lost one: a None in sys.modules makes
+    # the import of that name fail
     out = run_python(
-        BLOCK_APP_EXTRA + f"import {module}\n"
+        BLOCK_APP_PACKAGES + f"import {module}\n"
         "print(sorted(n for n in sys.modules if n.split('.')[0] in "
-        f"{APP_EXTRA!r} and sys.modules[n] is not None))\n"
+        f"{APP_PACKAGES!r} and sys.modules[n] is not None))\n"
     )
     assert out.strip() == "[]"
+
+
+# The commands that do not serve the app load none of its packages either, although every
+# installation has them now: they cost start-up time and memory in each worker process.
+
+COMMAND_PROBE = """
+import json, sys
+from surfcensus.cli import app
+code = 0
+try:
+    app(args={args!r})
+except SystemExit as exc:
+    code = exc.code if isinstance(exc.code, int) else int(exc.code is not None)
+loaded = sorted({{n.split(".")[0] for n in sys.modules}} & set({packages!r}))
+print("\\n" + json.dumps({{"code": code, "loaded": loaded}}))
+"""
+
+
+def run_command(*args: object, cwd: Path) -> tuple[int, list[str], str]:
+    """Exit code of ``surfcensus ARGS`` in a fresh interpreter, the packages of the app that
+    it had loaded when it ended, and what it wrote to stderr."""
+    code = COMMAND_PROBE.format(args=[str(arg) for arg in args], packages=APP_PACKAGES)
+    environment = {k: v for k, v in os.environ.items() if k != "FREESURFER_HOME"}
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, cwd=cwd, env=environment
+    )
+    assert result.stdout.strip(), result.stderr
+    probe = json.loads(result.stdout.strip().splitlines()[-1])
+    return probe["code"], probe["loaded"], result.stderr
+
+
+@pytest.fixture(scope="module")
+def commands(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[int, list[str], str]]:
+    """Every command that does not serve the app, run once on a tree of two light subjects,
+    and two that do need the app's packages."""
+    root = tmp_path_factory.mktemp("commands")
+    study = write_tree(root / "data" / "study", "fmriprep", ("sub-01", "sub-02"))
+    subject = study / "sourcedata" / "freesurfer" / "sub-01"
+    run, reviewed = root / "run", root / "reviewed"
+    calls: dict[str, tuple[object, ...]] = {
+        "--help": ("--help",),
+        "--version": ("--version",),
+        "review --help": ("review", "--help"),
+        "render-subject": ("render-subject", subject, "--out", root / "one", "--no-video"),
+        "inventory": ("inventory", "--run-dir", run, "--source", study),
+        "metrics": ("metrics", "--run-dir", run, "--jobs", 1),
+        "render": ("render", "--run-dir", run, "--jobs", 1),
+        "status": ("status", "--run-dir", run, "--failures"),
+        "review --no-serve": ("review", study, "--no-serve", "--run-dir", reviewed, "--jobs", 1),
+        "export": ("export", "--run-dir", reviewed),
+        # the two below are the control: they are commands of the app
+        "finalize": ("finalize", "--run-dir", reviewed),
+        "serve --mode team": ("serve", "--run-dir", reviewed, "--mode", "team", "--no-browser"),
+    }
+    return {name: run_command(*args, cwd=root) for name, args in calls.items()}
+
+
+@pytest.mark.parametrize(
+    "command",
+    [
+        "--help",
+        "--version",
+        "review --help",
+        "render-subject",
+        "inventory",
+        "metrics",
+        "render",
+        "status",
+        "review --no-serve",
+        "export",
+    ],
+)
+def test_a_command_that_does_not_serve_loads_no_package_of_the_app(
+    commands: dict[str, tuple[int, list[str], str]], command: str
+) -> None:
+    code, loaded, stderr = commands[command]
+    assert code == 0, stderr
+    assert loaded == []
+
+
+def test_the_probe_of_the_commands_sees_the_packages_of_the_app(
+    commands: dict[str, tuple[int, list[str], str]],
+) -> None:
+    # without ratings there is nothing to finalize, and team mode is not built: both stop,
+    # after they imported what they need
+    code, loaded, stderr = commands["finalize"]
+    assert code == 2 and {"sqlmodel", "sqlalchemy"} <= set(loaded), stderr
+    code, loaded, stderr = commands["serve --mode team"]
+    assert code == 2 and set(loaded) == set(APP_PACKAGES), stderr
 
 
 def test_the_app_package_names_its_database_without_importing_anything() -> None:

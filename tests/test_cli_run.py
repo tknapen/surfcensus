@@ -14,7 +14,11 @@ from pathlib import Path
 import pandas as pd
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
-from synth_tree import write_tier_a, write_tree  # pyrefly: ignore[missing-import]
+from synth_tree import (  # pyrefly: ignore[missing-import]
+    write_bids_dataset,
+    write_tier_a,
+    write_tree,
+)
 from typer.testing import CliRunner, Result
 
 from surfcensus.cli import app
@@ -89,7 +93,8 @@ def test_inventory_creates_a_local_run_and_says_what_it_found(study: Path, tmp_p
     name = pseudonym(run_dir)
     roles_b = "lh_thickness, rh_thickness, lh_sphere_reg, rh_sphere_reg, lh_annot, rh_annot"
     assert lines(result)[:-1] == [
-        f"{name}: layout fmriprep, pipeline fmriprep 23.2.0",
+        f"{name}: FreeSurfer subjects found in sourcedata/freesurfer "
+        "(fMRIPrep layout, fMRIPrep 23.2.0)",
         "subjects: 3 found, 2 complete, 1 with Tier A, 0 with Tier B",
         "FreeSurfer: 6.0.1 (1), unknown (2)",
         f"  lacks lh_pial, {roles_b}, lh_stats, rh_stats: 1 (sub-03)",
@@ -645,3 +650,161 @@ def test_verbose_says_which_layout_was_found(study: Path, tmp_path: Path) -> Non
         f"INFO: {study.resolve()} is an fMRIPrep output with subjects in sourcedata/freesurfer"
         in (loud.output)
     )
+
+
+# ---------------------------------------------------------------------------------------
+# the root of a BIDS dataset
+
+
+@pytest.fixture
+def dataset(tmp_path: Path) -> Path:
+    """A BIDS dataset with an fMRIPrep output below ``derivatives/``: the three subjects of
+    ``study``."""
+    root = write_bids_dataset(tmp_path / "data" / "ds000001", LABELS)
+    inner = write_tree(root / "derivatives" / "fmriprep", "fmriprep", LABELS, incomplete=["sub-03"])
+    write_tier_a(inner / FS_ROOT / "sub-01")
+    return root
+
+
+def test_inventory_of_a_dataset_root_says_where_the_subjects_were_found(
+    dataset: Path, tmp_path: Path
+) -> None:
+    before = snapshot_tree(dataset)
+    run_dir = tmp_path / "run"
+    inner = dataset.resolve() / "derivatives" / "fmriprep"
+    found = "(fMRIPrep layout, fMRIPrep 23.2.0)"
+    result = cli("inventory", "--run-dir", run_dir, "--source", dataset)
+    assert result.exit_code == 0, result.output
+    name = pseudonym(run_dir)
+    assert lines(result)[:2] == [
+        f"{name}: FreeSurfer subjects found in derivatives/fmriprep/sourcedata/freesurfer {found}",
+        "subjects: 3 found, 2 complete, 1 with Tier A, 0 with Tier B",
+    ]
+    # the run stores the folder that was found, as if that folder had been named
+    stored = load_config(run_dir).sources[0]
+    assert (stored.root, stored.identity) == (str(inner), str(inner))
+    one = uid(run_dir, "sub-01")
+
+    # the dataset, its derivatives folder and the folder found name the same run
+    for path, where in (
+        (inner, "sourcedata/freesurfer"),
+        (dataset / "derivatives", "fmriprep/sourcedata/freesurfer"),
+        (dataset, "derivatives/fmriprep/sourcedata/freesurfer"),
+    ):
+        again = cli("inventory", "--run-dir", run_dir, "--source", path)
+        assert again.exit_code == 0, again.output
+        assert lines(again)[0] == f"{name}: FreeSurfer subjects found in {where} {found}"
+        assert "inventory: 0 done, 3 skipped, 0 failed" in again.output
+    # without --source, where the subjects lie is said from the stored root
+    plain = cli("inventory", "--run-dir", run_dir)
+    assert lines(plain)[0] == f"{name}: FreeSurfer subjects found in sourcedata/freesurfer {found}"
+    assert load_config(run_dir).sources[0] == stored and uid(run_dir, "sub-01") == one
+
+    # the subjects directory itself is a plain subjects directory, with a root of its own
+    refused = cli("inventory", "--run-dir", run_dir, "--source", inner / FS_ROOT)
+    assert refused.exit_code == 2
+    assert refused.output.startswith(f"other root: this run directory belongs to {inner}; ")
+
+    # the dataset moved: --relocate with the new dataset root keeps the run and its subjects
+    moved = tmp_path / "elsewhere" / "ds"
+    moved.parent.mkdir()
+    shutil.move(dataset, moved)
+    assert cli("inventory", "--run-dir", run_dir, "--source", moved).exit_code == 2
+    relocated = cli("inventory", "--run-dir", run_dir, "--relocate", "--source", moved)
+    assert relocated.exit_code == 0, relocated.output
+    assert "inventory: 0 done, 3 skipped, 0 failed" in relocated.output
+    source = load_config(run_dir).sources[0]
+    assert (source.root, source.identity) == (
+        str(moved.resolve() / "derivatives" / "fmriprep"),
+        str(inner),
+    )
+    assert pseudonym(run_dir) == name and uid(run_dir, "sub-01") == one
+    assert snapshot_tree(moved) == before
+
+
+def test_a_dataset_root_with_subjects_in_two_places_warns_once_and_is_told_apart(
+    dataset: Path, tmp_path: Path
+) -> None:
+    write_tree(dataset / "derivatives", "bids_derivatives", ["sub-09"], fmriprep_version=None)
+    inner = dataset.resolve() / "derivatives" / "fmriprep"
+    warning = (
+        f"WARNING: FreeSurfer subjects lie in more than one place under {dataset.resolve()}: "
+        "using derivatives/freesurfer, not derivatives/fmriprep/sourcedata/freesurfer (to "
+        f"use it, give {inner} as the path)\n"
+    )
+    first = cli("inventory", "--run-dir", tmp_path / "first", "--source", dataset)
+    assert first.exit_code == 0, first.output
+    assert first.output.count("WARNING: ") == 1 and warning in first.output
+    # derivatives/freesurfer beside derivatives/fmriprep: the older fMRIPrep layout
+    assert (
+        f"{pseudonym(tmp_path / 'first')}: FreeSurfer subjects found in derivatives/freesurfer "
+        "(older fMRIPrep layout, fMRIPrep 23.2.0)"
+    ) in lines(first)
+    assert load_config(tmp_path / "first").sources[0].root == str(dataset.resolve() / "derivatives")
+    # the folder that the warning names gives the other subjects, as a run of its own
+    second = cli("inventory", "--run-dir", tmp_path / "second", "--source", inner)
+    assert second.exit_code == 0 and "WARNING" not in second.output
+    assert "subjects: 3 found" in second.output
+    refused = cli("inventory", "--run-dir", tmp_path / "first", "--source", inner)
+    assert refused.exit_code == 2 and refused.output.startswith("other root: ")
+    # review says it once as well
+    reviewed = cli("review", dataset, "--no-serve", "--jobs", 1, "--run-dir", tmp_path / "third")
+    assert reviewed.exit_code == 0, reviewed.output
+    assert reviewed.output.count("WARNING: FreeSurfer subjects lie in more than one place") == 1
+    assert "Found 1 subject in derivatives/freesurfer (older fMRIPrep layout)." in reviewed.output
+
+
+def test_a_dataset_without_freesurfer_output_is_exit_2_with_what_was_looked_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = write_bids_dataset(tmp_path / "data" / "ds000001", LABELS)
+    monkeypatch.chdir(tmp_path)
+    before = snapshot_tree(tmp_path)
+    commands = (
+        ("inventory", "--run-dir", tmp_path / "run", "--source", raw),
+        ("review", raw, "--no-serve"),
+        ("review", raw, "--no-serve", "--run-dir", tmp_path / "run"),
+    )
+    for command in commands:
+        result = cli(*command)
+        assert result.exit_code == 2, result.output
+        assert result.output == (
+            f"layout: no FreeSurfer output found in {raw.resolve()}: it looks like a BIDS "
+            "dataset without derivatives. Looked for subjects (directories with mri/ and "
+            "surf/) in derivatives/ (there is no such folder), sourcedata/freesurfer/, "
+            "freesurfer/ and the dataset's own folders; if they are elsewhere, give that "
+            "folder as the path\n"
+        )
+        # one or two lines of a terminal 160 columns wide, the path aside
+        assert len(result.output) - len(str(raw.resolve())) <= 2 * 160
+    assert snapshot_tree(tmp_path) == before  # no run directory was made, here or beside
+
+    # derivatives with folders for FreeSurfer output and no subject in them
+    (raw / "derivatives" / "freesurfer").mkdir(parents=True)
+    (raw / "derivatives" / "fmriprep" / "sub-01" / "anat").mkdir(parents=True)
+    before = snapshot_tree(tmp_path)
+    for command in commands:
+        result = cli(*command)
+        assert result.exit_code == 2, result.output
+        assert result.output == (
+            f"layout: no FreeSurfer subject found in {raw.resolve()}. A subject is a "
+            "directory with mri/ and surf/ that is not a template; looked in derivatives/ "
+            "and its folders (fmriprep, freesurfer), in each for subject directories, "
+            "sourcedata/freesurfer/ and freesurfer/, and at the path's own "
+            "sourcedata/freesurfer/, freesurfer/ and folders. Without a subject: "
+            "derivatives/freesurfer (empty)\n"
+        )
+    assert snapshot_tree(tmp_path) == before
+
+
+def test_verbose_says_where_in_a_dataset_the_subjects_were_found(
+    dataset: Path, tmp_path: Path
+) -> None:
+    loud = cli("--verbose", "inventory", "--run-dir", tmp_path / "loud", "--source", dataset)
+    assert loud.exit_code == 0, loud.output
+    inner = dataset.resolve() / "derivatives" / "fmriprep"
+    assert (
+        f"INFO: {inner} is an fMRIPrep output with subjects in sourcedata/freesurfer\n"
+        f"INFO: {dataset.resolve()} is a BIDS dataset with FreeSurfer subjects in "
+        "derivatives/fmriprep/sourcedata/freesurfer\n"
+    ) in loud.output

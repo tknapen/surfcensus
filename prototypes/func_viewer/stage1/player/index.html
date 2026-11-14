@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Functional viewer</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/player/player.css">
+</head>
+<body>
+  <header id="bar">
+    <strong id="pack-id" title="the neutral id of this pack"></strong>
+    <div id="runs" class="buttons" role="group" aria-label="run of the session"></div>
+    <div id="views-buttons" class="buttons" role="group" aria-label="streams shown">
+      <button type="button" data-view="raw"><kbd>1</kbd> raw</button>
+      <button type="button" data-view="pre"><kbd>2</kbd> preprocessed</button>
+      <button type="button" data-view="side"><kbd>3</kbd> side by side</button>
+      <button type="button" data-view="diff"><kbd>4</kbd> difference</button>
+    </div>
+    <div id="kinds-buttons" class="buttons" role="group" aria-label="moving picture or still">
+      <button type="button" data-kind="series"><kbd>q</kbd> series</button>
+      <button type="button" data-kind="mean"><kbd>w</kbd> mean</button>
+      <button type="button" data-kind="sd"><kbd>e</kbd> SD</button>
+    </div>
+    <button type="button" id="help-button"><kbd>?</kbd> help</button>
+  </header>
+  <p id="run-note"></p>
+  <p id="warning" role="alert" hidden></p>
+  <main id="views"></main>
+  <p id="legend"><span id="legend-text"></span> <canvas id="legend-bar" width="255" height="10" hidden></canvas></p>
+  <section id="controls" aria-label="controls">
+    <div class="row">
+      <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
+      <label>rate <select id="rate"></select> volumes per s <kbd>[</kbd> <kbd>]</kbd></label>
+      <output id="readout"></output>
+    </div>
+    <div class="row">
+      <label class="wide">volume <input id="time" type="range" min="0" max="0" step="1" value="0"></label>
+    </div>
+    <div class="row" id="slices">
+      <label>sagittal <input type="range" data-plane="0" min="0" max="0" step="1"> <output></output></label>
+      <label>coronal <input type="range" data-plane="1" min="0" max="0" step="1"> <output></output></label>
+      <label>axial <input type="range" data-plane="2" min="0" max="0" step="1"> <output></output></label>
+    </div>
+    <div class="row">
+      <label><input type="checkbox" id="contours" checked> contours <kbd>s</kbd></label>
+      <label><input type="checkbox" id="crosshair" checked> crosshair <kbd>c</kbd></label>
+      <label><input type="checkbox" id="traces-on" checked> traces and markers <kbd>t</kbd></label>
+      <label>difference scale, gray levels <select id="diff-scale"></select></label>
+      <label>FD threshold, mm <input type="number" id="fd-limit" min="0" step="0.1" value="0.5"></label>
+    </div>
+  </section>
+  <canvas id="traces" aria-label="framewise displacement and standardised DVARS of this run"></canvas>
+  <p id="status"></p>
+
+  <div id="help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
+    <div class="sheet">
+      <h1 id="help-title">What this page shows</h1>
+      <p>One session of functional MRI, run by run, in the anatomy. Two streams of every run lie on the same slices:</p>
+      <ul>
+        <li><b>raw</b>: the series as it was acquired, each volume resampled once into the anatomy through
+          <b>one rigid registration for the whole session</b> (that of the session's anchor run). Nothing is corrected:
+          no motion correction, no slice timing, no distortion correction. So everything that moved within the session,
+          within a run and between runs, is still in it. Distortion and the bright fluid band of EPI are in it by
+          construction. It is the reference for what preprocessing changed, not the thing to be judged.</li>
+        <li><b>preprocessed</b>: the series as fMRIPrep stored it.</li>
+      </ul>
+      <p>A run that is not the anchor is drawn through the anchor's registration. How far that puts it from where its
+        own stored registration would is written under the run buttons. A run beyond <span id="help-limit"></span> mm
+        is flagged: it may not share the anchor's scanner frame.</p>
+      <p><b>Exact values.</b> Every voxel on screen is the stored 8-bit value, one block per voxel, no smoothing.
+        <span id="help-window"></span> The stills (mean, SD) are computed before the 8 bits; the SD has a window of its own.</p>
+      <p><b>Difference</b> is raw minus preprocessed of the two 8-bit values. Red to yellow: raw is higher. Blue to cyan:
+        raw is lower. The colour saturates at the chosen scale, which is written under the views.</p>
+      <p><b>Markers.</b> A volume whose framewise displacement exceeds the threshold has a band in the traces, and the
+        frame carries a red marker that stays for at least <span id="help-hold"></span> ms however fast it plays.
+        Volumes that the confounds table marks as non-steady-state have an amber band and marker.</p>
+      <p><b>Playing</b> paints every volume; when the computer is slower than the rate, playing takes longer and
+        nothing is skipped. The status line says how many volumes per second were painted.
+        A long run is held in memory in pieces around the current volume, up to <span id="help-memory"></span>.</p>
+      <table>
+        <tr><th>Key</th><th>Action</th></tr>
+        <tr><td><kbd>Space</kbd></td><td>play, pause</td></tr>
+        <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous, next volume (pauses)</td></tr>
+        <tr><td><kbd>Shift</kbd> + <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>10 volumes</td></tr>
+        <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first, last volume</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>slower, faster (1 to 60 volumes per second)</td></tr>
+        <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd></td><td>next, previous slice of the active plane; with <kbd>Shift</kbd>, 5 slices</td></tr>
+        <tr><td><kbd>p</kbd></td><td>next plane becomes the active one (it has a frame); the mouse wheel over a panel scrubs its slices</td></tr>
+        <tr><td>click, drag</td><td>in a panel: the other two planes go to that point; in the traces: go to that volume</td></tr>
+        <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd></td><td>raw, preprocessed, side by side, difference</td></tr>
+        <tr><td><kbd>f</kbd></td><td>flip between raw and preprocessed</td></tr>
+        <tr><td><kbd>q</kbd> <kbd>w</kbd> <kbd>e</kbd></td><td>the moving series, the temporal mean, the temporal SD (stills)</td></tr>
+        <tr><td><kbd>r</kbd>, <kbd>Shift</kbd> + <kbd>r</kbd></td><td>next, previous run</td></tr>
+        <tr><td><kbd>s</kbd></td><td>surface contours on, off (held down: off while held)</td></tr>
+        <tr><td><kbd>c</kbd></td><td>crosshair on, off</td></tr>
+        <tr><td><kbd>t</kbd></td><td>traces and markers on, off</td></tr>
+        <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
+      </table>
+      <p>Contours: white surface red, pial surface yellow, both hemispheres, cut at the centre of the slice.</p>
+      <p><button type="button" id="help-close">close</button></p>
+    </div>
+  </div>
+  <script type="module" src="/player/main.js"></script>
+</body>
+</html>

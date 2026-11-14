@@ -1,9 +1,10 @@
 """The rater web app: rating screen, click marks, queue, review. See docs/rater_app.md.
 
 No module of the package is imported here; use the modules. ``app.schemas`` (the shapes of
-the API) needs pydantic only. Every other module needs the ``app`` extra (fastapi, uvicorn,
-sqlmodel, jinja2). Code outside this package reads ``app.sqlite`` with the standard library,
-by the names below, so that ``surfcensus export`` works on a core install.
+the API) needs pydantic only. Every other module imports the app's packages (fastapi,
+uvicorn, sqlmodel, jinja2), which are dependencies of the package and are imported by these
+modules alone: code outside this package reads ``app.sqlite`` with the standard library, by
+the names below, so that the phase commands and ``surfcensus export`` never load them.
 """
 
 import json

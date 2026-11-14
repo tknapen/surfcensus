@@ -183,6 +183,36 @@ def write_tree(
     return root
 
 
+def write_bids_dataset(
+    root: Path, labels: Sequence[str] = ("sub-01", "sub-02"), *, description: bool = True
+) -> Path:
+    """The raw part of a BIDS dataset as OpenNeuro hands one out, under ``root``:
+    ``dataset_description.json`` (unless ``description`` is false), ``participants.tsv``,
+    ``README`` and ``<label>/anat/<label>_T1w.nii.gz`` (a file of a few bytes: nothing reads
+    it). No ``derivatives/`` folder: a test adds what it needs with :func:`write_tree`, for
+    example ``write_tree(root / "derivatives" / "fmriprep", "fmriprep", labels)`` for
+    ``derivatives/fmriprep/sourcedata/freesurfer/<label>`` or
+    ``write_tree(root / "derivatives", "bids_derivatives", labels)`` for
+    ``derivatives/freesurfer/<label>``. Returns ``root``, the path a user would pass.
+
+    The file names are those of a BIDS dataset from memory of the specification; no real
+    OpenNeuro dataset root was listed for this.
+    """
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    if description:
+        raw = {"Name": "A synthetic dataset", "BIDSVersion": "1.8.0", "DatasetType": "raw"}
+        (root / "dataset_description.json").write_text(json.dumps(raw, indent=2) + "\n")
+    (root / "README").write_text("Synthetic.\n")
+    (root / "participants.tsv").write_text(
+        "participant_id\n" + "".join(f"{label}\n" for label in labels)
+    )
+    for label in labels:
+        (root / label / "anat").mkdir(parents=True, exist_ok=True)
+        (root / label / "anat" / f"{label}_T1w.nii.gz").write_bytes(b"not an image\n")
+    return root
+
+
 def write_linked_tree(
     root: Path, store: Path, labels: Sequence[str], *, with_template: bool = False
 ) -> Path:

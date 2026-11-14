@@ -2818,9 +2818,11 @@ name = "surfcensus"
 version = "0.0.1"
 source = { editable = "." }
 dependencies = [
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "imageio-ffmpeg" },
     { name = "jaxtyping" },
+    { name = "jinja2" },
     { name = "matplotlib" },
     { name = "nibabel" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
@@ -2833,32 +2835,24 @@ dependencies = [
     { name = "pyyaml" },
     { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "sqlmodel" },
     { name = "tqdm" },
     { name = "typer" },
+    { name = "uvicorn" },
 ]
 
 [package.optional-dependencies]
 all = [
-    { name = "fastapi" },
-    { name = "jinja2" },
     { name = "krippendorff" },
     { name = "marimo" },
     { name = "scikit-learn" },
-    { name = "sqlmodel" },
     { name = "statsmodels" },
-    { name = "uvicorn", extra = ["standard"] },
 ]
 analysis = [
     { name = "krippendorff" },
     { name = "marimo" },
     { name = "scikit-learn" },
     { name = "statsmodels" },
-]
-app = [
-    { name = "fastapi" },
-    { name = "jinja2" },
-    { name = "sqlmodel" },
-    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.dev-dependencies]
@@ -2871,15 +2865,16 @@ dev = [
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "uvicorn", extra = ["standard"] },
 ]
 
 [package.metadata]
 requires-dist = [
-    { name = "fastapi", marker = "extra == 'app'" },
+    { name = "fastapi" },
     { name = "httpx" },
     { name = "imageio-ffmpeg" },
     { name = "jaxtyping" },
-    { name = "jinja2", marker = "extra == 'app'" },
+    { name = "jinja2" },
     { name = "krippendorff", marker = "extra == 'analysis'" },
     { name = "marimo", marker = "extra == 'analysis'" },
     { name = "matplotlib", specifier = ">=3.8" },
@@ -2893,12 +2888,12 @@ requires-dist = [
     { name = "pyyaml" },
     { name = "scikit-learn", marker = "extra == 'analysis'" },
     { name = "scipy" },
-    { name = "sqlmodel", marker = "extra == 'app'" },
+    { name = "sqlmodel" },
     { name = "statsmodels", marker = "extra == 'analysis'" },
     { name = "surfcensus", extras = ["app", "analysis"], marker = "extra == 'all'" },
     { name = "tqdm" },
     { name = "typer" },
-    { name = "uvicorn", extras = ["standard"], marker = "extra == 'app'" },
+    { name = "uvicorn" },
 ]
 provides-extras = ["app", "analysis", "all"]
 
@@ -2910,6 +2905,7 @@ dev = [
     { name = "pyrefly" },
     { name = "pytest" },
     { name = "ruff" },
+    { name = "uvicorn", extras = ["standard"] },
 ]
 
 [[package]]

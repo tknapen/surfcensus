@@ -16,6 +16,11 @@ test-network:
 test-browser:
     uv run --group browser pytest -m browser
 
+# the quick start as a user gets it: the wheel, installed into a fresh environment with its
+# dependencies from the package index, and `surfcensus review` there up to a stored rating
+test-install:
+    uv run pytest -m install -s tests/test_install.py
+
 lint:
     uv run ruff check .
     uv run ruff format --check .

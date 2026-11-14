@@ -16,6 +16,7 @@ import pytest
 from synth import file_modes_apply, snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_tree import (  # pyrefly: ignore[missing-import]
     FS_ROOT,
+    write_bids_dataset,
     write_light_subject,
     write_light_template,
     write_linked_tree,
@@ -25,7 +26,7 @@ from synth_tree import (  # pyrefly: ignore[missing-import]
 import surfcensus
 import surfcensus.sources.local as local_module
 from surfcensus.config import ConfigError, SourceConfig, new_local_config
-from surfcensus.privacy import new_local_salt, subject_uid
+from surfcensus.privacy import local_salt_from_hex, new_local_salt, subject_uid
 from surfcensus.render import RenderConfig, render_subject
 from surfcensus.run import from_config
 from surfcensus.sources.base import (
@@ -42,8 +43,10 @@ from surfcensus.sources.base import (
 )
 from surfcensus.sources.local import (
     LocalSource,
+    dataset_holding,
     detect_layout,
     find_adjacent_template,
+    found_in,
     freesurfer_template_places,
     local,
     place_holding,
@@ -52,6 +55,7 @@ from surfcensus.sources.local import (
     source_places,
     stored_subjects_dirs,
     template_files_missing,
+    where_subjects_lie,
 )
 from surfcensus.sources.patterns import ROLE_CANDIDATES
 
@@ -383,7 +387,558 @@ def test_a_subjects_directory_without_search_permission(tmp_path: Path) -> None:
         (tree / "sub-02").chmod(0o755)
 
 
-# ---------------------------------------------------------------------------- one subject
+# ---------------------------------------------------------------------------- BIDS dataset root
+
+# what lies below derivatives/, as (folder, layout) pairs for write_tree, and the record
+# expected of the dataset root: root relative to the dataset, fs_root, layout, pipeline,
+# version
+DATASETS = {
+    "derivatives/freesurfer": (
+        [("derivatives", "bids_derivatives")],
+        ("derivatives", "freesurfer", "bids_derivatives", "freesurfer", None),
+    ),
+    "derivatives/freesurfer beside derivatives/fmriprep": (
+        [("derivatives", "fmriprep_legacy")],
+        ("derivatives", "freesurfer", "fmriprep_legacy", "fmriprep", "23.2.0"),
+    ),
+    "derivatives/fmriprep/sourcedata/freesurfer": (
+        [("derivatives/fmriprep", "fmriprep")],
+        ("derivatives/fmriprep", "sourcedata/freesurfer", "fmriprep", "fmriprep", "23.2.0"),
+    ),
+    "derivatives/fmriprep/freesurfer": (
+        [("derivatives/fmriprep", "bids_derivatives")],
+        ("derivatives/fmriprep", "freesurfer", "bids_derivatives", "freesurfer", None),
+    ),
+    "derivatives/freesurfer-7.3.2": (
+        [("derivatives/freesurfer-7.3.2", "subjects_dir")],
+        ("derivatives/freesurfer-7.3.2", ".", "subjects_dir", "freesurfer", None),
+    ),
+    "derivatives/fmriprep-21.0.2/sourcedata/freesurfer": (
+        [("derivatives/fmriprep-21.0.2", "fmriprep")],
+        ("derivatives/fmriprep-21.0.2", "sourcedata/freesurfer", "fmriprep", "fmriprep", "23.2.0"),
+    ),
+    "derivatives/smriprep/freesurfer": (
+        [("derivatives/smriprep", "bids_derivatives")],
+        ("derivatives/smriprep", "freesurfer", "bids_derivatives", "freesurfer", None),
+    ),
+}
+SALT = local_salt_from_hex("5c" * 32)
+
+
+def _dataset(root: Path, name: str, labels: tuple[str, ...] = LABELS) -> Path:
+    dataset = write_bids_dataset(root, labels)
+    for folder, layout in DATASETS[name][0]:
+        write_tree(dataset / folder, layout, labels)
+    return dataset
+
+
+def _uids(source: LocalSource) -> list[str]:
+    return [
+        subject_uid(SALT, s.dataset.source, s.dataset.identity, s.dataset.pipeline, s.subject_label)
+        for s in source.subjects(source.dataset)
+    ]
+
+
+def _warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+
+
+@pytest.mark.parametrize("name", list(DATASETS))
+def test_a_dataset_root_is_the_folder_found_below_its_derivatives(
+    tmp_path: Path, name: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    dataset = _dataset(tmp_path / "ds000001", name)
+    before = snapshot_tree(dataset)
+    inner, fs_root, layout, pipeline, version = DATASETS[name][1]
+    root = dataset.resolve() / inner
+    with caplog.at_level(logging.INFO, logger="surfcensus"):
+        source = LocalSource(dataset)
+    assert source.dataset == DatasetRecord(
+        source="local",
+        identity=str(root),
+        accession=None,
+        root=str(root),
+        fs_root=fs_root,
+        layout=layout,
+        pipeline=pipeline,
+        pipeline_version=version,
+    )
+    assert _warnings(caplog) == []
+    said = caplog.records[-1].getMessage()
+    assert said == (
+        f"{dataset.resolve()} is a BIDS dataset with FreeSurfer subjects in "
+        f"{(Path(inner) / fs_root).as_posix()}"
+    )
+    assert _labels(source) == list(LABELS)
+    assert source.subjects_dir == root / fs_root
+
+    # the dataset root, its derivatives folder and the folder found are one source: the
+    # same record, the same stored description, the same subject identifiers
+    for path in (dataset / "derivatives", root, str(dataset) + "/"):
+        other = LocalSource(path)
+        assert other.dataset == source.dataset
+        assert other.config() == source.config()
+        assert _uids(other) == _uids(source)
+    assert len(set(_uids(source))) == len(LABELS)
+    assert source.config().root == str(root)
+    # and the stored root, which is the folder found, builds it again without a search
+    rebuilt = from_config(source.config(), new_local_config(root), tmp_path / "run")
+    assert isinstance(rebuilt, LocalSource) and rebuilt.dataset == source.dataset
+    assert snapshot_tree(dataset) == before
+
+
+def test_a_dataset_root_without_a_description_is_read_through_its_derivatives(
+    tmp_path: Path,
+) -> None:
+    """A derivatives/ folder is what makes a path a dataset root; a description is not
+    needed, and neither are sub-* folders."""
+    dataset = tmp_path / "study"
+    write_tree(dataset / "derivatives" / "fmriprep", "fmriprep", LABELS)
+    record = LocalSource(dataset).dataset
+    assert (record.root, record.fs_root) == (
+        str(dataset.resolve() / "derivatives" / "fmriprep"),
+        "sourcedata/freesurfer",
+    )
+    # a link of another name to the derivatives folder is that folder
+    (tmp_path / "outputs").symlink_to(dataset / "derivatives")
+    assert LocalSource(tmp_path / "outputs").dataset == record
+    # and a dataset whose derivatives folder is a link to another place
+    other = write_bids_dataset(tmp_path / "linked")
+    (other / "derivatives").symlink_to(dataset / "derivatives")
+    assert LocalSource(other).dataset == record
+
+
+def test_the_places_below_derivatives_are_tried_in_a_stated_order(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """derivatives/ itself; then its folders that hold subjects; then those with
+    sourcedata/freesurfer; then those with freesurfer/; each group by name."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset.resolve() / "derivatives"
+    order = [
+        ("zz-pipe", "bids_derivatives", "zz-pipe/freesurfer", "zz-pipe"),
+        ("aa-pipe", "bids_derivatives", "aa-pipe/freesurfer", "aa-pipe"),
+        ("fmriprep-21.0.2", "fmriprep", "fmriprep-21.0.2/sourcedata/freesurfer", "fmriprep-21.0.2"),
+        ("aprep", "fmriprep", "aprep/sourcedata/freesurfer", "aprep"),
+        ("freesurfer-7.3.2", "subjects_dir", "freesurfer-7.3.2", "freesurfer-7.3.2"),
+        ("fastsurfer", "subjects_dir", "fastsurfer", "fastsurfer"),
+        (".", "bids_derivatives", "freesurfer", "."),
+    ]
+    expected: list[tuple[str, str]] = []  # subjects directory, folder to give
+    for index, (folder, layout, subjects_dir, root) in enumerate(order):
+        write_tree(derivatives / folder, layout, [f"sub-{index:02d}"])
+        expected.insert(0, (subjects_dir, root))
+        # groups in the stated order, names ascending within a group
+        ranked = sorted(
+            expected,
+            key=lambda item: (
+                0
+                if item[1] == "."
+                else 1
+                if item[0] == item[1]
+                else 2
+                if item[0].endswith("sourcedata/freesurfer")
+                else 3,
+                item[1],
+            ),
+        )
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="surfcensus"):
+            source = LocalSource(dataset)
+        assert source.subjects_dir == derivatives / ranked[0][0], ranked
+        assert source.dataset.root == str((derivatives / ranked[0][1]).resolve())
+        if len(ranked) == 1:
+            assert _warnings(caplog) == []
+            continue
+        (warning,) = _warnings(caplog)
+        unused = "; ".join(
+            f"derivatives/{place} (to use it, give {(derivatives / root).resolve()} as the path)"
+            for place, root in ranked[1:]
+        )
+        assert warning == (
+            f"FreeSurfer subjects lie in more than one place under {dataset.resolve()}: "
+            f"using derivatives/{ranked[0][0]}, not {unused}"
+        )
+        # the folder that the warning names for a place gives that place
+        for place, root in ranked[1:]:
+            assert LocalSource(derivatives / root).subjects_dir == derivatives / place
+    assert [place for place, _ in ranked] == [
+        "freesurfer",
+        "fastsurfer",
+        "freesurfer-7.3.2",
+        "aprep/sourcedata/freesurfer",
+        "fmriprep-21.0.2/sourcedata/freesurfer",
+        "aa-pipe/freesurfer",
+        "zz-pipe/freesurfer",
+    ]
+
+
+def test_one_subjects_directory_reached_from_several_folders_is_one_place(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """derivatives/freesurfer beside derivatives/fmriprep is found from derivatives/
+    (rule 3), from derivatives/fmriprep (rule 4) and from derivatives/freesurfer (rule 5):
+    one place, read as the first finds it, and no warning."""
+    dataset = _dataset(tmp_path / "ds", "derivatives/freesurfer beside derivatives/fmriprep")
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        record = LocalSource(dataset).dataset
+    assert (record.layout, record.pipeline) == ("fmriprep_legacy", "fmriprep")
+    assert _warnings(caplog) == []
+
+
+@pytest.mark.parametrize("layout", ["fmriprep", "bids_derivatives", "subjects_dir"])
+def test_subjects_at_the_top_of_a_dataset_win_over_those_below_derivatives(
+    tmp_path: Path, layout: Layout, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A path that rules 2 to 5 match is read as before, also when it has a derivatives/
+    folder with subjects; the warning names those."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    write_tree(dataset, layout, ["sub-11"], fmriprep_version=None)
+    plain = LocalSource(dataset).dataset
+    write_tree(dataset / "derivatives" / "fmriprep", "fmriprep", ["sub-22"])
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        source = LocalSource(dataset)
+    assert source.dataset == plain
+    assert (source.dataset.root, source.dataset.layout, source.dataset.fs_root) == (
+        str(dataset.resolve()),
+        layout,
+        FS_ROOT[layout],
+    )
+    assert _labels(source) == ["sub-11"]
+    (warning,) = _warnings(caplog)
+    shown = "the folder itself" if layout == "subjects_dir" else FS_ROOT[layout]
+    inner = dataset.resolve() / "derivatives" / "fmriprep"
+    assert warning == (
+        f"FreeSurfer subjects lie in more than one place under {dataset.resolve()}: using "
+        f"{shown}, not derivatives/fmriprep/sourcedata/freesurfer (to use it, give {inner} "
+        "as the path)"
+    )
+    assert _labels(LocalSource(inner)) == ["sub-22"]
+
+
+def test_what_the_search_below_derivatives_does_not_reach(tmp_path: Path) -> None:
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset / "derivatives"
+    # four folders below derivatives/, and a folder of another name inside a pipeline folder
+    write_light_subject(derivatives / "a" / "b" / "freesurfer" / "sub-01")
+    write_light_subject(derivatives / "pipe" / "ses-01" / "sub-01")
+    write_light_subject(derivatives / "pipe" / "freesurfer-7" / "sub-01")
+    # subjects in a folder that is named like a template, and a template alone
+    write_light_subject(derivatives / "fsaverage" / "sub-01")
+    write_light_subject(derivatives / "freesurfer" / "fsaverage")
+    # subjects in a top-level folder that is not derivatives/
+    write_light_subject(dataset / "code" / "freesurfer" / "sub-01")
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.reason == "layout"
+    # each is found when its own folder is named
+    assert _labels(LocalSource(derivatives / "a" / "b")) == ["sub-01"]
+    assert _labels(LocalSource(derivatives / "pipe" / "freesurfer-7")) == ["sub-01"]
+    assert _labels(LocalSource(dataset / "code")) == ["sub-01"]
+    # the deepest place that is reached: derivatives/<folder>/sourcedata/freesurfer
+    write_light_subject(derivatives / "pipe" / "sourcedata" / "freesurfer" / "sub-07")
+    source = LocalSource(dataset)
+    assert source.dataset.root == str((derivatives / "pipe").resolve())
+    assert _labels(source) == ["sub-07"]
+
+
+def test_subject_directories_in_derivatives_itself_are_a_subjects_directory(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A folder of derivatives/ that is a subject is not a pipeline folder: it is searched
+    for nothing, and derivatives/ is then the subjects directory."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    for label in ("sub-01", "sub-02"):
+        write_light_subject(dataset / "derivatives" / label)
+    # a subject with a freesurfer/ folder of its own, which rule 3 would take as a place
+    write_light_subject(dataset / "derivatives" / "sub-02" / "freesurfer" / "inner")
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        source = LocalSource(dataset)
+    assert (source.dataset.root, source.dataset.layout, source.dataset.fs_root) == (
+        str(dataset.resolve() / "derivatives"),
+        "subjects_dir",
+        ".",
+    )
+    assert _labels(source) == ["sub-01", "sub-02"]
+    assert _warnings(caplog) == []  # the folder inside the subject is no second place
+
+
+def test_a_raw_dataset_without_derivatives_says_what_is_missing(tmp_path: Path) -> None:
+    dataset = write_bids_dataset(tmp_path / "ds000001")
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.reason == "layout"
+    assert caught.value.detail == (
+        f"no FreeSurfer output found in {dataset.resolve()}: it looks like a BIDS dataset "
+        "without derivatives. Looked for subjects (directories with mri/ and surf/) in "
+        "derivatives/ (there is no such folder), sourcedata/freesurfer/, freesurfer/ and the "
+        "dataset's own folders; if they are elsewhere, give that folder as the path"
+    )
+    assert "\n" not in caught.value.detail
+    # without the two marks of a BIDS dataset, the message is that of any folder
+    (dataset / "dataset_description.json").unlink()
+    with pytest.raises(SourceError, match=r"^layout: no FreeSurfer subject found at "):
+        LocalSource(dataset)
+    plain = tmp_path / "plain"
+    plain.mkdir()
+    (plain / "dataset_description.json").write_text("{}\n")
+    with pytest.raises(SourceError, match=r"^layout: no FreeSurfer subject found at "):
+        LocalSource(plain)
+
+
+def test_derivatives_without_a_subject_says_where_it_looked_and_what_is_bare(
+    tmp_path: Path,
+) -> None:
+    dataset = write_bids_dataset(tmp_path / "ds000001")
+    derivatives = dataset / "derivatives"
+    (derivatives / "freesurfer").mkdir(parents=True)  # as a subdataset that is not installed
+    (derivatives / "fmriprep" / "sourcedata" / "freesurfer" / "fsaverage" / "mri").mkdir(
+        parents=True
+    )
+    (derivatives / "fmriprep" / "sub-01" / "anat").mkdir(parents=True)
+    (derivatives / "mriqc").mkdir()
+    (derivatives / "freesurfer-7.3.2").mkdir()
+    (derivatives / "freesurfer-7.3.2" / "README").write_text("moved\n")
+    (derivatives / "notes.txt").write_text("not a folder\n")
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.reason == "layout"
+    assert caught.value.detail == (
+        f"no FreeSurfer subject found in {dataset.resolve()}. A subject is a directory with "
+        "mri/ and surf/ that is not a template; looked in derivatives/ and its folders "
+        "(fmriprep, freesurfer, freesurfer-7.3.2, mriqc), in each for subject directories, "
+        "sourcedata/freesurfer/ and freesurfer/, and at the path's own "
+        "sourcedata/freesurfer/, freesurfer/ and folders. Without a subject: "
+        "derivatives/freesurfer (empty), derivatives/fmriprep/sourcedata/freesurfer, "
+        "derivatives/freesurfer-7.3.2"
+    )
+    # the derivatives folder itself as the path: the same search, said for that folder
+    with pytest.raises(SourceError) as caught:
+        LocalSource(derivatives)
+    assert caught.value.detail == (
+        f"no FreeSurfer subject found in {derivatives.resolve()}. A subject is a directory "
+        "with mri/ and surf/ that is not a template; looked in the path and its folders "
+        "(fmriprep, freesurfer, freesurfer-7.3.2, mriqc), in each for subject directories, "
+        "sourcedata/freesurfer/ and freesurfer/. Without a subject: freesurfer (empty), "
+        "fmriprep/sourcedata/freesurfer, freesurfer-7.3.2"
+    )
+    # more folders than a line takes
+    for index in range(12):
+        (derivatives / f"pipe-{index:02d}").mkdir()
+    with pytest.raises(SourceError, match=r"pipe-05 and 6 more\), in each for"):
+        LocalSource(dataset)
+
+
+def test_a_folder_below_derivatives_that_cannot_be_examined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset.resolve() / "derivatives"
+    write_tree(derivatives / "aaa", "subjects_dir", ["sub-01"])
+    write_tree(derivatives / "fmriprep", "fmriprep", ["sub-02"])
+    _refuse_listdir(monkeypatch, derivatives / "aaa")
+    # passed over, with a warning, when another folder holds subjects
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        source = LocalSource(dataset)
+    assert source.dataset.root == str(derivatives / "fmriprep")
+    assert _warnings(caplog) == [
+        "derivatives/aaa could not be examined (Permission denied) and was not searched "
+        "for FreeSurfer subjects"
+    ]
+    # the same for a folder that cannot even be looked at
+    monkeypatch.undo()
+    _refuse_stat(monkeypatch, derivatives / "aaa")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        assert LocalSource(dataset).dataset.root == str(derivatives / "fmriprep")
+    assert _warnings(caplog) == [
+        "derivatives/aaa could not be examined (Permission denied) and was not searched "
+        "for FreeSurfer subjects"
+    ]
+    # and for a place that the rules read in derivatives/ itself: with the dataset as the
+    # path it is one of several places, and the warning names the place, not derivatives/
+    (derivatives / "freesurfer").mkdir()
+    monkeypatch.undo()
+    _refuse_listdir(monkeypatch, derivatives / "freesurfer")
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        assert LocalSource(dataset).subjects_dir == derivatives / "aaa"
+    assert _warnings(caplog)[0] == (
+        "derivatives/freesurfer could not be examined (Permission denied) and was not "
+        "searched for FreeSurfer subjects"
+    )
+    assert len(_warnings(caplog)) == 2  # and the one that names the other place
+    (derivatives / "freesurfer").rmdir()
+    monkeypatch.undo()
+    _refuse_listdir(monkeypatch, derivatives / "aaa")
+    # named by the error when nothing else holds one: it may be where the subjects are
+    shutil.rmtree(derivatives / "fmriprep")
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.reason == "layout"
+    assert caught.value.detail.endswith(
+        "Could not be examined: derivatives/aaa (Permission denied)"
+    )
+    # the folder that the path's own rules read is as strict as before
+    monkeypatch.undo()
+    _refuse_listdir(monkeypatch, derivatives)
+    with pytest.raises(SourceError) as caught:
+        LocalSource(derivatives)
+    assert (caught.value.reason, caught.value.detail) == (
+        "unreadable",
+        f"{derivatives}: Permission denied",
+    )
+
+
+def test_a_stored_root_is_not_searched_below_its_derivatives(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The root a run stores is the folder that was found. A source that is rebuilt from a
+    root whose subjects are gone stops; it does not go on with the subjects of another
+    folder under the same identity."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset.resolve() / "derivatives"
+    write_tree(derivatives, "bids_derivatives", ["sub-01"])  # derivatives/freesurfer
+    stored = LocalSource(dataset).config()
+    assert stored.root == str(derivatives)
+    config = new_local_config(stored.root, sources=(stored,))
+    assert stored_subjects_dirs(config) == [derivatives / "freesurfer"]
+
+    # the subjects leave the folder, and another folder below derivatives/ holds subjects
+    shutil.rmtree(derivatives / "freesurfer")
+    write_tree(derivatives / "fmriprep", "fmriprep", ["sub-01"])
+    with pytest.raises(SourceError) as caught:
+        from_config(stored, config, tmp_path / "run")
+    assert caught.value.reason == "layout"
+    # also a stored source that names no identity, as a configuration written by hand
+    bare = SourceConfig(kind="local", root=stored.root)
+    with pytest.raises(SourceError, match=r"^layout: "):
+        from_config(bare, new_local_config(stored.root), tmp_path / "run")
+    assert LocalSource(derivatives, nested=True, identity=stored.identity).dataset.root == str(
+        derivatives / "fmriprep"
+    )
+    with pytest.raises(SourceError, match=r"^layout: "):
+        LocalSource(derivatives, identity=stored.identity)
+    with pytest.raises(SourceError, match=r"^layout: no FreeSurfer subject found at "):
+        detect_layout(derivatives, nested=False)
+    # nor is a stored root told that it looks like a dataset without derivatives
+    with pytest.raises(SourceError, match=r"^layout: no FreeSurfer subject found at "):
+        detect_layout(dataset, nested=False)
+    assert stored_subjects_dirs(config) == [derivatives]
+    assert where_subjects_lie(config) is None
+
+    # named anew, the path is searched and gives the other folder, under its own identity
+    with caplog.at_level(logging.INFO, logger="surfcensus"):
+        fresh = LocalSource(dataset)
+    assert fresh.dataset.root == str(derivatives / "fmriprep")
+    assert fresh.dataset.identity != stored.identity
+    assert caplog.records
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="surfcensus"):
+        assert detect_layout(dataset, quiet=True) == (fresh.dataset, ())
+    assert caplog.records == []
+
+
+PINNED_UIDS = {  # salt 5c5c..., source local, identity /data/study; computed 2026-11-14
+    "freesurfer": ["d0f19ba514bbc45c", "8bc99260dd67eea9"],
+    "fmriprep": ["bcad5e2297cf4a34", "b68b935fd5ecd5ca"],
+}
+
+
+@pytest.mark.parametrize("layout", LAYOUTS)
+def test_the_subject_uid_of_each_layout_is_what_it_was(tmp_path: Path, layout: Layout) -> None:
+    """A run made before dataset roots were read must open with its subjects: the
+    identifier of a subject is a hash of source, identity, pipeline and label, and none of
+    the four changed for a path that the earlier rules matched. Pinned on a fixed salt."""
+    tree = write_tree(tmp_path / "study", layout, ["sub-01", "sub-02"])
+    write_bids_dataset(tree)  # with the marks of a dataset around it, and without
+    for source in (LocalSource(tree, identity="/data/study"), LocalSource(tree)):
+        record = source.dataset
+        assert (record.source, record.root, record.fs_root, record.layout, record.pipeline) == (
+            "local",
+            str(tree.resolve()),
+            FS_ROOT[layout],
+            layout,
+            PIPELINE[layout][0],
+        )
+    assert LocalSource(tree).dataset.identity == str(tree.resolve())
+    assert _uids(LocalSource(tree, identity="/data/study")) == PINNED_UIDS[PIPELINE[layout][0]]
+    one = LocalSource(tree / FS_ROOT[layout] / "sub-02", identity="/data/study")
+    assert one.dataset.pipeline == "freesurfer"
+    assert _uids(one) == PINNED_UIDS["freesurfer"][1:]
+
+
+def test_the_template_next_to_the_subjects_of_a_dataset_is_found(tmp_path: Path) -> None:
+    dataset = write_bids_dataset(tmp_path / "ds")
+    inner = write_tree(dataset / "derivatives" / "fmriprep", "fmriprep", LABELS, with_template=True)
+    source = LocalSource(dataset)
+    assert source.dataset.template_location == "sourcedata/freesurfer/fsaverage"
+    expected = inner.resolve() / "sourcedata" / "freesurfer" / "fsaverage"
+    assert source.template_dir(source.dataset) == expected
+    assert find_adjacent_template(source.subjects_dir) == expected
+    assert _labels(source) == list(LABELS)  # fsaverage and fsaverage5 are no subjects
+
+
+def test_where_the_subjects_lie_is_said_relative_to_the_folder_named(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path / "ds", "derivatives/fmriprep/sourcedata/freesurfer")
+    record = detect_layout(dataset)[0]
+    assert found_in(record, dataset) == "derivatives/fmriprep/sourcedata/freesurfer"
+    assert found_in(record, str(dataset) + "/") == "derivatives/fmriprep/sourcedata/freesurfer"
+    assert found_in(record, dataset / "derivatives") == "fmriprep/sourcedata/freesurfer"
+    assert found_in(record, dataset / "derivatives" / "fmriprep") == "sourcedata/freesurfer"
+    # no folder named, or one that does not hold the subjects: relative to the root
+    assert found_in(record) == "sourcedata/freesurfer"
+    assert found_in(record, tmp_path / "elsewhere") == "sourcedata/freesurfer"
+    # the subjects directory itself, and one subject in it, say nothing
+    subjects_dir = dataset / "derivatives" / "fmriprep" / "sourcedata" / "freesurfer"
+    plain = detect_layout(subjects_dir)[0]
+    assert found_in(plain, subjects_dir) is None and found_in(plain) is None
+    assert found_in(detect_layout(subjects_dir / "sub-01")[0], subjects_dir / "sub-01") is None
+    # the older layout named by its fmriprep folder: the subjects lie beside it
+    legacy = write_tree(tmp_path / "out", "fmriprep_legacy", ["sub-01"])
+    assert found_in(detect_layout(legacy / "fmriprep")[0], legacy / "fmriprep") == "freesurfer"
+
+    # from the root a local run stores, which is the folder found
+    stored = LocalSource(dataset).config()
+    config = new_local_config(stored.root, sources=(stored,))
+    assert where_subjects_lie(config) == "sourcedata/freesurfer"
+    assert where_subjects_lie(config, dataset) == "derivatives/fmriprep/sourcedata/freesurfer"
+    two = new_local_config(stored.root, sources=(stored, LocalSource(legacy).config()))
+    assert where_subjects_lie(two, dataset) is None
+
+
+def test_the_dataset_that_holds_the_subjects(tmp_path: Path) -> None:
+    dataset = _dataset(tmp_path / "ds", "derivatives/fmriprep/sourcedata/freesurfer")
+    inner = dataset / "derivatives" / "fmriprep"
+    for path in (
+        dataset,
+        dataset / "derivatives",
+        inner,
+        inner / "sourcedata" / "freesurfer",
+        inner / "sourcedata" / "freesurfer" / "sub-01",
+    ):
+        assert dataset_holding(detect_layout(path)[0], path) == dataset.resolve(), path
+        assert dataset_holding(detect_layout(path)[0]) == dataset.resolve(), path
+
+    # without a description, only the root that was named and searched is a dataset
+    bare = tmp_path / "bare"
+    write_tree(bare / "derivatives" / "fmriprep", "fmriprep", ["sub-01"])
+    assert dataset_holding(detect_layout(bare)[0], bare) == bare.resolve()
+    for path in (bare / "derivatives", bare / "derivatives" / "fmriprep"):
+        assert dataset_holding(detect_layout(path)[0], path) is None
+
+    # an fMRIPrep output with its own description is no dataset that holds derivatives
+    plain = write_tree(tmp_path / "out", "fmriprep", ["sub-01"])
+    assert dataset_holding(detect_layout(plain)[0], plain) is None
+    # nested datasets: the outermost
+    outer = write_bids_dataset(tmp_path / "outer")
+    nested = _dataset(outer / "derivatives" / "study", "derivatives/freesurfer")
+    assert dataset_holding(detect_layout(nested)[0], nested) == outer.resolve()
+    # a derivatives folder that is a link to another place: the dataset that was named
+    linked = write_bids_dataset(tmp_path / "linked")
+    (linked / "derivatives").symlink_to(bare / "derivatives")
+    assert dataset_holding(detect_layout(linked)[0], linked) == linked.resolve()
+    assert dataset_holding(detect_layout(linked)[0]) is None
 
 
 def test_one_subject_directory_is_its_parent_restricted_to_that_name(tmp_path: Path) -> None:
