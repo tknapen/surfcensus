@@ -1363,6 +1363,20 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
+.epi #rate-note {
+  /* a box of one size whatever it says, so that nothing beside it moves when it appears */
+  display: inline-block;
+  flex: 0 0 auto;
+  width: 24ch;
+  height: 1.4em;
+  line-height: 1.4em;
+  overflow: hidden;
+  color: var(--flag);
+  font-size: 0.85em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
 .epi #track {
   position: relative;
   flex: 1 1 300px;

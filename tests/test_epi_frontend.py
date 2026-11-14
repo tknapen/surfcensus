@@ -481,3 +481,154 @@ def test_the_playback_clock_paints_every_volume(js_copy: Path) -> None:
         "}\noutput({ shown });\n",
     )
     assert math.isclose(out["shown"], 120, abs_tol=2)
+
+
+# --- the playback rate (D43) ---------------------------------------------------------------------
+
+
+@needs_node
+def test_the_rates_and_the_keys_that_step_through_them(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const up = [1]; while (up.length < 20) up.push(L.stepRate(up[up.length - 1], 1));\n"
+        "const down = [300];\n"
+        "while (down.length < 20) down.push(L.stepRate(down[down.length - 1], -1));\n"
+        "output({ rates: L.RATES, max: L.PAINT_EVERY_MAX, up, down, odd: L.stepRate(100, 1) });\n",
+    )
+    assert out["rates"] == [1, 2, 5, 12, 24, 30, 60, 120, 200, 300]
+    assert out["max"] == 60
+    assert out["up"][:10] == out["rates"] and set(out["up"][10:]) == {300}
+    assert out["down"][:10] == out["rates"][::-1] and set(out["down"][10:]) == {1}
+    assert out["odd"] == 200  # a rate not in the list steps from the next one above it
+
+
+@needs_node
+def test_volumes_are_left_out_only_above_60_and_above_the_frame_rate(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const r = {};\n"
+        "for (const rate of L.RATES) for (const fps of [null, 30, 60, 120, 144, 300])\n"
+        "  r[`${rate}|${fps}`] = L.maySkip(rate, fps);\n"
+        "output(r);\n",
+    )
+    for key, skip in out.items():
+        rate, fps = key.split("|")
+        rate = int(rate)
+        if rate <= 60 or fps == "null":
+            assert skip is False, key  # at 60 and below every volume is painted, on any machine
+        else:
+            assert skip is (rate > 1.1 * float(fps)), key
+
+
+def advance_js(rate: int, frame_ms: float, skip: bool, seconds: float = 2.0) -> str:
+    return (
+        f"let due = 0; const steps = [];\n"
+        f"for (let now = 0; now < {seconds * 1000}; now += {frame_ms}) {{\n"
+        f"  const s = L.playbackAdvance(due, now, {rate}, {str(skip).lower()});\n"
+        "  if (s.n > 0) { steps.push(s.n); due = s.nextDue; }\n"
+        "}\noutput({ steps });\n"
+    )
+
+
+@needs_node
+@pytest.mark.parametrize("rate", [1, 12, 30, 60])
+def test_without_skipping_the_clock_paints_every_volume_one_at_a_time(
+    js_copy: Path, rate: int
+) -> None:
+    for frame in (16.7, 40.0):  # a page at 60 frames per second, and one that is slower
+        steps = run_js(js_copy, advance_js(rate, frame, False))["steps"]
+        assert set(steps) == {1}
+        if 1000 / frame >= rate:
+            assert math.isclose(len(steps), 2 * rate, abs_tol=2)
+
+
+@needs_node
+@pytest.mark.parametrize("rate", [120, 200, 300])
+def test_with_skipping_the_stream_advances_at_the_rate_asked(js_copy: Path, rate: int) -> None:
+    for frame in (16.7, 8.3, 25.0):
+        steps = run_js(js_copy, advance_js(rate, frame, True))["steps"]
+        # stream time: the volumes due by each frame, so the stream moves on at the rate
+        assert math.isclose(sum(steps), 2 * rate, abs_tol=rate * frame / 1000 + 2), (
+            frame,
+            sum(steps),
+        )
+        assert all(n >= 1 for n in steps)
+        assert len(steps) <= 2000 / frame + 1  # at most one paint per frame
+        expected = rate * frame / 1000
+        assert max(steps) <= math.ceil(expected) + 1
+
+
+@needs_node
+def test_a_clock_far_behind_starts_again_and_does_not_jump(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "output([L.playbackAdvance(0, 2000, 300, true), L.playbackAdvance(0, 2000, 30, false),\n"
+        "        L.playbackAdvance(100, 50, 300, true), L.playbackAdvance(0, 16, 300, true)]);\n",
+    )
+    assert out[0] == {"n": 1, "nextDue": pytest.approx(2000 + 1000 / 300), "resynced": True}
+    assert out[1]["n"] == 1 and out[1]["resynced"] is True
+    assert out[2]["n"] == 0  # not due yet
+    assert out[3]["n"] == 1 + math.floor(20 / (1000 / 300))
+
+
+@needs_node
+def test_the_frame_rate_is_the_median_interval_of_the_last_second(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const t = []; for (let k = 0; k < 120; k++) t.push(k * 1000 / 60);\n"
+        "t.push(t[t.length - 1] + 200);\n"  # one long frame does not move the median
+        "output([L.frameRate(t, t[t.length - 1]), L.frameRate(t.slice(0, 5), 70),\n"
+        "        L.frameRate([], 0)]);\n",
+    )
+    assert out[0] == pytest.approx(60, rel=1e-6)
+    assert out[1] is None and out[2] is None
+
+
+@needs_node
+def test_what_is_said_beside_the_rate(js_copy: Path) -> None:
+    ratios = [1.0, 1.03, 1.2, 1.4, 1.6, 1.9, 2.0, 2.4, 3.0, 3.4, 5.0, 11.0, 21.0, 22.0, 23.0]
+    out = run_js(
+        js_copy,
+        "output({ fresh: input.map((r) => L.skipNote(r)),\n"
+        "  ord: [1, 2, 3, 4, 11, 12, 13, 21, 22, 23, 101, 111].map(L.ordinal) });\n",
+        ratios,
+    )
+    texts = [n["text"] for n in out["fresh"]]
+    assert texts == [
+        "",
+        "",
+        "80% of volumes shown",
+        "70% of volumes shown",
+        "60% of volumes shown",
+        "every 2nd volume shown",
+        "every 2nd volume shown",
+        "every 2nd volume shown",
+        "every 3rd volume shown",
+        "every 3rd volume shown",
+        "every 5th volume shown",
+        "every 11th volume shown",
+        "every 21st volume shown",
+        "every 22nd volume shown",
+        "every 23rd volume shown",
+    ]
+    assert out["ord"] == [
+        "1st", "2nd", "3rd", "4th", "11th", "12th", "13th", "21st", "22nd", "23rd", "101st", "111th"
+    ]  # fmt: skip
+    assert max(len(t) for t in texts) <= 24  # the box of the note is 24 characters wide
+
+
+@needs_node
+def test_a_ratio_near_a_rounding_boundary_keeps_its_text(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const run = (ratios) => {\n"
+        "  let prev = null;\n"
+        "  return ratios.map((r) => (prev = L.skipNote(r, prev)).text);\n"
+        "};\n"
+        "output([run([4.4, 4.6, 4.45, 4.55, 4.6]), run([4.6, 4.4, 4.6, 5.2, 5.4]),\n"
+        "        run([1.04, 1.03, 1.06, 1.03]), run([1.06, 1.03, 1.0])]);\n",
+    )
+    assert out[0] == ["every 4th volume shown"] * 5
+    assert out[1] == ["every 5th volume shown"] * 3 + ["every 5th volume shown"] * 2
+    assert out[2] == ["", "", "90% of volumes shown", "90% of volumes shown"]
+    assert out[3] == ["90% of volumes shown", "90% of volumes shown", ""]

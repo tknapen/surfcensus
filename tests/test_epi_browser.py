@@ -8,7 +8,9 @@ a brighter run, a flagged run, a session without contours. What is checked: the 
 and the voxel centres of a screenshot against the values decoded in Python with
 ``func.packread``, under intensity normalization off and on; that playing paints every volume
 of the stream once and in order at 12, 30 and 60 volumes per second through a run boundary, a
-grid change, a session boundary and the end of the stream, and nothing blank; jumps to the
+grid change, a session boundary and the end of the stream, and nothing blank; that at 120, 200
+and 300 per second the stream keeps the rate, leaves out the volumes between two paints and
+says so (D43); jumps to the
 exact volume; the slices after a grid change by the nearest-mm rule; the contours of the grid
 on screen; the memory limit; the warnings; what the page says about the run on screen; the
 page at 1400 and 400 px; no request to another host and an empty console."""
@@ -16,6 +18,8 @@ page at 1400 and 400 px; no request to another host and an empty console."""
 from __future__ import annotations
 
 import io
+import itertools
+import re
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -342,6 +346,85 @@ def test_playing_paints_every_volume_once_in_order_through_every_boundary(
     assert len(boxes) == 3
 
 
+def play_for(page: Page, start: int, rate: int, seconds: float) -> list[dict[str, Any]]:
+    """Play from ``start`` at ``rate`` for ``seconds`` and return what was painted."""
+    page.set({"g": start, "rate": rate})
+    page.js("window.__epi.page.log.length = 0")
+    page.set({"playing": True})
+    page.page.wait_for_timeout(int(seconds * 1000))
+    page.set({"playing": False})
+    return [e for e in page.js("window.__epi.page.log") if e["reason"] == "play"]
+
+
+NOTE = re.compile(r"^(every \d+(st|nd|rd|th) volume shown|\d0% of volumes shown)$")
+
+
+@pytest.mark.parametrize("rate", [120, 200, 300])
+def test_above_the_refresh_rate_the_stream_keeps_the_rate_and_says_what_it_leaves_out(
+    page: Page, packed: PackedStream, rate: int
+) -> None:
+    """D43: above the frame rate the page achieves, the volume that is due is painted and the
+    ones in between are not; none out of order, none twice, none blank, no stall at a run, grid
+    or session boundary, the stream at the rate asked, and the page says so beside the rate
+    without anything moving."""
+    segs = segments(packed)
+    total = sum(s["n"] for s in segs)
+    page.set({"view": "side", "normalized": False, "g": 0})
+    held0 = held_rects(page)
+    assert page.js("document.getElementById('rate-note').textContent") == ""
+    stalls = page.js("window.__epi.page.stalls + window.__epi.page.holds")
+    log = play_for(page, 0, rate, 3.5)
+    fps = page.js("window.__epi.page.fps")
+    gs = [e["g"] for e in log]
+    # in order: strictly increasing within a loop, and a loop starts again at the first volume
+    for a, b in itertools.pairwise(gs):
+        assert b > a or b == 0, (a, b)
+    assert gs.count(0) >= 2, "the stream did not loop"
+    assert all(e["nz"] > 0 for e in log), "a blank frame was painted"
+    assert page.js("window.__epi.page.stalls + window.__epi.page.holds") == stalls
+    # every run of every session and grid was on screen in every full loop
+    loops: list[list[int]] = [[]]
+    for g in gs:
+        if g == 0 and loops[-1]:
+            loops.append([])
+        loops[-1].append(g)
+    for loop in loops[1:-1]:
+        assert {segs.index(segment_of(segs, g)) for g in loop} == set(range(len(segs)))
+    # volumes were left out, at most one paint per frame, and the stream kept the rate: the
+    # tolerance of 10 per cent holds on a shared machine under load (measured: within 2)
+    assert max(e["n"] for e in log) > 1
+    span = (log[-1]["ms"] - log[0]["ms"]) / 1000
+    stream_rate = sum(e["n"] for e in log[1:]) / span
+    painted = (len(log) - 1) / span
+    assert stream_rate == pytest.approx(rate, rel=0.10), stream_rate
+    assert painted <= fps * 1.15, (painted, fps)
+    # what the page says, in a box that keeps its place and size
+    page.set({"g": 0, "rate": rate})
+    page.set({"playing": True})
+    page.page.wait_for_function(
+        "() => document.getElementById('rate-note').textContent !== ''", timeout=5000
+    )
+    note = page.js("document.getElementById('rate-note').textContent")
+    assert NOTE.match(note), note
+    assert moved(held0, held_rects(page)) == {}
+    page.set({"playing": False})
+    page.page.wait_for_function(
+        "() => document.getElementById('rate-note').textContent === ''", timeout=3000
+    )
+    assert total == 192
+
+
+@pytest.mark.parametrize("rate", [30, 60])
+def test_at_60_and_below_no_volume_is_left_out(page: Page, packed: PackedStream, rate: int) -> None:
+    """D43 keeps D38 at the rates of before: every volume once, in order, and nothing said."""
+    total = sum(s["n"] for s in segments(packed))
+    log = play_for(page, 100, rate, 2.5)
+    assert [e["n"] for e in log] == [1] * len(log)
+    assert [e["g"] for e in log] == [(101 + k) % total for k in range(len(log))]
+    assert page.js("window.__epi.page.skipping") is False
+    assert page.js("document.getElementById('rate-note').textContent") == ""
+
+
 def test_the_slices_on_another_grid_are_the_nearest_in_mm_and_come_back(
     page: Page, packed: PackedStream
 ) -> None:
@@ -607,6 +690,17 @@ def test_nothing_moves_at_any_boundary_of_the_stream(
         held1 = held_rects(opened)
         opened.set({"playing": False})
         assert moved(held0, held1) == {}
+        # a change of rate while playing, to one that leaves volumes out: the text beside the
+        # rate appears in its own box, and nothing moves (D43)
+        opened.set({"playing": True})
+        opened.set({"rate": 300})
+        opened.page.wait_for_function(
+            "() => document.getElementById('rate-note').textContent !== ''", timeout=5000
+        )
+        held2 = held_rects(opened)
+        opened.set({"playing": False, "rate": 2})
+        assert moved(held0, held2) == {}
+        assert moved(held0, held_rects(opened)) == {}
     finally:
         opened.clean()
 

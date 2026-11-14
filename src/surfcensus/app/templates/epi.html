@@ -25,6 +25,7 @@
   <section id="timeline" aria-label="the stream of every run, session after session">
     <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
     <label class="epi-rate">rate <select id="rate" aria-label="volumes per second"></select>/s</label>
+    <span id="rate-note" class="epi-rate-note" aria-live="off"></span>
     <div id="track">
       <div id="segments" role="group" aria-label="the runs of the stream; each jumps to its first volume"></div>
       <input id="time" type="range" min="0" max="0" step="1" value="0" aria-label="volume of the stream">
@@ -64,6 +65,9 @@
   <section id="about" aria-label="what the two streams are">
     {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if poll_idle_s is defined and poll_idle_s %} <span id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
     <p id="reading"></p>
+    <p id="rate-limit">Above 60 volumes per second, faster than most displays refresh, not every volume is put on
+      screen (beside the rate it says which share is), and an artefact in a single volume can be missed. At 60 or
+      slower, and stepping with the arrow keys, every volume is shown.</p>
   </section>
 
   <div id="notice" hidden role="alertdialog" aria-labelledby="notice-text">
@@ -115,16 +119,21 @@
       <p><b>Markers.</b> A volume whose framewise displacement exceeds the threshold has a band in the traces, and the
         frame carries a red marker that stays for at least <span id="help-hold"></span> ms. Volumes that the confounds
         table marks as non-steady-state have an amber band and marker.</p>
-      <p><b>Playing</b> paints every volume; when the computer is slower than the rate, playing takes longer and
-        nothing is skipped. The stream is held in memory in pieces around the current volume, up to
-        <span id="help-memory"></span> for the whole stream.</p>
+      <p><b>Playing</b> at up to 60 volumes per second paints every volume, once and in order; when the computer is
+        slower than the rate, playing takes longer and nothing is skipped. At 120, 200 and 300 per second the stream
+        moves on at the rate asked, faster than most displays refresh (60 times a second, some 120 or 144): the
+        volumes that fall between two pictures are not put on screen, none is shown out of order or twice, and the
+        text beside the rate says which share is shown (for example <i>every 5th volume shown</i>). <b>An artefact in a
+        single volume can be missed at these rates.</b> To see every volume, play at 60 or slower, or step with the
+        arrow keys. When a piece of the stream is not loaded yet, playing waits for it at any rate. The stream is held
+        in memory in pieces around the current volume, up to <span id="help-memory"></span> for the whole stream.</p>
       <table>
         <tr><th>Key</th><th>Action</th></tr>
         <tr><td><kbd>Space</kbd></td><td>play, pause</td></tr>
         <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous, next volume of the stream (pauses)</td></tr>
         <tr><td><kbd>Shift</kbd> + <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>10 volumes</td></tr>
         <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first, last volume of the stream</td></tr>
-        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>slower, faster (1 to 60 volumes per second)</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>slower, faster (1 to 300 volumes per second; above 60, not every volume is shown)</td></tr>
         <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd></td><td>next, previous slice of the active plane; with <kbd>Shift</kbd>, 5 slices</td></tr>
         <tr><td><kbd>p</kbd></td><td>next plane becomes the active one; the mouse wheel over a panel scrubs its slices</td></tr>
         <tr><td>click, drag</td><td>in a panel: the other two planes go to that point; in the traces: go to that volume</td></tr>

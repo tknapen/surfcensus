@@ -26,7 +26,10 @@ import {
   movePlace,
   PLANES,
   planeSize,
-  playbackStep,
+  frameRate,
+  maySkip,
+  playbackAdvance,
+  skipNote,
   pointOf,
   RATES,
   signalOf,
@@ -78,6 +81,9 @@ let nextDue = 0;
 let seek = null;
 let lastFlip = 'pre';
 let stalled = false;
+const frameTimes = []; // the animation frames of the last second or so, for the frame rate
+let note = null; // what is said beside the rate (logic.skipNote), and when it was said
+let noteAt = -Infinity;
 let segOnScreen = -1;
 let allGrids = [];
 let errorShown = null; // the error the status line says, until a later load succeeds
@@ -92,8 +98,11 @@ const page = {
   markerLog: [],
   timing: { opened: T_OPEN, stream: null, firstFrame: null, contours: null, allLoaded: null },
   lastSeek: null,
-  stalls: 0,
+  stalls: 0, // the clock waited: the next volume was not loaded, nothing was painted
+  holds: 0, // the clock waited after painting a loaded volume short of the one that was due
   resyncs: 0,
+  fps: null, // the frame rate the page achieves (logic.frameRate)
+  skipping: false, // whether playing may leave volumes unpainted now (logic.maySkip)
   errors: [],
   requests: 0,
   fetchedBytes: 0,
@@ -196,7 +205,7 @@ function enterSegment(k) {
   writeLegend();
 }
 
-function render(reason = 'other') {
+function render(reason = 'other', advanced = 0) {
   const k = segOf(state.g);
   enterSegment(k);
   const streams = streamsOf(state.view);
@@ -242,7 +251,8 @@ function render(reason = 'other') {
   const now = performance.now();
   shown = { g: state.g, seg: k, grid: grid.grid_key, kind: state.kind, view: state.view, slices: state.slices.slice(), normalized: state.normalized, key: stateKey(state) };
   if (state.kind === 'series') {
-    page.log.push({ ms: now, g: state.g, seg: k, grid: grid.grid_key, view: state.view, reason, nz, slices: state.slices.slice() });
+    // n: how many volumes the stream moved on to this one (1 when none was left out)
+    page.log.push({ ms: now, g: state.g, n: advanced, seg: k, grid: grid.grid_key, view: state.view, reason, nz, slices: state.slices.slice() });
     if (page.log.length > 40000) page.log.splice(0, 20000);
     if (page.timing.firstFrame === null) page.timing.firstFrame = now;
     if (seek && seek.g === state.g) {
@@ -550,10 +560,16 @@ function writeLegend() {
   $('legend').dataset.normalized = String(state.normalized);
 }
 
+// Over the last two seconds of playing: volumes painted per second, and volumes the stream
+// advanced per second (stream time per wall time; the same when no volume is left out).
 function measuredRate() {
   const now = performance.now();
   const recent = page.log.filter((e) => e.reason === 'play' && now - e.ms < 2000);
-  return recent.length > 1 ? ((recent.length - 1) * 1000) / (recent[recent.length - 1].ms - recent[0].ms) : null;
+  if (recent.length < 2) return null;
+  const span = (recent[recent.length - 1].ms - recent[0].ms) / 1000;
+  if (!(span > 0)) return null;
+  const advanced = recent.slice(1).reduce((a, e) => a + e.n, 0);
+  return { painted: (recent.length - 1) / span, stream: advanced / span };
 }
 
 function writeStatus(vols, k) {
@@ -570,7 +586,8 @@ function writeStatus(vols, k) {
   }
   if (state.playing) {
     const rate = measuredRate();
-    parts.push(`${state.rate} volumes per s asked${rate ? `, ${rate.toFixed(1)} painted` : ''}`);
+    const played = rate && Math.abs(rate.stream - rate.painted) > 0.05 * rate.painted ? `, ${rate.stream.toFixed(0)} played` : '';
+    parts.push(`${state.rate} volumes per s asked${rate ? `${played}, ${rate.painted.toFixed(1)} painted` : ''}`);
   }
   const s = store.stats();
   parts.push(`${formatBytes(s.decodedChunkBytes + s.stillBytes)} decoded in memory (chunks limited to ${formatBytes(s.limitBytes)})`);
@@ -799,7 +816,39 @@ function setPlaying(on) {
 function setRate(rate) {
   state.rate = rate;
   nextDue = performance.now();
+  writeNote(performance.now(), true);
   writeControls();
+}
+
+// The volumes the stream advanced per volume painted over the last second of playing.
+function skipRatio(now) {
+  let painted = 0;
+  let advanced = 0;
+  for (let k = page.log.length - 1; k >= 0; k--) {
+    const e = page.log[k];
+    if (now - e.ms > 1000) break;
+    if (e.reason !== 'play') continue;
+    painted += 1;
+    advanced += e.n;
+  }
+  return painted >= 3 ? advanced / painted : 1;
+}
+
+// Beside the rate: whether volumes are left out on screen, said at most once a second so that
+// it does not change at every frame; the box keeps its size whatever it holds.
+function writeNote(now, reset = false) {
+  if (reset) {
+    note = null;
+    noteAt = now;
+  } else if (now - noteAt < 1000) return;
+  else {
+    noteAt = now;
+    note = state.playing && page.skipping ? skipNote(skipRatio(now), note) : null;
+  }
+  const text = note ? note.text : '';
+  const el = $('rate-note');
+  if (el.textContent !== text) el.textContent = text;
+  el.title = text ? `${text}: above the refresh rate of the display not every volume can be put on screen, and an artefact in a single volume can be missed` : '';
 }
 
 function setDiffScale(scale) {
@@ -835,16 +884,33 @@ function helpStops() {
 
 function tick(now) {
   if (store.stopped) state.playing = false;
+  frameTimes.push(now);
+  while (frameTimes.length && now - frameTimes[0] > 1000) frameTimes.shift();
+  page.fps = frameRate(frameTimes, now);
+  page.skipping = maySkip(state.rate, page.fps);
   if (state.playing && state.kind === 'series' && !state.help) {
-    const step = playbackStep(nextDue, now, state.rate);
-    if (step.advance) {
+    const step = playbackAdvance(nextDue, now, state.rate, page.skipping);
+    if (step.n > 0) {
       const next = wrap(state.g + 1, timeline.total);
-      if (readyFor(next)) {
-        state.g = next;
-        nextDue = step.nextDue;
+      // the volume that is due; past the end of the stream the loop starts again at the
+      // first volume, and the volumes before the end that fall between two paints are not painted
+      let ahead = Math.min(step.n, timeline.total - 1);
+      if (state.g + ahead >= timeline.total) ahead = timeline.total - state.g;
+      let target = wrap(state.g + ahead, timeline.total);
+      let held = false;
+      if (ahead > 1 && !readyFor(target)) {
+        // the one due is not loaded: the latest loaded volume before it, and the clock waits there
+        held = true;
+        while (ahead > 1 && !readyFor(target)) target = wrap(state.g + --ahead, timeline.total);
+      }
+      if (readyFor(target)) {
+        state.g = target;
+        // at the end of the stream the volumes that were due past it are not carried over
+        nextDue = held ? now + 1000 / state.rate : step.nextDue - ((step.n - ahead) * 1000) / state.rate;
+        if (held) page.holds += 1;
         if (step.resynced) page.resyncs += 1;
         stalled = false;
-        render('play');
+        render('play', ahead);
       } else {
         // the next volume is not loaded: wait for it and do not skip it
         if (!stalled) {
@@ -858,6 +924,7 @@ function tick(now) {
     }
   }
   if (marker.fd || marker.ns) showMarker(now);
+  writeNote(now, !state.playing && note !== null);
   if (page.timing.allLoaded === null && page.timing.firstFrame !== null && store.idle() && [...contoursOf.values()].every((c) => c === null || c.every((x) => x !== null))) {
     page.timing.allLoaded = now;
     writeStatus();

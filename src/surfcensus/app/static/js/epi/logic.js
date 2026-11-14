@@ -20,7 +20,14 @@ export const STREAMS = ['raw', 'pre'];
 export const STILLS = ['ref', 'mean', 'sd'];
 export const VIEWS = ['raw', 'pre', 'side', 'diff'];
 export const KINDS = ['series', 'mean', 'sd'];
-export const RATES = [1, 2, 5, 12, 24, 30, 60];
+export const RATES = [1, 2, 5, 12, 24, 30, 60, 120, 200, 300];
+// At this rate and below, playing paints every volume once, in order, whatever the machine:
+// when frames come late, playing takes longer (D38). Above it, and only when the rate is above
+// the frame rate the page achieves, the volumes that fall between two paints are not painted
+// (D43): a display refreshes 60 times a second (some 120 or 144), so it cannot show more.
+export const PAINT_EVERY_MAX = 60;
+// The rate counts as above the frame rate the page achieves when it exceeds it by this factor.
+export const SKIP_MARGIN = 1.1;
 export const DIFF_SCALES = [8, 16, 32, 64, 128];
 export const HOLD_MS = 500; // a marker stays on the frame at least this long
 
@@ -391,14 +398,78 @@ export function desiredChunks({ sizes, cursor, streams, limitBytes }) {
 // 1000 / rate later, so every volume is painted and none is skipped: when frames come late,
 // playing takes longer. If the clock has fallen more than resyncMs behind, it starts anew.
 export function playbackStep(nextDue, now, rate, slackMs = 4, resyncMs = 250) {
-  if (now + slackMs < nextDue) return { advance: false, nextDue, resynced: false };
-  let due = nextDue + 1000 / rate;
+  const s = playbackAdvance(nextDue, now, rate, false, slackMs, resyncMs);
+  return { advance: s.n > 0, nextDue: s.nextDue, resynced: s.resynced };
+}
+
+// The clock in stream time (D43). Volume g + 1 is due at nextDue (ms), volume g + k at nextDue
+// + (k - 1) * 1000 / rate. At an animation frame at `now`, `n` is how many volumes the stream
+// moves on: 0 when the next is not due yet; without skipping 1 (playbackStep: every volume is
+// painted and playing takes longer when frames come late); with skipping every volume that is
+// due by now, so that the stream advances at the rate asked and the volumes in between are not
+// painted. A clock more than resyncMs behind starts anew from the next volume (a tab that was
+// hidden, a long pause of the machine) and does not jump ahead.
+export function playbackAdvance(nextDue, now, rate, skip, slackMs = 4, resyncMs = 250) {
+  if (now + slackMs < nextDue) return { n: 0, nextDue, resynced: false };
+  const step = 1000 / rate;
+  if (now - nextDue > resyncMs) return { n: 1, nextDue: now + step, resynced: true };
+  const n = skip ? 1 + Math.floor((now + slackMs - nextDue) / step) : 1;
+  let due = nextDue + n * step;
   let resynced = false;
   if (now - due > resyncMs) {
-    due = now + 1000 / rate;
+    due = now + step;
     resynced = true;
   }
-  return { advance: true, nextDue: due, resynced };
+  return { n, nextDue: due, resynced };
+}
+
+// Whether playing at `rate` may leave volumes unpainted: only above PAINT_EVERY_MAX, and only
+// when the rate is above the frame rate the page achieves (fps, null while not measured).
+export function maySkip(rate, fps) {
+  return rate > PAINT_EVERY_MAX && fps !== null && rate > fps * SKIP_MARGIN;
+}
+
+// The frame rate the page achieves: 1000 over the median interval between the animation
+// frames of the last second (times in ms, ascending), or null with fewer than 10 of them.
+export function frameRate(times, now, windowMs = 1000) {
+  const recent = times.filter((t) => now - t <= windowMs);
+  if (recent.length < 10) return null;
+  const gaps = [];
+  for (let k = 1; k < recent.length; k++) gaps.push(recent[k] - recent[k - 1]);
+  gaps.sort((a, b) => a - b);
+  const mid = gaps.length >> 1;
+  const median = gaps.length % 2 ? gaps[mid] : (gaps[mid - 1] + gaps[mid]) / 2;
+  return median > 0 ? 1000 / median : null;
+}
+
+export function ordinal(n) {
+  const tens = n % 100;
+  if (tens >= 11 && tens <= 13) return `${n}th`;
+  return `${n}${{ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'}`;
+}
+
+// What the page says beside the rate while playing skips volumes. ratio: volumes the stream
+// advanced per volume painted over about the last second (1 when every volume is painted).
+// prev: what this returned last time, so that a ratio near a rounding boundary keeps its text
+// instead of switching at every update. Returns { kind ('' | 'share' | 'every'), value, text }.
+//   ratio below 1.05: nothing is said; below 1.75: the share shown, to 10 per cent; else
+//   every Nth volume shown, N rounded.
+export function skipNote(ratio, prev = null) {
+  const none = { kind: '', value: 0, text: '' };
+  if (!(ratio >= 1.05)) {
+    if (prev && prev.kind && ratio >= 1.02) return prev; // hysteresis at the lower end
+    return none;
+  }
+  if (ratio < 1.75) {
+    const value = clamp(Math.round(100 / ratio / 10) * 10, 10, 90);
+    if (prev && prev.kind === 'share' && Math.abs(100 / ratio - prev.value) < 8) return prev;
+    if (prev && prev.kind === 'every' && prev.value === 2 && ratio > 1.65) return prev;
+    return { kind: 'share', value, text: `${value}% of volumes shown` };
+  }
+  const value = Math.round(ratio);
+  if (prev && prev.kind === 'every' && Math.abs(ratio - prev.value) < 0.7) return prev;
+  if (prev && prev.kind === 'share' && ratio < 1.85) return prev;
+  return { kind: 'every', value, text: `every ${ordinal(value)} volume shown` };
 }
 
 export function stepRate(rate, direction) {
