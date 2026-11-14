@@ -249,14 +249,14 @@ export function panelSizesMm(shape, voxel) {
 // How to lay out nGroups groups of three panels in a box of availW x availH px: the panels of a
 // group in a row or a column, the groups beside or under each other, whichever gives the largest
 // scale (px per mm). gap is the space between panels and between groups, head the height of a
-// group's heading.
-export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22) {
+// group's heading, frame the width of the frame round a group (both sides together).
+export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4) {
   let best = null;
   for (const panels of ['row', 'column']) {
     const gw = panels === 'row' ? sizes.reduce((a, s) => a + s[0], 0) : Math.max(...sizes.map((s) => s[0]));
     const gh = panels === 'row' ? Math.max(...sizes.map((s) => s[1])) : sizes.reduce((a, s) => a + s[1], 0);
-    const gapsW = panels === 'row' ? 2 * gap : 0;
-    const gapsH = (panels === 'row' ? 0 : 2 * gap) + head;
+    const gapsW = (panels === 'row' ? 2 * gap : 0) + frame;
+    const gapsH = (panels === 'row' ? 0 : 2 * gap) + head + frame;
     for (const groups of nGroups > 1 ? ['row', 'column'] : ['row']) {
       const nw = groups === 'row' ? nGroups : 1;
       const nh = groups === 'row' ? 1 : nGroups;
@@ -266,7 +266,7 @@ export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22) {
       if (!best || scale > best.scale) best = { scale, panels, groups };
     }
   }
-  best.scale = clamp(best.scale, 0.35, 8);
+  best.scale = clamp(best.scale, 0.1, 8);
   return best;
 }
 

@@ -838,3 +838,47 @@ def test_review_from_inside_a_dataset_that_has_no_place_beside_it_asks_for_a_run
     assert result.exit_code == 0, result.output
     assert f"Run directory: {tmp_path / 'work' / 'surfcensus-run'} (new)" in result.output
     assert snapshot_tree(dataset) == inside
+
+
+def test_a_run_of_the_subjects_directory_follows_to_the_dataset_root_within_one_pipeline(
+    tmp_path: Path,
+) -> None:
+    """The subjects directory named itself is a source of its own. Its run is taken over
+    to the dataset root with --relocate when both are read as one pipeline, and refused
+    when they are not, since the subjects would get other identifiers (decision D21)."""
+    plain = write_bids_dataset(tmp_path / "plain", LABELS)
+    write_tree(plain / "derivatives", "bids_derivatives", LABELS)
+    run_dir = tmp_path / "run"
+    subjects_dir = plain.resolve() / "derivatives" / "freesurfer"
+    assert cli("inventory", "--run-dir", run_dir, "--source", subjects_dir).exit_code == 0
+    name, one = pseudonym(run_dir), uid(run_dir, "sub-01")
+    refused = cli("inventory", "--run-dir", run_dir, "--source", plain)
+    assert refused.exit_code == 2
+    assert refused.output.startswith(f"other root: this run directory belongs to {subjects_dir}; ")
+    moved = cli("inventory", "--run-dir", run_dir, "--source", plain, "--relocate")
+    assert moved.exit_code == 0, moved.output
+    assert lines(moved)[0] == (
+        f"{name}: FreeSurfer subjects found in derivatives/freesurfer (BIDS derivatives layout)"
+    )
+    assert "inventory: 0 done, 3 skipped, 0 failed" in moved.output
+    source = load_config(run_dir).sources[0]
+    assert (source.root, source.identity) == (
+        str(plain.resolve() / "derivatives"),
+        str(subjects_dir),
+    )
+    assert pseudonym(run_dir) == name and uid(run_dir, "sub-01") == one
+
+    # beside an fmriprep/ folder the dataset root is the older fMRIPrep layout: another
+    # pipeline than the subjects directory alone
+    legacy = write_bids_dataset(tmp_path / "legacy", LABELS)
+    write_tree(legacy / "derivatives", "fmriprep_legacy", LABELS)
+    other = tmp_path / "other"
+    inner = legacy / "derivatives" / "freesurfer"
+    assert cli("inventory", "--run-dir", other, "--source", inner).exit_code == 0
+    refused = cli("inventory", "--run-dir", other, "--source", legacy, "--relocate")
+    assert refused.exit_code == 2
+    assert refused.output == (
+        "invalid: the run holds a local dataset of pipeline freesurfer; what was found at "
+        "the new place is local, fmriprep, and its subjects would get other identifiers\n"
+    )
+    assert load_config(other).sources[0].root == str(inner.resolve())

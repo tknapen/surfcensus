@@ -690,6 +690,26 @@ def part_markers(check, page, manifest):
         check.note("markers: no volume of this pack is above the threshold; nothing to measure")
         check.results["markers"] = None
         return
+    # paused on a marked volume: every group carries the marker, also after the view changes,
+    # and it leaves after the stated time once another volume is on screen
+    carried = (
+        "Array.from(document.querySelectorAll('.group'), (g) => g.classList.contains('marker-fd'))"
+    )
+    change = {"run": run, "t": above[0], "view": "raw", "kind": "series"}
+    page.evaluate("(c) => window.__player.set(c)", change)
+    one = page.evaluate(carried)
+    page.evaluate("window.__player.set({ view: 'side' })")
+    two = page.evaluate(carried)
+    marked = {*above, *entry["non_steady"]}
+    quiet = next(t for t in range(entry["n_volumes"]) if t not in marked)
+    page.evaluate("(t) => window.__player.set({ t })", quiet)
+    time.sleep(hold / 1000 + 0.25)
+    gone = page.evaluate(carried)
+    check.expect(
+        one == [True] and two == [True, True] and gone == [False, False],
+        "markers: a marked volume carries the marker in every group, also after a change of"
+        " view, and the marker leaves once another volume is on screen",
+    )
     page.evaluate(
         "(c) => window.__player.set(c)",
         {"run": run, "t": 0, "view": "raw", "kind": "series", "rate": 60},

@@ -14,6 +14,7 @@ export class Views {
     this.handlers = handlers;
     this.groups = new Map(); // key -> { element, heading, badge, panels: [{ box, gray, over, image }] }
     this.scale = 2;
+    this.markerState = ['', ''];
   }
 
   // keys: the groups to show ('raw', 'pre', 'diff'); labels: key -> heading text
@@ -24,6 +25,7 @@ export class Views {
       this.groups.clear();
       for (const key of keys) this.groups.set(key, this.makeGroup(key));
       this.layout();
+      this.marker(...this.markerState); // the new groups carry the marker that is up
     }
     for (const key of keys) this.groups.get(key).heading.textContent = labels[key];
   }
@@ -172,6 +174,7 @@ export class Views {
 
   // The marker on the frame: text in the heading of every group and a coloured frame.
   marker(kind, text) {
+    this.markerState = [kind, text];
     for (const group of this.groups.values()) {
       group.element.classList.toggle('marker-fd', kind === 'fd');
       group.element.classList.toggle('marker-ns', kind === 'ns');

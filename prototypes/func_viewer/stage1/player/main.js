@@ -19,7 +19,7 @@ import {
   VIEWS,
   wrap,
 } from './logic.js';
-import { DEFAULT_LIMIT_MB, inflate, Store } from './store.js';
+import { DEFAULT_LIMIT_MB, inflate, sha256Hex, Store } from './store.js';
 import { Traces } from './traces.js';
 import { Views } from './views.js';
 
@@ -84,11 +84,11 @@ function stateKey(s) {
 // ---- painting ------------------------------------------------------------------------------
 
 function groupLabels() {
-  const what = { series: '', mean: 'temporal mean of ', sd: 'temporal SD of ' }[state.kind];
+  const what = { series: '', mean: 'temporal mean: ', sd: 'temporal SD: ' }[state.kind];
   return {
-    raw: `${what}raw: one registration per session, nothing corrected`,
-    pre: `${what}preprocessed (fMRIPrep, as stored)`,
-    diff: `${what ? `${what.replace(' of ', '')}: ` : ''}raw minus preprocessed`,
+    raw: `${what}raw, session registration`,
+    pre: `${what}preprocessed, as stored`,
+    diff: `${what}raw minus preprocessed`,
   };
 }
 
@@ -543,12 +543,6 @@ async function fetchCounted(url) {
   return buffer;
 }
 
-async function sha256Hex(buffer) {
-  if (!crypto.subtle) return 'unversioned';
-  const digest = await crypto.subtle.digest('SHA-256', buffer);
-  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
-}
-
 function buildControls() {
   manifest.runs.forEach((r, index) => {
     const b = document.createElement('button');
@@ -628,14 +622,20 @@ function availableHeight() {
   const used = ['bar', 'run-note', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
   const warn = $('warning').hidden ? 0 : $('warning').offsetHeight;
   const tr = state.traces ? $('traces').offsetHeight : 0;
-  return window.innerHeight - used - warn - tr - 70;
+  // In a narrow window the views take most of its height and the controls are reached by
+  // scrolling; in a wide one everything fits, and the views never get less than 0.4 of it.
+  if (window.innerWidth < 700) return 0.9 * window.innerHeight;
+  return Math.max(window.innerHeight - used - warn - tr - 70, 0.4 * window.innerHeight);
 }
 
 async function loadContours() {
   if (!manifest.contours) return;
   await Promise.all(
     PLANES.map(async (name, plane) => {
-      const packed = await fetchCounted(store.url(manifest.contours.planes[name].file));
+      const entry = manifest.contours.planes[name];
+      const packed = await fetchCounted(store.url(entry.file));
+      const digest = await sha256Hex(packed);
+      if (digest && digest !== entry.sha256) throw new Error(`${entry.file}: the bytes are not those the manifest lists`);
       const data = await inflate(packed);
       contours[plane] = decodeContours(data.buffer, manifest.contours.unit);
       if (shown) drawOverlay();
@@ -648,7 +648,7 @@ async function start() {
   const text = await fetchCounted(`${PACK_URL}manifest.json`);
   manifest = JSON.parse(new TextDecoder().decode(text));
   if (manifest.format !== 'func-viewer-pack' || manifest.version !== 1) throw new Error('this is not a pack this page can read');
-  const version = (await sha256Hex(text)).slice(0, 16);
+  const version = ((await sha256Hex(text)) || 'unversioned').slice(0, 16);
   const mem = Number(params.get('mem')) || DEFAULT_LIMIT_MB;
   store = new Store(manifest, PACK_URL, version, {
     limitBytes: mem * 1024 * 1024,

@@ -128,6 +128,9 @@ input:focus-visible {
 
 .group h2 {
   margin: 0;
+  /* the heading takes the width of the panels and never widens the group */
+  width: 0;
+  min-width: 100%;
   height: 22px;
   font-size: 12px;
   font-weight: 600;
@@ -139,8 +142,15 @@ input:focus-visible {
   gap: 10px;
 }
 
+.group h2 span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+}
+
 .group .badge {
   font-weight: 700;
+  flex: none;
 }
 
 .group.marker-fd {

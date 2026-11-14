@@ -4,6 +4,12 @@ import { chunkOf, desiredChunks, STREAMS } from './logic.js';
 
 export const DEFAULT_LIMIT_MB = 512;
 
+export async function sha256Hex(buffer) {
+  if (!crypto.subtle) return null; // not a secure context: nothing can be checked
+  const digest = await crypto.subtle.digest('SHA-256', buffer);
+  return Array.from(new Uint8Array(digest), (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 export async function inflate(buffer) {
   const stream = new Blob([buffer]).stream().pipeThrough(new DecompressionStream('deflate'));
   return new Uint8Array(await new Response(stream).arrayBuffer());
@@ -47,7 +53,11 @@ export class Store {
     const packed = await response.arrayBuffer();
     this.counts.requests += 1;
     this.counts.fetchedBytes += packed.byteLength;
-    return inflate(packed);
+    const digest = await sha256Hex(packed);
+    if (digest && digest !== entry.sha256) throw new Error(`${entry.file}: the bytes are not those the manifest lists`);
+    const values = await inflate(packed);
+    if (values.length !== this.nVoxels) throw new Error(`${entry.file}: ${values.length} bytes, expected ${this.nVoxels}`);
+    return values;
   }
 
   // The reference volume and the two stills of both streams of a run; loaded once and kept.
