@@ -90,7 +90,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "pack_status": ("ctx",),
         "pack_failures": ("ctx",),
         "pack_estimate": ("ctx",),
-        "run_pack": ("ctx", "jobs", "sessions", "force", "retry_failed", "stop"),
+        "run_pack": ("ctx", "jobs", "sessions", "force", "retry_failed", "stop", "waiting"),
         "pack_session_unit": ("session_uid", "work", "epi_dir", "config", "keep"),
         "write_stream": ("ctx", "participant_uid"),
     },
@@ -125,7 +125,7 @@ METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     },
     "Run": {
         "func_inventory": ("force",),
-        "pack": ("jobs", "sessions", "force", "retry_failed", "stop"),
+        "pack": ("jobs", "sessions", "force", "retry_failed", "stop", "waiting"),
     },
 }
 

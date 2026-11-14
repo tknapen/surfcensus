@@ -232,7 +232,8 @@ def test_no_epi_makes_no_pack_and_is_stored_until_given_again(
     run = review(folder.raw_root, run_dir=run_dir, jobs=1, serve=False, epi=True)
     assert viewable(run) == 11 and pack_counts(run) == (11, 0, 0)
     run.close()
-    assert load_config(run_dir).epi.enabled  # pyrefly: ignore[missing-attribute]
+    # back at the defaults: no section (review of step 2), so the interface is on by default
+    assert load_config(run_dir).epi is None
 
 
 def test_epi_runs_selects_runs_is_stored_and_a_glob_that_matches_none_is_refused(
