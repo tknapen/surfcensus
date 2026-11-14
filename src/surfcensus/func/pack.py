@@ -19,6 +19,13 @@ of the session directory; ``session.json`` is written last of a session. So the 
 ``pack.json`` marks a complete pack and that of ``session.json`` a complete session, as
 ``render.json`` marks a render.
 
+The pack is the tool's display cache and nothing more: 8-bit values of the files that exist,
+on the grid of each preprocessed series, kept in the run directory (or the ``--out`` directory
+of ``epi-session``) so that a browser can play them, and made again from the data at any time.
+It writes no image volume, no resampled series and nothing into or beside the data, and builds
+no grid common to runs or sessions. Each run is stored under its own window and the window is
+recorded, so that the page can show the stream of a subject either way (decision D38).
+
 The preprocessed stream is the series as the pipeline wrote it, scaled per volume and
 quantised; the raw stream comes from ``func.geometry.raw_stream`` (the one placement of D36)
 and is only quantised. Nothing else is done to either.
@@ -481,7 +488,7 @@ def pack_run(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInf
                     squares[stream] += v64 * v64
                 q = quantise(vol, *window)
                 hashers[stream].update(volume_bytes(q))
-                pending[stream].append(volume_bytes(q))  # uint8: mod 256
+                pending[stream].append(volume_bytes(q - ref[stream]))  # uint8: mod 256
                 if len(pending[stream]) == k_chunk or t == n - 1:
                     flush(stream, t + 1 - len(pending[stream]))
         for stream in STREAMS:

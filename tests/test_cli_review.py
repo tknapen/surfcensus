@@ -1134,3 +1134,33 @@ def test_the_commands_are_listed_in_the_help() -> None:
     for command in ("review", "serve", "finalize", "calibration", "export"):
         assert f" {command} " in listed
     assert "freeze" in said(cli("calibration", "--help").output)
+
+
+def test_serve_review_ignores_the_signals_before_its_closing_line(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """``stopped`` (the command line's ``CommandSignals.served``) is called once the app
+    has stopped and before the closing line, so that a Ctrl-C that comes as the line is
+    printed has nothing to interrupt (review of the quick start: one came between the
+    line and the end of the call, and the command ended with 130 after its closing line)."""
+    from surfcensus import review as reviewing
+    from surfcensus.app.server import ServerHandle
+
+    order: list[str] = []
+
+    class App(reviewing.ReviewApp):
+        def stop(self) -> None:
+            order.append("app stopped")
+
+    def progress(run_dir: Path, rater: str | None) -> tuple[int, int]:
+        order.append("closing line")
+        return 0, 1
+
+    monkeypatch.setattr(reviewing, "_progress_of", progress)
+    with Run(run_dir) as run:  # a handle without a server: it is not running
+        app = App(ServerHandle(url="http://127.0.0.1:1/", port=1), run_dir, 0.0)
+        reviewing.serve_review(
+            run, app, open_browser=False, stopped=lambda: order.append("signals ignored")
+        )
+    assert order == ["app stopped", "signals ignored", "closing line"]
+    assert capsys.readouterr().err.splitlines()[-1].startswith("0 rated, 1 to go.")
