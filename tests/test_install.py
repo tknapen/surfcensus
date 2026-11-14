@@ -179,6 +179,8 @@ def test_the_wheel_holds_the_app_and_the_protocol_and_nothing_else_beside_the_co
             "epi_index.html",
             "rate.html",
             "review.html",
+            "subject.html",
+            "subjects.html",
         }
         for name in sorted(static | templates | {"surfcensus/data/protocol.yaml"}):
             assert name in names, f"{name} is not in the wheel"
