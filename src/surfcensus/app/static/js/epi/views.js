@@ -3,7 +3,8 @@
 // and a second canvas over it for the contours and the crosshair. A grid with a smaller field
 // of view sits in the middle of its box; the scale in px per mm is that of the whole stream,
 // so at a boundary nothing moves but the pictures. The orientation letters lie in a margin of
-// the box (PAD px on every side) outside the canvas, so that they cover no voxel.
+// the box above and below the canvas (PAD_Y px; the letters of the left and right edges at the
+// two ends of the upper margin), so that they cover no voxel.
 import {
   DIFF_SURFACE_COLOURS,
   diffToRgba,
@@ -17,7 +18,8 @@ import {
   voxelToPanel,
 } from './logic.js';
 
-export const PAD = 13;
+export const PAD_X = 1;
+export const PAD_Y = 13;
 const EDGES = ['left', 'right', 'top', 'bottom'];
 
 // per surface of a contour file (lh, rh white; lh, rh pial): the colour in a group's panels
@@ -145,13 +147,13 @@ export class Views {
       const innerH = Math.max(8, Math.round(this.sizes[plane][1] * this.scale));
       const cw = Math.min(innerW, Math.max(4, Math.round(mm[plane][0] * this.scale)));
       const ch = Math.min(innerH, Math.max(4, Math.round(mm[plane][1] * this.scale)));
-      panel.box.style.width = `${innerW + 2 * PAD}px`;
-      panel.box.style.height = `${innerH + 2 * PAD}px`;
+      panel.box.style.width = `${innerW + 2 * PAD_X}px`;
+      panel.box.style.height = `${innerH + 2 * PAD_Y}px`;
       for (const canvas of [panel.gray, panel.over]) {
         canvas.style.width = `${cw}px`;
         canvas.style.height = `${ch}px`;
-        canvas.style.left = `${PAD + Math.floor((innerW - cw) / 2)}px`;
-        canvas.style.top = `${PAD + Math.floor((innerH - ch) / 2)}px`;
+        canvas.style.left = `${PAD_X + Math.floor((innerW - cw) / 2)}px`;
+        canvas.style.top = `${PAD_Y + Math.floor((innerH - ch) / 2)}px`;
       }
       const ow = Math.round(cw * dpr);
       const oh = Math.round(ch * dpr);
@@ -172,7 +174,7 @@ export class Views {
     const n = this.groups.size || 1;
     const availW = this.root.clientWidth;
     const availH = Math.max(this.handlers.availableHeight(), 200);
-    const fit = fitLayout(this.sizes, n, availW, availH, 8, 22, 4, PAD);
+    const fit = fitLayout(this.sizes, n, availW, availH, 8, 22, 4, PAD_X, PAD_Y);
     this.scale = fit.scale;
     this.root.dataset.groups = fit.groups;
     for (const group of this.groups.values()) {

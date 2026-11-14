@@ -9,6 +9,7 @@ builds the inputs); the expected values are computed here.
 from __future__ import annotations
 
 import json
+import math
 import zlib
 from pathlib import Path
 
@@ -185,3 +186,16 @@ def test_the_common_scale_of_a_stream() -> None:
     shown = byte_values((0.0, 800.0))[half]
     stands = byte_values((0.0, 400.0))
     assert np.abs(shown - stands).max() <= 800.0 / 255 / 2 + 1e-9
+
+
+def test_the_common_scale_rounds_as_its_rule_is_written() -> None:
+    """Page review 9: the rule is floor(b * (hi / H) + 0.5). At an exact half the order of the
+    operations decides: with hi = 7, H = 10 and b = 45, 45 * (7 / 10) is just below 31.5 in
+    float64 and gives 31, where 45 * 7 / 10 = 31.5 exactly would give 32."""
+    from surfcensus.func.model import RULES
+
+    table = common_scale((0.0, 7.0), 10.0)
+    assert int(table[45]) == 31
+    assert math.floor(45 * (7.0 / 10.0) + 0.5) == 31 and math.floor(45 * 7.0 / 10.0 + 0.5) == 32
+    assert "floor(b * (hi / H) + 0.5)" in RULES["common_scale"]
+    assert int(common_scale((0.0, 10.0), 10.0)[45]) == 45  # the largest keeps its values

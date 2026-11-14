@@ -110,10 +110,11 @@ FUNC_SUFFIXES: Mapping[Generation, Mapping[FuncRole, tuple[str, ...]]] = {
     },
 }
 """Per generation and role of the anatomy-space layout, the candidate suffixes of a file in
-``sub-X/[ses-Y/]func/``, first match first. Which reference image arbitrates in the second
-generation is to verify (docs/epi_interface.md, What could not be verified). The series, its
-sidecar and its mask are taken in one space: the first of :data:`ANAT_SPACES` that has the
-series."""
+``sub-X/[ses-Y/]func/``, first match first; a ``.nii.gz`` suffix also matches the same name
+as ``.nii``, the compressed one first (:func:`_forms`). Which reference image arbitrates in
+the second generation is to verify (docs/epi_interface.md, What could not be verified). The
+series, its sidecar and its mask are taken in one space: the first of :data:`ANAT_SPACES`
+that has the series."""
 
 NATIVE_SUFFIXES: Mapping[FuncRole, str] = {
     FuncRole.PRE_BOLD: "_desc-preproc_bold.nii.gz",
@@ -490,6 +491,15 @@ def _rest_entities(rest: str) -> tuple[dict[str, str], str]:
     return found, parts[-1]
 
 
+def _forms(suffix: str) -> tuple[str, ...]:
+    """A suffix as it is written, and for a compressed NIfTI also its uncompressed form: of a
+    ``.nii.gz`` and a ``.nii`` of one name the first is taken, as for raw series (a derivative
+    whose copies were decompressed is read as it lies)."""
+    if suffix.endswith(".nii.gz"):
+        return (suffix, suffix[: -len(".gz")])
+    return (suffix,)
+
+
 def _variant(suffix: str) -> str:
     return suffix.lstrip("_").split(".", 1)[0]
 
@@ -589,8 +599,8 @@ class FmriprepConnector:
         if not places:
             return []
         figures, _ = _list(root / participant / "figures", root)
-        known = tuple(s for role in suffixes.values() for s in role) + tuple(
-            NATIVE_SUFFIXES.values()
+        known = tuple(f for role in suffixes.values() for s in role for f in _forms(s)) + tuple(
+            f for s in NATIVE_SUFFIXES.values() for f in _forms(s)
         )
         runs: list[DerivRun] = []
         for session, func in places:
@@ -633,7 +643,7 @@ class FmriprepConnector:
                     (
                         _space_of(s)
                         for s in suffixes.get(FuncRole.PRE_BOLD, ())
-                        if stem + s in present
+                        if any(stem + f in present for f in _forms(s))
                     ),
                     None,
                 )
@@ -642,11 +652,10 @@ class FmriprepConnector:
                     for suffix in candidates:
                         if spaced and (chosen is None or _space_of(suffix) != chosen):
                             continue
-                        if stem + suffix in present:
+                        name = next((stem + f for f in _forms(suffix) if stem + f in present), None)
+                        if name is not None:
                             variant = _variant(suffix) if len(candidates) > 1 else None
-                            refs[role] = _ref(
-                                role, func / (stem + suffix), root, files[stem + suffix], variant
-                            )
+                            refs[role] = _ref(role, func / name, root, files[name], variant)
                             break
                 for role, suffix in FIGURE_SUFFIXES.items():
                     if stem + suffix in figures:

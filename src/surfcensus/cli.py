@@ -7,7 +7,7 @@ import re
 import secrets
 import sqlite3
 import time
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -146,6 +146,9 @@ def epi_session_command(
         metavar="GLOB",
         help="Only the runs whose BIDS name matches (*task-rest*). Repeatable.",
     ),
+    force: bool = typer.Option(
+        False, "--force", help="Pack every run again, also those whose pack in --out is current."
+    ),
     serve: bool = typer.Option(False, "--serve", help="Then show the packs on 127.0.0.1."),
     port: int | None = typer.Option(
         None, "--port", min=0, max=65535, metavar="N", help="With --serve; 0: any free one."
@@ -163,10 +166,14 @@ def epi_session_command(
         raise typer.BadParameter("--port and --no-browser go with --serve")
     target = Path(out)
     start = time.perf_counter()
+    # what the line of a Ctrl-C or SIGTERM says: while packing, that the packs that are done
+    # stay (an earlier complete output in --out stays whole and servable); once the packs are
+    # complete, only that the page was stopped
+    stopped = [
+        "packing was stopped; the packs that are done stay, and the next call makes the rest"
+    ]
     with _stops_with_exit_2():
-        with _stops_at_signals(
-            "the packs are not complete, and the next call makes them"
-        ) as signals:
+        with _stops_at_signals(lambda: stopped[0]) as signals:
             stream = epi_subject(
                 path,
                 subject,
@@ -175,7 +182,9 @@ def epi_session_command(
                 raw=raw,
                 runs=epi_runs or None,
                 progress=lambda line: typer.echo(line, err=True),
+                force=force,
             )
+            stopped[0] = f"the EPI page was stopped; the packs are complete in {target}"
             packed, listed = _packed_runs(target, stream.sessions)
             if packed == 0:
                 typer.echo(
@@ -200,16 +209,18 @@ def epi_session_command(
 
 
 def _packed_runs(out: Path, sessions: Sequence[str]) -> tuple[int, int]:
-    """The packed runs and all listed runs of the sessions of ``out/stream.json``."""
+    """The packed runs and the listed runs of the sessions of ``out/stream.json``, without
+    the runs that ``--epi-runs`` left out (``not selected``)."""
     from surfcensus.func import SESSION_JSON
     from surfcensus.func.model import SessionInfo, read_info
+    from surfcensus.records import NOT_SELECTED
 
     packed = listed = 0
     for sid in sessions:
         info = read_info(out / sid / SESSION_JSON, SessionInfo)
         if info is None:
             continue
-        listed += len(info.runs)
+        listed += sum(1 for run in info.runs if run.reason != NOT_SELECTED)
         packed += sum(1 for run in info.runs if run.reason is None)
     return packed, listed
 
@@ -218,7 +229,9 @@ _RECORDED_STAYS = "what was recorded stays, and the next call goes on"
 
 
 @contextmanager
-def _stops_at_signals(what: str = _RECORDED_STAYS) -> Iterator[CommandSignals]:
+def _stops_at_signals(
+    what: str | Callable[[], str] = _RECORDED_STAYS,
+) -> Iterator[CommandSignals]:
     """SIGTERM and Ctrl-C of a command (``stopping.command_signals``).
 
     While the command works, a SIGTERM ends it as Ctrl-C does, through
@@ -232,7 +245,7 @@ def _stops_at_signals(what: str = _RECORDED_STAYS) -> Iterator[CommandSignals]:
 
     def said(signals: CommandSignals) -> None:
         word = "terminated" if signals.exit_code() == TERMINATED else "interrupted"
-        typer.echo(f"{word}; {what}", err=True)
+        typer.echo(f"{word}; {what() if callable(what) else what}", err=True)
 
     with command_signals(said) as signals:
         yield signals

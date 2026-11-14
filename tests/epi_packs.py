@@ -21,7 +21,10 @@ The stream (decision D38) is two sessions of one subject:
   the real frame check; its raw affine is recorded as unchecked and its report says
   distortion correction was applied.
 * session B, ``sub-01 ses-2``: its three runs, packed without contours (no FreeSurfer
-  subject), and a fourth listed with the reason ``no raw series`` and not packed.
+  subject), and a fourth listed with the reason ``no raw series`` and not packed. Its second
+  run has :data:`OFFSET` added to every value of both series, which raises its value window
+  and leaves its temporal SD as it is, so that with normalization off its value table and its
+  SD table differ (a mean still drawn through the SD table shows).
 
 Chunks are made small (``chunk_bytes`` of :data:`CHUNK_VOLUMES` volumes of the 8 mm grid), so
 every run has several, and a memory limit of 1 MiB evicts.
@@ -78,6 +81,8 @@ CHUNK_VOLUMES = 4
 """Volumes per chunk on the 8 mm grid (4,284 voxels)."""
 BRIGHTER = 1.6
 """The gain of the brighter run."""
+OFFSET = 300.0
+"""Added to both series of the second run of session B."""
 GRID_C_SHAPE = (19, 20, 16)
 GRID_C_CENTRE = (2.0, -21.0, 17.0)
 GRID_C_VOXEL = 7.0
@@ -172,9 +177,9 @@ def _write_series(
     nib.save(img, path)
 
 
-def _scaled_copy(source: Path, target: Path, gain: float) -> None:
+def _scaled_copy(source: Path, target: Path, gain: float, offset: float = 0.0) -> None:
     img = nib.load(str(source))
-    data = np.asarray(img.dataobj, dtype=np.float32) * np.float32(gain)
+    data = np.asarray(img.dataobj, dtype=np.float32) * np.float32(gain) + np.float32(offset)
     copy = nib.Nifti1Image(data, img.affine, img.header)
     target.parent.mkdir(parents=True, exist_ok=True)
     nib.save(copy, target)
@@ -346,10 +351,16 @@ def make_stream(root: Path, *, n_volumes: int = 24) -> PackedStream:
     inputs = []
     frame_inputs = {}
     grid_of = {}
-    for src in b_runs:
+    for k, src in enumerate(b_runs):
         rid = run_id(src.stem)
         items.append((rid, src.name, src, None))
-        inputs.append(_input(rid, src, anchor_b, anchor_b_id, grid_a, {}))
+        shifted: dict[FuncRole, Path] = {}
+        if k == 1:
+            for role in (FuncRole.RAW_BOLD, FuncRole.PRE_BOLD):
+                target = extra / "offset" / Path(src.files[role.value]).name
+                _scaled_copy(src.files[role.value], target, 1.0, OFFSET)
+                shifted[role] = target
+        inputs.append(_input(rid, src, anchor_b, anchor_b_id, grid_a, shifted))
         frame_inputs[rid] = (src, src.files["pre_mask"], grid_a)
         grid_of[rid] = grid_a.key
         packed.append(PackedRun(rid, bid, src, grid_a))

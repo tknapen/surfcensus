@@ -198,3 +198,120 @@ def _first_chunk(shape: object) -> str:
             if run.get("pack"):
                 return session["media_url"] + run["pack"]["streams"]["raw"]["chunks"][0]["file"]
     raise AssertionError("no packed run in the shape")
+
+
+def test_ctrl_c_while_the_page_is_served_says_the_packs_are_complete(
+    dataset: SyntheticFuncDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, terminal: str
+) -> None:
+    """Page review 6: once the packs are complete, a Ctrl-C (or a SIGTERM that is taken as
+    one) while the page is served says that the page was stopped, not that the packs are not
+    complete."""
+    import surfcensus.app.epi as epi
+
+    def interrupted(out_dir: Path, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(epi, "serve_packs", interrupted)
+    out = tmp_path / "packs"
+    result = invoke(dataset.raw_root, "--subject", "02", "--out", out, "--serve", "--no-browser")
+    assert result.exit_code == 130, result.output  # pyrefly: ignore[missing-attribute]
+    text = said(result.output)  # pyrefly: ignore[missing-attribute]
+    assert f"interrupted; the EPI page was stopped; the packs are complete in {out}" in text
+    assert "not complete" not in text
+
+
+def test_a_second_call_keeps_the_packs_and_force_packs_again(
+    dataset: SyntheticFuncDataset, tmp_path: Path
+) -> None:
+    out = tmp_path / "packs"
+    assert invoke(dataset.raw_root, "--subject", "02", "--out", out).exit_code == 0  # pyrefly: ignore[missing-attribute]
+    result = invoke(dataset.raw_root, "--subject", "02", "--out", out)
+    text = result.output  # pyrefly: ignore[missing-attribute]
+    assert (
+        result.exit_code == 0 and "EPI packs: 0 runs to pack, 4 kept from an earlier call" in text
+    )  # pyrefly: ignore[missing-attribute]
+    assert text.count("kept (its pack is current)") == 4
+    result = invoke(dataset.raw_root, "--subject", "02", "--out", out, "--force")
+    text = result.output  # pyrefly: ignore[missing-attribute]
+    assert result.exit_code == 0 and text.count("volumes, packed,") == 4  # pyrefly: ignore[missing-attribute]
+
+
+SLOW_SECOND_CALL = """
+import sys, time
+import surfcensus.func.pack as pack
+real = pack.pack_run
+def slow(*args, **kwargs):
+    info = real(*args, **kwargs)
+    print("ONE RUN PACKED", file=sys.stderr, flush=True)
+    time.sleep(60)
+    return info
+pack.pack_run = slow
+from surfcensus.cli import app
+app()
+"""
+
+
+def test_a_second_call_stopped_by_sigterm_leaves_a_servable_output(
+    dataset: SyntheticFuncDataset, tmp_path: Path
+) -> None:
+    """A second call into a complete --out, stopped by SIGTERM after it has replaced one pack:
+    stream.json and session.json are those of the first call, and every pack they list is
+    whole, so the output can still be served."""
+    from surfcensus.func import SESSION_JSON, packread
+    from surfcensus.func.model import SessionInfo
+    from surfcensus.func.pack import content_digest
+
+    out = tmp_path / "packs"
+    assert invoke(dataset.raw_root, "--subject", "01", "--out", out).exit_code == 0  # pyrefly: ignore[missing-attribute]
+    stream_before = (out / STREAM_JSON).read_bytes()
+    process = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            SLOW_SECOND_CALL,
+            "epi-session",
+            str(dataset.raw_root),
+            "--subject",
+            "01",
+            "--out",
+            str(out),
+            "--force",
+        ],
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert process.stderr is not None
+        lines = []
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            line = process.stderr.readline()
+            if not line:
+                break
+            lines.append(line)
+            if line.startswith("ONE RUN PACKED"):
+                break
+        assert lines and lines[-1].startswith("ONE RUN PACKED"), "".join(lines)
+        process.send_signal(signal.SIGTERM)
+        _, rest = process.communicate(timeout=60)
+        assert process.returncode == 143, "".join(lines) + rest
+        assert "terminated; packing was stopped; the packs that are done stay" in rest
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.communicate()
+    assert (out / STREAM_JSON).read_bytes() == stream_before
+    stream = read_info(out / STREAM_JSON, StreamInfo)
+    assert stream is not None
+    n = 0
+    for sid in stream.sessions:
+        info = read_info(out / sid / SESSION_JSON, SessionInfo)
+        assert info is not None
+        for run in info.runs:
+            if run.reason is None:
+                pack = packread.read_pack(out / sid, run.run)
+                assert pack is not None and packread.pack_on_disk(out / sid, run.run)
+                assert content_digest(out / sid, pack) == pack.content_digest
+                n += 1
+        assert not [p.name for p in (out / sid).iterdir() if p.name.startswith(".")]
+    assert n == 7

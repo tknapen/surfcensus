@@ -258,7 +258,12 @@ def test_names_that_are_no_raw_run_are_passed_over(tmp_path: Path) -> None:
     os.symlink(tmp_path / "absent", func / "sub-01_task-rest_run-7_bold.nii.gz")  # dangling
     with contextlib.suppress(OSError):  # a file system that refuses such a name has no such file
         os.close(os.open(os.fsencode(func) + b"/sub-01_task-r\xe9st_run-8_bold.nii.gz", os.O_CREAT))
-    listed = bids.list_raw_runs(tmp_path, "sub-01")
+    found = bids.list_raw_runs(tmp_path, "sub-01")
+    # a sidecar beside no series is listed with the sidecar alone, for its AcquisitionTime
+    alone = [r for r in found if FuncRole.RAW_BOLD not in r.files]
+    assert [r.stem for r in alone] == ["sub-01_task-rest_run-4"]
+    assert set(alone[0].files) == {FuncRole.RAW_SIDECAR}
+    listed = [r for r in found if FuncRole.RAW_BOLD in r.files]
     assert [r.files[FuncRole.RAW_BOLD].location.rsplit("/", 1)[1] for r in listed] == [
         "sub-01_task-rest_run-1_bold.nii.gz",
         "sub-01_task-rest_run-2_bold.nii",

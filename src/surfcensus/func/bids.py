@@ -398,12 +398,14 @@ def list_raw_runs(raw_root: Path, participant: str) -> list[RawRun]:
     Each echo of a multi-echo acquisition is a raw run of its own, with the ``key`` of the
     run (no echo in it) and its ``entities.echo``; two raw runs with one key and no echo are
     two names of one run (``run-1`` beside ``run-01``) and both are listed. Of a ``.nii.gz``
-    and a ``.nii`` with one stem only the first is listed. A file in a ``ses-`` folder whose
-    name names another session, the phase or real part of complex data (``part-``), and a
-    name that is no run are passed over. Sorted by session (none first), name order, stem.
-    The sidecar of a level is the one of that level with the most entities that apply; levels
-    are not merged, so a time in a higher level than the nearest sidecar is not seen. Raises
-    ``OSError`` as :func:`list_dir`."""
+    and a ``.nii`` with one stem only the first is listed. A run whose series is not a file
+    (a link whose target is missing, a git-annex link without content) and whose sidecar is,
+    beside it, is listed with that sidecar alone (no ``raw_bold``). A file in a ``ses-``
+    folder whose name names another session, the phase or real part of complex data
+    (``part-``), and a name that is no run are passed over. Sorted by session (none first),
+    name order, stem. The sidecar of a level is the one of that level with the most entities
+    that apply; levels are not merged, so a time in a higher level than the nearest sidecar is
+    not seen. Raises ``OSError`` as :func:`list_dir`."""
     root = Path(raw_root)
     if not valid_participant(participant):
         return []
@@ -450,6 +452,31 @@ def list_raw_runs(raw_root: Path, participant: str) -> list[RawRun]:
                         files=files,
                     )
                 )
+        # a run whose series is not a file (a link whose target is missing, a git-annex link
+        # without content) but whose own sidecar is: listed with the sidecar alone, so that its
+        # AcquisitionTime counts for the anchor rule of its session (``session.plan_session``)
+        for name in sorted(listings[func]):
+            if not name.endswith(SIDECAR_SUFFIX):
+                continue
+            parsed = _raw_entities(name[: -len(SIDECAR_SUFFIX)] + RAW_SUFFIXES[0], participant)
+            if parsed is None:
+                continue
+            entities, stem = parsed
+            if entities.ses != session or stem in seen:
+                continue
+            seen.add(stem)
+            ref = file_ref(
+                FuncRole.RAW_SIDECAR, "raw", func / name, root, listings[func][name], None
+            )
+            runs.append(
+                RawRun(
+                    entities=entities,
+                    key=run_key(entities),
+                    order=name_order(entities),
+                    stem=stem,
+                    files={FuncRole.RAW_SIDECAR: ref},
+                )
+            )
     runs.sort(key=lambda r: (r.entities.ses is not None, r.entities.ses or "", r.order, r.stem))
     return runs
 

@@ -174,15 +174,26 @@ def command_signals(
     if threading.current_thread() is not threading.main_thread():
         yield signals
         return
-    earlier_term: Any = signal.signal(signal.SIGTERM, signals.on_sigterm)
-    earlier_int: Any = signal.getsignal(signal.SIGINT)
-    if earlier_int is signal.default_int_handler:
-        # SIG_IGN (a job of a shell without job control) stays as it is, and so does a
-        # handler of a caller's own
-        signal.signal(signal.SIGINT, signals.on_sigint)
+    earlier_term: Any = None
+    earlier_int: Any = None
+    term_set = False
     try:
+        # The handlers are set inside the ``try``, SIGINT's first: a Ctrl-C that arrives while
+        # they are being set (Python's own handler, or this object's) raises
+        # ``KeyboardInterrupt`` here and is the command's, with its line and 130, not an
+        # exception that escapes to click as an abort with exit code 1. A SIGTERM before its
+        # handler is set has its default, as before the command started.
+        earlier_int = signal.getsignal(signal.SIGINT)
+        if earlier_int is signal.default_int_handler:
+            # SIG_IGN (a job of a shell without job control) stays as it is, and so does a
+            # handler of a caller's own
+            signal.signal(signal.SIGINT, signals.on_sigint)
+        earlier_term = signal.signal(signal.SIGTERM, signals.on_sigterm)
+        term_set = True
         yield signals
     except KeyboardInterrupt:
+        if not (signals.interrupted or signals.terminated):
+            signals.interrupted = True  # Python's own handler took it, before this object's
         signals.ending()
         if said is not None:
             said(signals)
@@ -190,7 +201,7 @@ def command_signals(
     finally:
         if not (signals.ended or signals.terminated or signals.interrupted):
             # None: a handler that was not set from Python, which cannot be put back
-            if earlier_term is not None:
+            if term_set and earlier_term is not None:
                 signal.signal(signal.SIGTERM, earlier_term)
             if earlier_int is signal.default_int_handler:
                 signal.signal(signal.SIGINT, earlier_int)

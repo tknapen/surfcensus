@@ -380,7 +380,9 @@ def test_the_sidecars_and_the_anchors(dataset: SyntheticFuncDataset) -> None:
         return int(hours) * 3600 + int(minutes) * 60 + float(rest)
 
     for session in dataset.sessions:
-        runs = [r for r in dataset.runs_of(session.participant, session.session) if r.packable]
+        # the rule is decided over every run of the session, packable or not, and the anchor
+        # is the first run by it that has a stored transform
+        runs = dataset.runs_of(session.participant, session.session)
         times = {}
         for run in runs:
             sidecar = run.files.get("raw_sidecar")
@@ -393,8 +395,10 @@ def test_the_sidecars_and_the_anchors(dataset: SyntheticFuncDataset) -> None:
         else:
             assert session.rule == "name_order"
             order = by_name
-        assert session.order == tuple(r.stem for r in order)
-        assert session.anchor == order[0].stem
+        assert session.order == tuple(r.stem for r in order if r.packable)
+        assert session.anchor == next(r.stem for r in order if "xfm_to_anat" in r.files)
+    # sub-02: the first run by name order is multi-echo and not packed; it is the anchor
+    assert dataset.session("sub-02", None).anchor == "sub-02_task-me_run-1"
     # in ses-1 the time rule and the name rule disagree about the anchor
     first_by_name = dataset.run("sub-01", "1", "motor", "1").stem
     assert dataset.session("sub-01", "1").anchor == "sub-01_ses-1_task-rest_run-2" != first_by_name
@@ -416,15 +420,16 @@ def test_the_frame_displacements(dataset: SyntheticFuncDataset) -> None:
     points = apply(GRID_AFFINE, np.argwhere(mask).astype(float))
     for session in dataset.sessions:
         runs = {r.stem: r for r in dataset.runs_of(session.participant, session.session)}
-        matrices = {stem: itk_ras(runs[stem].files["xfm_to_anat"])[0] for stem in session.order}
+        framed = list(dict.fromkeys([session.anchor, *session.order]))
+        matrices = {stem: itk_ras(runs[stem].files["xfm_to_anat"])[0] for stem in framed}
 
         def largest(a: str, b: str, matrices: dict[str, np.ndarray] = matrices) -> float:
             moved = apply(np.linalg.inv(matrices[a]) @ matrices[b], points)
             return float(np.sqrt(((moved - points) ** 2).sum(axis=1)).max())
 
-        flagged = tuple(s for s in session.order[1:] if largest(session.anchor, s) > 10.0)
+        others = [s for s in session.order if s != session.anchor]
+        flagged = tuple(s for s in others if largest(session.anchor, s) > 10.0)
         assert flagged == session.flagged
-        others = list(session.order[1:])
         outlier = len(others) >= 2 and len(flagged) == len(others)
         if outlier:
             outlier = all(

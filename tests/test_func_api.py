@@ -500,7 +500,12 @@ def test_the_runs_named_and_one_session(dataset: SyntheticFuncDataset, tmp_path:
         dataset.raw_root, "sub-02", tmp_path / "rest", runs=["*task-rest_run-5"], key=KEY
     )
     (only,) = sessions_of(tmp_path / "rest")
-    assert [r.name for r in only.runs] == ["task-rest_run-5"] and len(stream.sessions) == 1
+    assert len(stream.sessions) == 1
+    assert [r.name for r in only.runs if r.reason is None] == ["task-rest_run-5"]
+    # the runs left out are still runs of the session, listed and not packed
+    left = [r for r in only.runs if r.reason is not None]
+    assert len(left) == 11 and all(r.reason == "not selected" for r in left)
+    assert all(r.detail and "--epi-runs" in r.detail for r in left)
 
 
 def test_what_it_says(dataset: SyntheticFuncDataset, tmp_path: Path) -> None:
@@ -508,9 +513,14 @@ def test_what_it_says(dataset: SyntheticFuncDataset, tmp_path: Path) -> None:
     api.epi_subject(dataset.raw_root, "sub-02", tmp_path / "out", progress=lines.append)
     assert lines[0].startswith(
         "Functional: 12 runs in 1 session of sub-02 in derivatives/fmriprep (fMRIPrep 21.0.2),"
-        " raw series in . (BIDS); 4 can be packed (T1w space), 8 cannot: "
+        f" raw series in {dataset.raw_root} (BIDS); 4 can be packed (T1w space), 8 cannot: "
     )
-    assert lines[1].startswith("EPI packs: 4 runs to pack, about ") and "an estimate" in lines[1]
+    # the anchor is the first run by name order, task-me run-1, which is multi-echo
+    assert lines[1] == (
+        "sub-02: the anchor task-me_run-1 is not packed (multi-echo); the raw stream of every"
+        " packed run is drawn through its stored registration."
+    )
+    assert lines[2].startswith("EPI packs: 4 runs to pack, about ") and "an estimate" in lines[2]
     runs = [x for x in lines if x.startswith("sub-02: task-")]
     assert len(runs) == 4 and all(" 12 volumes, " in x for x in runs)
     assert (
@@ -523,7 +533,9 @@ def test_a_participant_without_a_packable_run_gives_a_stream(tmp_path: Path) -> 
     ds = write_copy(tmp_path)
     stream = api.epi_subject(ds.raw_root, "sub-02", tmp_path / "out", runs=["*task-std*"])
     (info,) = sessions_of(tmp_path / "out")
-    assert len(stream.sessions) == 1 and [r.reason for r in info.runs] == ["standard space only"]
+    reasons = {r.name: r.reason for r in info.runs}
+    assert len(stream.sessions) == 1 and reasons["task-std_run-1"] == "standard space only"
+    assert set(reasons.values()) == {"standard space only", "not selected"}
 
 
 def test_the_config_is_used(dataset: SyntheticFuncDataset, tmp_path: Path) -> None:
@@ -551,12 +563,364 @@ def test_stream_json_is_written_last(
     monkeypatch.setattr(api.pack_, "pack_session", watch)
     out = tmp_path / "out"
     api.epi_subject(dataset.raw_root, "sub-01", out)
-    api.epi_subject(dataset.raw_root, "sub-01", out)  # an earlier stream.json is removed first
-    assert seen == [False, False, False, False]
+    first = (out / STREAM_JSON).read_bytes()
+    # a second call keeps the earlier stream.json, so that a page served from ``out`` keeps a
+    # whole stream, until the new one is renamed over it at the end
+    api.epi_subject(dataset.raw_root, "sub-01", out)
+    assert seen == [False, False, True, True]
     assert json.loads((out / STREAM_JSON).read_text())["label"] == "sub-01"
+    assert (out / STREAM_JSON).read_bytes() == first  # the same ids, the same stream
     assert len(list(_walk(out))) > 0
 
 
 def test_the_order_of_sessions_compares_numbers_as_numbers() -> None:
     labels = ["10", "2", "pre", None, "1b", "1a", "01"]
     assert sorted(labels, key=api.session_key) == [None, "01", "1a", "1b", "2", "10", "pre"]
+
+
+# --- one anchor per session, whatever is packed (decision D36; data review F1) -----------------
+
+ANCHOR = "ses-1_task-rest_run-2"
+"""The anchor of sub-01 ses-1 by AcquisitionTime (9:5:3.5), not the first in name order."""
+
+
+@pytest.fixture(scope="module")
+def ses1(dataset: SyntheticFuncDataset, tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """sub-01 ses-1 packed whole, with the fixed key."""
+    out = tmp_path_factory.mktemp("ses1-full")
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["1"], key=KEY)
+    return out
+
+
+def _others(info: SessionInfo) -> dict[str, object]:
+    """The frame of every packed run but the anchor, by name."""
+    return {r.name: r.frame for r in info.runs if r.reason is None and not r.anchor}
+
+
+def test_a_filter_does_not_move_the_anchor(
+    dataset: SyntheticFuncDataset, ses1: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "motor"
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["1"], runs=["*task-motor*"], key=KEY)
+    (full,) = sessions_of(ses1)
+    (info,) = sessions_of(out)
+    anchor = next(r for r in info.runs if r.anchor)
+    # the anchor is the session's, not the one run that was selected
+    assert anchor.name == ANCHOR and anchor.reason == "not selected"
+    assert info.registration is not None and info.registration.anchor == anchor.run
+    assert not info.registration.anchor_packed and info.registration.rule == "acquisition_time"
+    # every run of the session is listed, in the same order of the session as without a filter
+    order = {r.name: r.session_order for r in full.runs}
+    assert {r.name: r.session_order for r in info.runs} == order
+    assert sorted(order.values()) == list(range(4))
+    # the motor run is drawn through the anchor's transform: its pack is that of the full
+    # session, value for value (the content digest covers the defining JSON, whose inputs
+    # name the anchor's transform)
+    _, mine = pack_of(out, info, "ses-1_task-motor_run-1")
+    _, whole = pack_of(ses1, full, "ses-1_task-motor_run-1")
+    assert mine.anchor_run == anchor.run and mine.content_digest == whole.content_digest
+    assert any(i.role == "anchor_xfm_to_anat" for i in mine.inputs)
+    assert _others(info) == {"ses-1_task-motor_run-1": _others(full)["ses-1_task-motor_run-1"]}
+    motor = dataset.run("sub-01", "1", "motor", "1")
+    for t in (0, mine.n_volumes - 1):
+        expected = independent_raw_volume(
+            motor, dataset.run("sub-01", "1", "rest", "2"), t, mine.window
+        )
+        decoded = packread.decode_volume(out / info.session, mine, "raw", t)
+        assert np.array_equal(decoded, expected)
+    # the first index follows the packed runs
+    assert [r.first for r in info.runs if r.reason is None] == [0]
+
+
+@pytest.mark.parametrize("case", ["no confounds", "no mask", "fewer volumes", "dangling raw"])
+def test_an_anchor_that_cannot_be_packed_is_the_anchor_all_the_same(
+    ses1: Path, tmp_path: Path, case: str
+) -> None:
+    ds = write_copy(tmp_path)
+    run = ds.run("sub-01", "1", "rest", "2")
+    expected = {
+        "no confounds": "no confounds table",
+        "no mask": "no brain mask",
+        "fewer volumes": "volume counts differ",
+        "dangling raw": "no raw series",
+    }[case]
+    if case == "no confounds":
+        run.files["confounds"].unlink()
+    elif case == "no mask":
+        run.files["pre_mask"].unlink()
+    elif case == "fewer volumes":
+        img = nib.load(run.files["raw_bold"])
+        data = np.asarray(img.dataobj)[..., :-2]
+        run.files["raw_bold"].unlink()
+        nib.save(nib.Nifti1Image(data, None, img.header), run.files["raw_bold"])
+    else:
+        run.files["raw_bold"].unlink()
+        run.files["raw_bold"].symlink_to(tmp_path / "absent.nii.gz")
+    out = tmp_path / "out"
+    api.epi_subject(ds.raw_root, "sub-01", out, sessions=["1"], key=KEY)
+    (full,) = sessions_of(ses1)
+    (info,) = sessions_of(out)
+    anchor = next(r for r in info.runs if r.anchor)
+    assert anchor.name == ANCHOR and anchor.reason == expected
+    assert info.registration is not None and not info.registration.anchor_packed
+    if case == "dangling raw":
+        assert anchor.detail is not None and "is a link whose target is missing" in anchor.detail
+    # the frame numbers of the other runs are those of the full session, and so are their packs
+    assert _others(info) == _others(full)
+    assert {r.name: r.session_order for r in info.runs} == {
+        r.name: r.session_order for r in full.runs
+    }
+    for name in _others(full):
+        assert (
+            pack_of(out, info, name)[1].content_digest
+            == pack_of(ses1, full, name)[1].content_digest
+        )
+
+
+@pytest.mark.parametrize("case", ["no transform", "unreadable transform"])
+def test_without_a_readable_transform_the_next_run_is_the_anchor(tmp_path: Path, case: str) -> None:
+    ds = write_copy(tmp_path)
+    xfm = ds.run("sub-01", "1", "rest", "2").files["xfm_to_anat"]
+    if case == "no transform":
+        xfm.unlink()
+    else:
+        xfm.write_text("#Insight Transform File V1.0\nthis is no transform\n")
+    out = tmp_path / "out"
+    lines: list[str] = []
+    api.epi_subject(ds.raw_root, "sub-01", out, sessions=["1"], key=KEY, progress=lines.append)
+    (info,) = sessions_of(out)
+    first = next(r for r in info.runs if r.name == ANCHOR)
+    anchor = next(r for r in info.runs if r.anchor)
+    # the next run by AcquisitionTime (9:12:40.0)
+    assert anchor.name == "ses-1_task-rest_run-1" and anchor.reason is None
+    assert not first.anchor
+    if case == "no transform":
+        assert first.reason == "no transform to the anatomy"
+    else:
+        assert first.reason == "pack failure" and first.detail is not None
+        assert first.detail.startswith("its stored transform to the anatomy cannot be read")
+    reg = info.registration
+    assert (
+        reg is not None
+        and reg.anchor_packed
+        and reg.note
+        == (
+            f"the first run by the rule ({ANCHOR}) has no readable stored transform to the "
+            "anatomy, so the anchor is the next run, ses-1_task-rest_run-1"
+        )
+    )
+    assert f"sub-01 ses-1: {reg.note}." in lines
+    assert first.session_order == 0 and anchor.session_order == 1
+
+
+# --- a second call into the same --out (page review 2, data review F5) ------------------------
+
+
+def _mtimes(out: Path) -> dict[str, int]:
+    return {
+        p.relative_to(out).as_posix(): p.stat().st_mtime_ns
+        for p in out.rglob("*")
+        if p.is_file() and p.name not in (SESSION_JSON, STREAM_JSON)
+    }
+
+
+def test_a_second_call_keeps_the_packs_that_are_current(
+    dataset: SyntheticFuncDataset, tmp_path: Path
+) -> None:
+    ds = write_copy(tmp_path)
+    out = tmp_path / "out"
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY)
+    before = _mtimes(out)
+    digests = _digests(out)
+    lines: list[str] = []
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY, progress=lines.append)
+    # nothing is packed again: every pack file and every contour file is as it was
+    assert _mtimes(out) == before and _digests(out) == digests
+    assert any(
+        x.startswith("EPI packs: 0 runs to pack, 7 kept from an earlier call") for x in lines
+    )
+    assert sum("kept (its pack is current)" in x for x in lines) == 7
+    assert "sub-01 ses-1: 4 of 4 runs packed (4 kept, 0 packed now)," in "\n".join(lines)
+    # a changed input of one run packs that run again, and only it
+    sessions = {i.label: i for i in sessions_of(out)}
+    motor = ds.run("sub-01", "1", "motor", "1")
+    table = motor.files["confounds"]
+    table.write_text(table.read_text() + "\n")  # another SHA-256, the same rows
+    lines.clear()
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY, progress=lines.append)
+    again = [x for x in lines if "volumes, packed," in x]
+    assert len(again) == 1 and again[0].startswith("sub-01 ses-1: ses-1_task-motor_run-1: ")
+    # a changed anchor transform packs every run of its session again (an input of each)
+    anchor = ds.run("sub-01", "1", "rest", "2").files["xfm_to_anat"]
+    anchor.write_text(anchor.read_text() + "\n")
+    lines.clear()
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY, progress=lines.append)
+    ses1 = [x for x in lines if x.startswith("sub-01 ses-1: ses-1_")]
+    assert len(ses1) == 4 and all("volumes, packed," in x for x in ses1)
+    assert all("kept" in x for x in lines if x.startswith("sub-01 ses-2: ses-2_task-rest_run-3"))
+    # a pack that lost a file is packed again; force packs everything again
+    (info,) = [sessions[k] for k in sessions if k == "sub-01 ses-2"]
+    run = next(r for r in info.runs if r.reason is None)
+    pack = read_info(out / info.session / run.run / PACK_JSON, PackInfo)
+    assert pack is not None
+    (out / info.session / pack.streams["raw"].chunks[0].file).unlink()
+    lines.clear()
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY, progress=lines.append)
+    assert sum("volumes, packed," in x for x in lines) == 1
+    lines.clear()
+    api.epi_subject(ds.raw_root, "sub-01", out, key=KEY, progress=lines.append, force=True)
+    assert sum("volumes, packed," in x for x in lines) == 7
+
+
+def test_runs_that_leave_a_session_lose_their_pack_after_session_json(
+    dataset: SyntheticFuncDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["1"], key=KEY)
+    (info,) = sessions_of(out)
+    session_dir = out / info.session
+    packed = {r.name: r.run for r in info.runs if r.reason is None}
+    assert all((session_dir / run).is_dir() for run in packed.values())
+    # the earlier session.json stays in place while the second call packs: a reader of the
+    # directory sees a whole session at every moment
+    seen: list[bool] = []
+    real = api.pack_.pack_run
+
+    def watch(session_dir_: Path, *args: object, **kwargs: object) -> object:
+        old = read_info(Path(session_dir_) / SESSION_JSON, SessionInfo)
+        listed = [] if old is None else [r.run for r in old.runs if r.reason is None]
+        seen.append(bool(listed) and all((Path(session_dir_) / r).is_dir() for r in listed))
+        return real(session_dir_, *args, **kwargs)  # pyrefly: ignore[bad-argument-type]
+
+    monkeypatch.setattr(api.pack_, "pack_run", watch)
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["1"], runs=["*task-motor*"], key=KEY)
+    assert seen == []  # the motor run's pack is current: nothing is packed
+    (after,) = sessions_of(out)
+    # the runs not selected are listed and lose their packs; the selected one keeps its own
+    kept = [r for r in after.runs if r.reason is None]
+    assert [r.name for r in kept] == ["ses-1_task-motor_run-1"]
+    for name, run in packed.items():
+        assert (session_dir / run).is_dir() == (name == "ses-1_task-motor_run-1")
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["1"], key=KEY, force=True)
+    assert seen and all(seen)
+
+
+# --- links, missing targets and uncompressed series (data review F2, F3, F4) -------------------
+
+
+def test_an_out_where_a_linked_input_lies_is_refused(tmp_path: Path) -> None:
+    """Per-file links, as a DataLad or git-annex clone has them: the directory that holds the
+    target of a linked input is read, so nothing is written there."""
+    ds = write_copy(tmp_path)
+    store = tmp_path / "store" / "objects"
+    store.mkdir(parents=True)
+    for role in ("raw_bold", "pre_mask"):
+        source = ds.run("sub-01", "2", "rest", "3").files[role]
+        target = store / role / source.name
+        target.parent.mkdir()
+        shutil.move(source, target)
+        source.symlink_to(target)
+    before = snapshot_links(tmp_path / "store")
+    for out in (store / "raw_bold" / "o", store / "pre_mask"):
+        with pytest.raises(ConfigError) as caught:
+            api.epi_subject(ds.raw_root, "sub-01", out)
+        assert "leads into" in str(caught.value) and "which is only read" in str(caught.value)
+        assert not out.exists() or out == store / "pre_mask"
+    assert snapshot_links(tmp_path / "store") == before
+    # beside the store is not inside it
+    api.epi_subject(ds.raw_root, "sub-01", tmp_path / "store" / "packs", sessions=["2"])
+    assert (tmp_path / "store" / "packs" / STREAM_JSON).is_file()
+
+
+@pytest.mark.parametrize("which", ["raw_bold", "pre_bold"])
+def test_a_series_that_is_a_link_without_target_is_said_to_be_one(
+    tmp_path: Path, which: str
+) -> None:
+    ds = write_copy(tmp_path)
+    run = ds.run("sub-01", "2", "rest", "3")
+    path = run.files[which]
+    path.unlink()
+    path.symlink_to(tmp_path / "nowhere" / path.name)
+    api.epi_subject(ds.raw_root, "sub-01", tmp_path / "out", sessions=["2"])
+    (info,) = sessions_of(tmp_path / "out")
+    item = next(r for r in info.runs if r.name == run.name)
+    what = "raw" if which == "raw_bold" else "preprocessed"
+    assert item.reason == f"no {what} series"
+    assert item.detail == f"the {what} series {path.name} is a link whose target is missing"
+
+
+def test_a_derivative_without_a_preprocessed_series_says_only_that(tmp_path: Path) -> None:
+    ds = write_copy(tmp_path)
+    api.epi_subject(ds.raw_root, "sub-02", tmp_path / "out", runs=["*task-min*"])
+    (info,) = sessions_of(tmp_path / "out")
+    item = next(r for r in info.runs if r.name == "task-min_run-1")
+    assert item.reason == "no preprocessed series" and item.detail is None
+
+
+def test_an_uncompressed_derivative_is_read_like_a_compressed_one(
+    ses1: Path, tmp_path: Path
+) -> None:
+    ds = write_copy(tmp_path)
+    run = ds.run("sub-01", "1", "motor", "1")
+    for role in ("pre_bold", "pre_mask", "reference"):
+        path = run.files[role]
+        img = nib.load(path)
+        nib.save(img, path.with_name(path.name[: -len(".gz")]))
+        path.unlink()
+    out = tmp_path / "out"
+    api.epi_subject(ds.raw_root, "sub-01", out, sessions=["1"], key=KEY)
+    (info,) = sessions_of(out)
+    (full,) = sessions_of(ses1)
+    name = "ses-1_task-motor_run-1"
+    item = next(r for r in info.runs if r.name == name)
+    assert item.reason is None
+    mine, whole = pack_of(out, info, name)[1], pack_of(ses1, full, name)[1]
+    assert mine.raw_affine == whole.raw_affine and mine.window == whole.window
+    for stream in ("raw", "pre"):
+        for t in (0, mine.n_volumes - 1):
+            assert np.array_equal(
+                packread.decode_volume(out / info.session, mine, stream, t),
+                packread.decode_volume(ses1 / full.session, whole, stream, t),
+            )
+
+
+def test_what_it_says_about_the_registration(dataset: SyntheticFuncDataset, tmp_path: Path) -> None:
+    lines: list[str] = []
+    api.epi_subject(dataset.raw_root, "sub-01", tmp_path / "out", progress=lines.append)
+    flagged = [x for x in lines if "flagged (raw data)" in x]
+    assert len(flagged) == 3, lines
+    assert flagged[0].startswith(
+        "sub-01 ses-1: flagged (raw data): ses-1_task-rest_run-3, drawn through the "
+        f"registration of the anchor {ANCHOR}, lies up to 12."
+    )
+    assert flagged[0].endswith("beyond the limit of 10 mm.")
+    assert (
+        "sub-01 ses-2: the anchor ses-2_task-rest_run-1 is the outlier (raw data): every other"
+        " run is flagged against it and they agree with each other, so the anchor, or its"
+        " stored registration, is the odd one."
+    ) in lines
+    assert f"raw series in {dataset.raw_root} (BIDS)" in lines[0]
+
+
+def test_an_interrupt_between_the_two_renames_puts_the_earlier_pack_back(
+    dataset: SyntheticFuncDataset, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    out = tmp_path / "out"
+    api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["2"], key=KEY)
+    (info,) = sessions_of(out)
+    run = next(r for r in info.runs if r.reason is None)
+    session_dir = out / info.session
+    before = (session_dir / run.run / PACK_JSON).read_bytes()
+    real = os.replace
+
+    def interrupted(source: object, target: object) -> None:
+        if Path(str(source)).parent.name.endswith(".tmp") and Path(str(target)).name == run.run:
+            raise KeyboardInterrupt  # after the earlier pack was moved aside
+        real(source, target)  # pyrefly: ignore[bad-argument-type]
+
+    monkeypatch.setattr(api.pack_.os, "replace", interrupted)
+    with pytest.raises(KeyboardInterrupt):
+        api.epi_subject(dataset.raw_root, "sub-01", out, sessions=["2"], key=KEY, force=True)
+    monkeypatch.undo()
+    assert (session_dir / run.run / PACK_JSON).read_bytes() == before
+    assert packread.pack_on_disk(session_dir, run.run)

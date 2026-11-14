@@ -633,8 +633,10 @@ def test_placeholders_are_no_files_here(tmp_path: Path) -> None:
     )
     # a git-annex link without content is not listed; step 2 names it as not fetched
     assert FuncRole.PRE_BOLD not in run.files and FuncRole.CONFOUNDS not in run.files
-    raw = {r.stem for r in bids.list_raw_runs(linked.raw_root, "sub-01")}
-    assert "sub-01_ses-2_task-rest_run-2" not in raw
+    raw = {r.stem: r for r in bids.list_raw_runs(linked.raw_root, "sub-01")}
+    # the raw series is no file either: the run is listed with its sidecar alone, whose
+    # AcquisitionTime counts for the anchor rule of the session
+    assert set(raw["sub-01_ses-2_task-rest_run-2"].files) == {FuncRole.RAW_SIDECAR}
     pointed = write_func_dataset(tmp_path / "pointer", annex="pointer")
     match = made.detect(pointed.deriv_root)
     assert match is not None

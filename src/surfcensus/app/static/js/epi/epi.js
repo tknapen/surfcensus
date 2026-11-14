@@ -392,13 +392,13 @@ function writeRun() {
   let where;
   if (run.anchor) {
     note = `${session.label}, ${run.name}: the anchor run of the session (${rule}); the raw stream of every run of the session is drawn through its stored registration to the anatomy.`;
-    where = `anchor of ${session.label} (${rule})`;
+    where = `anchor of ${session.label}, ${rule}`;
   } else if (f) {
     note =
       `${session.label}, ${run.name}: drawn through the registration of the anchor run ${anchorName}, it lies ${f.mean_mm.toFixed(2)} mm on average and ` +
       `${f.max_mm.toFixed(2)} mm at most (over its brain mask) from where its own stored registration puts it: ` +
       `a rotation of ${f.rotation_deg.toFixed(2)} degrees and a shift of ${f.translation_mm.toFixed(2)} mm.`;
-    where = `${session.label}, through the anchor's registration: ${f.max_mm.toFixed(2)} mm at most (${f.mean_mm.toFixed(2)} mean) from its own`;
+    where = `${session.label} · through the anchor's registration; its own would put it ${f.max_mm.toFixed(2)} mm away at most (${f.mean_mm.toFixed(2)} mean)`;
   } else {
     note = `${session.label}, ${run.name}.`;
     where = session.label;
@@ -438,7 +438,7 @@ function writeRun() {
   const sessionNote = missing.length
     ? `${session.label}: ${missing.length} run(s) not in the stream: ${missing.map((r) => `${r.name} (${r.reason}${r.detail ? `: ${r.detail}` : ''})`).join('; ')}.`
     : `${session.label}: every listed run is in the stream.`;
-  $('session-note').textContent = sessionNote;
+  $('session-note').textContent = reg && reg.note ? `${sessionNote} ${reg.note}` : sessionNote;
   if (missing.length) badges.push(badge(`${missing.length} of ${session.label} not in the stream`, sessionNote));
   $('badges').replaceChildren(...badges);
   writeCorrections();
@@ -507,12 +507,13 @@ function legendText() {
   const what = sd ? 'temporal SD' : 'signal';
   const top = sd ? tables[k].topSd : tables[k].top;
   const scope = state.normalized
-    ? `Intensity normalization on: each run under its own window; for ${run.name} gray 0 to 255 is ${what} 0 to ${top.toFixed(0)}.`
-    : `Intensity normalization off: one window for the whole stream; gray 0 to 255 is ${what} 0 to ${top.toFixed(0)} in every run.`;
+    ? `Intensity normalization on: each run under its own window; in ${run.name} gray 0 to 255 is ${what} 0 to ${top.toFixed(0)}.`
+    : `Intensity normalization off: one window for the stream; gray 0 to 255 is ${what} 0 to ${top.toFixed(0)} in every run.`;
   if (state.view !== 'diff') return scope;
+  // what the colours of the difference mean comes first: it is what this view shows
   return (
-    `${scope} Difference raw minus preprocessed of the gray levels on screen, the effect of preprocessing on this run: the colour saturates at ${state.diffScale} gray levels ` +
-    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}). Blue: raw lower. Red: raw higher. Contours here: white surface green, pial magenta, on a dark outline.`
+    `Raw minus preprocessed, of the gray levels on screen: blue raw lower, red raw higher, saturating at ${state.diffScale} gray levels ` +
+    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}); contours green (white surface) and magenta (pial). ${scope}`
   );
 }
 
@@ -976,7 +977,7 @@ function buildControls() {
 // page's height less that of the views), so that nothing is forgotten and the page does not
 // overflow. On a narrow window the views come first and take most of a screen.
 function availableHeight() {
-  if (window.innerWidth < 700) return Math.max(0.92 * window.innerHeight - $('bar').offsetHeight, 200);
+  if (window.innerWidth < 700) return 2 * window.innerHeight; // the width decides; the page scrolls
   const epi = document.querySelector('.epi');
   const rest = epi.getBoundingClientRect().height - $('views').getBoundingClientRect().height;
   return Math.max(window.innerHeight - rest - 2, 0.3 * window.innerHeight);
@@ -1207,6 +1208,8 @@ window.__epi = {
     session: $('session-note').textContent,
     status: $('status').textContent,
     readout: $('readout').textContent,
+    badges: $('badges').textContent,
+    notice: $('notice').hidden ? '' : $('notice-text').textContent,
   }),
 };
 

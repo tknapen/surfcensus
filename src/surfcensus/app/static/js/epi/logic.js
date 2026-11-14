@@ -438,14 +438,15 @@ export function streamPanelSizesMm(grids) {
 }
 
 // How to lay out nGroups groups of three panels in a box of availW x availH px (stage 1).
-// pad: px on every side of each panel outside its picture (the margin of the edge letters).
-export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4, pad = 0) {
+// padX, padY: px left and right, above and below each panel outside its picture (the margin
+// that holds the edge letters).
+export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4, padX = 0, padY = 0) {
   let best = null;
   for (const panels of ['row', 'column']) {
     const gw = panels === 'row' ? sizes.reduce((a, s) => a + s[0], 0) : Math.max(...sizes.map((s) => s[0]));
     const gh = panels === 'row' ? Math.max(...sizes.map((s) => s[1])) : sizes.reduce((a, s) => a + s[1], 0);
-    const gapsW = (panels === 'row' ? 2 * gap + 6 * pad : 2 * pad) + frame;
-    const gapsH = (panels === 'row' ? 2 * pad : 2 * gap + 6 * pad) + head + frame;
+    const gapsW = (panels === 'row' ? 2 * gap + 6 * padX : 2 * padX) + frame;
+    const gapsH = (panels === 'row' ? 2 * padY : 2 * gap + 6 * padY) + head + frame;
     for (const groups of nGroups > 1 ? ['row', 'column'] : ['row']) {
       const nw = groups === 'row' ? nGroups : 1;
       const nh = groups === 'row' ? 1 : nGroups;

@@ -294,7 +294,8 @@ def test_the_frame_checks_of_the_design(dataset: SyntheticFuncDataset) -> None:
     recomputed here over the run's brain mask."""
     for expected in dataset.sessions:
         runs = {r.stem: r for r in dataset.runs_of(expected.participant, expected.session)}
-        transforms = {stem: m4(runs[stem].anat_to_scanner) for stem in expected.order}
+        framed = list(dict.fromkeys([expected.anchor, *expected.order]))
+        transforms = {stem: m4(runs[stem].anat_to_scanner) for stem in framed}
         masks = {}
         for stem in expected.order:
             img = nib.load(runs[stem].files["pre_mask"])
@@ -304,7 +305,7 @@ def test_the_frame_checks_of_the_design(dataset: SyntheticFuncDataset) -> None:
         assert check.flagged == expected.flagged
         assert check.shared_frame_plausible == (not expected.flagged)
         assert check.anchor_is_outlier == expected.anchor_is_outlier
-        assert list(check.runs) == list(expected.order)
+        assert list(check.runs) == framed
         own = check.runs[expected.anchor]
         assert (own.mean_mm, own.max_mm, own.flagged) == (0.0, 0.0, False)
         for stem in expected.order:
@@ -503,11 +504,23 @@ def seconds(text: str) -> float:
 
 
 def expected_order(dataset: SyntheticFuncDataset, participant: str, ses: str | None) -> list[str]:
-    packable = [r for r in dataset.runs_of(participant, ses) if expected_reason(r) is None]
-    by_name = sorted(packable, key=lambda r: (r.design.task, int(r.design.run)))
-    if all(r.design.time is not None and "raw_sidecar" in r.files for r in packable):
-        return [r.stem for r in sorted(by_name, key=lambda r: seconds(r.design.time or ""))]
-    return [r.stem for r in by_name]
+    """The packable runs in the session's acquisition order, the rule decided over EVERY run
+    of the session (not only the packable ones), as the anchor is."""
+    every = dataset.runs_of(participant, ses)
+    by_name = sorted(every, key=lambda r: (r.design.task, int(r.design.run)))
+    if all(r.design.time is not None and "raw_sidecar" in r.files for r in every):
+        by_name = sorted(by_name, key=lambda r: seconds(r.design.time or ""))
+    return [r.stem for r in by_name if expected_reason(r) is None]
+
+
+def expected_anchor(dataset: SyntheticFuncDataset, participant: str, ses: str | None) -> str:
+    """The first run of the session by the rule that has a stored transform, packable or
+    not."""
+    every = dataset.runs_of(participant, ses)
+    by_name = sorted(every, key=lambda r: (r.design.task, int(r.design.run)))
+    if all(r.design.time is not None and "raw_sidecar" in r.files for r in every):
+        by_name = sorted(by_name, key=lambda r: seconds(r.design.time or ""))
+    return next(r.stem for r in by_name if "xfm_to_anat" in r.files)
 
 
 def plan_for(
@@ -546,9 +559,15 @@ def test_the_plan_of_each_session(dataset: SyntheticFuncDataset, key: tuple) -> 
     assert [stem_of[r.run] for r in plan.runs[: len(packed)]] == order
     rest = [stem_of[r.run] for r in plan.runs[len(packed) :]]
     assert rest == sorted(rest, key=lambda s: order_of(s))
-    assert plan.anchor is not None and stem_of[plan.anchor.run] == order[0]
+    anchor = expected_anchor(dataset, participant, ses)
+    assert plan.anchor is not None and stem_of[plan.anchor.run] == anchor
+    assert anchor == dataset.session(participant, ses).anchor
     rule = "acquisition_time" if participant == "sub-01" else "name_order"
     assert plan.anchor.rule == rule
+    # in sub-02 the first run by name order is task-me run-1, which is multi-echo and not
+    # packed: it is the anchor all the same (one anchor per session, whatever is packed)
+    if participant == "sub-02":
+        assert anchor == "sub-02_task-me_run-1" and anchor not in order
     for item in plan.runs:
         run = mine[stem_of[item.run]]
         assert item.reason == expected_reason(run), run.stem
@@ -556,8 +575,12 @@ def test_the_plan_of_each_session(dataset: SyntheticFuncDataset, key: tuple) -> 
         assert (item.raw is None) == ("raw_bold" not in run.files)
     # the frame check is that of the transforms the connector gave, the anchor's for every run
     assert plan.frame is not None
-    assert [stem_of[r] for r in plan.frame.runs] == order
-    assert sorted(connector.calls) == sorted(order)
+    framed = order if anchor in order else [anchor, *order]
+    assert [stem_of[r] for r in plan.frame.runs] == framed
+    # every run that lists a transform is read for it: the anchor is chosen among them all
+    assert sorted(connector.calls) == sorted(
+        r.stem for r in mine.values() if "xfm_to_anat" in r.files
+    )
     fixture = dataset.session(participant, ses)
     assert tuple(stem_of[r] for r in plan.frame.flagged) == fixture.flagged
     assert plan.frame.anchor_is_outlier == fixture.anchor_is_outlier

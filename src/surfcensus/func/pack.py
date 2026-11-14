@@ -631,7 +631,9 @@ def _locked(directory: Path) -> Iterator[bool]:
 
 
 def _swap_into_place(session_dir: Path, tmp_root: Path, run: str) -> None:
-    """Move ``tmp_root/run`` to ``session_dir/run``, the earlier one aside first."""
+    """Move ``tmp_root/run`` to ``session_dir/run``, the earlier one aside first. Between the
+    two renames, and only then, the run's directory is not there; an exception between them
+    (an interrupt) moves the earlier one back."""
     final = session_dir / run
     with _locked(session_dir) as locked:
         if locked:  # what a killed call of this run left; under the lock no other call is in it
@@ -641,10 +643,17 @@ def _swap_into_place(session_dir: Path, tmp_root: Path, run: str) -> None:
                 if name != mine and re.fullmatch(rf"\.{run}\.[0-9a-f]{{16}}\.(tmp|old)", name):
                     shutil.rmtree(entry, ignore_errors=True)
         old = None
-        if final.is_symlink() or final.exists():
-            old = session_dir / f".{run}.{secrets.token_hex(8)}.old"
-            os.replace(final, old)
-        os.replace(tmp_root / run, final)
+        try:
+            if final.is_symlink() or final.exists():
+                old = session_dir / f".{run}.{secrets.token_hex(8)}.old"
+                os.replace(final, old)
+            os.replace(tmp_root / run, final)
+        except BaseException:
+            # interrupted between the two renames (a Ctrl-C, a SIGTERM taken as one): the
+            # earlier pack goes back, so that a session.json that lists the run finds it
+            if old is not None and not (final.is_symlink() or final.exists()):
+                os.replace(old, final)
+            raise
     if old is not None:
         if old.is_symlink() or old.is_file():
             old.unlink()
@@ -976,9 +985,7 @@ def pack_session(
                 frame=frame,
                 reason=reasons.get(item.run),
                 detail=details.get(item.run) if item.run in reasons else None,
-                session_order=(
-                    plan.order.index(item.run) if item.run in plan.order else None
-                ),
+                session_order=(plan.order.index(item.run) if item.run in plan.order else None),
                 n_volumes=None if pack is None else pack.n_volumes,
                 tr_s=None if pack is None else pack.tr_s,
                 first=None if pack is None else first,

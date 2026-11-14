@@ -56,14 +56,13 @@
       <label><input type="checkbox" id="traces-on" checked> traces <kbd>t</kbd></label>
       <label>difference scale <select id="diff-scale" aria-label="difference scale, gray levels"></select></label>
       <label>FD threshold, mm <input type="number" id="fd-limit" min="0" step="0.1" value="0.5"></label>
+      <p id="legend"><canvas id="legend-bar" width="255" height="10" hidden></canvas> <span id="legend-text"></span></p>
     </div>
   </section>
-  <p id="legend"><canvas id="legend-bar" width="255" height="10" hidden></canvas> <span id="legend-text"></span></p>
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
   <section id="about" aria-label="what the two streams are">
     <p id="reading"></p>
-    <p class="uses">Quality control of the <b>raw data</b>: motion, artefacts in single volumes, distortion and dropout as acquired, movement between runs. Quality control of the <b>preprocessing</b>: what was corrected, what remains, how the preprocessed series fits the white and pial contours.</p>
   </section>
 
   <div id="notice" hidden role="alertdialog" aria-labelledby="notice-text">
@@ -77,6 +76,9 @@
       <p>Every functional run of a subject, session after session, as one continuous moving picture in the anatomy. The
         page serves two kinds of quality control at once: of the <b>raw data</b>, and of the <b>preprocessing</b>. Two
         streams of every run lie on the same slices, with the white and pial surfaces of FreeSurfer as contours:</p>
+      <p>Quality control of the <b>raw data</b>: motion, artefacts in single volumes, distortion and dropout as
+        acquired, movement between runs. Quality control of the <b>preprocessing</b>: what was corrected, what remains,
+        how the preprocessed series fits the white and pial contours.</p>
       <ul>
         <li><b>raw</b>: the raw BIDS series, resampled once (cubic interpolation) onto the grid of the preprocessed
           series by the session's one rigid placement (the stored registration of the session's anchor run), and

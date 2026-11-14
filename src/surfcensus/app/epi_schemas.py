@@ -87,6 +87,10 @@ class RegistrationOut(_Shape):
     anchor_is_outlier: bool
     portable_voxel_map: bool
     reading: str
+    anchor_packed: bool = True
+    """Whether the anchor is among the packed runs (``RegistrationInfo.anchor_packed``)."""
+    note: str | None = None
+    """Why a later run is the anchor, when the first by the rule has no readable transform."""
 
 
 class EpiPackOut(_Shape):
@@ -126,6 +130,8 @@ class EpiRunOut(_Shape):
     """One sentence beside the reason, when there is more to say."""
     pack: EpiPackOut | None
     """None for a run that is not packed, or whose pack is not whole on disk."""
+    session_order: int | None = None
+    """The place of the run among all runs of its session (``SessionRunInfo.session_order``)."""
 
 
 class EpiSessionOut(_Shape):

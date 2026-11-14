@@ -1089,72 +1089,12 @@ textarea:focus-visible {
     "timeline"
     "run"
     "controls"
-    "legend"
     "traces"
     "status"
     "about";
   row-gap: 4px;
   padding: 6px 10px 6px;
   font-size: 13px;
-}
-
-/* on a wide window the run strip and the statement of the two streams take a column of their
-   own beside the views; the column has no height of its own (contain: size), so what it holds
-   never changes the height of a row */
-@media (min-width: 1700px) {
-  .epi {
-    grid-template-columns: minmax(0, 1fr) 340px;
-    column-gap: 16px;
-    grid-template-areas:
-      "bar bar"
-      "views run"
-      "timeline run"
-      "controls about"
-      "legend about"
-      "traces about"
-      "status about";
-  }
-
-  .epi #run-strip {
-    contain: size;
-    height: auto;
-    overflow: hidden;
-    align-self: stretch;
-  }
-
-  .epi #run-strip .line {
-    white-space: normal;
-    height: auto;
-    overflow: visible;
-  }
-
-  .epi #run-strip #corrections {
-    margin-top: 6px;
-  }
-
-  .epi #run-details,
-  .epi #run-details[hidden] {
-    display: block !important;
-    position: static;
-    width: auto;
-    max-height: none;
-    margin-top: 6px;
-    box-shadow: none;
-  }
-
-  .epi #run-more {
-    display: none;
-  }
-
-  .epi #run-strip {
-    padding-right: 0;
-  }
-
-  .epi #about {
-    contain: size;
-    align-self: stretch;
-    overflow: hidden;
-  }
 }
 
 .epi #bar {
@@ -1175,10 +1115,6 @@ textarea:focus-visible {
 
 .epi #controls {
   grid-area: controls;
-}
-
-.epi #legend {
-  grid-area: legend;
 }
 
 .epi #traces {
@@ -1348,7 +1284,8 @@ textarea:focus-visible {
 }
 
 /* a panel: a box of one size for the whole stream; the picture in its middle, the edge
-   letters in a margin of 13 px around it (views.js PAD), so that they cover no voxel */
+   letters in a margin of 13 px above and below it (views.js PAD_Y), so that they cover no
+   voxel */
 .epi .epi-panel {
   position: relative;
   outline: 1px solid var(--line);
@@ -1378,30 +1315,26 @@ textarea:focus-visible {
 
 .epi .epi-letter {
   position: absolute;
+  height: 13px;
   font: 600 11px/13px system-ui, sans-serif;
   color: var(--text);
   pointer-events: none;
-  text-align: center;
 }
 
-.epi .epi-letter.left,
-.epi .epi-letter.right {
-  width: 13px;
-  top: 50%;
-  transform: translateY(-50%);
-}
-
+/* left and right: the two ends of the upper margin; top and bottom: the middle of the upper
+   and the lower margin */
 .epi .epi-letter.left {
-  left: 0;
+  top: 0;
+  left: 3px;
 }
 
 .epi .epi-letter.right {
-  right: 0;
+  top: 0;
+  right: 3px;
 }
 
 .epi .epi-letter.top,
 .epi .epi-letter.bottom {
-  height: 13px;
   left: 50%;
   transform: translateX(-50%);
 }
@@ -1641,12 +1574,17 @@ textarea:focus-visible {
   width: 5em;
 }
 
+/* the legend: the rest of the second row of controls, two lines at most, the whole text in
+   its tooltip */
 .epi #legend {
+  flex: 1 1 360px;
+  min-width: 0;
   margin: 0;
   height: 34px;
   line-height: 17px;
   overflow: hidden;
   color: var(--muted);
+  font-size: 12px;
 }
 
 .epi #legend[data-normalized="true"] #legend-text {
@@ -1663,7 +1601,7 @@ textarea:focus-visible {
 .epi #traces {
   display: block;
   width: 100%;
-  height: 120px;
+  height: 104px;
   touch-action: none;
   cursor: col-resize;
 }

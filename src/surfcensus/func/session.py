@@ -279,12 +279,13 @@ def check_frame(
 
     Each run's displacement is taken over its own brain mask. The anchor need not have a mask
     (an anchor that is not packed, because it was not selected or lacks its mask, say): its
-    entry is all zeros either way, with ``n_voxels`` 0 when it has none. ``shared_frame_plausible``: no
-    run is flagged. ``anchor_is_outlier``: at least two runs besides the anchor, every one of
-    them flagged, and no pair of them flagged against each other (over the mask of the first
-    of the pair in the order of ``transforms``): then the anchor, or its stored transform, is
-    the odd one, and the whole session is drawn off the anatomy. Raises ``ValueError`` when the
-    anchor or a run's mask is missing."""
+    entry is all zeros either way, with ``n_voxels`` 0 when it has none.
+    ``shared_frame_plausible``: no run is flagged. ``anchor_is_outlier``: at least two runs
+    besides the anchor, every one of them flagged, and no pair of them flagged against each
+    other (over the mask of the first of the pair in the order of ``transforms``): then the
+    anchor, or its stored transform, is the odd one, and the whole session is drawn off the
+    anatomy. Raises ``ValueError`` when the anchor, or the mask of a run but the anchor, is
+    missing."""
     if anchor not in transforms:
         raise ValueError("the anchor is not among the runs")
     missing = [run for run in transforms if run not in masks and run != anchor]
@@ -294,9 +295,7 @@ def check_frame(
     for run, own in transforms.items():
         if run == anchor:
             n_voxels = int(np.count_nonzero(masks[run][0])) if run in masks else 0
-            runs[run] = FrameDisplacement(
-                0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, n_voxels, False
-            )
+            runs[run] = FrameDisplacement(0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, n_voxels, False)
             continue
         mask, affine = masks[run]
         runs[run] = frame_displacement(own, transforms[anchor], mask, affine, limit_mm)

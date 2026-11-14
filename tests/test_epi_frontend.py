@@ -290,6 +290,51 @@ def test_a_place_half_way_between_two_slices_goes_to_the_lower_index(js_copy: Pa
     assert out == [0, 1, 2]
 
 
+@needs_node
+def test_a_step_in_one_plane_moves_the_place_along_its_normal_only(
+    js_copy: Path, shape: dict[str, Any]
+) -> None:
+    """Finding 12 of the review of the page: a slice step on a coarse grid moved the place to
+    that grid's slice centres, so on coming back to a fine grid the other two planes changed.
+    With ``movePlace`` only the stepped plane's distance changes."""
+    grids = {g["grid_key"]: g for s in shape["sessions"] for g in s["grids"]}
+    fine, coarse = sorted(grids.values(), key=lambda g: g["shape"][0], reverse=True)[:2]
+    rng = np.random.default_rng(12)
+    cases = [
+        {"slices": [int(rng.integers(0, n)) for n in fine["shape"]], "plane": int(p), "dir": d}
+        for p in range(3)
+        for d in (-1, 1)
+        for _ in range(15)
+    ]
+    out = run_js(
+        js_copy,
+        "output(input.cases.map((c) => {\n"
+        "  const x = L.pointOf(input.fine, c.slices);\n"
+        "  const on = L.slicesAt(input.coarse, x);\n"
+        "  const n = input.coarse.shape[c.plane];\n"
+        "  const to = Math.min(n - 1, Math.max(0, on[c.plane] + c.dir));\n"
+        "  const stepped = on.slice(); stepped[c.plane] = to;\n"
+        "  const moved = L.movePlace(input.coarse, x, c.plane, to);\n"
+        "  const reset = L.pointOf(input.coarse, stepped);\n"
+        "  return { back: L.slicesAt(input.fine, moved), old: L.slicesAt(input.fine, reset),"
+        " d: L.slicesAt(input.coarse, moved), to };\n"
+        "}));\n",
+        {"fine": fine, "coarse": coarse, "cases": cases},
+    )
+    changed_by_old_rule = 0
+    for case, got in zip(cases, out, strict=True):
+        p = case["plane"]
+        others = [q for q in range(3) if q != p]
+        # the other two planes come back where they were; the stepped plane is on its slice
+        assert [got["back"][q] for q in others] == [case["slices"][q] for q in others], case
+        assert got["d"][p] == got["to"]  # on the coarse grid, the slice that was stepped to
+        changed_by_old_rule += [got["old"][q] for q in others] != [
+            case["slices"][q] for q in others
+        ]
+    # the cases do reach what the earlier rule (the place from all three slices) got wrong
+    assert changed_by_old_rule > 0
+
+
 # --- intensity ------------------------------------------------------------------------------
 
 
@@ -304,11 +349,17 @@ def test_the_common_scale_is_that_of_packread_for_every_byte(
         hi = float(rng.uniform(1, 5000))
         pairs.append((hi, hi * float(rng.uniform(1, 3))))
     pairs += [(1.0, 1.0), (255.0, 510.0), (1.0, 3.0), (1.0, 2.0), (0.1, 0.30000000000000004)]
+    # exact halves, where floor(b * (hi / top) + 0.5) and the rounding of b * hi / top differ
+    # (review of the page: windows (0, 7) and (0, 10), stored value 45: 31, not 32)
+    pairs += [(7.0, 10.0), (3.0, 10.0), (7.0, 20.0)]
     out = run_js(
         js_copy, "output(input.map(([h, t]) => Array.from(L.commonScale(h, t))));\n", pairs
     )
     for (hi, top), table in zip(pairs, out, strict=True):
         assert table == common_scale((0.0, hi), top).tolist(), (hi, top)
+    halves = dict(zip(pairs, out, strict=True))
+    assert halves[(7.0, 10.0)][45] == 31 == int(common_scale((0.0, 7.0), 10.0)[45])
+    assert round(45 * 7.0 / 10.0 + 1e-9) == 32  # the other rounding, which the test must catch
 
 
 @needs_node

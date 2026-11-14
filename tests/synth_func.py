@@ -436,8 +436,9 @@ class SyntheticSession:
     rule: str
     """``acquisition_time`` or ``name_order``."""
     order: tuple[str, ...]
-    """The stems of the packable runs in acquisition order (the anchor is the first acquired by
-    its rule)."""
+    """The stems of the packable runs in the session's acquisition order (decided over every
+    run of the session; the anchor, the first run by the rule with a stored transform, need
+    not be packable and then is not among them)."""
     flagged: tuple[str, ...]
     """Packable runs whose frame displacement exceeds 10 mm somewhere in the brain mask."""
     anchor_is_outlier: bool
@@ -898,18 +899,25 @@ def _time_seconds(text: str) -> float:
 
 
 def _session(runs: Sequence[SyntheticRun], key: tuple[str, str | None]) -> SyntheticSession:
-    """The expected anchor, order and frame check of a session, from the design alone."""
-    mine = [r for r in runs if (r.design.participant, r.design.session) == key and r.packable]
-    by_name = sorted(mine, key=lambda r: (r.design.task, int(r.design.run)))
-    if all(r.design.time is not None for r in mine):
+    """The expected anchor, order and frame check of a session, from the design alone.
+
+    The rule is decided over EVERY run of the session (decision D36 as built: the anchor does
+    not depend on which runs are packed): the time rule when every run has a raw sidecar with
+    a time, else name order. The anchor is the first run in that order that has a stored
+    transform, packable or not. ``order`` is the packable runs in that order."""
+    every = [r for r in runs if (r.design.participant, r.design.session) == key]
+    by_name_all = sorted(every, key=lambda r: (r.design.task, int(r.design.run)))
+    if all(r.design.time is not None and "raw_sidecar" in r.files for r in every):
         rule = "acquisition_time"
-        order = sorted(by_name, key=lambda r: _time_seconds(r.design.time or ""))
+        session_order = sorted(by_name_all, key=lambda r: _time_seconds(r.design.time or ""))
     else:
         rule = "name_order"
-        order = by_name
-    anchor = order[0]
+        session_order = by_name_all
+    anchor = next(r for r in session_order if "xfm_to_anat" in r.files)
+    order = [r for r in session_order if r.packable]
     relative = {r.stem: np.linalg.inv(anchor.displacement) @ r.displacement for r in order}
     others = [r for r in order if r is not anchor]
+    relative[anchor.stem] = np.eye(4)
     # every displacement of the design is a pure shift, a rotation of a few degrees or a scale
     # of 0.4 %, so "beyond 10 mm somewhere in the mask" follows from the shift alone here; the
     # test computes the maximum over the mask and compares

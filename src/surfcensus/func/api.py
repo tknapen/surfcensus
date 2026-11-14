@@ -61,7 +61,6 @@ from surfcensus.records import (
     ConnectorMatch,
     DerivRun,
     PlaneContours,
-    RawRun,
     RunPackInput,
     SessionPlan,
     SessionRun,
@@ -385,7 +384,10 @@ def _dangling(root: Path, participant: str) -> dict[tuple[str | None, str], list
 
 _SERIES_REASONS = {
     NO_RAW_SERIES: ("raw", ("_bold.nii.gz", "_bold.nii")),
-    NO_PREPROCESSED_SERIES: ("preprocessed", ("_desc-preproc_bold.nii.gz", "_desc-preproc_bold.nii")),
+    NO_PREPROCESSED_SERIES: (
+        "preprocessed",
+        ("_desc-preproc_bold.nii.gz", "_desc-preproc_bold.nii"),
+    ),
 }
 """A missing series, what it is called, and the ends of the names of such a series."""
 
@@ -558,7 +560,9 @@ def _failed_plan(
     )
 
 
-def _with_withheld(plan: SessionPlan, withheld: Mapping[str, tuple[str, str | None]]) -> SessionPlan:
+def _with_withheld(
+    plan: SessionPlan, withheld: Mapping[str, tuple[str, str | None]]
+) -> SessionPlan:
     """A failed plan whose withheld runs keep their own reason and detail."""
     if not withheld:
         return plan
@@ -597,7 +601,8 @@ class _Session:
     inputs: list[RunPackInput]
     contours: dict[str, Sequence[PlaneContours]] | None
     contour_note: str
-    voxels_volumes: int
+    work: dict[str, int]
+    """Run id -> volumes times voxels, for the estimate."""
 
 
 def _contours(
@@ -640,12 +645,12 @@ def _inputs(
     folders: FuncFolders,
     connector: Connector,
     session_inputs: Sequence[tuple[str, str, Path]],
-) -> tuple[list[RunPackInput], dict[str, str], int]:
+) -> tuple[list[RunPackInput], dict[str, str], dict[str, int]]:
     """The inputs of every packable run of a plan, the details of those whose inputs could
-    not be read, and the volumes times voxels of the packable runs (for the estimate)."""
+    not be read, and the volumes times voxels of each packable run (for the estimate)."""
     items = {r.run: r for r in plan.runs if r.reason is None}
     if not items or plan.anchor is None:
-        return [], {}, 0
+        return [], {}, {}
 
     def paths_of(item: SessionRun) -> dict[FuncRole, Path]:
         files: dict[FuncRole, object] = dict(item.deriv.files)
@@ -662,9 +667,9 @@ def _inputs(
         anchor_rigid = connector.raw_to_anat(anchor.deriv, anchor_paths)
     except _READ_ERRORS as err:
         detail = f"the anchor's transform cannot be read: {_no_path(err, folders.deriv_root)}"
-        return [], {run: detail for run in items}, 0
+        return [], {run: detail for run in items}, {}
     out: list[RunPackInput] = []
-    work = 0
+    work: dict[str, int] = {}
     for run, item in items.items():
         paths = paths_of(item)
         try:
@@ -700,8 +705,92 @@ def _inputs(
                 session_inputs=tuple(extra),  # pyrefly: ignore[bad-argument-type]
             )
         )
-        work += n * grid.shape[0] * grid.shape[1] * grid.shape[2]
+        work[run] = n * grid.shape[0] * grid.shape[1] * grid.shape[2]
     return out, failed, work
+
+
+# --- links among the inputs, and what the registration says ----------------------------------
+
+
+def _link_targets(planned: Sequence[_Session], folders: FuncFolders) -> list[tuple[str, Path]]:
+    """For every listed input file of the planned sessions that is a link, or is reached
+    through one, the directory that holds its target: the raw series and sidecars, the
+    derivative's files of every run (selected or not) and of the session, and the FreeSurfer
+    files of the contours. From the listing and ``realpath`` alone; no file is opened."""
+    paths: list[Path] = []
+    for item in planned:
+        for run in item.plan.runs:
+            files: dict[FuncRole, object] = dict(run.deriv.files)
+            if run.raw is not None:
+                files.update({k: v for k, v in run.raw.files.items() if k not in files})
+            paths += _paths(files, folders.deriv_root, folders.raw_root).values()
+        paths += _paths(dict(item.plan.files), folders.deriv_root, folders.raw_root).values()
+        if item.plan.fs_subject is not None and folders.fs_subjects_dir is not None:
+            try:
+                found = patterns.resolve_subject_files(
+                    folders.fs_subjects_dir / item.plan.fs_subject
+                )
+            except OSError:
+                found = {}
+            paths += [found[role] for role in _FS_FILES if role in found]
+    places: dict[Path, str] = {}
+    for path in paths:
+        written = Path(os.path.abspath(path))
+        real = Path(os.path.realpath(path))
+        if real != written and real.parent not in places:
+            places[real.parent] = f"the directory that the link {path.name} leads into,"
+    return [(what, place) for place, what in places.items()]
+
+
+def refuse_in_sources_of_links(
+    out: Path, planned: Sequence[_Session], folders: FuncFolders
+) -> None:
+    """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory that
+    holds the target of a linked input file (:func:`_link_targets`), as the renderer refuses
+    an output beside the target of a linked input. Per-file links are the layout of DataLad
+    and git-annex clones, whose object store holds the targets."""
+    from surfcensus.sources.local import refuse_in_sources
+
+    refuse_in_sources(out, [], what="output", also=_link_targets(planned, folders))
+
+
+def _registration_lines(planned: Sequence[_Session], participant: str) -> list[str]:
+    """Lines that say, per session, what the one registration of the session finds in the raw
+    data: an anchor that is not packed or not the first run by the rule, each run beyond the
+    frame limit, and an anchor that is the outlier."""
+    lines = []
+    for item in planned:
+        plan = item.plan
+        if plan.anchor is None:
+            continue
+        text = _session_label(participant, item.label)
+        names = {r.run: r.name for r in plan.runs}
+        anchor = names.get(plan.anchor.run, plan.anchor.run)
+        reasons = {r.run: r.reason for r in plan.runs}
+        if plan.anchor_note:
+            lines.append(f"{text}: {plan.anchor_note}.")
+        if reasons.get(plan.anchor.run) is not None and any(v is None for v in reasons.values()):
+            lines.append(
+                f"{text}: the anchor {anchor} is not packed ({reasons[plan.anchor.run]}); the "
+                "raw stream of every packed run is drawn through its stored registration."
+            )
+        if plan.frame is None:
+            continue
+        for run in plan.frame.flagged:
+            d = plan.frame.runs[run]
+            lines.append(
+                f"{text}: flagged (raw data): {names.get(run, run)}, drawn through the "
+                f"registration of the anchor {anchor}, lies up to {d.max_mm:.1f} mm (mean "
+                f"{d.mean_mm:.1f} mm) from where its own stored registration puts it, beyond "
+                f"the limit of {plan.frame.limit_mm:g} mm."
+            )
+        if plan.frame.anchor_is_outlier:
+            lines.append(
+                f"{text}: the anchor {anchor} is the outlier (raw data): every other run is "
+                "flagged against it and they agree with each other, so the anchor, or its "
+                "stored registration, is the odd one."
+            )
+    return lines
 
 
 # --- packing --------------------------------------------------------------------------------
@@ -738,6 +827,7 @@ def epi_subject(
     key: bytes | None = None,
     runs: Sequence[str] | None = None,
     progress: Progress | None = None,
+    force: bool = False,
 ) -> StreamInfo:
     """Pack every session of ``subject`` (``sub-01`` or ``01``) found under ``path``, or the
     sessions named (``1`` or ``ses-1``), into ``<out>/<session_id>/``, and write
@@ -746,7 +836,11 @@ def epi_subject(
     numbers compared as numbers). Within a session the runs follow in acquisition order.
 
     ``runs`` restricts the runs packed to those whose derivative stem matches one of the
-    shell patterns (``*task-rest*``); the others are not listed. ``key`` keys the ids
+    shell patterns (``*task-rest*``); the other runs of the sessions that hold a selected run
+    are listed as ``not selected`` and are not packed, but they stay runs of their session: one
+    of them can be its anchor, and the session's acquisition order is the same whatever is
+    selected (``session.plan_session``). A run whose pack in ``out`` is current is kept
+    (``pack.current_pack``); ``force`` packs every run again. ``key`` keys the ids
     (module docstring). ``progress`` is given one line at a time: the listing, an estimate
     of the time, each run with its volumes and seconds, each session.
 
@@ -823,7 +917,10 @@ def epi_subject(
         for r in druns:
             files = unfetched_deriv.get((label, r.key), []) + unfetched_raw.get((label, r.key), [])
             if (label, r.key) not in chosen:
-                withheld[r.key] = (NOT_SELECTED, f"--epi-runs leaves it out ({', '.join(patterns_)})")
+                withheld[r.key] = (
+                    NOT_SELECTED,
+                    f"--epi-runs leaves it out ({', '.join(patterns_)})",
+                )
             elif files:
                 withheld[r.key] = (NOT_FETCHED, _not_fetched(files))
         fs_subject = _fs_subject(folders.fs_subjects_dir, participant, label)
@@ -859,15 +956,18 @@ def epi_subject(
             plan = replace(plan, details={**plan.details, **failed})
         planned.append(_Session(label, sid, plan, inputs, contours, note, work))
 
+    # nothing is written into a directory that holds the target of a linked input
+    refuse_in_sources_of_links(out, planned, folders)
+
     # what was found, and an estimate
     n_runs = sum(len(s.plan.runs) for s in planned)
     n_ready = sum(len(s.inputs) for s in planned)
     cannot = [(s, r) for s in planned for r in s.plan.runs if r.reason is not None]
-    raw_said = (
-        f"raw series in {_shown(raw_root, given)} (BIDS)"
-        if raw_root is not None
-        else "no raw dataset found (give it with --raw DIR)"
-    )
+    if raw_root is None:
+        raw_said = "no raw dataset found (give it with --raw DIR)"
+    else:
+        named = raw if raw is not None else (path if raw_root == given else raw_root)
+        raw_said = f"raw series in {named} (BIDS)"
     version = folders.match.pipeline_version
     pipeline = f"fMRIPrep {version}" if version else "fMRIPrep"
     line = (
@@ -881,46 +981,76 @@ def epi_subject(
         )
         line += f", {len(cannot)} cannot: {shown}"
     say(line + ".")
-    work = sum(s.voxels_volumes for s in planned)
-    if work:
-        seconds = RATE_S_PER_VOLUME * work / RATE_VOXELS
-        say(
-            f"EPI packs: {_plural(n_ready, 'run')} to pack, about {_duration(seconds)} in one "
-            f"process (an estimate: {RATE_S_PER_VOLUME} s per volume of both streams on "
-            f"{RATE_VOXELS:,} voxels, scaled by voxels)."
-        )
+    for line in _registration_lines(planned, participant):
+        say(line)
+    kept = (
+        set()
+        if force
+        else {
+            run.run
+            for item in planned
+            for run in item.inputs
+            if pack_.current_pack(out / item.sid, run, config) is not None
+        }
+    )
+    work = sum(n for item in planned for run, n in item.work.items() if run not in kept)
+    to_pack = n_ready - len(kept)
+    if n_ready:
+        parts = [f"EPI packs: {_plural(to_pack, 'run')} to pack"]
+        if kept:
+            parts.append(f"{len(kept)} kept from an earlier call into {out}")
+        if work:
+            seconds = RATE_S_PER_VOLUME * work / RATE_VOXELS
+            parts.append(
+                f"about {_duration(seconds)} in one process (an estimate: "
+                f"{RATE_S_PER_VOLUME} s per volume of both streams on {RATE_VOXELS:,} voxels, "
+                "scaled by voxels)"
+            )
+        say(", ".join(parts) + ".")
 
-    # pack, session by session, and the stream last
+    # pack, session by session, and the stream last; an earlier stream.json stays until the
+    # new one is renamed over it, so a page served from ``out`` keeps a whole stream
     out.mkdir(parents=True, exist_ok=True)
-    (out / STREAM_JSON).unlink(missing_ok=True)
     infos: list[SessionInfo] = []
     for item in planned:
         text = _session_label(participant, item.label)
         names = {r.run: r.name for r in item.plan.runs}
+
+        kept_here: list[str] = []
 
         def report(
             run: str,
             info: object,
             reason: str | None,
             seconds: float,
+            kept: bool,
             text: str = text,
             names: Mapping[str, str] = names,
+            kept_here: list[str] = kept_here,
         ) -> None:
+            name = names.get(run, run)
             if reason is None and info is not None:
                 n = getattr(info, "n_volumes", 0)
-                say(f"{text}: {names.get(run, run)}: {n} volumes, {seconds:.1f} s")
+                if kept:
+                    kept_here.append(run)
+                    say(f"{text}: {name}: {n} volumes, kept (its pack is current), {seconds:.1f} s")
+                else:
+                    say(f"{text}: {name}: {n} volumes, packed, {seconds:.1f} s")
             else:
-                say(f"{text}: {names.get(run, run)}: not packed ({reason}), {seconds:.1f} s")
+                say(f"{text}: {name}: not packed ({reason}), {seconds:.1f} s")
 
         started = time.perf_counter()
         info = pack_.pack_session(
-            out, item.sid, item.plan, item.inputs, item.contours, config, report
+            out, item.sid, item.plan, item.inputs, item.contours, config, report, force=force
         )
         infos.append(info)
         packed = sum(1 for r in info.runs if r.reason is None)
         said = f"; {item.contour_note}" if item.contour_note else ""
+        again = (
+            f" ({len(kept_here)} kept, {packed - len(kept_here)} packed now)" if kept_here else ""
+        )
         say(
-            f"{text}: {packed} of {_plural(len(info.runs), 'run')} packed, "
+            f"{text}: {packed} of {_plural(len(info.runs), 'run')} packed{again}, "
             f"{time.perf_counter() - started:.1f} s{said}"
         )
     stream = StreamInfo(

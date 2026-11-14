@@ -262,6 +262,7 @@ class Packs:
                     sd_window=r.sd_window,
                     detail=r.detail,
                     pack=pack,
+                    session_order=r.session_order,
                 )
             )
         registration = None

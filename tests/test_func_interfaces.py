@@ -123,6 +123,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "AFFINE_UNCHECKED": None,
         "AFFINE_TOLERANCE": None,
         "FRAME_LIMIT_MM": None,
+        "session_order": ("runs",),
         "pick_anchor": ("runs",),
         "acquisition_order": ("runs", "anchor"),
         "raw_affine_choice": ("raw_bold", "reference"),
@@ -139,6 +140,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "run_ids",
             "fs_subject",
             "frame_limit_mm",
+            "withheld",
         ),
     },
     "surfcensus.func.geometry": {
@@ -190,7 +192,9 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "contours",
             "config",
             "progress",
+            "force",
         ),
+        "current_pack": ("session_dir", "run", "config"),
         "content_digest": ("session_dir", "info"),
     },
     "surfcensus.func.packread": {
@@ -238,6 +242,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "key",
             "runs",
             "progress",
+            "force",
         ),
         "RATE_S_PER_VOLUME": None,
         "RATE_VOXELS": None,
@@ -305,6 +310,8 @@ RECORDS: dict[str, tuple[str, ...]] = {
         "grid_of",
         "files",
         "details",
+        "order",
+        "anchor_note",
     ),
     "RunPackInput": (
         "run",
@@ -347,6 +354,8 @@ MODELS: dict[str, tuple[str, ...]] = {
         "anchor_is_outlier",
         "portable_voxel_map",
         "reading",
+        "anchor_packed",
+        "note",
     ),
     "GridInfo": (
         "grid_key",
@@ -372,6 +381,7 @@ MODELS: dict[str, tuple[str, ...]] = {
         "window",
         "sd_window",
         "detail",
+        "session_order",
     ),
     "FrameInfo": (
         "mean_mm",
@@ -502,6 +512,7 @@ def test_the_reasons_and_the_choices() -> None:
         "pack failure",
         "no confounds table",
         "not fetched",
+        "not selected",
     )
     assert set(records.DISPLAY_REASONS) <= set(records.PACK_REASONS)
     from surfcensus.func import session

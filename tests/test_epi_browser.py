@@ -245,39 +245,52 @@ def test_the_screenshot_shows_the_values_at_every_voxel_centre(
             image = np.asarray(Image.open(io.BytesIO(shot)).convert("RGB"))
             h, w = want[plane].shape[:2]
             assert (rect["cw"], rect["ch"]) == (w, h)
-            # the edge letters lie over the picture; a voxel centre under one is not compared
+            # the edge letters lie in the margin of the box, outside the picture: every voxel
+            # centre is compared, none is passed over (review of the page, finding 10)
             letters = page.js(
                 'Array.from(document.querySelectorAll(`#views .epi-group[data-group="pre"] '
                 '.epi-panel[data-plane="${arg}"] .epi-letter`)).map((e) => {'
-                " const r = e.getBoundingClientRect(); return [r.left - 2, r.top - 2, r.right + 2,"
-                " r.bottom + 2]; })",
+                " const r = e.getBoundingClientRect(); return [r.left, r.top, r.right, r.bottom,"
+                " e.textContent]; })",
                 plane,
             )
-            compared = 0
+            assert len(letters) == 4 and all(t for *_, t in letters)
+            for x1, y1, x2, y2, _ in letters:
+                apart = (
+                    x2 <= rect["x"]
+                    or x1 >= rect["x"] + rect["w"]
+                    or y2 <= rect["y"]
+                    or y1 >= rect["y"] + rect["h"]
+                )
+                assert apart, (plane, (x1, y1, x2, y2), rect)
             for r in range(h):
                 for c in range(w):
                     px = rect["x"] - x0 + (c + 0.5) * rect["w"] / w
                     py = rect["y"] - y0 + (r + 0.5) * rect["h"] / h
-                    ax, ay = px + x0, py + y0
-                    if any(x1 <= ax <= x2 and y1 <= ay <= y2 for x1, y1, x2, y2 in letters):
-                        continue
                     got = image[int(py), int(px)]
                     assert tuple(got) == tuple(want[plane][r, c]), (g, plane, r, c)
-                    compared += 1
-            assert compared > 0.9 * w * h
 
 
 def test_the_stills_and_their_sd_window(page: Page, packed: PackedStream) -> None:
     segs = segments(packed)
-    for normalized in (False, True):
-        for kind, still in (("mean", "mean"), ("sd", "sd")):
-            shown = page.set({"g": 40, "view": "raw", "kind": kind, "normalized": normalized})
-            seg = segment_of(segs, 40)
-            lut = table(segs, seg, normalized, sd=kind == "sd")
-            volume = lut[decode_still(seg["dir"], seg["pack"], "raw", still)]
-            for plane in range(3):
-                gray = panel_rows(volume, plane, shown["slices"][plane])
-                assert np.array_equal(canvas(page, "raw", plane)[..., 0], gray)
+    # the brighter run, and the run with an offset, whose value table and SD table differ when
+    # normalization is off (a mean drawn through the SD table, or the SD through the value
+    # table, shows there)
+    offset = segs[6]
+    assert offset["window"][1] / segs[1]["window"][1] != pytest.approx(
+        offset["sd_window"][1] / segs[1]["sd_window"][1], rel=1e-3
+    )
+    assert not np.array_equal(table(segs, offset, False), table(segs, offset, False, sd=True))
+    for g in (40, offset["first"] + 3):
+        for normalized in (False, True):
+            for kind, still in (("mean", "mean"), ("sd", "sd")):
+                shown = page.set({"g": g, "view": "raw", "kind": kind, "normalized": normalized})
+                seg = segment_of(segs, g)
+                lut = table(segs, seg, normalized, sd=kind == "sd")
+                volume = lut[decode_still(seg["dir"], seg["pack"], "raw", still)]
+                for plane in range(3):
+                    gray = panel_rows(volume, plane, shown["slices"][plane])
+                    assert np.array_equal(canvas(page, "raw", plane)[..., 0], gray), (g, kind)
             legend = page.js("window.__epi.texts().legend")
             assert ("normalization on" if normalized else "normalization off") in legend
             assert ("temporal SD" in legend) is (kind == "sd")
@@ -371,7 +384,7 @@ def test_jumps_go_to_the_exact_volume_anywhere_in_the_stream(
         assert page.js("Number(document.getElementById('time').value)") == g
     # a run button jumps to the first volume of its run
     for k, seg in enumerate(segs):
-        page.page.click(f'#runs button[data-seg="{k}"]')
+        page.page.click(f'#segments button[data-seg="{k}"]')
         page.page.wait_for_function(
             "(g) => window.__epi.shown && window.__epi.shown.g === g", arg=seg["first"]
         )
@@ -393,14 +406,30 @@ def test_what_the_page_says_follows_the_run_on_screen(page: Page, packed: Packed
         assert seg["run"].name in texts["runNote"] and seg["run"].name in texts["readout"]
         assert seg["run"].name in texts["corrections"]
         flagged = seg["run"].frame is not None and seg["run"].frame.flagged
-        assert ("FLAGGED" in texts["warning"]) is flagged
+        assert (f"{seg['run'].name} is flagged" in texts["warning"]) is flagged
+        assert ("flagged:" in texts["badges"]) is flagged
+        # the corrections: each statement with its own source, the dof once (finding 7)
+        assert texts["corrections"].count("6 dof") == 1, texts["corrections"]
+        assert "head-motion correction (stated by no file)" in texts["corrections"]
     assert (
         "unchecked" in said[3]["warning"] and "distortion correction, FLB" in said[3]["corrections"]
     )
+    assert (
+        'distortion correction, FLB (fieldmap-less, SyN-based) (summary report: "FLB")'
+        in (said[3]["corrections"])
+    )
+    # a statement about the raw data, said as such and not as a fault of the page
+    assert "statement about the raw data" in said[3]["warning"]
+    assert "failed" not in said[3]["warning"]
     assert "odd one" in said[5]["warning"]  # the anchor of the second session is the outlier
     assert "no raw series" in said[5]["session"]
-    assert page.js("document.querySelector('#runs button.flagged') !== null")
-    assert page.js("document.querySelectorAll('#runs button:disabled').length") == 1
+    assert "not in the stream" in said[5]["badges"]
+    assert page.js("document.querySelector('#segments button.flagged') !== null")
+    # nothing that changes while playing is announced as an alert
+    assert page.js("document.querySelectorAll('.epi [role=alert]').length") == 0
+    assert page.js("getComputedStyle(document.querySelector('#badges .badge.flag')).color") != (
+        "rgb(255, 82, 82)"
+    )
 
 
 def test_the_normalization_key_and_what_the_legend_says(page: Page) -> None:
@@ -472,3 +501,270 @@ def test_screenshots_for_a_reader(
         page.set(change)
         page.page.screenshot(path=str(where / f"{name}.png"))
         assert (where / f"{name}.png").stat().st_size > 1000
+
+
+# --- the layout (review of the page, findings 1, 3 and 10) ----------------------------------
+
+BLOCKS = ("bar", "timeline", "run-strip", "controls", "traces", "status", "about")
+
+
+def rects(page: Page) -> dict[str, list[list[float]]]:
+    """Where the panel boxes, the canvases and the blocks of the page lie, in CSS px."""
+    return page.js(
+        "(() => { const r = (e) => { const b = e.getBoundingClientRect();"
+        " return [b.x, b.y, b.width, b.height]; };"
+        " return { boxes: Array.from(document.querySelectorAll('#views .epi-panel')).map(r),"
+        " canvases: Array.from(document.querySelectorAll('#views canvas')).map(r),"
+        " blocks: arg.map((id) => document.getElementById(id)).filter(Boolean).map(r) }; })()",
+        list(BLOCKS),
+    )
+
+
+@pytest.mark.parametrize("size", [(1400, 900), (1920, 1080), (400, 900)])
+@pytest.mark.parametrize("view", ["raw", "side"])
+def test_nothing_moves_at_any_boundary_of_the_stream(
+    browser: Any, server: Any, packed: PackedStream, size: tuple[int, int], view: str
+) -> None:
+    """D38: at a run or session boundary nothing changes but the pictures. Every panel box and
+    every block of the page keeps its place and size; so does every canvas where the grid
+    stays, and where the grid changes the canvas keeps the scale in px per mm and its centre
+    in its box."""
+    segs = segments(packed)
+    total = sum(s["n"] for s in segs)
+    opened = Page(browser, server.url, *size)
+    try:
+        opened.set({"view": view})
+        for k, seg in enumerate([*segs[1:], segs[0]]):
+            after = seg["first"]
+            before = (after - 1) % total
+            prev = segment_of(segs, before)
+            opened.set({"g": before})
+            r0 = rects(opened)
+            opened.set({"g": after})
+            r1 = rects(opened)
+            assert r0["boxes"] == r1["boxes"], (k, after)
+            assert r0["blocks"] == r1["blocks"], (k, after)
+            if prev["grid"].grid_key == seg["grid"].grid_key:
+                assert r0["canvases"] == r1["canvases"], (k, after)
+            else:
+                for (x0, y0, w0, h0), (x1, y1, w1, h1) in zip(
+                    r0["canvases"], r1["canvases"], strict=True
+                ):
+                    assert abs((x0 + w0 / 2) - (x1 + w1 / 2)) <= 1
+                    assert abs((y0 + h0 / 2) - (y1 + h1 / 2)) <= 1
+        # and while playing through a run boundary, the flagged run and the session boundary
+        opened.set({"g": 40})
+        r0 = rects(opened)
+        log = play(opened, 40, 60, 80)
+        assert {e["g"] for e in log} >= {48, 72, 96, 119, 120}
+        opened.set({"g": 125})
+        assert rects(opened)["boxes"] == r0["boxes"]
+        assert rects(opened)["canvases"] == r0["canvases"]
+        assert rects(opened)["blocks"] == r0["blocks"]
+    finally:
+        opened.clean()
+
+
+@pytest.mark.parametrize("size", [(1400, 900), (1920, 1080)])
+def test_the_page_does_not_overflow_the_window(
+    browser: Any, server: Any, size: tuple[int, int]
+) -> None:
+    opened = Page(browser, server.url, *size)
+    try:
+        assert opened.js("window.__epi.state.traces") is True
+        for view in ("raw", "pre", "side", "diff"):
+            for g in (0, 75, 100, 150):  # an anchor, the flagged run, grid C, session B
+                opened.set({"view": view, "g": g})
+                height = opened.js("document.scrollingElement.scrollHeight")
+                assert height <= size[1], (view, g, height)
+                assert opened.js("document.scrollingElement.scrollWidth") <= size[0]
+    finally:
+        opened.clean()
+
+
+def picture_share(page: Page) -> float:
+    return page.js(
+        "(() => { let a = 0; for (const c of document.querySelectorAll('#views canvas.gray')) {"
+        " const r = c.getBoundingClientRect();"
+        " a += Math.max(0, Math.min(r.right, innerWidth) - Math.max(r.left, 0))"
+        " * Math.max(0, Math.min(r.bottom, innerHeight) - Math.max(r.top, 0)); }"
+        " return a / (innerWidth * innerHeight); })()"
+    )
+
+
+def test_the_pictures_come_first_and_take_most_of_the_window(browser: Any, server: Any) -> None:
+    """Finding 3: the views start under one bar, before any text about the run, and take the
+    largest share of the window the controls leave."""
+    opened = Page(browser, server.url, 1400, 900)
+    try:
+        for view, least in (("raw", 0.3), ("side", 0.2), ("diff", 0.3)):
+            opened.set({"view": view, "g": 75})
+            top = opened.js("document.getElementById('views').getBoundingClientRect().top")
+            bar = opened.js("document.getElementById('bar').getBoundingClientRect().bottom")
+            assert top <= bar + 8, (view, top, bar)
+            for block in ("timeline", "run-strip", "controls", "about"):
+                below = opened.js(f"document.getElementById('{block}').getBoundingClientRect().top")
+                assert below > top
+            share = picture_share(opened)
+            assert share >= least, (view, share)
+            # the views take what the rest leaves: the page fills the window, it does not
+            # leave a stretch empty under it (height-limited views)
+            if view != "side":
+                height = opened.js("document.querySelector('.epi').getBoundingClientRect().height")
+                assert height >= 900 - 30, (view, height)
+    finally:
+        opened.clean()
+    narrow = Page(browser, server.url, 400, 900)
+    try:
+        first = narrow.js("window.__epi.rect('raw', 0)")
+        assert first["y"] + first["h"] <= 900 and first["w"] > 300
+    finally:
+        narrow.clean()
+
+
+# --- the boundary marks (finding 4) ---------------------------------------------------------
+
+
+def test_the_cursor_and_the_boundaries_are_marked_apart_on_the_slider_and_in_the_traces(
+    page: Page, packed: PackedStream
+) -> None:
+    segs = segments(packed)
+    total = sum(s["n"] for s in segs)
+    page.set({"g": 30})
+    ticks = page.js("document.getElementById('time').style.getPropertyValue('--ticks')")
+    # one tick per boundary: thin ones between runs, one thick one between sessions
+    assert ticks.count("#c9d1db calc(") == 2 * (len(segs) - 2)
+    assert ticks.count("#ffffff calc(") == 2
+    # the segments are the runs, each a jump to its first volume, the session start marked
+    buttons = page.js(
+        "Array.from(document.querySelectorAll('#segments button')).map((b) => [b.textContent,"
+        " b.classList.contains('session-start'), b.getBoundingClientRect().width])"
+    )
+    assert [b[0] for b in buttons] == [s["run"].name for s in segs]
+    assert [b[1] for b in buttons] == [k == 5 for k in range(len(segs))]
+    assert all(w > 10 for *_, w in buttons)
+    # hiding the traces leaves the slider and its marks as they are
+    before = rects(page)["blocks"][BLOCKS.index("timeline")]
+    page.page.keyboard.press("t")
+    page.page.wait_for_function("() => window.__epi.state.traces === false")
+    assert page.js("document.getElementById('time').style.getPropertyValue('--ticks')") == ticks
+    assert page.js("document.getElementById('segments').children.length") == len(segs)
+    page.page.keyboard.press("t")
+    page.page.wait_for_function("() => window.__epi.state.traces === true")
+    assert rects(page)["blocks"][BLOCKS.index("timeline")][2:] == before[2:]
+    # in the traces: the cursor in a colour of its own, unlike a run or a session boundary
+    page.set({"g": 50})
+    shot = Image.open(io.BytesIO(page.page.locator("#traces").screenshot())).convert("RGB")
+    pixels = {tuple(p) for p in np.asarray(shot).reshape(-1, 3)}
+    assert (255, 61, 240) in pixels  # the cursor, magenta
+    assert (255, 255, 255) in pixels  # the session boundary, white
+    assert (201, 209, 219) in pixels  # a run boundary, light gray, dashed
+    assert total == 192
+
+
+# --- focus (finding 11) ---------------------------------------------------------------------
+
+
+def test_the_help_keeps_the_focus_inside_and_gives_it_back(page: Page) -> None:
+    page.js("document.getElementById('normalize').focus()")
+    page.page.keyboard.press("?")
+    page.page.wait_for_function("() => !document.getElementById('help').hidden")
+    for key in ("Tab", "Tab", "Tab", "Shift+Tab", "Tab"):
+        page.page.keyboard.press(key)
+        assert page.js("document.getElementById('help').contains(document.activeElement)"), key
+    page.page.keyboard.press("Escape")
+    page.page.wait_for_function("() => document.getElementById('help').hidden")
+    assert page.js("document.activeElement && document.activeElement.id") == "normalize"
+    # opened from nothing, it gives the focus back to nothing: Space then plays, as before
+    page.js("document.activeElement.blur()")
+    page.page.keyboard.press("?")
+    page.page.wait_for_function("() => !document.getElementById('help').hidden")
+    page.page.keyboard.press("Escape")
+    assert page.js("document.activeElement === document.body")
+
+
+# --- the place in the anatomy (finding 12) --------------------------------------------------
+
+
+def test_a_slice_step_on_another_grid_leaves_the_other_planes_where_they_were(
+    page: Page, packed: PackedStream
+) -> None:
+    for slices in ([10, 17, 5], [3, 5, 10], [8, 9, 7]):
+        page.set({"g": 10, "slices": slices})
+        on_c = page.set({"g": 100})
+        for plane in range(3):
+            page.set({"g": 100, "slices": on_c["slices"]})
+            page.set({"g": 10, "slices": slices})
+            page.set({"g": 100})
+            # one step up of the plane with the arrow key, as a viewer does it
+            page.js("window.__epi.state.active = arg", plane)
+            page.page.keyboard.press("ArrowUp")
+            page.page.wait_for_function(
+                "(a) => window.__epi.shown.slices[a[0]] === a[1]",
+                arg=[plane, min(on_c["slices"][plane] + 1, packed.runs[4].grid.shape[plane] - 1)],
+            )
+            back = page.set({"g": 130})
+            others = [q for q in range(3) if q != plane]
+            assert [back["slices"][q] for q in others] == [slices[q] for q in others], (
+                slices,
+                plane,
+            )
+
+
+# --- errors and packs made again (finding 2, the page's part) -------------------------------
+
+
+def test_an_error_that_passes_leaves_no_error_on_the_page(browser: Any, server: Any) -> None:
+    opened = Page.__new__(Page)
+    opened.page = browser.new_page(viewport={"width": 1400, "height": 900})
+    opened.url = server.url
+    opened.console = []
+    opened.requests = []
+    opened.page.on("request", lambda r: opened.requests.append(r.url))
+    failed: list[str] = []
+
+    def once(route: Any) -> None:
+        if not failed:
+            failed.append(route.request.url)
+            route.fulfill(status=404, body="")
+        else:
+            route.continue_()
+
+    opened.page.route("**/c0001.bin*", once)
+    opened.page.goto(server.url)
+    opened.page.wait_for_function("() => window.__epi && window.__epi.shown", timeout=20000)
+    opened.page.wait_for_function("() => window.__epi.page.errors.length > 0", timeout=20000)
+    opened.page.wait_for_function("() => window.__epi.allLoaded()", timeout=30000)
+    opened.set({"g": 2})
+    assert failed
+    assert "ERROR" not in opened.js("window.__epi.texts().status")
+    assert opened.js("window.__epi.texts().notice") == ""
+    opened.page.close()
+
+
+def test_packs_made_again_under_an_open_page_are_said_with_a_reload(
+    browser: Any, server: Any
+) -> None:
+    """A file whose bytes are not those the page was given, while the server now lists other
+    files: the page says the packs were made again, stops asking, and offers to reload."""
+    page = browser.new_page(viewport={"width": 1400, "height": 900})
+    calls: list[int] = []
+
+    def stream(route: Any) -> None:
+        response = route.fetch()
+        body = response.json()
+        if calls:  # every answer after the first lists other files
+            body["sessions"][0]["runs"][0]["pack"]["token"] = "0" * 16
+        calls.append(1)
+        route.fulfill(response=response, json=body)
+
+    page.route("**/api/epi/stream", stream)
+    page.route("**/c0002.bin*", lambda route: route.fulfill(status=200, body=b"not the bytes"))
+    page.goto(server.url)
+    page.wait_for_function("() => window.__epi && window.__epi.shown", timeout=20000)
+    page.wait_for_function("() => window.__epi.texts().notice !== ''", timeout=20000)
+    notice = page.evaluate("window.__epi.texts().notice")
+    assert "made again" in notice and "Reload" in notice
+    assert page.is_visible("#notice-reload")
+    assert len(calls) >= 2
+    page.close()

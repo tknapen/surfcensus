@@ -13,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from surfcensus import stopping
 from surfcensus.stopping import (
     INTERRUPTED,
     TERMINATED,
@@ -191,3 +192,38 @@ def test_a_signal_inside_code_run_from_a_string_still_ends_with_its_code(
     )
     assert done.stderr.strip() == f"line {code}"
     assert done.returncode == code  # not -2: killed by SIGINT after the line
+
+
+@pytest.mark.parametrize("at", ["sigint", "sigterm"])
+def test_a_ctrl_c_while_the_handlers_are_being_set_is_the_commands(
+    monkeypatch: pytest.MonkeyPatch, at: str
+) -> None:
+    """A Ctrl-C that arrives while ``command_signals`` sets its handlers (here: as the call
+    that sets the SIGINT, or the SIGTERM, handler returns) ends the command with its line and
+    130, not with a ``KeyboardInterrupt`` that escapes to click, which makes it an abort with
+    exit code 1 and no line of the command."""
+    real = signal.signal
+    wanted = signal.SIGINT if at == "sigint" else signal.SIGTERM
+    fired: list[int] = []
+
+    def setting(signum: int, handler: object) -> object:
+        earlier = real(signum, handler)  # pyrefly: ignore[bad-argument-type]
+        if signum == wanted and callable(handler) and not fired:
+            fired.append(signum)
+            raise KeyboardInterrupt  # what a Ctrl-C right here does
+        return earlier
+
+    monkeypatch.setattr(stopping.signal, "signal", setting)
+    seen: list[int] = []
+    body: list[str] = []
+    try:
+        with pytest.raises(SystemExit) as caught:
+            with command_signals(lambda s: seen.append(s.exit_code())):
+                body.append("ran")
+    except KeyboardInterrupt:
+        pytest.fail("the Ctrl-C escaped command_signals as a KeyboardInterrupt")
+    assert caught.value.code == stopping.INTERRUPTED and seen == [stopping.INTERRUPTED]
+    assert body == [] and fired == [wanted]
+    # the command is ending: both signals are ignored from here on
+    assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
