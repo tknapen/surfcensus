@@ -80,6 +80,22 @@ def _ignore(*signums: int) -> None:
         signal.signal(signum, signal.SIG_IGN)
 
 
+def _forget_caught_interrupt() -> None:
+    """Clear CPython's record that a ``KeyboardInterrupt`` went unhandled.
+
+    ``exec`` and ``eval`` of a source string run it through ``run_eval_code_obj``
+    (``Python/pythonrun.c``), which sets a flag of the whole process,
+    ``_PyRuntime.signals.unhandled_keyboard_interrupt``, when the string's code ends with a
+    ``KeyboardInterrupt``, also when a caller catches it. In Python 3.13 (3.13.18 tried; not
+    3.11.18 or 3.12.3, where ``SystemExit`` exits before) ``Py_RunMain`` reads the flag
+    after finalizing and calls ``exit_sigint()``: SIGINT back to ``SIG_DFL`` and
+    ``kill(getpid(), SIGINT)``. So a command whose Ctrl-C or SIGTERM landed while such a
+    string ran (scipy.stats and dataclasses make functions from strings as they are
+    imported) printed its line and then died of SIGINT instead of ending with 130 or 143.
+    Every such evaluation resets the flag first, so evaluating an empty one clears it."""
+    eval("None")
+
+
 class CommandSignals:
     """SIGTERM and Ctrl-C of one command, from its start to the end of the process.
 
@@ -130,12 +146,14 @@ class CommandSignals:
         self.ended = True
         if threading.current_thread() is threading.main_thread():
             _ignore(signal.SIGTERM, signal.SIGINT)
+        _forget_caught_interrupt()
 
     def ending(self) -> None:
         """The command ends at a signal: a late one must not kill it while it finalizes."""
         self.ended = True
         if threading.current_thread() is threading.main_thread():
             _ignore(signal.SIGTERM, signal.SIGINT)
+        _forget_caught_interrupt()
 
 
 @contextmanager

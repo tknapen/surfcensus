@@ -157,3 +157,37 @@ def test_outside_the_main_thread_no_handler_is_set() -> None:
     thread.start()
     thread.join()
     assert isinstance(seen[0], CommandSignals) and signal.getsignal(signal.SIGTERM) is earlier
+
+
+# A signal whose KeyboardInterrupt passes through code that ``exec`` or ``eval`` runs from a
+# source string (scipy.stats and dataclasses make functions that way while they are
+# imported) sets CPython's unhandled-KeyboardInterrupt flag; on Python 3.13 the process then
+# died of SIGINT after the closing line, whatever the exit code (5 of about 400 stress runs).
+_IN_A_STRING = """\
+import sys
+from surfcensus.stopping import command_signals
+with command_signals(lambda signals: print(f"line {signals.exit_code()}", file=sys.stderr)):
+    exec("import os, signal\\nos.kill(os.getpid(), signal.NAME)\\nfor _ in range(100000): pass\\n")
+"""
+
+
+@pytest.mark.parametrize(("name", "code"), [("SIGTERM", TERMINATED), ("SIGINT", INTERRUPTED)])
+def test_a_signal_inside_code_run_from_a_string_still_ends_with_its_code(
+    name: str, code: int
+) -> None:
+    import subprocess
+    from pathlib import Path
+
+    import surfcensus
+
+    source = str(Path(surfcensus.__file__).resolve().parents[1])
+    env = dict(os.environ, PYTHONPATH=source)
+    done = subprocess.run(
+        [sys.executable, "-c", _IN_A_STRING.replace("NAME", name)],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert done.stderr.strip() == f"line {code}"
+    assert done.returncode == code  # not -2: killed by SIGINT after the line
