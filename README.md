@@ -142,6 +142,8 @@ This packs the raw and the preprocessed EPI series of every functional run of th
 
 The path is a BIDS dataset with an fMRIPrep derivative below `derivatives/`, the derivative itself, or its FreeSurfer subjects directory; `--raw DIR` names the raw dataset when it lies elsewhere. `--session LABEL` packs only that session, `--epi-runs GLOB` only the runs whose name matches. The packs are a display cache: nothing is written into the data, no NIfTI file is written anywhere, and an `--out` inside one of the folders that are read is refused. Runs that cannot be shown (no raw series, multi-echo, only a standard-space or native-space series, files of a DataLad clone that are not fetched) are listed with their reason. Only fMRIPrep derivatives with `space-T1w` output are packed. The same command again keeps the packs that are current and makes only what changed (`--force` makes all again), so a second look at the two runs below takes about 3 s where the first took about 31 s.
 
+Without data of your own, `python scripts/fetch_example.py OUT` (from a clone; `uv run python ...`) fetches a small real example, `ds000102` sub-01 with its fMRIPrep derivative and FreeSurfer subject, about 160 MB, anonymously from the public buckets into `OUT/ds000102`, and prints the two commands to run on it.
+
 This is step 1 of the EPI interface (`docs/epi_interface.md`): one subject, no run directory, view only; nothing is rated. On the two runs of `ds000102` sub-01 (146 volumes each, 3 mm) the page was up 34 s after the command on one machine. Two independent reviews recomputed the packed values from the files and drove the page on real packs; no person has looked at a pack yet.
 
 ### Both interfaces from one command
