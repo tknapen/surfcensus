@@ -2186,3 +2186,75 @@ def test_a_key_is_written_as_the_screen_shows_it(js_copy: Path, shipped_protocol
         "values": ["4", "5", "6"],
         "none": [],
     }
+
+
+@needs_node
+def test_the_subject_page_names_the_degrees_of_freedom_of_a_registration_once(
+    js_copy: Path,
+) -> None:
+    """fMRIPrep's report says "... (boundary-based registration, BBR) - 6 dof"; the subject
+    page added ", 6 dof" again (seen on the worked example by the closing check of step 3),
+    where the EPI page says it once. Words without the number get it added."""
+    said = {"state": "applied", "source": "summary_report", "note": None}
+    out = run_js(
+        js_copy,
+        """
+        import { correctionLines } from "./js/subjects.js";
+        output(input.map((c) => correctionLines(c).at(-1)));
+        """,
+        [
+            {
+                "motion": {**said, "words": None},
+                "sdc": {**said, "state": "not applied", "words": "None"},
+                "sdc_method": None,
+                "slice_timing": {**said, "state": "not applied", "words": "Not applied"},
+                "registration": {**said, "words": words},
+                "dof": 6,
+                "sdc_figure_listed": False,
+            }
+            for words in (
+                "FreeSurfer bbregister (boundary-based registration, BBR) - 6 dof",
+                "bbregister",
+            )
+        ],
+    )
+    assert out == [
+        "registration FreeSurfer bbregister (boundary-based registration, BBR) - 6 dof"
+        " (summary report)",
+        "registration bbregister, 6 dof (summary report)",
+    ]
+
+
+@needs_node
+def test_the_subject_page_says_an_anchor_waits_for_its_pack_while_it_is_pending(
+    js_copy: Path,
+) -> None:
+    """While `review` still packs, the anchor of a session is pending, and the subject page
+    said "not packed: its registration places the raw stream all the same", which reads as a
+    run left out (seen on two real subjects by the closing check of step 3)."""
+    out = run_js(
+        js_copy,
+        """
+        import { anchorSuffix } from "./js/subjects.js";
+        output(input.map(anchorSuffix));
+        """,
+        [
+            {
+                "anchor_packed": packed,
+                "anchor_run_uid": "a" * 16,
+                "runs": [{"run_uid": "a" * 16, "state": state}],
+            }
+            for packed, state in (
+                (True, "packed"),
+                (False, "pending"),
+                (False, "cannot be packed"),
+                (False, "failed"),
+            )
+        ],
+    )
+    assert out == [
+        "",
+        " (waiting for its pack)",
+        " (not packed: its registration places the raw stream all the same)",
+        " (not packed: its registration places the raw stream all the same)",
+    ]

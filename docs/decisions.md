@@ -818,6 +818,26 @@ D44 (2026-11-14). The shared names of step 3 of the EPI interface (work package 
 - Fixtures: `add_epi(..., subject_uids=...)` with `session_ids(packed)`, and every run with corrections, a rigid registration and one raw affine per session that is `header, unchecked`; `write_review_folder(..., extra_fs=("sub-03",))` for a FreeSurfer subject without functional data.
 - Open defaults, built as proposed, each his to change: the rating-screen link on every subject; the subject pages only in a run with functional data; in a blind or multi-rater run the link once the rater is done; no `Subjects:` line in `review`.
 
+D45 (2026-11-14). Choices made while building step 3 of the EPI interface (work packages E3.A, E3.B and E3.Z; `docs/epi_interface.md`, "Step 3 as built"), beyond the shared names of D44. Where a choice departs from the plan of E3.0, it says so.
+
+- A session whose FreeSurfer subject is not present goes on its participant's row of the subjects page. Reason: otherwise it is on no row, and the plan asks that every present session is on exactly one.
+- A session row without a stored anchor takes the run whose `anchor` flag is set, and a stored order rule that is neither `acquisition time` nor `session label` is shown as `session label`. Reason: the page says what the catalog holds and never fails on a row.
+- The corrections on the subject page use the words of the EPI page, each with the file and the words it was read from, so that the two pages say the same of a run; the closing check compared them on two real subjects and found them equal once the degrees of freedom were said once (below).
+- An anchor whose pack is still pending is said to be waiting for its pack, not "not packed". Reason: while `review` packs behind the app, the anchor of every session is pending, and "not packed: its registration places the raw stream all the same" read as a run that is left out. Found by the closing check on two real subjects.
+- The registration line of the subject page adds the degrees of freedom only when fMRIPrep's words do not name them, as the EPI page does. Found by the closing check ("... BBR) - 6 dof, 6 dof").
+- The style of the subject pages has its own names (`.subjects-page`, `.subject-session`, `.session-facts`), since `.subjects` is the class of every table of the app; the progress line of the rating screen may wrap below 760 px, which keeps the three links readable at 400 px.
+- `status` says the third functional line as statements about the raw data ("(statements about the raw data)"), as `review` says the frame check, and names `--retry-failed` beside a failed pack, as `pack` and `review` do. `--failures` lists runs that cannot be packed but not runs left out by `--epi-runs`, which are no failure, and not the ledger rows of the session unit, whose failures are recorded on its runs (D41). Functional units are named by `func.status.unit_names` (participant and BIDS name beside the id), which replaced the helper of `cli.py`.
+- The export has sessions and runs that are no longer present, with `present` false and no pack state, so that a table says what the catalog holds; the pack columns of a run are filled only when it is `packed`. `epi.sources` of the manifest lists every functional source of the catalog. The help of `export` names the two tables. An export of a run without functional data keeps its bytes: checked against the code of `731ffb4` on a synthetic run, with `status` and `status --failures` (equal byte for byte).
+
+Open defaults of D44, built as proposed and each Tomas's to change:
+
+1. The link on the rating screen is on every subject being rated, also one without functional sessions.
+2. The subject pages and the review columns exist only in a local run with functional data whose EPI interface is on.
+3. In a blind run or with several raters the link and the pages open once the rater has nothing left to rate.
+4. `review` prints no `Subjects:` line; the pages are reached by links.
+
+Checked: see `docs/epi_interface.md`, "Step 3 as built" (Measured, and What was not checked). Not checked: a person looking at any of it; a participant row, a failed pack and a blind or multi-rater run on real data; any browser but Chromium.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.

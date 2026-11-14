@@ -102,7 +102,10 @@ export function correctionLines(corrections) {
   ];
   const statement = corrections.registration;
   if (statement.words) {
-    const dof = corrections.dof ? `, ${corrections.dof} dof` : "";
+    // fMRIPrep's words name the degrees of freedom already ("... BBR) - 6 dof"); say them
+    // once, as the EPI page does (js/epi/epi.js)
+    const stated = corrections.dof && new RegExp(`\\b${corrections.dof}\\s*dof\\b`).test(statement.words);
+    const dof = corrections.dof && !stated ? `, ${corrections.dof} dof` : "";
     const file = statement.source ? statement.source.replace(/_/g, " ") : "stated by no file";
     lines.push(`registration ${statement.words}${dof} (${file})`);
   } else if (statement.note) {
@@ -208,6 +211,15 @@ function drawSurface(subjectPage) {
   box.replaceChildren(...parts);
 }
 
+// What is said after the anchor's name. An anchor whose pack is still being made is waiting,
+// not left out: "not packed" is said only of an anchor that is not packed and is not waiting.
+export function anchorSuffix(funcSession) {
+  if (funcSession.anchor_packed) return "";
+  const anchor = funcSession.runs.find((funcRun) => funcRun.run_uid === funcSession.anchor_run_uid);
+  if (anchor && anchor.state === "pending") return " (waiting for its pack)";
+  return " (not packed: its registration places the raw stream all the same)";
+}
+
 function sessionFacts(funcSession, nSessions) {
   const facts = html("dl", "session-facts");
   const fact = (term, text) => facts.append(html("dt", "", term), html("dd", "", text));
@@ -215,9 +227,7 @@ function sessionFacts(funcSession, nSessions) {
   fact("in the stream", `${place}sessions ordered ${STREAM_RULE_TEXT[funcSession.stream_rule] || funcSession.stream_rule}`);
   if (funcSession.fs_subject) fact("FreeSurfer subject", funcSession.fs_subject);
   const anchorName = funcSession.anchor_name || funcSession.anchor_run_uid;
-  let anchorText = anchorName
-    ? `${anchorName}${funcSession.anchor_packed ? "" : " (not packed: its registration places the raw stream all the same)"}`
-    : "none";
+  let anchorText = anchorName ? `${anchorName}${anchorSuffix(funcSession)}` : "none";
   if (funcSession.anchor_rule) anchorText += `; chosen as ${RULE_TEXT[funcSession.anchor_rule] || funcSession.anchor_rule}`;
   if (funcSession.anchor_note) anchorText += `; ${funcSession.anchor_note}`;
   fact("anchor", anchorText);

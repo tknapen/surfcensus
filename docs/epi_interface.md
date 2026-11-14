@@ -1,6 +1,6 @@
 # EPI movie interface
 
-Specification of the second interface of the tool: the raw and the preprocessed EPI series of every functional run of a session, as moving pictures on the same slices with the FreeSurfer white and pial surfaces as contours, served by the same app and prepared by the same command as the surface interface. Written on 2026-11-14 from the prototype of stage 1 (`prototypes/func_viewer/`), its independent review, the code of the package and the sources of fMRIPrep on PyPI. Steps 1 and 2 of its build order are built (2026-11-14; sections "Step 1 as built" and "Step 2 as built"); step 3 is not, and its shared names are laid out (section "Step 3: the plan (E3.0)"). Where this document and `prototypes/func_viewer/README.md` disagree about the package, this document holds; the README remains the record of what stage 1 built and measured.
+Specification of the second interface of the tool: the raw and the preprocessed EPI series of every functional run of a session, as moving pictures on the same slices with the FreeSurfer white and pial surfaces as contours, served by the same app and prepared by the same command as the surface interface. Written on 2026-11-14 from the prototype of stage 1 (`prototypes/func_viewer/`), its independent review, the code of the package and the sources of fMRIPrep on PyPI. Steps 1, 2 and 3 of its build order are built (2026-11-14; sections "Step 1 as built", "Step 2 as built" and "Step 3 as built", each after its plan where there was one). Where this document and `prototypes/func_viewer/README.md` disagree about the package, this document holds; the README remains the record of what stage 1 built and measured.
 
 ## Why, in his words
 
@@ -384,7 +384,7 @@ His words, after the order of the sessions: "also, i want the maximum frame rate
 
 ## Step 3: the plan (E3.0)
 
-Work package E3.0 laid out on 2026-11-14 what the packages of step 3 share, before they are written side by side, as E2.0 did for step 2 (D40). Step 3 is navigation (a subjects page and a page per subject, linked from the rating screen, the review screen and the EPI pages), functional data in `surfcensus status`, and functional tables in `surfcensus export`. The names, fields, Literals, routes, columns and constants below are pinned in `tests/test_func_step3_interfaces.py`. Where this section and the older sections below disagree, this section holds until step 3 is built; what it changes in them is listed at its end. The decision entry is D44.
+Work package E3.0 laid out on 2026-11-14 what the packages of step 3 share, before they are written side by side, as E2.0 did for step 2 (D40). Step 3 is navigation (a subjects page and a page per subject, linked from the rating screen, the review screen and the EPI pages), functional data in `surfcensus status`, and functional tables in `surfcensus export`. The names, fields, Literals, routes, columns and constants below are pinned in `tests/test_func_step3_interfaces.py`. Where this section and the older sections below disagree, this section holds (and "Step 3 as built" over both); what it changes in them is listed at its end. The decision entry is D44.
 
 ### Two readings of "packed"
 
@@ -540,6 +540,101 @@ Built as proposed, each Tomas's to change:
 - "Routes and shapes": the routes are those of `SUBJECT_ROUTES`, the shapes those above; `EpiSessionOut` of that section is step 2's `EpiStreamOut`.
 - "Commands, exit codes, status, export": `status` counts by `pack_status`, the pages and the export by `recorded_states`; the manifest adds the `epi` key only when the functional tables are written; the status logic lives in `func/status.py`, not in `cli.py`.
 - "What it prints": unchanged, `EPI movies: <url>epi` and no subjects line (open default 4).
+
+## Step 3 as built (2026-11-14)
+
+Step 3 is built: the subject pages of a run (work package E3.A), functional data in `surfcensus status` and in `surfcensus export` (E3.B), and their binding into the command line (E3.Z). The shared names are those of the plan above (E3.0, D44). The choices that the plan did not make are decision D45. Where this section and the plan or the older sections disagree, this section holds, because it describes what exists.
+
+### What a user sees and runs
+
+Nothing new is run: `surfcensus review PATH` on a folder with both kinds of data makes the pages available, and `status` and `export` say more on such a run. `review` prints no line for the subjects page (open default 4); the pages are reached by links.
+
+- The rating screen. While a subject is on screen, the progress line has a third link beside "review" and "EPI movies": "functional runs of this subject", to `/subject/<subject_uid>`. It is shown under the rule of the "EPI movies" link (the routes are open to the rater) and on every subject, also one without functional sessions, whose page then says so (open defaults 1 and 3). The rating answers carry nothing new; `rate.js` builds the link from the `subject_uid` that the media URLs carry already.
+- The subjects page, `/subjects`. One row per present FreeSurfer subject with the sessions that use it, then one row per participant whose sessions have no present FreeSurfer subject: label, dataset pseudonym, the state of the surfaces (`rated`, `unratable`, `rendered, not rated`, `render failed`, `not rendered`, or none for a participant), sessions, runs, and the runs packed, waiting, failed and flagged, with a link to the subject's page and to its EPI stream. A sentence under the table names the two uses (quality control of the raw data and of the preprocessing) and says that packed, waiting and failed are what the catalog records.
+- The subject page, `/subject/{key}`, keyed by a `subject_uid` or, for a participant without a FreeSurfer subject, by its `participant_uid`. At the top: the state of the surfaces with a link to this subject on the review screen (`/review#subject=<uid>`, which opens it), the counts of the functional runs, a link to the EPI stream, and the statement of what the two streams are for. Then one box per session, in the order of the stream: its place ("1 of 2 sessions") and the rule of that order (`acquisition time` or `session label`, D42), the FreeSurfer subject, the anchor and the rule that chose it, the one rigid registration of the session, the frame check as a statement about the raw data (the flagged runs by name, an outlier anchor, a shared frame that is not plausible), a problem of the session, and a line when the session is not in the stream yet. Then a table of its runs in acquisition order: number, name, an anchor badge, a link "open the EPI page at this run" for a packed run of a session that the stream shows, the state, volumes, TR, the displacement under the session's registration (with "flagged, beyond the limit of 10 mm"), the raw affine and how it was checked, and the corrections the pipeline applied, each with the file and words it was read from, in the words of the EPI page. While packs wait, a line says so and the page asks again every 5 s.
+- The EPI page starts at the run that `#run=<run_uid>` names: the stream is the same, the cursor is on the first volume of that run. A run that is not in the stream starts the page at the beginning, with "the run asked for is not in the stream now". Its links under the views gain "subjects". The EPI index gains a link to `/subjects`.
+- The review screen gains two columns after `n_marks`, `func_sessions` and `func_packed`, in a run where the routes are offered; a `func_sessions` cell is a link to the subject page and does not open the row. The header gains a link "subjects".
+- From each page to the others: rating screen to subject page (the link of the progress line) and to the EPI index; subject page to the rating screen, the subjects page, the review of this subject, the EPI index, the EPI stream and each packed run; subjects page to the rating screen, the review screen and the EPI index; EPI page to the participants, the rating screen and the subjects page; review screen to the rating screen and the subjects page. The EPI page has no link back to the subject page it was opened from; the browser's back button does that.
+
+`surfcensus status` on a local run whose catalog has a present functional source prints three lines after `render:` (`func/status.py`):
+
+```
+func_inventory: 3 sessions of 2 participants, 19 runs: 11 can be packed, 8 cannot (multi-echo 1, native space only 1, no brain mask 1, no preprocessed series 1, no raw series 1, no transform to the anatomy 1, standard space only 1, volume counts differ 1)
+pack: 11 done, 0 failed, 0 pending
+func checks: 3 runs flagged, 1 raw affine unchecked, 1 session with the anchor the outlier (statements about the raw data)
+```
+
+The reasons are those of the present runs that cannot be packed or are not selected, sorted by name; a session whose plan failed adds `; 1 session could not be planned` to the first line. The `pack:` line is what `surfcensus pack` would do now; with a failed pack it ends with `(tried again with: surfcensus pack --run-dir DIR --retry-failed)`, and with `--no-epi` stored it reads `pack: off (--no-epi, stored)`. `status --failures` lists the failed packs and every present run that cannot be packed, each named by its participant and BIDS name beside its `run_uid` (`func_inventory <run_uid> (sub-02 task-me_run-1): multi-echo`), and a session that could not be planned; runs left out by `--epi-runs` are not failures and are not listed, and the ledger rows of phase `epi_session` are not listed either, since a session's failure is recorded on its runs (D41). A census run, a run without functional data and a catalog of schema 1 get none of these lines, and `status` still does not migrate.
+
+`surfcensus export` of a local run whose EPI interface is on and that has functional data writes two more tables after the ten, `func_sessions` and `func_runs`, as CSV or parquet, and a key `epi` in `manifest.json` with the config hashes of the pack, the session unit and the functional inventory and, per functional source, its dataset pseudonym, connector, pipeline version and layout generation. `func_sessions` has the public columns of the session with the rule of its order and the counts packed, failed and pending; `func_runs` every column of the public view of the runs (the corrections as JSON and their three states included), then the participant and the recorded pack state, reason, detail, volumes, bytes and time. Sessions and runs that are no longer present are in the tables with `present` false and no pack state. No trace, pack key, content digest or input signature is exported, and no file of a pack is read. Neither table is written in `--release` or in a census run (O28). An export of a run without functional data has the bytes of before (checked, below).
+
+### Two readings of "packed", as built
+
+`status` counts what `pack` would do now (`pack_status`: a row for the present settings and the present pack signature, and the pack whole on disk). The pages, the EPI index and the export show what the catalog records (`recorded_states`: a `done` or `failed` row under the present pack settings). So after a source file of a packed run changes and `inventory` runs, `status` says `1 pending` while the subject page says `packed (recorded)` and the page still plays the earlier pack; the export says `packed`. Both pages say that their states are what the catalog records. The `packed_at` of a run is the time its row was recorded, which is the end of its session's batch: the two runs of one session have one time.
+
+### Blindness, as built
+
+| Run | The four routes | The link on the rating screen | Review columns |
+|---|---|---|---|
+| local, not blind, one rater | 200 | shown while a subject is open | present |
+| blind, or a second rater, with subjects left | 403 (a browser gets a page with a link back and no uid) | hidden | `/api/review` 403 |
+| blind or a second rater, nothing left to rate | 200 | shown | present |
+| census | 404, as a route that does not exist | hidden | absent |
+| EPI interface off, or no functional data | 404 | hidden | absent; `/api/review` as before |
+
+A key that is not 16 lower-case hex characters, or that names neither a present subject nor a participant with sessions without one, is 404 ("there is no such subject"). The answers of the rating routes have the fields they had.
+
+### Departures from the plan, with their reasons
+
+E3.A, the pages:
+
+- A session whose FreeSurfer subject is not present goes on its participant's row; otherwise it would be on no row, against "every present session on exactly one row".
+- When a session row has no stored anchor, the anchor is the run whose `anchor` flag is set; `stream_rule` falls back to `session label` when the stored value is neither rule.
+- The style sheet section is named for the subject pages (`.subjects-page`, `.subject-session`, `.session-facts`), since `.subjects` is the class of every table of the app; one rule outside it lets the progress line of the rating screen wrap below 760 px, which put the three links on a line of their own at 400 px.
+- The "subjects" link of the review screen is added by `review.js`, since `review.html` was not among the package's files.
+
+E3.B, `status` and `export`:
+
+- The third line of `status` ends with "(statements about the raw data)", as the registration lines of `review` say it, and the `pack:` line names `--retry-failed` when a pack failed, as `pack` and `review` do.
+- `--failures` leaves out runs that are `not selected`; they are counted in the first line.
+- The export has sessions and runs that are no longer present, with `present` false; the pack columns of a run are filled only when it is `packed`. `epi.sources` lists every functional source of the catalog, present or not.
+
+E3.Z, the integration and its check:
+
+- `status` gets its lines from `func.status` and `--failures` names functional units with `unit_names`, which replaced `cli._run_names`; the help of `export` names the two tables.
+- The closing check found two faults on the subject page and both were fixed in `app/static/js/subjects.js`, with a test under Node each in `tests/test_frontend.py`: the registration line said "... BBR) - 6 dof, 6 dof" where fMRIPrep's words carry the degrees of freedom already (the EPI page said it once), and while packs were being made the anchor of a session was described as "not packed: its registration places the raw stream all the same", which reads as a run left out; it now says "waiting for its pack" while its pack is pending.
+
+### Measured, and what the pages said
+
+One shared 4-core Linux machine, Python 3.13, headless Chromium 153 at 1400 by 900 and 400 by 800 px with a device scale factor of 1. The worked example (`ds000102` sub-01) laid out as a BIDS root of links into the pytest cache, as the network tests lay it out, with the real `fsaverage` linked beside the FreeSurfer subject; `surfcensus review ROOT --no-browser --port 0` as a process in a new run directory.
+
+- The command printed the lines of step 2 (`Functional: 2 runs in 1 session of 1 participant in derivatives/fmriprep (fMRIPrep 21.0.2), raw series in . (BIDS); 2 can be packed (T1w space).`, `EPI packs: 0 of 2 runs made; 2 are made while the app runs (about 33 s in one process, ...)`) and named the app 14.3 s after the start by its own clock. The first pack was written 32 s and the second 46 s after the command was given. SIGTERM ended it with its closing lines (`0 rated, 1 to go. ...` and `EPI packs: 2 of 2 runs made.`); the same command again named the app after 1.1 s by its clock (2.5 s from outside) and ended at SIGTERM with exit code 0.
+- While the packs were made, `/api/subjects` answered one row with 2 runs waiting and `n_pending` 2, and the subject page listed both runs as waiting.
+- The path, at both sizes: the rating screen with a rating and a note entered; "functional runs of this subject" to the subject page; "open the EPI page at this run" on the second run, where the page started at volume 146 of 0 to 291 of the stream, the first of run 2 (`window.__epi.page.startRun` and the run on screen equal to the run asked for); "subjects" to the subjects page; "rating screen" to the rating screen, with the value and the note of the draft still there; the review screen, whose `func_sessions` cell (1) opened the subject page and whose link from there opened `/review#subject=<uid>` with the subject selected; the EPI index. No page scrolled sideways, no request went to another host and the console stayed empty.
+- The subject page said: one session without a label, "sessions ordered by session label", the FreeSurfer subject `sub-01`, the anchor `task-flanker_run-1` "chosen as the first run by name (no acquisition time for every run)", "no run flagged", and for the two runs 146 volumes, TR 2 s, 0.00 and 1.09 mm at most (0.83 mean) under the session's registration, the raw affine "header, checked against the reference image", and the same corrections: head-motion correction (with fMRIPrep's note that its report does not state it per run), no distortion correction (summary report: "None"), no slice-timing correction (summary report: "Not applied"), registration "FreeSurfer bbregister (boundary-based registration, BBR) - 6 dof" from the summary report. The EPI page at run 2 said the same corrections in one line, and its run note gave the same displacement (0.83 mm mean, 1.09 mm at most, a rotation of 0.20 degrees and a shift of 0.82 mm). On real data the two pages agree.
+- `status` printed `func_inventory: 1 session of 1 participant, 2 runs: 2 can be packed, 0 cannot`, `pack: 2 done, 0 failed, 0 pending` and `func checks: 0 runs flagged, 0 raw affines unchecked, 0 sessions with the anchor the outlier (statements about the raw data)`; `--failures` added nothing, since nothing failed. `export` wrote the ten tables, `func_sessions.csv` (1 row) and `func_runs.csv` (2 rows) and the manifest with its `epi` key; every value of the two tables that was compared (states, volumes, TR, raw affine, corrections, frame numbers, pack bytes, the anchor and its rule, the counts) equals the public views of the catalog, and no column holds a trace, key, digest or signature.
+- A real subject with ten runs in two sessions (FreeSurfer subject, no `fsaverage`), laid out as a BIDS root, with a run directory elsewhere: the app 11.4 s after the start, the line that the sessions are in the order of their labels (no acquisition date in the raw dataset), two flagged runs said as statements about the raw data, an estimate of 86 s for the packs, and every pack made about 53 s after the start. Its subject page showed the two sessions in label order (`ses-retest` first, "1 of 2 sessions, sessions ordered by session label"), the flagged run of each session in the frame check and in its row ("14.03 mm at most, 6.09 mean: flagged, beyond the limit of 10 mm", and 15.80 mm in the other session); the EPI page opened at that run started at its first volume (683, after four runs of the first session) with the warning of a flagged run, and gave the same corrections as the subject page. `status` printed `func_inventory: 2 sessions of 1 participant, 10 runs: 10 can be packed, 0 cannot`, `pack: 10 done, 0 failed, 0 pending` and `func checks: 2 runs flagged, 0 raw affines unchecked, 0 sessions with the anchor the outlier (statements about the raw data)`.
+- A synthetic run without functional data (two subjects, one without `lh.pial`), made with `review --no-serve`: the output of `status`, `status --failures`, `export` and `export --format parquet` with this code and with the code of `731ffb4` (before step 3), on two copies of one run, were equal byte for byte, and so were the export directories and the catalogs.
+
+What an agent saw in the screenshots (no person has looked): the subject page at 1400 px is readable, with the anchor badge and the flagged displacement in amber and the links in the run column; at 400 px the facts stack and the run table scrolls inside its box. With ten runs the page is long, because each run repeats the same four corrections. The subjects page and the EPI index have one row each and much empty space. The link line of the rating screen at 400 px sits under the progress counts. The pages name the rating screen differently ("rating screen" on most, "rating" on the review screen), and the subjects page says "quality control of the acquisition and of the processing" where the others say "of the raw data and of the preprocessing". The review screen puts the two functional columns at the end of a wide table, reached by scrolling it.
+
+### What was not checked
+
+- No person has looked at the pages; every reading of a screenshot was an agent's.
+- A participant row on real data (every real session here has its FreeSurfer subject), a failed pack, a run that cannot be packed and the `--failures` lines on real data; those were checked on synthetic folders and the fixture of `tests/epi_run_fixture.py`.
+- A blind run, a second rater, a census run and `--no-epi` through the browser on real data; they are tests on the fixture.
+- A real dataset with acquisition dates, so the rule `acquisition time` was not seen on a real subject page.
+- The cost of the pages on a large run: each request of the subject pages reads the subjects frame of the review screen, also each 5 s poll; not timed beyond these runs.
+- A collision between a `subject_uid` and a `participant_uid` (64 bits) is not checked; the subject row would win.
+- Any browser but Chromium, macOS, Windows, a screen reader.
+
+### What is now wrong in the sections below
+
+- "Pages": the routes are `/subjects`, `/subject/{key}` and `/epi/{participant_uid}#run=<run_uid>` as said above; there are no links to a previous and a next session, since a participant is one stream; the review screen's column is `func_sessions` with `func_packed`, not "sessions and packed runs".
+- "Blindness": the table above replaces it; the subject pages are absent (404) in a run without functional data.
+- "Routes and shapes" in "The app": the shapes are those of the plan of step 3 (`SubjectsOut`, `SubjectPageOut`), and `EpiSessionOut` is step 2's `EpiStreamOut`.
+- "Commands, exit codes, status, export": the lines of `status` and the columns of the export are those above; `status` counts by the pack signature and the pages and the export by the recorded state; the manifest gains `epi` only with the tables.
+- "What it prints": `review` prints `EPI movies: <url>epi` and no `Subjects:` line.
 
 ## Scope
 

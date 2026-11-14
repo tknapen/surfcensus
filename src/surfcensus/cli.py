@@ -1291,7 +1291,8 @@ def export_command(
     ),
 ) -> None:
     """Write the tables for analysis (phase 8): subjects, scores, selection, ratings,
-    marks, final marks, clusters, datasets, behaviour, skips and a manifest."""
+    marks, final marks, clusters, datasets, behaviour, skips and a manifest; in a local run
+    with functional data also func_sessions and func_runs."""
     if fmt not in ("csv", "parquet"):
         raise typer.BadParameter("is csv or parquet", param_hint="--format")
     with _stops_with_exit_2():

@@ -1952,6 +1952,7 @@ Profiles. `analysis` is the full pseudonymous export for the team's notebooks an
 | `js/tour.js` | package 4.H: the tour of the rating screen. Five steps as data (`tourSteps(protocol, keyMap)`, the keys read from the key map), the lit part and the card beside it (`unionBox`, `placeCard`; `scrollFor` where the page scrolls), the dialog (`Tour`), and the flag in `localStorage` that it was shown (`tourSeen`, `markTourSeen`, per rater name) |
 | `js/review.js` | sortable table; scatter of composite against final label (inline SVG); subject view with marks and cluster centroids; a plain message when the server answers 403 because the rater still has subjects to rate |
 | `js/help.js` | the `?` overlay with the scale definitions, a button that opens the tour and, when the session has any, the reference `examples` (tiles of calibration subjects) |
+| `templates/subjects.html`, `subject.html`; `js/subjects.js` | step 3 of `epi_interface.md`: the subjects page and the page of one subject in a run with functional data, from `SubjectsOut` and `SubjectPageOut`; they ask again every 5 s while packs wait and write nothing. The EPI pages (`templates/epi.html`, `epi_index.html`, `js/epi/`) are those of steps 1 and 2 of that document |
 
 ---
 
