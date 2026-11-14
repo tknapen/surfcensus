@@ -193,6 +193,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "config",
             "progress",
             "force",
+            "keep",
         ),
         "current_pack": ("session_dir", "run", "config"),
         "content_digest": ("session_dir", "info"),
