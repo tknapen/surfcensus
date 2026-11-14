@@ -119,7 +119,7 @@ def test_the_folders_and_the_counts(dataset: SyntheticFuncDataset) -> None:
     assert len(sorted(deriv.glob("sub-*/figures/*_desc-validation_bold.html"))) == 18
     assert len(sorted(deriv.glob("sub-*/figures/*_desc-sdc_bold.svg"))) == 1
     assert len(sorted(deriv.glob("sub-*/**/func/*_desc-confounds_timeseries.tsv"))) == 18
-    assert [r.packable for r in dataset.runs].count(True) == 10
+    assert [r.packable for r in dataset.runs].count(True) == 11
     reasons = sorted(r.design.reason for r in dataset.runs if not r.packable)
     assert reasons == sorted(
         [
@@ -129,7 +129,6 @@ def test_the_folders_and_the_counts(dataset: SyntheticFuncDataset) -> None:
             "no preprocessed series",
             "no raw series",
             "no transform to the anatomy",
-            "runs on different grids",
             "standard space only",
             "volume counts differ",
         ]
@@ -262,7 +261,10 @@ def test_the_series_hold_the_field(dataset: SyntheticFuncDataset) -> None:
             for t in (0, N_VOLUMES - 1):
                 got = np.asarray(img.dataobj[..., t]).ravel(order="F")
                 np.testing.assert_allclose(got, series_value(points, t), rtol=2e-7, atol=1e-4)
-        if run.design.reason in (None, "no brain mask", "volume counts differ"):
+        if (
+            run.design.reason in (None, "no brain mask", "volume counts differ")
+            and run.design.case != "other grid"
+        ):
             img = nib.load(run.files["pre_bold"])
             assert img.shape[:3] == GRID_SHAPE and img.shape[3] == run.n_pre_volumes
             np.testing.assert_allclose(img.affine, GRID_AFFINE, atol=1e-6)
@@ -272,7 +274,7 @@ def test_the_series_hold_the_field(dataset: SyntheticFuncDataset) -> None:
                 np.testing.assert_allclose(got, expected_pre(voxels, t), rtol=2e-7, atol=1e-4)
     differ = next(r for r in dataset.runs if r.design.reason == "volume counts differ")
     assert (differ.n_raw_volumes, differ.n_pre_volumes) == (N_VOLUMES, N_VOLUMES - 2)
-    other = next(r for r in dataset.runs if r.design.reason == "runs on different grids")
+    other = next(r for r in dataset.runs if r.design.case == "other grid")
     assert nib.load(other.files["pre_bold"]).shape[:3] == GRID_B_SHAPE
     assert nib.load(other.files["pre_mask"]).shape == GRID_B_SHAPE
 
@@ -281,11 +283,12 @@ def test_a_resampled_value_is_known_in_closed_form(dataset: SyntheticFuncDataset
     """The raw stream of every packable run through its anchor's transform, sampled here by
     scipy's cubic spline with the edge repeated, equals the closed form inside the raw field
     of view; for the anchor it equals the preprocessed series."""
-    voxels = voxel_centres(GRID_SHAPE)
-    mask = np.asarray(nib.load(dataset.runs[0].files["pre_mask"]).dataobj).ravel(order="F") > 0
     for run in dataset.runs:
         if not run.packable:
             continue
+        # the run on another grid is sampled on its own grid (decision D38)
+        voxels = voxel_centres(GRID_B_SHAPE if run.design.case == "other grid" else GRID_SHAPE)
+        mask = np.asarray(nib.load(run.files["pre_mask"]).dataobj).ravel(order="F") > 0
         anchor = anchor_of(dataset, run)
         u = raw_sample_voxels(run, anchor, voxels)
         inside = spline_interior(u)
@@ -296,7 +299,8 @@ def test_a_resampled_value_is_known_in_closed_form(dataset: SyntheticFuncDataset
             got = ndimage.map_coordinates(volume, u.T, order=3, mode="nearest")
             want = expected_raw_stream(run, anchor, voxels, t)
             assert np.abs(got - want)[inside].max() < SPLINE_TOLERANCE, run.stem
-            if run is anchor:
+            if run is anchor or np.allclose(anchor.displacement, run.displacement):
+                # the anchor, and a run that did not move against it (the run on another grid)
                 np.testing.assert_allclose(want, expected_pre(voxels, t), atol=1e-9)
             else:  # the head moved: the raw stream is not the preprocessed series
                 assert np.abs(want - expected_pre(voxels, t))[mask].max() > 0.1

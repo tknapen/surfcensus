@@ -34,6 +34,7 @@ from surfcensus.records import (
     MULTI_ECHO,
     NATIVE_SPACE_ONLY,
     NO_BRAIN_MASK,
+    NO_CONFOUNDS,
     NO_PREPROCESSED_SERIES,
     NO_RAW_SERIES,
     NO_TRANSFORM,
@@ -120,8 +121,8 @@ def pick_anchor(runs: Sequence[AnchorCandidate]) -> Anchor:
 
 
 def acquisition_order(runs: Sequence[AnchorCandidate], anchor: Anchor) -> tuple[str, ...]:
-    """The run ids in acquisition order with the anchor first: by time under the time rule,
-    else by name order; ties by name order.
+    """The run ids in acquisition order: by time under the time rule, else by name order;
+    ties by name order. The anchor comes first because its rule chose the first acquired.
 
     This is the order of the session's one continuous stream (D38), so it is the acquisition
     order exactly as the anchor rule defines it, and nothing is moved: the anchor is first
@@ -307,9 +308,8 @@ _MISSING_REASONS: tuple[tuple[FuncRole, str], ...] = (
     (FuncRole.PRE_BOLD, NO_PREPROCESSED_SERIES),
     (FuncRole.XFM_TO_ANAT, NO_TRANSFORM),
     (FuncRole.PRE_MASK, NO_BRAIN_MASK),
-    # a run without its confounds table is a run without the full preprocessed output
-    # (fMRIPrep writes the table at level ``full`` only); no reason of its own exists
-    (FuncRole.CONFOUNDS, NO_PREPROCESSED_SERIES),
+    # fMRIPrep writes the table at level ``full`` only; the pack needs it for the volume count
+    (FuncRole.CONFOUNDS, NO_CONFOUNDS),
 )
 """The reason of a missing role of ``PACK_REQUIRED``, first missing first."""
 
@@ -389,8 +389,8 @@ def plan_session(
     * The reason of a run that cannot be packed is the first that applies of: what
       ``connector.display`` says (``native space only`` for the ``native`` layout, which
       step 1 does not pack); ``multi-echo``; the first missing role of ``PACK_REQUIRED`` (raw
-      series, preprocessed series, transform, brain mask, confounds table, the last read as
-      ``no preprocessed series``); a brain mask on another grid than the series
+      series, preprocessed series, transform, brain mask, confounds table, the last
+      ``no confounds table``); a brain mask on another grid than the series
       (``no brain mask``); volume counts that differ.
     * Runs whose preprocessed series lie on different grids are all packed: each distinct
       grid (equal shape, affines within ``geometry.GRID_TOLERANCE``) is a group of its own,

@@ -13,8 +13,8 @@ their place the rule of stage 1 (``prototypes/func_viewer/stage1/session.py``), 
 
 The grid ruling in force: the runs of a session whose preprocessed series lie on different
 grids are all packed, each grid a group of its own; no run gets ``runs on different grids``.
-The fixture still labels its run on another grid with that reason, so the expected plan is
-computed here from the design with that run packable.
+The fixture now designs its run on another grid as packable; ``expected_reason`` keeps the
+mapping of the earlier label so that the tests read either.
 """
 
 from __future__ import annotations

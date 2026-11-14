@@ -39,8 +39,9 @@ import os
 import re
 import secrets
 import shutil
+import time
 import zlib
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -294,21 +295,43 @@ def _header_volumes(role: FuncRole, path: Path) -> tuple[Any, int]:
         raise PackError(PACK_FAILURE, f"unreadable input ({role.value}: {_no_path(err)})") from None
 
 
-def _inputs(files: Mapping[FuncRole, Path]) -> tuple[PackInput, ...]:
-    """Every file the pack was given, in ``FuncRole`` order (raw roles come first there)."""
+_DIGESTS: dict[tuple[str, int, int, int], str] = {}
+"""SHA-256 of files already read in this process, by (path, device, inode, mtime_ns): the
+FreeSurfer files and the anchor's transform are inputs of every run of a session."""
+
+
+def _file_digest(path: Path) -> tuple[int, str]:
+    st = path.stat()
+    key = (str(path), st.st_dev, st.st_ino, st.st_mtime_ns)
+    digest = _DIGESTS.get(key)
+    if digest is None:
+        digest = sha256_file(path)
+        if len(_DIGESTS) > 256:
+            _DIGESTS.clear()
+        _DIGESTS[key] = digest
+    return st.st_size, digest
+
+
+def _inputs(
+    files: Mapping[FuncRole, Path],
+    session_inputs: Sequence[tuple[str, str, Path]] = (),
+) -> tuple[PackInput, ...]:
+    """Every file the pack was given, in ``FuncRole`` order (raw roles come first there), then
+    the files outside the run that it depends on (``RunPackInput.session_inputs``), in the
+    order given."""
+    items: list[tuple[str, str, Path]] = [
+        (role.value, "raw" if role in FUNC_RAW_ROLES else "deriv", Path(files[role]))
+        for role in FuncRole
+        if role in files
+    ]
+    items += [(role, base, Path(path)) for role, base, path in session_inputs]
     out = []
-    for role in FuncRole:
-        if role not in files:
-            continue
-        path = Path(files[role])
+    for role, base, path in items:
         try:
-            size, digest = path.stat().st_size, sha256_file(path)
+            size, digest = _file_digest(path)
         except OSError as err:
-            raise PackError(
-                PACK_FAILURE, f"unreadable input ({role.value}: {_no_path(err)})"
-            ) from None
-        base = "raw" if role in FUNC_RAW_ROLES else "deriv"
-        out.append(PackInput(role=role.value, base=base, size=size, sha256=digest))
+            raise PackError(PACK_FAILURE, f"unreadable input ({role}: {_no_path(err)})") from None
+        out.append(PackInput(role=role, base=base, size=size, sha256=digest))  # pyrefly: ignore[bad-argument-type]
     return tuple(out)
 
 
@@ -433,7 +456,7 @@ def pack_run(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInf
     n, mask, steady, non_steady = checked.n, checked.mask, checked.steady, checked.non_steady
     motion = run.motion
     shape = tuple(int(x) for x in run.grid.shape)
-    inputs = _inputs(run.files)
+    inputs = _inputs(run.files, run.session_inputs)
     k_chunk = chunk_volumes(int(np.prod(shape)), config.chunk_bytes)
     portable = config.portable_voxel_map
 
@@ -842,14 +865,17 @@ def pack_session(
     runs: Sequence[RunPackInput],
     contours: Mapping[str, Sequence[PlaneContours]] | None,
     config: EpiConfig,
+    progress: Callable[[str, PackInfo | None, str | None, float], None] | None = None,
 ) -> SessionInfo:
     """Pack a whole session into ``<out_dir>/<session_id>/``: the contours of each grid
     (``contours`` by grid key; None without a FreeSurfer subject), every run of ``runs``, then
     ``session.json`` last. A run that raises :class:`PackError` is listed in ``session.json``
-    with its reason and the others are packed.
+    with its reason and the others are packed. ``progress`` is called after each run of
+    ``plan.runs`` without a reason, with its id, its pack (None when it failed), the reason
+    of a failure and the seconds it took.
 
     The session is one stretch of the subject's stream (decision D38): its packed runs one
-    after the other in the order of ``plan.runs`` (acquisition order, the anchor first), each
+    after the other in the order of ``plan.runs`` (acquisition order), each
     listed with its volumes, its TR, the index of its first volume within the session, and its
     own windows, from which the page makes the common scale of the stream. Runs on different
     grids are packed as groups, one per grid of ``plan.grids``, each with its own contours,
@@ -880,6 +906,7 @@ def pack_session(
 
     given = {r.run: r for r in runs}
     reasons: dict[str, str] = {}
+    details: dict[str, str] = dict(plan.details)
     packs: dict[str, PackInfo] = {}
     for item in plan.runs:
         if item.reason is not None:
@@ -887,10 +914,19 @@ def pack_session(
         elif item.run not in given:
             reasons[item.run] = PACK_FAILURE
         else:
+            started = time.perf_counter()
             try:
                 packs[item.run] = pack_run(session_dir, given[item.run], config)
             except PackError as err:
                 reasons[item.run] = err.reason
+                details[item.run] = err.detail
+            if progress is not None:
+                progress(
+                    item.run,
+                    packs.get(item.run),
+                    reasons.get(item.run),
+                    time.perf_counter() - started,
+                )
     for run in reasons:
         _remove_run_dir(session_dir, run)
 
@@ -910,6 +946,7 @@ def pack_session(
                 grid_key=plan.grid_of.get(item.run) if item.reason is None else None,
                 frame=frame,
                 reason=reasons.get(item.run),
+                detail=details.get(item.run) if item.run in reasons else None,
                 n_volumes=None if pack is None else pack.n_volumes,
                 tr_s=None if pack is None else pack.tr_s,
                 first=None if pack is None else first,

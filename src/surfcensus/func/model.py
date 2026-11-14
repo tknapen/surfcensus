@@ -226,7 +226,8 @@ class SessionRunInfo(_Frozen):
     name: str
     """The BIDS name without the subject; shown in a local run only."""
     acquisition_order: int = Field(ge=0)
-    """0 for the anchor; runs that cannot be packed follow the others."""
+    """The place in the session's stream, from 0 (the anchor, the first acquired by its
+    rule); runs that cannot be packed follow the others."""
     anchor: bool
     grid_key: str | None
     frame: FrameInfo | None
@@ -246,6 +247,9 @@ class SessionRunInfo(_Frozen):
     None when not packed."""
     sd_window: tuple[float, float] | None = None
     """The run's own window of the SD stills."""
+    detail: str | None = None
+    """For a run that is not packed: one sentence beside the reason, when there is more to
+    say (which files are not fetched; what a failed pack met). None otherwise."""
 
 
 class SessionInfo(_Frozen):
@@ -265,8 +269,8 @@ class SessionInfo(_Frozen):
     """None when no run of the session can be packed."""
     grids: tuple[GridInfo, ...]
     runs: tuple[SessionRunInfo, ...]
-    """In the order of the session's stream: acquisition order, the anchor first, then the
-    runs that are not packed."""
+    """In the order of the session's stream: the packed runs in acquisition order (the
+    anchor is the first acquired by its rule), then the runs that are not packed."""
     contours_from: str | None
     """Which FreeSurfer subject the contours were cut from, by its name in the subjects
     directory; None without contours."""
@@ -287,6 +291,10 @@ class StreamInfo(_Frozen):
     """``sub-01``."""
     sessions: tuple[str, ...]
     """The session ids (the names of the session directories), in stream order."""
+    order: str = "session label"
+    """How the sessions were put in order: ``session label`` (the ``ses-`` labels, numbers
+    within them compared as numbers, so ``ses-2`` before ``ses-10``; a dataset without
+    sessions has one), or ``as named`` when the sessions were given by name."""
 
 
 class TracesInfo(_Frozen):

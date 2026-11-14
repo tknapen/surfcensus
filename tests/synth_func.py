@@ -49,10 +49,11 @@ The design (:data:`DESIGN`): ``sub-01`` with two sessions and ``sub-02`` without
 * ``sub-01 ses-2``: an anchor that is the outlier, 14 mm from two runs that lie 1 mm apart.
 * ``sub-02``: the name-order rule (a run without ``AcquisitionTime``, whose raw name is
   ``run-02`` where the derivative has ``run-2``), a 9-dof registration that is not rigid, a
-  run without a summary report, and one run that cannot be packed for each reason the listing
-  and the headers can show: no raw series, no brain mask, no transform to the anatomy, volume
-  counts that differ, a run on another grid, multi-echo, standard space only, native space
-  only, and no preprocessed series (fMRIPrep's level ``minimal``).
+  run without a summary report, a run on another grid (packed on its own grid, a group of its
+  own with its own contours: decision D38 builds no grid common to the runs), and one run that
+  cannot be packed for each reason the listing and the headers can show: no raw series, no
+  brain mask, no transform to the anatomy, volume counts that differ, multi-echo, standard
+  space only, native space only, and no preprocessed series (fMRIPrep's level ``minimal``).
 
 ``annex`` turns files of ``sub-01 ses-2 task-rest run-2`` into git-annex placeholders
 (``tests/synth_annex.py``): with ``"link"`` its raw series, its preprocessed series and its
@@ -125,7 +126,7 @@ REPORT_TEMPLATE = (
     "\t\t\t<li>Original orientation: LAS</li>\n"
     "\t\t\t<li>Repetition time (TR): 2s</li>\n"
     "\t\t\t<li>Phase-encoding (PE) direction: Anterior-Posterior</li>\n"
-    "\t\t\t<li>Single-echo EPI sequence.</li>\n"
+    "\t\t\t<li>{echo}</li>\n"
     "\t\t\t<li>Slice timing correction: {stc}</li>\n"
     "\t\t\t<li>Susceptibility distortion correction: {sdc}</li>\n"
     "\t\t\t<li>Registration: {registration}</li>\n"
@@ -371,7 +372,7 @@ DESIGN: tuple[RunDesign, ...] = (
     RunDesign("sub-02", None, "rest", "2", "no brain mask", reason="no brain mask"),
     RunDesign("sub-02", None, "rest", "3", "no transform", reason="no transform to the anatomy"),
     RunDesign("sub-02", None, "rest", "4", "volume counts differ", reason="volume counts differ"),
-    RunDesign("sub-02", None, "rest", "5", "other grid", reason="runs on different grids"),
+    RunDesign("sub-02", None, "rest", "5", "other grid"),
     RunDesign("sub-02", None, "me", "1", "multi-echo", reason="multi-echo"),
     RunDesign("sub-02", None, "std", "1", "standard space only", reason="standard space only"),
     RunDesign("sub-02", None, "native", "1", "native space only", reason="native space only"),
@@ -435,7 +436,8 @@ class SyntheticSession:
     rule: str
     """``acquisition_time`` or ``name_order``."""
     order: tuple[str, ...]
-    """The stems of the packable runs in acquisition order, the anchor first."""
+    """The stems of the packable runs in acquisition order (the anchor is the first acquired by
+    its rule)."""
     flagged: tuple[str, ...]
     """Packable runs whose frame displacement exceeds 10 mm somewhere in the brain mask."""
     anchor_is_outlier: bool
@@ -829,7 +831,7 @@ def _write_run(
         files["pre_mask"] = func / f"{stem}_desc-brain_mask.nii.gz"
         _write_nifti(files["pre_mask"], np.ones(RAW_SHAPE, np.uint8), true)
     else:
-        series, mask = (pre_b, mask_b) if d.reason == "runs on different grids" else (pre_a, mask_a)
+        series, mask = (pre_b, mask_b) if d.case == "other grid" else (pre_a, mask_a)
         if d.reason == "volume counts differ":
             n_pre, series, params = n - 2, series[..., : n - 2], params[: n - 2]
         files["pre_bold"] = func / f"{stem}_space-T1w_desc-preproc_bold.nii.gz"
@@ -853,6 +855,11 @@ def _write_run(
         files["summary_report"] = figures / f"{stem}_desc-summary_bold.html"
         files["summary_report"].write_text(
             REPORT_TEMPLATE.format(
+                echo=(
+                    "Multi-echo EPI sequence: 2 echoes."
+                    if d.reason == "multi-echo"
+                    else "Single-echo EPI sequence."
+                ),
                 stc=d.stc["scanner-T1w" if old else "boldref-T1w"],
                 sdc=d.sdc,
                 registration=REGISTRATION.format(dof=d.dof),

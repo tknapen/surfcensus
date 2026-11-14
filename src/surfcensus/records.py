@@ -240,6 +240,14 @@ RUNS_ON_DIFFERENT_GRIDS = "runs on different grids"
 MULTI_ECHO = "multi-echo"
 SOURCE_CHANGED = "source changed"
 PACK_FAILURE = "pack failure"
+NO_CONFOUNDS = "no confounds table"
+"""Not in the list of the spec: a run with its series and transform whose confounds table is
+missing (fMRIPrep writes it at level ``full`` only); the pack needs it for the volume count
+and the stills. Before this reason existed such a run was given ``no preprocessed series``."""
+NOT_FETCHED = "not fetched"
+"""Not in the list of the spec: a file the pack would read is a git-annex placeholder (a link
+without its content, or a pointer file) in a DataLad or git-annex clone that was not fetched
+(decision D35). ``SessionPlan.details`` names the files; the fetch command is step 2."""
 
 PACK_REASONS: tuple[str, ...] = (
     NO_RAW_SERIES,
@@ -253,8 +261,12 @@ PACK_REASONS: tuple[str, ...] = (
     MULTI_ECHO,
     SOURCE_CHANGED,
     PACK_FAILURE,
+    NO_CONFOUNDS,
+    NOT_FETCHED,
 )
-"""Every reason a run is listed and not packed, or its pack failed."""
+"""Every reason a run is listed and not packed, or its pack failed. ``runs on different
+grids`` is kept so that the list stays as pinned, and is given to no run: runs on different
+grids are each packed on their own grid (decision D38)."""
 
 DISPLAY_REASONS: tuple[str, ...] = (
     NO_PREPROCESSED_SERIES,
@@ -331,8 +343,11 @@ class DerivRun:
     """The files of every role the run has, for the display layout the connector chose:
     ``pre_bold`` and ``pre_mask`` are those of that layout."""
     echoes: int = 1
-    """Echoes of the raw acquisition when the connector can tell; more than one is
-    ``multi-echo``."""
+    """Echoes of the raw acquisition when the connector can tell from the derivative's names;
+    more than one is ``multi-echo``. fMRIPrep's default multi-echo output carries no echo
+    entity, so this is 1 there, and a multi-echo run is known from the raw listing instead:
+    several :class:`RawRun` of one ``key`` with distinct ``entities.echo``
+    (``func.session.plan_session``)."""
 
 
 @dataclass(frozen=True)
@@ -542,8 +557,10 @@ class SessionPlan:
     """The name of the FreeSurfer subject in the subjects directory, or None: then the
     session is packed without contours."""
     runs: tuple[SessionRun, ...]
-    """Every run of the session, those that cannot be packed included, in acquisition order
-    with the anchor first; runs that cannot be packed follow in name order."""
+    """Every run of the session, those that cannot be packed included: the packable ones in
+    acquisition order, which is the order of the session's stream (decision D38; the anchor
+    is the first acquired by its rule, so it comes first without being moved there); runs
+    that cannot be packed follow in name order."""
     anchor: Anchor | None
     """None when no run of the session can be packed."""
     frame: FrameCheck | None
@@ -553,6 +570,9 @@ class SessionPlan:
     """Run id -> the key of its grid, for the packable runs."""
     files: Mapping[FuncRole, FuncFileRef] = field(default_factory=dict)
     """The session's own files (``xfm_anat_fsnative``)."""
+    details: Mapping[str, str] = field(default_factory=dict)
+    """Run id -> one sentence that says more than the reason of a run that cannot be packed,
+    for example which files are not fetched. Shown on the local machine only."""
 
 
 @dataclass(frozen=True)
@@ -575,3 +595,10 @@ class RunPackInput:
     rigid: RigidPath
     """The run's own stored transform."""
     tr_s: float | None
+    session_inputs: tuple[tuple[str, Literal["raw", "deriv", "freesurfer"], Path], ...] = ()
+    """``(role, base, path)`` of files outside the run that its pack depends on, listed in
+    ``pack.json`` after the run's own files: the anchor's stored transform
+    (``anchor_xfm_to_anat``, for a run that is not the anchor), the session's
+    ``xfm_anat_fsnative`` and the FreeSurfer files of the contours (``t1``, ``lh_white``,
+    ``rh_white``, ``lh_pial``, ``rh_pial``). So a changed anchor or surface changes the pack's
+    inputs and its content digest."""

@@ -182,7 +182,15 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "pack_run": ("session_dir", "run", "config"),
         "slice_planes": ("grid", "display_to_anat"),
         "write_contours": ("session_dir", "grid_key", "planes"),
-        "pack_session": ("out_dir", "session_id", "plan", "runs", "contours", "config"),
+        "pack_session": (
+            "out_dir",
+            "session_id",
+            "plan",
+            "runs",
+            "contours",
+            "config",
+            "progress",
+        ),
         "content_digest": ("session_dir", "info"),
     },
     "surfcensus.func.packread": {
@@ -220,6 +228,19 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "FuncFolders": None,
         "find_folders": ("path", "raw"),
         "epi_session": ("path", "subject", "out", "session", "raw", "config", "key"),
+        "epi_subject": (
+            "path",
+            "subject",
+            "out",
+            "sessions",
+            "raw",
+            "config",
+            "key",
+            "runs",
+            "progress",
+        ),
+        "RATE_S_PER_VOLUME": None,
+        "RATE_VOXELS": None,
     },
     "surfcensus.records": {
         "Matrix4": None,
@@ -283,6 +304,7 @@ RECORDS: dict[str, tuple[str, ...]] = {
         "grids",
         "grid_of",
         "files",
+        "details",
     ),
     "RunPackInput": (
         "run",
@@ -297,6 +319,7 @@ RECORDS: dict[str, tuple[str, ...]] = {
         "corrections",
         "rigid",
         "tr_s",
+        "session_inputs",
     ),
 }
 
@@ -348,6 +371,7 @@ MODELS: dict[str, tuple[str, ...]] = {
         "first",
         "window",
         "sd_window",
+        "detail",
     ),
     "FrameInfo": (
         "mean_mm",
@@ -397,7 +421,7 @@ MODELS: dict[str, tuple[str, ...]] = {
     "ContourFile": ("file", "bytes", "sha256", "slices", "lines", "points"),
     "StreamFiles": ("ref", "mean", "sd", "chunks"),
     "TracesInfo": ("fd", "dvars", "non_steady"),
-    "StreamInfo": ("format", "version", "surfcensus_version", "label", "sessions"),
+    "StreamInfo": ("format", "version", "surfcensus_version", "label", "sessions", "order"),
     "StatementInfo": ("state", "words", "source", "note"),
     "CorrectionsInfo": RECORDS["Corrections"],
 }
@@ -476,6 +500,8 @@ def test_the_reasons_and_the_choices() -> None:
         "multi-echo",
         "source changed",
         "pack failure",
+        "no confounds table",
+        "not fetched",
     )
     assert set(records.DISPLAY_REASONS) <= set(records.PACK_REASONS)
     from surfcensus.func import session
