@@ -9,24 +9,91 @@ one 8-bit window per run for both streams, 0 to the 99.5th percentile of the pre
 series inside the run's brain mask over the volumes 0, 10, 20, ...; the stills over the
 steady-state volumes in float64; every ``.bin`` file is a zlib stream.
 
-What changes against the prototype: the preprocessed series is read one volume at a time
-through the array proxy, never whole; a pack names nothing and is traced to its inputs in
-``pack.json``; its identity is :func:`content_digest`, over the decoded values, so that the
-compressed bytes may differ between zlib builds. A pack directory is written under a temporary
-name and renamed into place.
+What changes against the prototype: the series are read one volume at a time through the
+array proxy, never whole; a pack names nothing and is traced to its inputs in ``pack.json``
+(role, base, size and SHA-256, never a name or a path); its identity is
+:func:`content_digest`, over the decoded values and the JSON that defines the pack, so that
+the compressed bytes may differ between zlib builds. A run's pack is written into a hidden
+temporary directory beside it, ``pack.json`` last, and renamed into place under the ``flock``
+of the session directory; ``session.json`` is written last of a session. So the presence of
+``pack.json`` marks a complete pack and that of ``session.json`` a complete session, as
+``render.json`` marks a render.
+
+The preprocessed stream is the series as the pipeline wrote it, scaled per volume and
+quantised; the raw stream comes from ``func.geometry.raw_stream`` (the one placement of D36)
+and is only quantised. Nothing else is done to either.
 """
 
 from __future__ import annotations
 
+import hashlib
+import os
+import re
+import secrets
+import shutil
+import zlib
 from collections.abc import Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Any
 
+import nibabel as nib
 import numpy as np
-from jaxtyping import Float, UInt8
+from jaxtyping import Bool, Float, UInt8
 
+from surfcensus import __version__
+from surfcensus._io import atomic_path, canonical_json, sha256_file
 from surfcensus.config import EpiConfig
-from surfcensus.func.model import ContourFile, PackInfo, SessionInfo
-from surfcensus.records import PlaneContours, RunPackInput, SessionPlan
+from surfcensus.func import (
+    CONTOUR_UNIT,
+    CONTOURS_DIR,
+    ID_PATTERN,
+    PACK_JSON,
+    PLANES,
+    SESSION_JSON,
+    STILLS,
+    STREAMS,
+    TRACES_JSON,
+    chunk_name,
+    contour_file,
+    geometry,
+    stream_file,
+)
+from surfcensus.func.model import (
+    ChunkFile,
+    ContourFile,
+    FrameInfo,
+    GridInfo,
+    PackFile,
+    PackInfo,
+    PackInput,
+    PackSettings,
+    RegistrationInfo,
+    SessionInfo,
+    SessionRunInfo,
+    StreamFiles,
+    TracesInfo,
+    corrections_info,
+    info_text,
+)
+from surfcensus.func.packread import inflate_checked, stream_bytes
+from surfcensus.records import (
+    NO_BRAIN_MASK,
+    NO_PREPROCESSED_SERIES,
+    NO_RAW_SERIES,
+    PACK_FAILURE,
+    VOLUME_COUNTS_DIFFER,
+    FrameDisplacement,
+    PlaneContours,
+    RunPackInput,
+    SessionPlan,
+)
+from surfcensus.sources.base import FUNC_RAW_ROLES, FuncRole
+
+try:
+    import fcntl
+except ImportError:  # Windows has no flock: the swap of a run directory is not serialized there
+    fcntl = None
 
 ZLIB_LEVEL = 6
 MAX_CHUNK = 32
@@ -34,6 +101,16 @@ MAX_CHUNK = 32
 WINDOW_STEP = 10
 """The window and the reference volume are taken over the volumes 0, 10, 20, ..."""
 PERCENTILE = 99.5
+
+DIGEST_FORMAT = "epi-pack content digest 1"
+"""The first line of the text that :func:`content_digest` hashes; it changes when the rule of
+the digest changes."""
+
+_GRID_TOLERANCE = 1e-4
+"""A brain mask lies on the grid when its shape is the grid's and its affine agrees to this
+(``geometry.GRID_TOLERANCE``)."""
+
+_UNREADABLE = (OSError, ValueError, EOFError, zlib.error, nib.filebasedimages.ImageFileError)
 
 
 class PackError(Exception):
@@ -50,46 +127,626 @@ class PackError(Exception):
         return type(self), (self.reason, self.detail)
 
 
+# --- the values ---------------------------------------------------------------------------
+
+
 def quantise(
     volume: Float[np.ndarray, "i j k"], lo: float, hi: float
 ) -> UInt8[np.ndarray, "i j k"]:
-    """``clip(floor((v - lo) * 255 / (hi - lo) + 0.5), 0, 255)`` in float32; NaN is 0."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    """``clip(floor((v - lo) * 255 / (hi - lo) + 0.5), 0, 255)`` in float32; NaN is 0.
+
+    The expression of stage 1's ``pack_run.quantise``, operation for operation: the factor
+    ``255 / (hi - lo)`` is computed in float64 and rounded to float32 once, the product and the
+    sum are float32, and the cast after the clip truncates, which for values of 0 and more is
+    the floor. An infinity is clipped like a large number.
+    """
+    k = np.float32(255.0 / (hi - lo))
+    v = np.nan_to_num(np.asarray(volume, np.float32), nan=0.0)
+    return np.clip((v - np.float32(lo)) * k + np.float32(0.5), 0, 255).astype(np.uint8)
 
 
 def volume_bytes(volume: UInt8[np.ndarray, "i j k"]) -> bytes:
     """A volume in the byte order of the pack (Fortran order)."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    return np.asarray(volume, np.uint8).tobytes(order="F")
 
 
 def chunk_volumes(n_voxels: int, chunk_bytes: int) -> int:
     """Volumes per chunk: as many as fit ``chunk_bytes`` decoded, at least 1, at most
     :data:`MAX_CHUNK`."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    if n_voxels < 1:
+        raise ValueError("a grid has at least one voxel")
+    return max(1, min(MAX_CHUNK, int(chunk_bytes) // int(n_voxels)))
+
+
+def _open_series(series: Path) -> Any:
+    # keep_file_open: a gzip stream is read front to back once, not reopened per volume
+    return nib.load(str(series), keep_file_open=True)
+
+
+def _n_volumes(img: Any) -> int:
+    shape = tuple(img.shape)
+    return int(shape[3]) if len(shape) > 3 else 1
 
 
 def series_volumes(
     series: Path, volumes: Sequence[int] | None = None
 ) -> Iterator[tuple[int, Float[np.ndarray, "i j k"]]]:
     """``(t, float32 volume)`` of a stored series, scaled per volume, read one volume at a time
-    through the array proxy. ``volumes``: indices, all when None."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    through the array proxy. ``volumes``: indices, all when None.
+
+    The values are ``stored[..., t].astype(float32) * slope + inter``, the expression of stage
+    1 (``pack_run.scaled``), with ``slope`` and ``inter`` as nibabel's proxy holds them (1 and
+    0 for a series without scaling). Only the bytes of volume ``t`` are read (nibabel's
+    ``_get_unscaled`` with a slicer); a gzip stream is read forward through one open file. A
+    series of three dimensions is one volume, ``t`` 0.
+    """
+    img = _open_series(Path(series))
+    proxy = img.dataobj
+    slope, inter = float(proxy.slope), float(proxy.inter)
+    four_d = len(proxy.shape) > 3
+    n = _n_volumes(img)
+    wanted = range(n) if volumes is None else volumes
+    try:
+        for t in wanted:
+            t = int(t)
+            if not 0 <= t < n:
+                raise IndexError(f"volume {t} of a series of {n}")
+            slicer = (slice(None), slice(None), slice(None), t) if four_d else (slice(None),) * 3
+            stored = proxy._get_unscaled(slicer)
+            yield t, np.asarray(stored).astype(np.float32) * slope + inter
+    finally:
+        # the proxy keeps its file open (keep_file_open); close it with the generator
+        opener = getattr(proxy, "_opener", None)
+        if opener is not None:
+            opener.close_if_mine()
+
+
+def _raw_volumes(
+    run: RunPackInput, volumes: Sequence[int] | None, portable: bool
+) -> Iterator[tuple[int, Float[np.ndarray, "i j k"]]]:
+    """The raw stream of a run on its display grid: the one source of raw volumes of the pack
+    (``func.geometry.raw_stream``, decision D36)."""
+    return iter(
+        geometry.raw_stream(
+            run.files[FuncRole.RAW_BOLD],
+            run.raw_affine.matrix,
+            run.grid,
+            run.anchor_matrix,
+            run.display_to_anat,
+            volumes,
+            portable,
+        )
+    )
+
+
+def _guarded(
+    volumes: Iterator[tuple[int, Float[np.ndarray, "i j k"]]],
+    role: FuncRole,
+    wanted: Sequence[int],
+) -> Iterator[Float[np.ndarray, "i j k"]]:
+    """The volumes ``wanted`` of a series, in that order, with an error of reading turned into
+    :class:`PackError`, and a series that yields another volume, or fewer or more, refused."""
+    count = 0
+    while True:
+        try:
+            item = next(volumes)
+        except StopIteration:
+            break
+        except _UNREADABLE as err:
+            raise PackError(
+                PACK_FAILURE, f"unreadable input ({role.value}: {_no_path(err)})"
+            ) from None
+        if count >= len(wanted) or item[0] != wanted[count]:
+            due = wanted[count] if count < len(wanted) else "none"
+            raise PackError(PACK_FAILURE, f"{role.value}: volume {item[0]} where {due} was due")
+        count += 1
+        yield item[1]
+    if count != len(wanted):
+        raise PackError(PACK_FAILURE, f"{role.value}: {count} volumes of {len(wanted)}")
+
+
+def _no_path(err: BaseException) -> str:
+    """The text of an error with every absolute path replaced by its last component."""
+    text = str(err.strerror) if isinstance(err, OSError) and err.strerror else str(err)
+    return re.sub(r"(?:/[^/\s'\"]+)+/([^/\s'\"]+)", r"\1", text)
+
+
+# --- one run --------------------------------------------------------------------------------
+
+
+def _read_mask(
+    path: Path, grid_shape: tuple[int, int, int], grid_affine: np.ndarray
+) -> Bool[np.ndarray, "i j k"]:
+    try:
+        img = nib.load(str(path))
+        data = np.asarray(img.dataobj)
+    except _UNREADABLE as err:
+        raise PackError(PACK_FAILURE, f"unreadable input (pre_mask: {_no_path(err)})") from None
+    if data.ndim == 4 and data.shape[3] == 1:
+        data = data[..., 0]
+    if tuple(data.shape) != tuple(grid_shape):
+        raise PackError(NO_BRAIN_MASK, "the brain mask is not on the grid of the series")
+    if not np.allclose(np.asarray(img.affine, float), grid_affine, atol=_GRID_TOLERANCE):
+        raise PackError(NO_BRAIN_MASK, "the brain mask is not on the grid of the series")
+    mask = data > 0
+    if not mask.any():
+        raise PackError(NO_BRAIN_MASK, "the brain mask is empty")
+    return mask
+
+
+def _header_volumes(role: FuncRole, path: Path) -> tuple[Any, int]:
+    try:
+        img = nib.load(str(path))
+        return img, _n_volumes(img)
+    except _UNREADABLE as err:
+        raise PackError(PACK_FAILURE, f"unreadable input ({role.value}: {_no_path(err)})") from None
+
+
+def _inputs(files: Mapping[FuncRole, Path]) -> tuple[PackInput, ...]:
+    """Every file the pack was given, in ``FuncRole`` order (raw roles come first there)."""
+    out = []
+    for role in FuncRole:
+        if role not in files:
+            continue
+        path = Path(files[role])
+        try:
+            size, digest = path.stat().st_size, sha256_file(path)
+        except OSError as err:
+            raise PackError(
+                PACK_FAILURE, f"unreadable input ({role.value}: {_no_path(err)})"
+            ) from None
+        base = "raw" if role in FUNC_RAW_ROLES else "deriv"
+        out.append(PackInput(role=role.value, base=base, size=size, sha256=digest))
+    return tuple(out)
+
+
+class _Writer:
+    """Writes the compressed files of one run under a temporary session-like directory and
+    keeps what ``pack.json`` lists of them."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self.total = 0
+
+    def put(self, relative: str, data: bytes) -> PackFile:
+        blob = zlib.compress(data, ZLIB_LEVEL)
+        path = self.root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
+        self.total += len(blob)
+        return PackFile(file=relative, bytes=len(blob), sha256=hashlib.sha256(blob).hexdigest())
+
+
+def _steady(n: int, non_steady: Sequence[int]) -> np.ndarray:
+    steady = np.ones(n, bool)
+    steady[[t for t in non_steady if 0 <= t < n]] = False
+    if steady.sum() < 2:  # stage 1's rule: then the stills are over every volume
+        steady[:] = True
+    return steady
 
 
 def pack_run(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInfo:
     """Write ``<session_dir>/<run.run>/`` (the streams, the stills, ``traces.json`` and
     ``pack.json`` last) and return what ``pack.json`` holds. Raises :class:`PackError` for a
     run that turns out not to be packable (``volume counts differ``, ``no brain mask`` for an
-    empty mask or one off the grid)."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    empty mask or one off the grid).
+
+    Two passes over the volumes, as in stage 1. The first reads the volumes 0, 10, 20, ... of
+    the preprocessed series twice (once for the window, once for the reference volume of each
+    stream, since a reference is quantised under the window) and those of the raw stream once.
+    The second reads every volume of both streams once, writes the chunks as they fill and adds
+    the steady-state volumes to the sums of the stills. What is held: one volume of each
+    stream, the float64 sums and squares (32 bytes per voxel and stream), the chunk being
+    filled (at most ``chunk_bytes`` per stream), and the masked values of the volumes 0, 10,
+    20, ... of the preprocessed series for the percentile.
+
+    Everything is written into a hidden directory ``.<run>.<16 hex>.tmp`` in ``session_dir``,
+    ``pack.json`` last, and moved to ``<session_dir>/<run>`` under the ``flock`` of
+    ``session_dir``; an earlier pack of the run is moved aside first and removed. An
+    interrupted call leaves the earlier pack, or none, and removes its temporary directory.
+    The contours of the run's grid (``contours/<grid_key>/``) are read from ``session_dir``
+    for the digest when they are there, so :func:`pack_session` writes them first.
+    """
+    session_dir = Path(session_dir)
+    if not re.fullmatch(ID_PATTERN, run.run):
+        raise ValueError(f"not a run id: {run.run!r}")
+    files = run.files
+    for role, reason in (
+        (FuncRole.PRE_BOLD, NO_PREPROCESSED_SERIES),
+        (FuncRole.RAW_BOLD, NO_RAW_SERIES),
+        (FuncRole.PRE_MASK, NO_BRAIN_MASK),
+    ):
+        if role not in files:
+            raise PackError(reason, f"the run has no {role.value} file")
+    shape = tuple(int(x) for x in run.grid.shape)
+    grid_affine = np.asarray(run.grid.affine, float)
+    n_voxels = int(np.prod(shape))
+
+    pre_img, n = _header_volumes(FuncRole.PRE_BOLD, files[FuncRole.PRE_BOLD])
+    if tuple(int(x) for x in pre_img.shape[:3]) != shape:
+        raise PackError(PACK_FAILURE, "the preprocessed series is not on the grid of the run")
+    _, n_raw = _header_volumes(FuncRole.RAW_BOLD, files[FuncRole.RAW_BOLD])
+    if n_raw != n:
+        raise PackError(
+            VOLUME_COUNTS_DIFFER, f"the raw series has {n_raw} volumes, the preprocessed {n}"
+        )
+    motion = run.motion
+    if motion is not None and (len(motion.fd) != n or len(motion.dvars) != n):
+        raise PackError(
+            VOLUME_COUNTS_DIFFER,
+            f"the confounds table has {len(motion.fd)} rows, the series {n} volumes",
+        )
+    mask = _read_mask(files[FuncRole.PRE_MASK], shape, grid_affine)
+    inputs = _inputs(files)
+    non_steady = tuple(t for t in motion.non_steady if 0 <= t < n) if motion else ()
+    steady = _steady(n, non_steady)
+    k_chunk = chunk_volumes(n_voxels, config.chunk_bytes)
+    portable = config.portable_voxel_map
+    pre_path = files[FuncRole.PRE_BOLD]
+
+    def pre(volumes: Sequence[int]) -> Iterator[np.ndarray]:
+        return _guarded(series_volumes(pre_path, volumes), FuncRole.PRE_BOLD, volumes)
+
+    def raw(volumes: Sequence[int]) -> Iterator[np.ndarray]:
+        return _guarded(_raw_volumes(run, volumes, portable), FuncRole.RAW_BOLD, volumes)
+
+    # pass A, the volumes 0, 10, 20, ...: the window of the run and the reference volumes
+    sub = list(range(0, n, WINDOW_STEP))
+    values = np.empty((len(sub), int(mask.sum())), np.float32)
+    for row, vol in enumerate(pre(sub)):
+        values[row] = vol[mask]
+    # the values of stage 1's np.stack, partitioned in place instead of copied
+    hi = float(np.percentile(values, PERCENTILE, overwrite_input=True))
+    del values
+    if not hi > 0:
+        raise PackError(PACK_FAILURE, "the preprocessed series has no signal inside the mask")
+    window = (0.0, hi)
+    ref_sum = {s: np.zeros(shape, np.float64) for s in STREAMS}
+    for vol in pre(sub):
+        ref_sum["pre"] += quantise(vol, *window)
+    for vol in raw(sub):
+        ref_sum["raw"] += quantise(vol, *window)
+    ref = {s: np.floor(ref_sum[s] / len(sub) + 0.5).astype(np.uint8) for s in STREAMS}
+    del ref_sum
+
+    session_dir.mkdir(parents=True, exist_ok=True)
+    tmp_root = session_dir / f".{run.run}.{secrets.token_hex(8)}.tmp"
+    try:
+        writer = _Writer(tmp_root)
+        sums = {s: np.zeros(shape, np.float64) for s in STREAMS}
+        squares = {s: np.zeros(shape, np.float64) for s in STREAMS}
+        chunks: dict[str, list[ChunkFile]] = {s: [] for s in STREAMS}
+        pending: dict[str, list[bytes]] = {s: [] for s in STREAMS}
+        hashers = {s: hashlib.sha256() for s in STREAMS}
+
+        def flush(stream: str, first: int) -> None:
+            name = chunk_name(len(chunks[stream]))
+            entry = writer.put(stream_file(run.run, stream, name), b"".join(pending[stream]))
+            chunks[stream].append(
+                ChunkFile(**entry.model_dump(), first=first, count=len(pending[stream]))
+            )
+            pending[stream].clear()
+
+        # pass B, every volume: the chunks, and the sums for the stills
+        every = range(n)
+        sources = {"raw": raw(every), "pre": pre(every)}
+        for t in range(n):
+            for stream in STREAMS:
+                vol = next(sources[stream])
+                if steady[t]:
+                    v64 = vol.astype(np.float64)
+                    sums[stream] += v64
+                    squares[stream] += v64 * v64
+                q = quantise(vol, *window)
+                hashers[stream].update(volume_bytes(q))
+                pending[stream].append(volume_bytes(q - ref[stream]))  # uint8: mod 256
+                if len(pending[stream]) == k_chunk or t == n - 1:
+                    flush(stream, t + 1 - len(pending[stream]))
+        for stream in STREAMS:
+            for _ in sources[stream]:  # the guard refuses a volume beyond the last
+                pass
+
+        # the stills
+        n_steady = int(steady.sum())
+        mean = {s: sums[s] / n_steady for s in STREAMS}
+        sd = {
+            s: np.sqrt(np.maximum(squares[s] - sums[s] ** 2 / n_steady, 0.0) / (n_steady - 1))
+            if n_steady > 1
+            else np.zeros(shape, np.float64)
+            for s in STREAMS
+        }
+        del sums, squares
+        sd_hi = float(np.percentile(sd["pre"][mask], PERCENTILE))
+        sd_window = (0.0, sd_hi if sd_hi > 0 else 1.0)
+        stills: dict[str, dict[str, bytes]] = {
+            s: {
+                "ref": volume_bytes(ref[s]),
+                "mean": volume_bytes(quantise(mean[s], *window)),
+                "sd": volume_bytes(quantise(sd[s], *sd_window)),
+            }
+            for s in STREAMS
+        }
+        streams = {
+            s: StreamFiles(
+                **{
+                    still: writer.put(stream_file(run.run, s, still), stills[s][still])
+                    for still in STILLS
+                },
+                chunks=tuple(chunks[s]),
+            )
+            for s in STREAMS
+        }
+
+        traces = TracesInfo(
+            fd=tuple(motion.fd) if motion else (),
+            dvars=tuple(motion.dvars) if motion else (),
+            non_steady=non_steady,
+        )
+        traces_bytes = info_text(traces).encode()
+        traces_rel = f"{run.run}/{TRACES_JSON}"
+        (tmp_root / traces_rel).write_bytes(traces_bytes)
+        traces_file = PackFile(
+            file=traces_rel,
+            bytes=len(traces_bytes),
+            sha256=hashlib.sha256(traces_bytes).hexdigest(),
+        )
+
+        info = PackInfo(
+            surfcensus_version=__version__,
+            run=run.run,
+            session=session_dir.name,
+            config_hash=config.pack_hash(),
+            settings=_settings(config),
+            inputs=inputs,
+            grid_key=run.grid.key,
+            anchor_run=run.anchor_run,
+            n_volumes=n,
+            tr_s=run.tr_s,
+            window=window,
+            sd_window=sd_window,
+            chunk_volumes=k_chunk,
+            stills_volumes=n_steady,
+            raw_affine=run.raw_affine.choice,
+            reference_image=run.raw_affine.reference_image,
+            rigid=run.rigid.rigid,
+            corrections=corrections_info(run.corrections),
+            streams=streams,
+            traces=traces_file,
+            content_digest="0" * 64,
+        )
+        parts = _digest_parts(
+            info,
+            {s: hashers[s].hexdigest() for s in STREAMS},
+            {s: {still: _sha(stills[s][still]) for still in STILLS} for s in STREAMS},
+            _sha(traces_bytes),
+            _contour_digests(session_dir, info.grid_key),
+        )
+        info = info.model_copy(update={"content_digest": _digest(parts)})
+        (tmp_root / run.run / PACK_JSON).write_text(info_text(info))
+        _swap_into_place(session_dir, tmp_root, run.run)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    return info
+
+
+def _settings(config: EpiConfig) -> PackSettings:
+    return PackSettings(
+        portable_voxel_map=config.portable_voxel_map,
+        chunk_bytes=config.chunk_bytes,
+        window_step=WINDOW_STEP,
+        percentile=PERCENTILE,
+        zlib_level=ZLIB_LEVEL,
+        contour_unit=CONTOUR_UNIT,
+    )
+
+
+@contextmanager
+def _locked(directory: Path) -> Iterator[bool]:
+    """``flock`` on the directory itself, as a render's media directory is locked; yields
+    whether a lock is held. Without ``fcntl``, or where the file system refuses it, none."""
+    descriptor = -1
+    locked = False
+    try:
+        if fcntl is not None:
+            try:
+                descriptor = os.open(directory, os.O_RDONLY)
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+                locked = True
+            except OSError:
+                pass
+        yield locked
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _swap_into_place(session_dir: Path, tmp_root: Path, run: str) -> None:
+    """Move ``tmp_root/run`` to ``session_dir/run``, the earlier one aside first."""
+    final = session_dir / run
+    with _locked(session_dir) as locked:
+        if locked:  # what a killed call of this run left; under the lock no other call is in it
+            mine = tmp_root.name
+            for entry in session_dir.iterdir():
+                name = entry.name
+                if name != mine and re.fullmatch(rf"\.{run}\.[0-9a-f]{{16}}\.(tmp|old)", name):
+                    shutil.rmtree(entry, ignore_errors=True)
+        old = None
+        if final.is_symlink() or final.exists():
+            old = session_dir / f".{run}.{secrets.token_hex(8)}.old"
+            os.replace(final, old)
+        os.replace(tmp_root / run, final)
+    if old is not None:
+        if old.is_symlink() or old.is_file():
+            old.unlink()
+        else:
+            shutil.rmtree(old, ignore_errors=True)
+
+
+# --- the digest -----------------------------------------------------------------------------
+
+
+def _sha(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _defining_json(info: PackInfo) -> str:
+    """The JSON that defines a pack: ``pack.json`` without the content digest, without the
+    version of the package that wrote it, and without the compressed size and SHA-256 of every
+    file entry (an object with a ``file`` key), which depend on the zlib build."""
+
+    def strip(value: Any) -> Any:
+        if isinstance(value, dict):
+            drop = {"bytes", "sha256"} if "file" in value else set()
+            return {k: strip(v) for k, v in value.items() if k not in drop}
+        if isinstance(value, list):
+            return [strip(v) for v in value]
+        return value
+
+    data = info.model_dump(mode="json")
+    data.pop("content_digest")
+    data.pop("surfcensus_version")
+    return canonical_json(strip(data))
+
+
+def _contour_digests(session_dir: Path, grid_key: str) -> dict[str, str] | None:
+    """The SHA-256 of the decoded contour file of every plane of a grid, or None when the
+    session directory holds no contours of that grid. A plane whose file is missing while
+    others are there is an error: contours are written whole by :func:`write_contours`."""
+    folder = Path(session_dir) / CONTOURS_DIR / grid_key
+    if not folder.is_dir():
+        return None
+    out = {}
+    for plane in PLANES:
+        path = Path(session_dir) / contour_file(grid_key, plane)
+        out[plane] = _sha(inflate_checked(path, None))
+    return out
+
+
+def _digest_parts(
+    info: PackInfo,
+    volumes: Mapping[str, str],
+    stills: Mapping[str, Mapping[str, str]],
+    traces: str,
+    contours: Mapping[str, str] | None,
+) -> list[str]:
+    lines = [DIGEST_FORMAT, f"json {_sha(_defining_json(info).encode())}"]
+    lines += [f"volumes {s} {volumes[s]}" for s in STREAMS]
+    lines += [f"still {s} {still} {stills[s][still]}" for s in STREAMS for still in STILLS]
+    lines.append(f"traces {traces}")
+    if contours is None:
+        lines.append("contours none")
+    else:
+        lines += [f"contours {plane} {contours[plane]}" for plane in PLANES]
+    return lines
+
+
+def _digest(lines: Sequence[str]) -> str:
+    return _sha(("\n".join(lines) + "\n").encode())
+
+
+def content_digest(session_dir: Path, info: PackInfo) -> str:
+    """SHA-256 over the decoded 8-bit volumes (raw then pre, in volume order), the references,
+    the stills, the traces as written and the decoded contour bytes of its grid, in a fixed
+    order: the identity of a pack whatever zlib wrote it.
+
+    Precisely: the SHA-256 of the lines of :func:`_digest_parts` joined by newlines, which are
+    the rule's name, the SHA-256 of the defining JSON (``pack.json`` without the digest, the
+    package version and the compressed sizes and digests of its files; :func:`_defining_json`),
+    then per stream the SHA-256 of its decoded volumes one after the other, per stream and
+    still the SHA-256 of the decoded still, the SHA-256 of ``traces.json``, and per plane the
+    SHA-256 of the inflated contour file of the grid, or ``contours none``. Each compressed
+    file is checked against the SHA-256 that ``info`` lists for it before it is inflated
+    (``ValueError`` otherwise); the contour files are checked by their content only, since
+    ``pack.json`` does not list them. :func:`pack_run` computes the same lines while it writes,
+    from the values in memory.
+    """
+    session_dir = Path(session_dir)
+    volumes = {}
+    for stream in STREAMS:
+        hasher = hashlib.sha256()
+        for data in stream_bytes(session_dir, info, stream):
+            hasher.update(data)
+        volumes[stream] = hasher.hexdigest()
+    stills = {
+        s: {
+            still: _sha(
+                inflate_checked(
+                    session_dir / getattr(info.streams[s], still).file,
+                    getattr(info.streams[s], still).sha256,
+                )
+            )
+            for still in STILLS
+        }
+        for s in STREAMS
+    }
+    traces_path = session_dir / info.traces.file
+    traces = traces_path.read_bytes()
+    if _sha(traces) != info.traces.sha256:
+        raise ValueError(f"{TRACES_JSON} of run {info.run} is not the file pack.json lists")
+    contours = _contour_digests(session_dir, info.grid_key)
+    return _digest(_digest_parts(info, volumes, stills, _sha(traces), contours))
+
+
+# --- contours and the session ---------------------------------------------------------------
 
 
 def write_contours(
     session_dir: Path, grid_key: str, planes: Sequence[PlaneContours]
 ) -> Mapping[str, ContourFile]:
     """Write ``contours/<grid_key>/<plane>.bin`` and return, per plane, the
-    ``func.model.ContourFile`` of it."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    ``func.model.ContourFile`` of it.
+
+    Each file is the plane's data compressed with zlib at :data:`ZLIB_LEVEL`, written
+    atomically. ``planes`` must hold each of the three planes once; the result is in the
+    order of ``func.PLANES``.
+    """
+    by_plane = {p.plane: p for p in planes}
+    if len(by_plane) != len(planes) or set(by_plane) != set(PLANES):
+        raise ValueError("contours need each of the planes sagittal, coronal and axial once")
+    out: dict[str, ContourFile] = {}
+    for plane in PLANES:
+        item = by_plane[plane]
+        relative = contour_file(grid_key, plane)
+        blob = zlib.compress(item.data, ZLIB_LEVEL)
+        with atomic_path(Path(session_dir) / relative) as tmp:
+            tmp.write_bytes(blob)
+        out[plane] = ContourFile(
+            file=relative,
+            bytes=len(blob),
+            sha256=_sha(blob),
+            slices=item.slices,
+            lines=item.lines,
+            points=item.points,
+        )
+    return out
+
+
+def _frame_info(d: FrameDisplacement) -> FrameInfo:
+    def r(x: float) -> float:
+        return round(float(x), 4)
+
+    return FrameInfo(
+        mean_mm=r(d.mean_mm),
+        max_mm=r(d.max_mm),
+        rotation_deg=r(d.rotation_deg),
+        translation_mm=r(d.translation_mm),
+        translation_ras=(
+            r(d.translation_ras[0]),
+            r(d.translation_ras[1]),
+            r(d.translation_ras[2]),
+        ),
+        shear_scale=r(d.shear_scale),
+        flagged=bool(d.flagged),
+    )
+
+
+def _remove_run_dir(session_dir: Path, run: str) -> None:
+    path = session_dir / run
+    with _locked(session_dir):
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+        elif path.is_dir():
+            shutil.rmtree(path)
 
 
 def pack_session(
@@ -103,12 +760,95 @@ def pack_session(
     """Pack a whole session into ``<out_dir>/<session_id>/``: the contours of each grid
     (``contours`` by grid key; None without a FreeSurfer subject), every run of ``runs``, then
     ``session.json`` last. A run that raises :class:`PackError` is listed in ``session.json``
-    with its reason and the others are packed."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    with its reason and the others are packed.
 
+    Runs on different grids are packed as groups, one per grid of ``plan.grids``, each with
+    its own contours. The runs are packed in the order of ``plan.runs`` (acquisition order,
+    the anchor first); a run of ``plan.runs`` without a reason that ``runs`` does not hold is
+    listed as ``pack failure``. A run that is not packed loses a pack directory that an
+    earlier call left. ``session.json`` is removed before anything is written and written
+    again last, so it marks a session whose every pack is in place.
+    """
+    if not re.fullmatch(ID_PATTERN, session_id):
+        raise ValueError(f"not a session id: {session_id!r}")
+    session_dir = Path(out_dir) / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    (session_dir / SESSION_JSON).unlink(missing_ok=True)
 
-def content_digest(session_dir: Path, info: PackInfo) -> str:
-    """SHA-256 over the decoded 8-bit volumes (raw then pre, in volume order), the references,
-    the stills, the traces as written and the decoded contour bytes of its grid, in a fixed
-    order: the identity of a pack whatever zlib wrote it."""
-    raise NotImplementedError("work package E1.C: func/pack.py")
+    grid_keys = list(dict.fromkeys(plan.grid_of[r.run] for r in plan.runs if r.run in plan.grid_of))
+    grid_keys += [k for k in plan.grids if k not in grid_keys]
+    contour_files: dict[str, Mapping[str, ContourFile] | None] = {}
+    for key in grid_keys:
+        if contours is not None and key in contours:
+            contour_files[key] = write_contours(session_dir, key, contours[key])
+        else:
+            contour_files[key] = None
+
+    given = {r.run: r for r in runs}
+    listed: list[SessionRunInfo] = []
+    for order, item in enumerate(plan.runs):
+        reason = item.reason
+        if reason is None:
+            if item.run not in given:
+                reason = PACK_FAILURE
+            else:
+                try:
+                    pack_run(session_dir, given[item.run], config)
+                except PackError as err:
+                    reason = err.reason
+        if reason is not None:
+            _remove_run_dir(session_dir, item.run)
+        frame = None
+        if item.reason is None and plan.frame is not None and item.run in plan.frame.runs:
+            frame = _frame_info(plan.frame.runs[item.run])
+        listed.append(
+            SessionRunInfo(
+                run=item.run,
+                name=item.name,
+                acquisition_order=order,
+                anchor=plan.anchor is not None and item.run == plan.anchor.run,
+                grid_key=plan.grid_of.get(item.run) if item.reason is None else None,
+                frame=frame,
+                reason=reason,
+            )
+        )
+
+    registration = None
+    if plan.anchor is not None and plan.frame is not None:
+        registration = RegistrationInfo(
+            anchor=plan.anchor.run,
+            rule=plan.anchor.rule,
+            limit_mm=plan.frame.limit_mm,
+            shared_frame_plausible=plan.frame.shared_frame_plausible,
+            anchor_is_outlier=plan.frame.anchor_is_outlier,
+            portable_voxel_map=config.portable_voxel_map,
+        )
+    grids = tuple(
+        GridInfo(
+            grid_key=key,
+            shape=plan.grids[key].shape,
+            voxel_mm=geometry.voxel_mm(plan.grids[key]),
+            oblique_deg=geometry.oblique_deg(plan.grids[key]),
+            edge_letters=dict(geometry.edge_letters(plan.grids[key])),
+            contours=None if contour_files[key] is None else dict(contour_files[key] or {}),
+        )
+        for key in grid_keys
+        if key in plan.grids
+    )
+    label = plan.participant if plan.session is None else f"{plan.participant} ses-{plan.session}"
+    info = SessionInfo(
+        surfcensus_version=__version__,
+        session=session_id,
+        label=label,
+        config_hash=config.session_hash(),
+        fd_threshold_mm=config.fd_threshold_mm,
+        registration=registration,
+        grids=grids,
+        runs=tuple(listed),
+        contours_from=plan.fs_subject
+        if any(v is not None for v in contour_files.values())
+        else None,
+    )
+    with atomic_path(session_dir / SESSION_JSON) as tmp:
+        tmp.write_text(info_text(info))
+    return info

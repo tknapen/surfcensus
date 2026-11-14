@@ -23,6 +23,7 @@ import os
 import signal
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import urllib.error
@@ -2906,6 +2907,37 @@ def test_serve_prints_the_url_opens_the_browser_and_stops_at_sigterm(
     stopper.join()
     assert not waited_on
     assert opened == [] and signal.getsignal(signal.SIGTERM) is earlier
+
+
+def test_the_sigterm_handler_of_serve_takes_no_lock(
+    app_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Review of the quick start (F1): ``threading.Event.set`` takes the event's lock, and a
+    second SIGTERM that arrives while a handler holds it waits for it for good. The handler
+    sets a ``stopping.StopFlag``: it calls nothing of the threading module."""
+    called: list[str] = []
+
+    def browser(url: str) -> bool:  # in the main thread, once the server listens
+        handler = signal.getsignal(signal.SIGTERM)
+
+        def profile(frame: Any, event: str, arg: object) -> None:
+            if event == "call" and frame.f_code.co_filename == threading.__file__:
+                called.append(frame.f_code.co_name)
+
+        sys.setprofile(profile)
+        try:
+            handler(signal.SIGTERM, None)  # type: ignore[operator]
+            handler(signal.SIGTERM, None)  # type: ignore[operator]  # a second one
+        finally:
+            sys.setprofile(None)
+        return True
+
+    monkeypatch.setattr(server.webbrowser, "open", browser)
+    earlier = signal.getsignal(signal.SIGTERM)
+    with interrupted_if_it_waits_on() as waited_on:
+        serve(app_run, port=0)  # returns because the handler set the stop
+    assert not waited_on and called == []
+    assert signal.getsignal(signal.SIGTERM) is earlier
 
 
 def test_serve_with_a_stop_event_leaves_sigterm_to_its_caller(

@@ -821,3 +821,23 @@ def test_no_progress_bar_without_a_description_or_a_terminal(
         progress="render",
     )
     assert redirected.getvalue() == ""
+
+
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_a_worker_takes_sigterm_with_its_default_also_from_a_parent_that_ignores_it() -> None:
+    """A command that has taken its SIGTERM ignores it from then on (``stopping``), and a
+    process spawned after that would inherit the ignoring: neither a process manager nor
+    the pool, which ends broken workers with SIGTERM, could end it (review of the quick
+    start). The worker's initializer gives SIGTERM its default; SIGINT stays ignored."""
+    code = (
+        "import signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+        "from surfcensus.batches import _start_worker\n"
+        "_start_worker(20)\n"
+        "print(signal.getsignal(signal.SIGTERM) == signal.SIG_DFL,"
+        " signal.getsignal(signal.SIGINT) == signal.SIG_IGN)\n"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=True
+    )
+    assert done.stdout.split() == ["True", "True"]

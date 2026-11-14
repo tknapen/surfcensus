@@ -680,10 +680,136 @@ def test_a_run_made_inside_a_dataset_by_an_earlier_version_is_still_found(
     # nor is a directory with something else under the name of a configuration
     (foreign / CONFIG_FILE).write_text("not: [a configuration\n")
     assert default_run_dir(other) == tmp_path / DEFAULT_RUN_DIR
-    # once there is a run beside the dataset, it is the one
+    # a run of this root comes first, also when the place beside the dataset holds a run
+    # of something else (review of the quick start, F4): that run was refused with a hint
+    # to relocate, which would have taken it to this data
     (tmp_path / DEFAULT_RUN_DIR).mkdir()
     (tmp_path / DEFAULT_RUN_DIR / CONFIG_FILE).write_text("")
+    assert default_run_dir(dataset) == earlier
+    # once the run of this root is beside the dataset, it is the one
+    shutil.rmtree(tmp_path / DEFAULT_RUN_DIR)
+    shutil.copytree(earlier, tmp_path / DEFAULT_RUN_DIR)
     assert default_run_dir(dataset) == tmp_path / DEFAULT_RUN_DIR
+
+
+def test_two_datasets_in_one_folder_each_keep_their_run(tmp_path: Path) -> None:
+    """Review of the quick start (F4). ``surfcensus-run`` beside a dataset is one name for
+    every dataset of the folder (O23). An earlier run of a dataset is found before the run
+    of another at that place; a dataset without one is told which ``--run-dir`` to give,
+    is found there afterwards, and is never offered ``--relocate``, which would bind the
+    other dataset's run, its renders and ratings to this data."""
+    a, b, c = (_bids_dataset(tmp_path / name) for name in ("dsA", "dsB", "dsC"))
+    # dsB was reviewed by a version that put the run inside the dataset
+    earlier = b / "derivatives" / DEFAULT_RUN_DIR
+    review(b / "derivatives" / "fmriprep", run_dir=earlier, serve=False, jobs=1).close()
+    b_uids = uids_by_label(earlier)
+    with review(a, serve=False, jobs=1) as run:
+        assert run.run_dir == tmp_path / DEFAULT_RUN_DIR
+    a_uids = uids_by_label(tmp_path / DEFAULT_RUN_DIR)
+    a_root = load_config(tmp_path / DEFAULT_RUN_DIR).sources[0].root
+    for path in (b, b / "derivatives", b / "derivatives" / "fmriprep"):
+        assert default_run_dir(path) == earlier, path
+        with review(path, serve=False, jobs=1) as run:
+            assert run.run_dir == earlier
+    assert uids_by_label(earlier) == b_uids
+
+    # dsC has no run: the place beside the dataset holds dsA's
+    own = tmp_path / f"dsC-{DEFAULT_RUN_DIR}"
+    with pytest.raises(ConfigError) as refused:
+        review(c, serve=False, jobs=1)
+    assert refused.value.reason == "other root"
+    assert refused.value.detail == (
+        f"{tmp_path / DEFAULT_RUN_DIR} holds the run of {a_root}, which still holds its "
+        "subjects, so this path is another dataset: give it a run directory of its own "
+        f"with --run-dir {own}"
+    )
+    # --relocate would rebind dsA's run: refused, and nothing of the run changes
+    before = snapshot_tree(tmp_path / DEFAULT_RUN_DIR)
+    with pytest.raises(ConfigError) as refused:
+        review(c, serve=False, jobs=1, relocate=True)
+    assert refused.value.reason == "invalid"
+    assert refused.value.detail.startswith(
+        f"--relocate: the data of this run are still where they were ({a_root}), so this "
+        "path looks like another dataset, not the same data moved"
+    )
+    with pytest.raises(ConfigError, match="still where they were"):
+        Run(tmp_path / DEFAULT_RUN_DIR, local(c), relocate=True)
+    assert snapshot_tree(tmp_path / DEFAULT_RUN_DIR) == before
+    assert uids_by_label(tmp_path / DEFAULT_RUN_DIR) == a_uids
+    # the directory the message names, given once, is found afterwards
+    review(c, run_dir=own, serve=False, jobs=1).close()
+    assert default_run_dir(c) == own
+    with review(c, serve=False, jobs=1) as run:
+        assert run.run_dir == own
+    assert not (c / "derivatives" / DEFAULT_RUN_DIR).exists()
+
+
+def test_the_refusal_of_another_root_suggests_relocate_only_where_it_is_right(
+    tmp_path: Path,
+) -> None:
+    dataset = _bids_dataset(tmp_path / "ds")
+    run_dir = tmp_path / DEFAULT_RUN_DIR
+    review(dataset, serve=False, jobs=1).close()
+    root = load_config(run_dir).sources[0].root
+    before = uids_by_label(run_dir)
+    # the same subjects named another way, in another pipeline: no --relocate, which the
+    # catalog refuses as another pipeline
+    subjects_dir = dataset / "derivatives" / "fmriprep" / "sourcedata" / "freesurfer"
+    for path in (subjects_dir, subjects_dir / "sub-01"):
+        with pytest.raises(ConfigError) as refused:
+            review(path, run_dir=run_dir, serve=False, jobs=1)
+        assert refused.value.reason == "other root"
+        assert refused.value.detail == (
+            f"this run directory belongs to {root}, where the subjects of this path lie as "
+            f"well, in a layout that gives them other identifiers: give {root} as the path "
+            "to go on with that run, or --run-dir DIR for a new run"
+        )
+    # data that moved: --relocate, as before
+    moved = dataset.rename(tmp_path / "moved")
+    with pytest.raises(ConfigError) as refused:
+        review(moved, run_dir=run_dir, serve=False, jobs=1)
+    assert refused.value.detail == (
+        f"this run directory belongs to {root}, which holds no subjects now: pass "
+        "--relocate if they moved to this path, or --run-dir DIR for a new run"
+    )
+    review(moved, run_dir=run_dir, serve=False, jobs=1, relocate=True).close()
+    assert uids_by_label(run_dir) == before
+
+    # a subjects directory named itself, then the dataset of one pipeline above it
+    tree = tmp_path / "bids"
+    write_bids_dataset(tree)
+    write_tree(tree / "derivatives", "bids_derivatives", ["sub-01"])
+    plain = tree / "derivatives" / "freesurfer"
+    other = tmp_path / "run2"
+    review(plain, run_dir=other, serve=False, jobs=1).close()
+    with pytest.raises(ConfigError) as refused:
+        review(tree, run_dir=other, serve=False, jobs=1)
+    assert "named another way" in refused.value.detail
+    assert "--relocate to name the subjects as this path" in refused.value.detail
+    uids = uids_by_label(other)
+    review(tree, run_dir=other, serve=False, jobs=1, relocate=True).close()
+    assert uids_by_label(other) == uids
+
+
+def test_a_run_of_an_fmriprep_output_goes_beside_it_never_inside_it(tmp_path: Path) -> None:
+    """Review of the quick start (F5): an fMRIPrep output with a ``dataset_description.json``
+    is a BIDS-derivative dataset, also when it was downloaded without DataLad; its
+    subjects directory, named itself, gets its run beside the output, as a BIDS dataset
+    does. A run that an earlier version made inside it is still used."""
+    output = write_tree(tmp_path / "data" / "ds000102-fmriprep", "fmriprep", ["sub-01"])
+    assert (output / "dataset_description.json").is_file()
+    subjects_dir = output / "sourcedata" / "freesurfer"
+    beside = tmp_path / "data" / DEFAULT_RUN_DIR
+    for path in (output, subjects_dir, subjects_dir / "sub-01"):
+        assert default_run_dir(path) == beside, path
+    # an earlier run inside it, of the subjects directory, is still found
+    earlier = output / "sourcedata" / DEFAULT_RUN_DIR
+    review(subjects_dir, run_dir=earlier, serve=False, jobs=1).close()
+    assert default_run_dir(subjects_dir) == earlier
+    # an output without a description is a folder like any other: beside the path
+    shutil.rmtree(earlier)
+    (output / "dataset_description.json").unlink()
+    assert default_run_dir(subjects_dir) == output / "sourcedata" / DEFAULT_RUN_DIR
 
 
 def test_review_of_a_dataset_root_finds_the_subjects_below_derivatives(

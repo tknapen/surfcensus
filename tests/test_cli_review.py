@@ -8,6 +8,7 @@ template); the test that needs scores against a reference has its own.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -15,6 +16,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Iterator
 from pathlib import Path
@@ -349,20 +351,30 @@ def test_the_app_of_a_review_stops_at_ctrl_c_and_at_sigterm(
     review_process.send_signal(stop_with)
     if stop_with == signal.SIGTERM:
         # a process manager may signal a whole group, and a wrapper may pass the signal on:
-        # the second one arrives while the command is stopping, and changes nothing
-        time.sleep(0.05)
-        review_process.send_signal(stop_with)
+        # more arrive at once and while the command is stopping, and change nothing. With
+        # a handler that took a lock (threading.Event.set) a burst could hang the command
+        # for good (review of the quick start, F1)
+        for gap in (0.0, 0.0, 0.001, 0.05):
+            time.sleep(gap)
+            review_process.send_signal(stop_with)
     # read on from the stream the first lines came from: it has read ahead
     assert review_process.stderr is not None and review_process.stdout is not None
     err = ""
-    if stop_with == signal.SIGTERM:
-        # and a third comes late, when the closing line is out and the command is about to
-        # end: with the default handler back in place by then, it killed the command
-        while "to go." not in err:
-            line = review_process.stderr.readline()
-            assert line, f"no closing line:\n{err}"
-            err += line
-        review_process.send_signal(stop_with)
+    while "to go." not in err:
+        line = review_process.stderr.readline()
+        assert line, f"no closing line:\n{err}"
+        err += line
+    # and more come late, when the closing line is out and the command is about to end:
+    # with a Python handler in place, which CPython takes away while the interpreter
+    # finalizes, one of them killed the command (F2). SIGINT as well: the closing line
+    # is out, and a Ctrl-C now has nothing left to stop
+    deadline = time.monotonic() + 60
+    while review_process.poll() is None:
+        assert time.monotonic() < deadline, "the command did not end"
+        for late in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(ProcessLookupError):
+                review_process.send_signal(late)
+        time.sleep(0.01)
     err += review_process.stderr.read()
     out = review_process.stdout.read()
     assert review_process.wait(timeout=60) == 0, err
@@ -377,17 +389,97 @@ def test_the_app_of_a_review_stops_at_ctrl_c_and_at_sigterm(
         client.get(url + "healthz")
 
 
-# The handler of the commands that serve, without a process: the functions behind the
-# commands are replaced by ones that send this process a SIGTERM where a real one arrives.
+def _session_processes(session: int) -> list[str]:
+    """The processes of a session that are not zombies, by their command lines."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            if os.getsid(int(entry)) != session:
+                continue
+            with open(f"/proc/{entry}/stat") as stat:
+                if stat.read().rsplit(")", 1)[1].split()[0] == "Z":
+                    continue
+            with open(f"/proc/{entry}/cmdline") as cmdline:
+                found.append(cmdline.read().replace("\0", " "))
+        except OSError:
+            continue
+    return found
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc")
+@pytest.mark.parametrize(
+    "order", [(signal.SIGTERM, signal.SIGINT), (signal.SIGINT, signal.SIGTERM)], ids=str
+)
+def test_signals_while_a_review_prepares_with_workers_end_it_cleanly(
+    study: Path, order: tuple[signal.Signals, signal.Signals]
+) -> None:
+    """F3 of the review of the quick start: SIGTERM and SIGINT in either order while the
+    preparation runs in worker processes. The first decides the code (143 or 130); no
+    traceback, no hang, and no worker is left behind."""
+    command = [sys.executable, "-c", "from surfcensus.cli import app; app()", "review"]
+    # every render in the pool of two workers, before the app
+    options = ["--no-browser", "--port", "0", "--jobs", "2", "--video", "--serve-after", "0"]
+    process = subprocess.Popen(
+        [*command, str(study), *options],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ | {"PYTHONUNBUFFERED": "1"},
+        preexec_fn=_default_sigint,
+        start_new_session=True,
+    )
+    try:
+        assert process.stderr is not None
+        err = ""
+        while not err.endswith("\n") or not err.splitlines()[-1].startswith("Scores: "):
+            line = process.stderr.readline()  # the scores are out: the renders come next
+            assert line, err
+            err += line
+        time.sleep(0.3)  # while the workers start and render
+        for signum in order:
+            process.send_signal(signum)
+            time.sleep(0.05)
+        err += process.stderr.read()
+        code = process.wait(timeout=60)
+        time.sleep(0.5)
+        left = _session_processes(process.pid)
+    finally:
+        if process.poll() is None:
+            os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        if process.stderr is not None:
+            process.stderr.close()
+    assert "Traceback" not in err and "Exception ignored" not in err, err
+    assert left == [], left
+    if "Rating app:" in err:  # the preparation was over: the first signal stopped the app
+        assert code == 0, err
+    else:
+        word, expected = ("terminated", 143) if order[0] == signal.SIGTERM else ("interrupted", 130)
+        assert code == expected, err
+        assert err.splitlines()[-1] == (
+            f"{word}; what was recorded stays, and the next call goes on"
+        )
+
+
+# The handlers of the commands, without a process: the functions behind the commands are
+# replaced by ones that send this process a signal where a real one arrives. A burst that
+# would make a handler wait for a lock cannot be sent into the test process safely (it
+# would hang the tests); what is tested instead is the cause, deterministically: a handler
+# that sets the stop calls nothing of the threading module (rule 1 of ``stopping``).
 
 
 @pytest.fixture
-def sigterm_restored() -> Iterator[None]:
-    """A command that was stopped by SIGTERM keeps its handler, for a process that is about
-    to end. The test process goes on, and gets back the handler it had."""
-    earlier = signal.getsignal(signal.SIGTERM)
+def handlers_restored() -> Iterator[None]:
+    """A command that took a signal, or served the app, ignores SIGTERM and SIGINT from
+    then on, for a process that is about to end. The test process goes on, and gets back
+    the handlers it had; SIGINT is Python's own during the test."""
+    earlier_term = signal.getsignal(signal.SIGTERM)
+    earlier_int = signal.signal(signal.SIGINT, signal.default_int_handler)
     yield
-    signal.signal(signal.SIGTERM, earlier)
+    signal.signal(signal.SIGTERM, earlier_term)
+    signal.signal(signal.SIGINT, earlier_int)
 
 
 class _NoRun:
@@ -400,69 +492,151 @@ class _NoRun:
         return None
 
 
-def _sigterm_to_self() -> None:
-    os.kill(os.getpid(), signal.SIGTERM)
+def _signal_to_self(signum: int = signal.SIGTERM) -> None:
+    os.kill(os.getpid(), signum)
     time.sleep(0.01)  # the handler runs in this thread, at the next instruction
 
 
+def threading_calls(handler: Any, *args: object) -> list[str]:
+    """The functions of the threading module that ``handler(*args)`` calls, as a profile of
+    this thread records them: ``Event.set`` and every lock of a ``Condition`` are there."""
+    called: list[str] = []
+
+    def profile(frame: Any, event: str, arg: object) -> None:
+        if event == "call" and frame.f_code.co_filename == threading.__file__:
+            called.append(frame.f_code.co_name)
+
+    sys.setprofile(profile)
+    try:
+        handler(*args)
+    finally:
+        sys.setprofile(None)
+    return called
+
+
 @pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
-def test_a_sigterm_after_the_app_has_stopped_changes_nothing(
-    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+def test_a_sigterm_while_serving_stops_the_app_without_a_lock_and_is_ignored_after(
+    monkeypatch: pytest.MonkeyPatch, handlers_restored: None
 ) -> None:
     from surfcensus import review as reviewing
 
-    earlier = signal.getsignal(signal.SIGTERM)
     seen: list[object] = []
 
     def served(run: object, app: object, *, stop: Any, **options: object) -> None:
         assert not stop.is_set()
-        _sigterm_to_self()  # stops the app in order: no exit from the handler
+        handler = signal.getsignal(signal.SIGTERM)
+        # F1: the handler takes no lock, so a second signal that arrives while it runs, or
+        # while the main thread waits on the stop, cannot wait for it for good
+        assert threading_calls(handler, signal.SIGTERM, None) == []
         assert stop.is_set()
-        _sigterm_to_self()  # a second one while it stops
+        # F2: from its first statement on, every later SIGTERM is ignored by the process
         seen.append(signal.getsignal(signal.SIGTERM))
+        _signal_to_self()  # ignored: the test goes on
+        # Ctrl-C keeps its meaning while the app stops
+        seen.append(signal.getsignal(signal.SIGINT))
 
     monkeypatch.setattr(reviewing, "open_review", lambda *a, **k: (_NoRun(), object()))
     monkeypatch.setattr(reviewing, "serve_review", served)
     monkeypatch.setattr(reviewing, "rateable", lambda run: 1)
     result = cli("review", "nowhere", "--no-browser")
     assert result.exit_code == 0, result.output
-    # the handler of the command is still there when the command has returned, and takes
-    # a signal that comes now: the default, which was back at this point, ends the process
-    handler = signal.getsignal(signal.SIGTERM)
-    assert seen == [handler] and handler is not earlier and callable(handler)
-    _sigterm_to_self()
+    assert seen[0] == signal.SIG_IGN and callable(seen[1])
+    # the closing line is out: neither signal ends the process now, also not once the
+    # interpreter finalizes, when CPython takes Python's handlers away and not SIG_IGN
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    _signal_to_self(signal.SIGTERM)
+    _signal_to_self(signal.SIGINT)
 
 
 @pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
-def test_a_sigterm_while_a_review_prepares_ends_it_once(
-    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+def test_a_sigterm_while_a_review_prepares_ends_it_as_ctrl_c_does(
+    monkeypatch: pytest.MonkeyPatch, handlers_restored: None
 ) -> None:
+    """F3: the preparation is written for KeyboardInterrupt (the batches wait for running
+    work and release their leases); a SystemExit raised in pool or lock code is not what
+    it expects. Once taken, SIGTERM and SIGINT are ignored, so nothing interrupts the
+    unwinding a second time."""
     from surfcensus import review as reviewing
 
-    earlier = signal.getsignal(signal.SIGTERM)
-    undone: list[str] = []
+    raised: list[type[BaseException]] = []
 
     def preparing(*args: object, **options: object) -> None:
         try:
-            _sigterm_to_self()
+            _signal_to_self()
             raise AssertionError("the first SIGTERM did not end the preparation")
+        except BaseException as exc:
+            raised.append(type(exc))
+            raise
         finally:
-            _sigterm_to_self()  # a second one while the first is being acted on
-            undone.append("cleaned up")
+            _signal_to_self(signal.SIGTERM)  # more, while the first is being acted on
+            _signal_to_self(signal.SIGINT)
+            raised.append(GeneratorExit)  # the unwinding was not interrupted
 
     monkeypatch.setattr(reviewing, "open_review", preparing)
     result = cli("review", "nowhere", "--no-browser")
-    assert result.exit_code == 143 and undone == ["cleaned up"]
-    assert signal.getsignal(signal.SIGTERM) is not earlier
-    _sigterm_to_self()
+    assert raised == [KeyboardInterrupt, GeneratorExit]
+    assert result.exit_code == 143
+    assert result.stderr == "terminated; what was recorded stays, and the next call goes on\n"
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
 
 
-def test_a_review_that_serves_nothing_puts_the_sigterm_handler_back(
-    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_ctrl_c_while_a_review_prepares_takes_a_later_sigterm_quietly(
+    monkeypatch: pytest.MonkeyPatch, handlers_restored: None
 ) -> None:
     from surfcensus import review as reviewing
 
-    earlier = signal.getsignal(signal.SIGTERM)
+    raised: list[type[BaseException]] = []
+
+    def preparing(*args: object, **options: object) -> None:
+        try:
+            _signal_to_self(signal.SIGINT)
+        except BaseException as exc:
+            raised.append(type(exc))
+            # Ctrl-C is ending the command: a SIGTERM now raises nothing of its own
+            _signal_to_self(signal.SIGTERM)
+            raised.append(GeneratorExit)
+            raise
+
+    monkeypatch.setattr(reviewing, "open_review", preparing)
+    result = cli("review", "nowhere", "--no-browser")
+    assert raised == [KeyboardInterrupt, GeneratorExit]
+    assert result.exit_code == 130
+    assert result.stderr == "interrupted; what was recorded stays, and the next call goes on\n"
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+
+
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_a_phase_command_ends_at_sigterm_as_at_ctrl_c(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, handlers_restored: None
+) -> None:
+    from surfcensus.run import Run
+
+    raised: list[type[BaseException]] = []
+
+    def rendering(self: object, **options: object) -> None:
+        try:
+            _signal_to_self()
+        except BaseException as exc:
+            raised.append(type(exc))
+            raise
+
+    monkeypatch.setattr(Run, "render", rendering)
+    result = cli("render", "--run-dir", run_dir)
+    assert raised == [KeyboardInterrupt]
+    assert result.exit_code == 143
+    assert result.stderr == "terminated; what was recorded stays, and the next call goes on\n"
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+
+
+def test_a_command_that_takes_no_signal_puts_the_handlers_back(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, handlers_restored: None
+) -> None:
+    from surfcensus import review as reviewing
+
+    earlier = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
     during: list[object] = []
 
     def nothing_served(*args: object, **options: object) -> tuple[_NoRun, None]:
@@ -473,43 +647,71 @@ def test_a_review_that_serves_nothing_puts_the_sigterm_handler_back(
     monkeypatch.setattr(reviewing, "rateable", lambda run: 1)
     result = cli("review", "nowhere", "--no-serve")
     assert result.exit_code == 0, result.output
-    assert during[0] is not earlier and signal.getsignal(signal.SIGTERM) is earlier
+    assert during[0] not in earlier
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == earlier
 
     def refused(*args: object, **options: object) -> None:
         raise ConfigError("invalid", "no")
 
     monkeypatch.setattr(reviewing, "open_review", refused)
     assert cli("review", "nowhere", "--no-serve").exit_code == 2
-    assert signal.getsignal(signal.SIGTERM) is earlier
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == earlier
+    # a phase command that does its work (1: sub-03 lacks lh.pial, a failed unit)
+    assert cli("render", "--run-dir", run_dir).exit_code == 1
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == earlier
 
 
 @pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
-def test_a_sigterm_after_serve_has_stopped_changes_nothing(
-    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+def test_serve_stops_at_sigterm_without_a_lock_and_ignores_both_signals_after(
+    monkeypatch: pytest.MonkeyPatch, handlers_restored: None
 ) -> None:
     import surfcensus.app.server as server
 
-    earlier = signal.getsignal(signal.SIGTERM)
+    earlier = signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)
 
     def served(run_dir: object, *, stop: Any, **options: object) -> None:
-        _sigterm_to_self()
+        assert threading_calls(signal.getsignal(signal.SIGTERM), signal.SIGTERM, None) == []
         assert stop.is_set()
+        _signal_to_self()  # ignored from the first one on
 
     monkeypatch.setattr(server, "serve", served)
     result = cli("serve", "--run-dir", "nowhere", "--mode", "local", "--no-browser")
     assert result.exit_code == 0, result.output
-    assert signal.getsignal(signal.SIGTERM) is not earlier
-    _sigterm_to_self()
+    assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN
+    assert signal.getsignal(signal.SIGINT) == signal.SIG_IGN
+    _signal_to_self(signal.SIGTERM)
+    _signal_to_self(signal.SIGINT)
 
-    # a serve that is refused has served nothing, and the handler is put back
-    signal.signal(signal.SIGTERM, earlier)
+    # a serve that is refused has served nothing, and the handlers are put back
+    signal.signal(signal.SIGTERM, earlier[0])
+    signal.signal(signal.SIGINT, earlier[1])
 
     def refused(run_dir: object, **options: object) -> None:
         raise ConfigError("invalid", "no")
 
     monkeypatch.setattr(server, "serve", refused)
     result = cli("serve", "--run-dir", "nowhere", "--mode", "local", "--no-browser")
-    assert result.exit_code == 2 and signal.getsignal(signal.SIGTERM) is earlier
+    assert result.exit_code == 2
+    assert (signal.getsignal(signal.SIGTERM), signal.getsignal(signal.SIGINT)) == earlier
+
+
+def test_review_as_a_function_stops_at_sigterm_without_a_lock_and_puts_it_back(
+    run_dir: Path, monkeypatch: pytest.MonkeyPatch, handlers_restored: None
+) -> None:
+    from surfcensus import review as reviewing
+
+    earlier = signal.getsignal(signal.SIGTERM)
+    stops: list[Any] = []
+
+    def served(run: object, app: object, *, stop: Any, **options: object) -> None:
+        assert threading_calls(signal.getsignal(signal.SIGTERM), signal.SIGTERM, None) == []
+        stops.append(stop)
+
+    monkeypatch.setattr(reviewing, "open_review", lambda *a, **k: (Run(run_dir), object()))
+    monkeypatch.setattr(reviewing, "serve_review", served)
+    reviewing.review("nowhere", open_browser=False).close()
+    assert stops[0].is_set()
+    assert signal.getsignal(signal.SIGTERM) is earlier
 
 
 # --- serve ----------------------------------------------------------------------------------------
