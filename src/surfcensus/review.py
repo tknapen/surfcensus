@@ -131,14 +131,15 @@ def default_run_dir(path: Path | str) -> Path:
     if (candidate / "config.yaml").is_file():
         return candidate
     # where the rule above put the run of this folder before datasets were known: beside
-    # the path, or beside the folder that holds the subjects
+    # the path, beside the root, or (the older fMRIPrep layout named by its fmriprep
+    # folder) in the root
     for earlier in dict.fromkeys((beside, Path(record.root).parent, Path(record.root))):
         if _holds_run_of(earlier / DEFAULT_RUN_DIR, record.root):
             return earlier / DEFAULT_RUN_DIR
     if os.access(dataset.parent, os.W_OK | os.X_OK):
         return candidate
-    here = Path.cwd().resolve()
-    if here == dataset or dataset in here.parents:
+    here = Path.cwd()
+    if here.resolve() == dataset or dataset in here.resolve().parents:
         raise ConfigError(
             "invalid",
             f"no place for the run directory: {dataset.parent} cannot be written to, and "

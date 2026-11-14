@@ -808,3 +808,33 @@ def test_verbose_says_where_in_a_dataset_the_subjects_were_found(
         f"INFO: {dataset.resolve()} is a BIDS dataset with FreeSurfer subjects in "
         "derivatives/fmriprep/sourcedata/freesurfer\n"
     ) in loud.output
+
+
+def test_review_from_inside_a_dataset_that_has_no_place_beside_it_asks_for_a_run_directory(
+    dataset: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The default run directory never lies inside the dataset: where the place beside it
+    cannot be written to and the command is run from inside, only --run-dir can say where
+    the run goes."""
+    real_access = os.access
+    monkeypatch.setattr(
+        os, "access", lambda path, mode: Path(path) != dataset.parent and real_access(path, mode)
+    )
+    monkeypatch.chdir(dataset / "derivatives")
+    before, inside = snapshot_tree(tmp_path), snapshot_tree(dataset)
+    for path in ("..", ".", "fmriprep"):
+        result = cli("review", path, "--no-serve", "--jobs", 1)
+        assert result.exit_code == 2, result.output
+        assert result.output == (
+            f"invalid: no place for the run directory: {dataset.parent} cannot be written to, "
+            f"and the current directory lies inside the dataset {dataset}, which gets no "
+            "files of a run unless asked; say where the run goes with --run-dir DIR\n"
+        )
+    assert snapshot_tree(tmp_path) == before
+    # from elsewhere, the run goes to the current directory
+    (tmp_path / "work").mkdir()
+    monkeypatch.chdir(tmp_path / "work")
+    result = cli("review", dataset, "--no-serve", "--jobs", 1)
+    assert result.exit_code == 0, result.output
+    assert f"Run directory: {tmp_path / 'work' / 'surfcensus-run'} (new)" in result.output
+    assert snapshot_tree(dataset) == inside
