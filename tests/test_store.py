@@ -55,8 +55,23 @@ TABLES = {
     "work",
     "renders",
     "selection",
+    # migration 2: the EPI interface in a run directory
+    "func_sources",
+    "func_participants",
+    "func_sessions",
+    "func_runs",
+    "func_files",
+    "packs",
 }
 VIEWS = {"public_datasets", "public_subjects", "public_files"}
+# migration 2; what they hold is tested in tests/test_store_func.py
+FUNC_VIEWS = {
+    "public_func_sources",
+    "public_func_participants",
+    "public_func_sessions",
+    "public_func_runs",
+    "public_packs",
+}
 # item 1 of the contract's list of private values (section 5.1), as column names
 PRIVATE_COLUMNS = {
     "dataset_id",
@@ -260,7 +275,7 @@ def test_create_writes_the_identity_of_the_run_and_reopening_reads_it(tmp_path: 
         secret = catalog.run_secret()
         assert len(secret) == 32 and secret.hex() == meta["run_secret"]
         assert catalog.meta("template_id") is None and catalog.meta("nothing") is None
-        assert catalog.query("PRAGMA user_version")[0][0] == store.SCHEMA_VERSION == 1
+        assert catalog.query("PRAGMA user_version")[0][0] == store.SCHEMA_VERSION == 2
     with Catalog(path) as again:
         assert {r["key"]: r["value"] for r in again.query("SELECT key, value FROM meta")} == meta
         assert again.run_secret() == secret
@@ -286,7 +301,9 @@ def test_a_catalog_has_the_tables_and_views_of_the_contract(local: Catalog) -> N
         (r["type"], r["name"])
         for r in local.query("SELECT type, name FROM sqlite_master WHERE type IN ('table','view')")
     }
-    assert found == {("table", name) for name in TABLES} | {("view", name) for name in VIEWS}
+    assert found == {("table", name) for name in TABLES} | {
+        ("view", name) for name in VIEWS | FUNC_VIEWS
+    }
     assert local.query("PRAGMA foreign_keys")[0][0] == 1
 
 
@@ -848,7 +865,7 @@ def test_the_schema_version_counts_the_migrations() -> None:
     assert list(store._statements("\n-- nothing but a comment\n\n")) == []
 
 
-MIGRATION_2 = """
+MIGRATION_3 = """
 ALTER TABLE datasets ADD COLUMN note TEXT;
 -- a second statement, with a semicolon in a string: ';'
 CREATE TABLE extra (x TEXT DEFAULT ';');
@@ -865,10 +882,10 @@ def test_a_test_migration_preserves_the_rows(
     path = run_dir_of(local) / CATALOG_FILE
     local.close()
 
-    monkeypatch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_2))
-    monkeypatch.setattr(store, "SCHEMA_VERSION", 2)
+    monkeypatch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_3))
+    monkeypatch.setattr(store, "SCHEMA_VERSION", 3)
     with Catalog(path) as migrated:
-        assert migrated.query("PRAGMA user_version")[0][0] == 2
+        assert migrated.query("PRAGMA user_version")[0][0] == 3
         assert migrated.subject_record(uid) == record
         assert [
             tuple(r) for r in migrated.query("SELECT key, value FROM meta ORDER BY key")
@@ -876,7 +893,7 @@ def test_a_test_migration_preserves_the_rows(
         assert row(migrated, "SELECT note FROM datasets") == {"note": None}
         assert count(migrated, "extra") == 0
     with Catalog(path) as again:  # the second opening has nothing to apply
-        assert again.query("PRAGMA user_version")[0][0] == 2
+        assert again.query("PRAGMA user_version")[0][0] == 3
         assert again.subject_record(uid) == record
 
 
@@ -884,8 +901,8 @@ def test_a_newer_schema_is_refused(local: Catalog, monkeypatch: pytest.MonkeyPat
     path = run_dir_of(local) / CATALOG_FILE
     local.close()
     with monkeypatch.context() as patch:
-        patch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_2))
-        patch.setattr(store, "SCHEMA_VERSION", 2)
+        patch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_3))
+        patch.setattr(store, "SCHEMA_VERSION", 3)
         Catalog(path).close()
     before = path.read_bytes()
     openers = (
@@ -895,7 +912,7 @@ def test_a_newer_schema_is_refused(local: Catalog, monkeypatch: pytest.MonkeyPat
         lambda: PublicCatalog.open(path.parent, readonly=False),
     )
     for opener in openers:
-        with pytest.raises(ConfigError, match=r"has schema 2; this version .* reads up to 1") as c:
+        with pytest.raises(ConfigError, match=r"has schema 3; this version .* reads up to 2") as c:
             opener()
         assert c.value.reason == "newer schema"
     assert path.read_bytes() == before
@@ -908,15 +925,18 @@ def test_a_read_only_opening_applies_no_migration_and_refuses_an_older_schema(
     path = run_dir_of(local) / CATALOG_FILE
     local.close()
     before = path.read_bytes()
-    monkeypatch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_2))
-    monkeypatch.setattr(store, "SCHEMA_VERSION", 2)
+    # a migration that is not additive raises the oldest schema a reader takes as it is (a
+    # catalog of schema 1 is read as one without functional data: tests/test_store_func.py)
+    monkeypatch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, MIGRATION_3))
+    monkeypatch.setattr(store, "SCHEMA_VERSION", 3)
+    monkeypatch.setattr(store, "READONLY_OLDEST", 3)
 
     for opener in (lambda: PublicCatalog.open(path.parent), lambda: Catalog(path, readonly=True)):
         with pytest.raises(ConfigError) as caught:
             opener()
         assert caught.value.reason == "invalid"
         assert caught.value.detail == (
-            "catalog schema 1 is older than this version; run any phase command once"
+            "catalog schema 2 is older than this version; run any phase command once"
         )
     assert path.read_bytes() == before
     assert sorted(p.name for p in path.parent.iterdir()) == [CATALOG_FILE]
@@ -925,7 +945,7 @@ def test_a_read_only_opening_applies_no_migration_and_refuses_an_older_schema(
         assert public.subject_uids() == [uid]
     with PublicCatalog.open(path.parent) as public:
         assert public.subject_uids() == [uid]
-        assert public._db.rows("PRAGMA user_version")[0][0] == 2
+        assert public._db.rows("PRAGMA user_version")[0][0] == 3
 
 
 def test_a_failing_migration_changes_nothing(
@@ -937,11 +957,11 @@ def test_a_failing_migration_changes_nothing(
     broken = "CREATE TABLE extra (x TEXT);\nALTER TABLE datasets ADD COLUMN note TEXT;\nNONSENSE;"
     with monkeypatch.context() as patch:
         patch.setattr(store, "MIGRATIONS", (*store.MIGRATIONS, broken))
-        patch.setattr(store, "SCHEMA_VERSION", 2)
+        patch.setattr(store, "SCHEMA_VERSION", 3)
         with pytest.raises(sqlite3.OperationalError):
             Catalog(path)
     with Catalog(path) as intact:
-        assert intact.query("PRAGMA user_version")[0][0] == 1
+        assert intact.query("PRAGMA user_version")[0][0] == 2
         assert not intact.query("SELECT 1 FROM sqlite_master WHERE name = 'extra'")
         assert "note" not in {r["name"] for r in intact.query("PRAGMA table_info(datasets)")}
         assert count(intact, "subjects") == 1

@@ -31,7 +31,6 @@ in step 2 by the run's own key, ``privacy.py``).
 from __future__ import annotations
 
 import fnmatch
-import os
 import re
 import secrets
 import shutil
@@ -40,33 +39,55 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-import nibabel as nib
-
 from surfcensus import __version__
 from surfcensus._io import atomic_path
 from surfcensus.config import ConfigError, EpiConfig
-from surfcensus.func import ID_PATTERN, SESSION_JSON, STREAM_JSON, bids, func_id, geometry
+from surfcensus.func import ID_PATTERN, SESSION_JSON, STREAM_JSON, bids, func_id
 from surfcensus.func import connectors as connectors_
-from surfcensus.func import contours as contours_
 from surfcensus.func import pack as pack_
-from surfcensus.func import session as session_
-from surfcensus.func.connectors.base import Connector, ConnectorError
+from surfcensus.func.connectors.base import ConnectorError
+from surfcensus.func.discover import (
+    FuncFolders,
+    _absolute,
+    _shown,
+    find_folders,
+    refuse_out,
+)
+from surfcensus.func.inventory import (
+    SESSION_ORDER,
+    contour_job,
+    cut_contours,
+    link_targets,
+    list_participant,
+    pack_inputs,
+    plan_one,
+    probe_participant,
+    run_name,
+    session_key,
+    session_text,
+    withheld_of,
+)
 from surfcensus.func.model import SessionInfo, StreamInfo, info_text, read_info
 from surfcensus.records import (
-    NO_PREPROCESSED_SERIES,
-    NO_RAW_SERIES,
-    NOT_FETCHED,
     NOT_SELECTED,
-    PACK_FAILURE,
-    ConnectorMatch,
-    DerivRun,
     PlaneContours,
     RunPackInput,
     SessionPlan,
-    SessionRun,
 )
-from surfcensus.sources import patterns
-from surfcensus.sources.base import FUNC_READ_ROLES, FileRole, FuncRole, SourceError
+from surfcensus.sources.base import SourceError
+
+__all__ = [
+    "RATE_S_PER_VOLUME",
+    "RATE_VOXELS",
+    "SESSION_ORDER",
+    "FuncFolders",
+    "epi_session",
+    "epi_subject",
+    "find_folders",
+    "refuse_in_sources_of_links",
+    "refuse_out",
+    "session_key",
+]
 
 RATE_S_PER_VOLUME = 0.114
 """Seconds to pack one volume of both streams on :data:`RATE_VOXELS` voxels, one process:
@@ -75,374 +96,7 @@ measured on the worked example (``ds000102`` sub-01 run 1, 146 volumes, portable
 RATE_VOXELS = 109_368
 """The voxels of the grid :data:`RATE_S_PER_VOLUME` was measured on (49 x 62 x 36, 3 mm)."""
 
-SESSION_ORDER = "session label"
-"""The rule of the order of a subject's sessions in its stream (``StreamInfo.order``)."""
-
-_FS_FILES: tuple[FileRole, ...] = (
-    FileRole.T1,
-    FileRole.LH_WHITE,
-    FileRole.RH_WHITE,
-    FileRole.LH_PIAL,
-    FileRole.RH_PIAL,
-)
-"""The FreeSurfer files the contours are cut from, inputs of every pack with contours."""
-
 Progress = Callable[[str], None]
-
-
-@dataclass(frozen=True)
-class FuncFolders:
-    """The three folders a session needs, as :func:`find_folders` found them."""
-
-    deriv_root: Path
-    match: ConnectorMatch
-    raw_root: Path | None
-    """None: the runs are listed with ``no raw series`` and the message names ``--raw``."""
-    fs_subjects_dir: Path | None
-    """None: the sessions are packed without contours."""
-
-
-# --- the folders ----------------------------------------------------------------------------
-
-
-def _absolute(path: Path | str) -> Path:
-    return Path(os.path.abspath(path))
-
-
-def _detect(folder: Path) -> tuple[Connector, ConnectorMatch] | None:
-    try:
-        return connectors_.detect(folder)
-    except ConnectorError as err:
-        raise SourceError("unreadable", f"{folder}: {err.detail}") from None
-
-
-def _subjects_dir_of(folder: Path) -> Path | None:
-    """The FreeSurfer subjects directory that the surface source finds for an fMRIPrep
-    output ``folder`` (``sourcedata/freesurfer/``, or ``freesurfer/`` beside it), or None."""
-    from surfcensus.sources.local import detect_layout
-
-    try:
-        record, _ = detect_layout(folder, nested=False, quiet=True)
-    except SourceError:
-        return None
-    if record.layout not in ("fmriprep", "fmriprep_legacy"):
-        return None
-    return Path(record.root) / record.fs_root
-
-
-def _deriv_candidates(record_root: Path, fs_root: str, layout: str) -> list[Path]:
-    """Where the fMRIPrep output lies for a surface layout: the folder above
-    ``sourcedata/freesurfer``, or the ``fmriprep/`` folder beside ``freesurfer/``."""
-    subjects = record_root / fs_root
-    if layout == "fmriprep":
-        return [record_root]
-    if layout == "fmriprep_legacy":
-        return [record_root / "fmriprep"]
-    out = []
-    if subjects.name == "freesurfer" and subjects.parent.name == "sourcedata":
-        out.append(subjects.parent.parent)
-    if subjects.name == "freesurfer":
-        out.append(subjects.parent / "fmriprep")
-    return out
-
-
-def _derivative(given: Path) -> tuple[Path, ConnectorMatch, Path | None]:
-    from surfcensus.sources.local import detect_layout
-
-    looked: list[Path] = []
-    # 1. what the surface source finds, then the fMRIPrep output that holds those subjects
-    try:
-        record, _ = detect_layout(given, quiet=True)
-    except SourceError as err:
-        if err.reason in ("not found", "invalid"):
-            raise
-        record = None
-    if record is not None:
-        subjects = Path(record.root) / record.fs_root
-        for candidate in _deriv_candidates(Path(record.root), record.fs_root, record.layout):
-            looked.append(candidate)
-            if candidate.is_dir():
-                found = _detect(candidate)
-                if found is not None:
-                    return candidate, found[1], subjects
-    # 2. the folder itself is a derivative (one that holds no FreeSurfer subjects, say)
-    looked.append(given)
-    found = _detect(given)
-    if found is not None:
-        return given, found[1], _subjects_dir_of(given)
-    # 3. the folders of derivatives/, in name order
-    derivatives = given if given.name == "derivatives" else given / "derivatives"
-    if derivatives.is_dir():
-        try:
-            names = sorted(e.name for e in os.scandir(derivatives) if e.is_dir())
-        except OSError as err:
-            raise SourceError("unreadable", f"{derivatives}: {err.strerror or err}") from None
-        for name in names:
-            candidate = derivatives / name
-            looked.append(candidate)
-            found = _detect(candidate)
-            if found is not None:
-                return candidate, found[1], _subjects_dir_of(candidate)
-    shown = ", ".join(_shown(p, given) for p in dict.fromkeys(looked))
-    raise SourceError(
-        "layout",
-        f"no derivative of a known pipeline ({', '.join(connectors_.CONNECTORS)}) with "
-        f"functional runs found in {given}: looked at {shown}. A derivative has a "
-        "dataset_description.json that names the pipeline and sub-*/[ses-*/]func/ folders",
-    )
-
-
-def _is_raw(folder: Path) -> bool:
-    try:
-        return bids.is_raw_dataset(folder)
-    except OSError as err:
-        raise SourceError("unreadable", f"{folder}: {err.strerror or err}") from None
-
-
-def _raw_dataset(deriv: Path, raw: Path | None) -> Path | None:
-    if raw is not None:
-        raw = _absolute(raw)
-        if not raw.is_dir():
-            raise SourceError("not found", f"--raw {raw} is not a directory")
-        if not _is_raw(raw):
-            raise SourceError(
-                "layout",
-                f"--raw {raw} holds no raw BIDS functional series "
-                "(sub-*/[ses-*/]func/*_bold.nii[.gz])",
-            )
-        return raw
-    for chain in (_absolute(deriv), deriv.resolve()):
-        for folder in chain.parents:
-            if folder.name == "derivatives" and _is_raw(folder.parent):
-                return folder.parent
-    inside = deriv / "sourcedata" / "raw"
-    if inside.is_dir() and _is_raw(inside):
-        return inside
-    return None
-
-
-def find_folders(path: Path, raw: Path | None = None) -> FuncFolders:
-    """The derivative, the raw dataset and the FreeSurfer subjects directory of ``path`` by
-    the rules of docs/epi_interface.md, "Which folders are found by rule", for a local folder.
-
-    The derivative: the fMRIPrep output that holds the FreeSurfer subjects that the surface
-    source finds for ``path`` (``sources.local.detect_layout``: the folder above
-    ``sourcedata/freesurfer/``, or ``fmriprep/`` beside ``freesurfer/``); else ``path`` itself
-    when a connector recognises it (a derivative without FreeSurfer subjects); else the first
-    folder of ``path/derivatives/`` (or of ``path`` when it is ``derivatives/``), in name
-    order, that a connector recognises. The raw dataset: ``raw``; else the BIDS dataset whose
-    ``derivatives/`` holds the derivative; else ``sourcedata/raw/`` inside the derivative;
-    else None. The FreeSurfer subjects directory: the one the surface source finds, or None.
-
-    Raises ``SourceError``: ``not found`` for a path that is no directory, ``layout`` when no
-    derivative of a known pipeline is found (the message says where it looked) or ``raw``
-    holds no raw series, ``unreadable`` for a folder that cannot be listed.
-    """
-    given = _absolute(path)
-    if not given.is_dir():
-        raise SourceError("not found", f"{given} is not a directory")
-    deriv, match, subjects = _derivative(given)
-    return FuncFolders(
-        deriv_root=deriv,
-        match=match,
-        raw_root=_raw_dataset(deriv, raw),
-        fs_subjects_dir=subjects,
-    )
-
-
-# --- places that are only read ----------------------------------------------------------------
-
-
-def _read_places(folders: FuncFolders) -> list[tuple[str, Path]]:
-    """The derivative and the raw dataset, and what a link at their top level leads to; the
-    places of the FreeSurfer subjects directory come from ``sources.local.source_places``."""
-    places: list[tuple[str, Path]] = []
-    for what, root in (
-        ("the derivative", folders.deriv_root),
-        ("the raw dataset", folders.raw_root),
-    ):
-        if root is None:
-            continue
-        places.append((what, root))
-        try:
-            with os.scandir(root) as entries:
-                links = sorted(e.name for e in entries if e.is_symlink())
-        except OSError:
-            continue
-        for name in links:
-            try:
-                target = (root / name).resolve()
-            except (OSError, RuntimeError):
-                continue
-            if target.is_dir():
-                places.append((f"the directory that {name} in {what} links to,", target))
-    return places
-
-
-def refuse_out(out: Path, folders: FuncFolders) -> None:
-    """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a folder that is
-    read (the raw dataset, the derivative, the FreeSurfer subjects directory) or what a link
-    at the top level of one of them leads to."""
-    from surfcensus.sources.local import refuse_in_sources
-
-    subjects = [folders.fs_subjects_dir] if folders.fs_subjects_dir is not None else []
-    refuse_in_sources(out, subjects, what="output", also=_read_places(folders))
-
-
-# --- files without content ------------------------------------------------------------------
-
-
-def _stem_key(name: str) -> str | None:
-    try:
-        return bids.run_key(bids.parse_entities(name.split(".", 1)[0]))
-    except ValueError:
-        return None
-
-
-def _placeholders(
-    root: Path, participant: str, extra: Sequence[Path] = ()
-) -> dict[tuple[str | None, str], list[tuple[str, int | None]]]:
-    """The git-annex placeholders of a participant's functional files under ``root``: for
-    each ``(session, run key)`` the files (relative to ``root``) and their sizes from the
-    keys. Links without content are found in the listing (``readlink``); a regular file of at
-    most 32 kB is read at its head (``sources.patterns.annex_pointer``)."""
-    found: dict[tuple[str | None, str], list[tuple[str, int | None]]] = {}
-    try:
-        places = list(bids.func_dirs(root, participant))
-    except OSError:
-        return found
-    folders = [(session, func) for session, func in places]
-    folders += [(None, p) for p in extra]
-    for session, folder in folders:
-        try:
-            entries = list(os.scandir(folder))
-        except OSError:
-            continue
-        for entry in sorted(entries, key=lambda e: e.name):
-            key = _stem_key(entry.name)
-            if key is None:
-                continue
-            path = Path(entry.path)
-            size: int | None = None
-            try:
-                link = patterns.annex_link(path)
-                if link is not None:
-                    size = patterns.annex_key_size(link[1])
-                elif entry.is_file():
-                    st = entry.stat()
-                    if st.st_size > patterns.POINTER_MAX_BYTES:
-                        continue
-                    with path.open("rb") as stream:
-                        head = stream.read(patterns.POINTER_PROBE_BYTES)
-                    pointer = patterns.annex_pointer(head, st.st_size)
-                    if pointer is None:
-                        continue
-                    size = patterns.annex_key_size(pointer)
-                else:
-                    continue
-            except OSError:
-                continue
-            ses = session
-            if ses is None:
-                try:
-                    ses = bids.parse_entities(entry.name.split(".", 1)[0]).ses
-                except ValueError:
-                    continue
-            location = path.relative_to(root).as_posix()
-            found.setdefault((ses, key), []).append((location, size))
-    return found
-
-
-def _dangling(root: Path, participant: str) -> dict[tuple[str | None, str], list[str]]:
-    """The links of a participant's ``func/`` folders under ``root`` whose target is missing
-    and that are no git-annex links (those are placeholders, :func:`_placeholders`): for each
-    ``(session, run key)`` the file names. From the listing and ``readlink`` alone."""
-    found: dict[tuple[str | None, str], list[str]] = {}
-    try:
-        places = list(bids.func_dirs(root, participant))
-    except OSError:
-        return found
-    for session, folder in places:
-        try:
-            entries = sorted(os.scandir(folder), key=lambda e: e.name)
-        except OSError:
-            continue
-        for entry in entries:
-            key = _stem_key(entry.name)
-            if key is None:
-                continue
-            try:
-                if not entry.is_symlink() or os.path.exists(entry.path):
-                    continue
-                if patterns.annex_link(Path(entry.path)) is not None:
-                    continue
-            except OSError:
-                continue
-            found.setdefault((session, key), []).append(entry.name)
-    return found
-
-
-_SERIES_REASONS = {
-    NO_RAW_SERIES: ("raw", ("_bold.nii.gz", "_bold.nii")),
-    NO_PREPROCESSED_SERIES: (
-        "preprocessed",
-        ("_desc-preproc_bold.nii.gz", "_desc-preproc_bold.nii"),
-    ),
-}
-"""A missing series, what it is called, and the ends of the names of such a series."""
-
-
-def _dangling_details(
-    plan: SessionPlan,
-    raw_links: Mapping[tuple[str | None, str], list[str]],
-    deriv_links: Mapping[tuple[str | None, str], list[str]],
-) -> SessionPlan:
-    """The detail of a run whose series is missing because the file there is a link whose
-    target is missing: that it is, so that ``no preprocessed series`` (or ``no raw series``)
-    does not read as "the pipeline wrote none"."""
-    details = dict(plan.details)
-    for item in plan.runs:
-        if item.reason not in _SERIES_REASONS or item.run in details:
-            continue
-        what, ends = _SERIES_REASONS[item.reason]
-        links = (raw_links if what == "raw" else deriv_links).get(
-            (plan.session, item.deriv.key), []
-        )
-        names = [n for n in links if n.endswith(ends) and (what == "raw" or "_space-" in n)]
-        if names:
-            words = "is a link" if len(names) == 1 else "are links"
-            details[item.run] = (
-                f"the {what} series {', '.join(names)} {words} whose target is missing"
-            )
-    return replace(plan, details=details)
-
-
-def _not_fetched(files: Sequence[tuple[str, int | None]]) -> str:
-    names = ", ".join(name for name, _ in files)
-    known = [size for _, size in files if size is not None]
-    amount = f"; {patterns.size_words(sum(known))}" if known else ""
-    verb = (
-        "file is a git-annex placeholder" if len(files) == 1 else "files are git-annex placeholders"
-    )
-    return f"{len(files)} {verb} whose content is not here: {names}{amount}"
-
-
-# --- ordering and ids -----------------------------------------------------------------------
-
-
-def _natural(label: str) -> tuple[tuple[int, int, str], ...]:
-    """Numbers in a label compared as numbers: ``2`` before ``10``, ``pre`` after ``2``."""
-    return tuple(
-        (0, int(part), "") if part.isascii() and part.isdigit() else (1, 0, part)
-        for part in re.split(r"([0-9]+)", label)
-        if part
-    )
-
-
-def session_key(label: str | None) -> tuple[int, tuple[tuple[int, int, str], ...]]:
-    """The order of a subject's sessions in its stream: no ``ses-`` (a dataset without
-    sessions) first, then the labels with numbers compared as numbers."""
-    return (0, ()) if label is None else (1, _natural(label))
 
 
 def _participant(subject: str) -> str:
@@ -452,15 +106,6 @@ def _participant(subject: str) -> str:
             "invalid", f"{subject!r} is no BIDS participant (sub-<letters and digits>)"
         )
     return participant
-
-
-def _session_label(participant: str, label: str | None) -> str:
-    return participant if label is None else f"{participant} ses-{label}"
-
-
-def _run_name(run: DerivRun) -> str:
-    first, _, rest = run.stem.partition("_")
-    return rest if first.startswith("sub-") and rest else run.stem
 
 
 @dataclass(frozen=True)
@@ -496,103 +141,6 @@ def _previous(out: Path, participant: str) -> _Previous:
     return _Previous(sessions, runs, tuple(stream.sessions))
 
 
-# --- the plan and the inputs of one session ---------------------------------------------------
-
-
-def _paths(files: Mapping[FuncRole, object], deriv: Path, raw: Path | None) -> dict[FuncRole, Path]:
-    out: dict[FuncRole, Path] = {}
-    for role, ref in files.items():
-        base = getattr(ref, "base", "deriv")
-        location = getattr(ref, "location", "")
-        if base == "raw":
-            if raw is not None:
-                out[role] = raw / location
-        else:
-            out[role] = deriv / location
-    return out
-
-
-def _fs_subject(subjects: Path | None, participant: str, label: str | None) -> str | None:
-    """``sub-X_ses-Y`` when the subjects directory has it, else ``sub-X``, else None."""
-    if subjects is None:
-        return None
-    names = ([f"{participant}_ses-{label}"] if label is not None else []) + [participant]
-    for name in names:
-        try:
-            if patterns.is_subject_candidate(subjects / name):
-                return name
-        except OSError:
-            continue
-    return None
-
-
-def _failed_plan(
-    participant: str,
-    label: str | None,
-    druns: Sequence[DerivRun],
-    run_ids: Mapping[str, str],
-    connector: Connector,
-    detail: str,
-) -> SessionPlan:
-    """A session whose plan could not be made (a file that cannot be read): every run is
-    listed as ``pack failure`` with the detail."""
-    runs = tuple(
-        SessionRun(
-            run=run_ids[r.key],
-            name=_run_name(r),
-            deriv=r,
-            raw=None,
-            display=connector.display(r),
-            reason=PACK_FAILURE,
-        )
-        for r in sorted(druns, key=lambda r: (r.order, r.stem))
-    )
-    return SessionPlan(
-        participant=participant,
-        session=label,
-        fs_subject=None,
-        runs=runs,
-        anchor=None,
-        frame=None,
-        grids={},
-        grid_of={},
-        details={r.run: detail for r in runs},
-    )
-
-
-def _with_withheld(
-    plan: SessionPlan, withheld: Mapping[str, tuple[str, str | None]]
-) -> SessionPlan:
-    """A failed plan whose withheld runs keep their own reason and detail."""
-    if not withheld:
-        return plan
-    key_of = {r.run: r.deriv.key for r in plan.runs}
-    runs = tuple(
-        replace(r, reason=withheld[key_of[r.run]][0]) if key_of[r.run] in withheld else r
-        for r in plan.runs
-    )
-    details = dict(plan.details)
-    for r in runs:
-        if r.deriv.key in withheld:
-            detail = withheld[r.deriv.key][1]
-            if detail:
-                details[r.run] = detail
-            else:
-                details.pop(r.run, None)
-    return replace(plan, runs=runs, details=details)
-
-
-_READ_ERRORS = (OSError, ValueError, EOFError, ConnectorError, nib.filebasedimages.ImageFileError)
-
-
-def _no_path(err: BaseException, *roots: Path | None) -> str:
-    text = str(getattr(err, "detail", None) or getattr(err, "strerror", None) or err)
-    for root in roots:
-        if root is not None:
-            text = text.replace(f"{root}{os.sep}", "").replace(str(root), ".")
-    return f"{type(err).__name__}: {text}" if not isinstance(err, ConnectorError) else text
-
-
 @dataclass
 class _Session:
     label: str | None
@@ -605,153 +153,21 @@ class _Session:
     """Run id -> volumes times voxels, for the estimate."""
 
 
-def _contours(
-    plan: SessionPlan,
-    folders: FuncFolders,
-    connector: Connector,
-) -> tuple[dict[str, Sequence[PlaneContours]] | None, str, list[tuple[str, str, Path]]]:
-    """The contours of every grid of a session, what to say about them, and the session
-    inputs they add to each pack (the fsnative transform and the FreeSurfer files)."""
-    if not plan.grids:
-        return None, "", []
-    if plan.fs_subject is None or folders.fs_subjects_dir is None:
-        return None, "without contours: no FreeSurfer subject of this session", []
-    fs_dir = folders.fs_subjects_dir / plan.fs_subject
-    from surfcensus.sources.local import unfetched_render_files
-
-    unfetched = unfetched_render_files(fs_dir)
-    if unfetched:
-        return None, f"without contours: {plan.fs_subject}: {unfetched[0]}", []
-    xfm = plan.files.get(FuncRole.XFM_ANAT_FSNATIVE)
-    if xfm is None:
-        return None, "without contours: the derivative has no transform to fsnative", []
-    xfm_path = folders.deriv_root / xfm.location
-    try:
-        q = connector.anat_to_fsnative({FuncRole.XFM_ANAT_FSNATIVE: xfm_path})
-        files = patterns.resolve_subject_files(fs_dir)
-        out: dict[str, Sequence[PlaneContours]] = {}
-        for key, grid in plan.grids.items():
-            surfaces = contours_.surfaces_in_display(fs_dir, q, grid)
-            out[key] = contours_.plane_contours(surfaces, grid)
-    except _READ_ERRORS as err:
-        return None, f"without contours: {_no_path(err, fs_dir, folders.deriv_root)}", []
-    inputs: list[tuple[str, str, Path]] = [(FuncRole.XFM_ANAT_FSNATIVE.value, "deriv", xfm_path)]
-    inputs += [(role.value, "freesurfer", files[role]) for role in _FS_FILES if role in files]
-    return out, f"contours from {plan.fs_subject}", inputs
-
-
-def _inputs(
-    plan: SessionPlan,
-    folders: FuncFolders,
-    connector: Connector,
-    session_inputs: Sequence[tuple[str, str, Path]],
-) -> tuple[list[RunPackInput], dict[str, str], dict[str, int]]:
-    """The inputs of every packable run of a plan, the details of those whose inputs could
-    not be read, and the volumes times voxels of each packable run (for the estimate)."""
-    items = {r.run: r for r in plan.runs if r.reason is None}
-    if not items or plan.anchor is None:
-        return [], {}, {}
-
-    def paths_of(item: SessionRun) -> dict[FuncRole, Path]:
-        files: dict[FuncRole, object] = dict(item.deriv.files)
-        if item.raw is not None:
-            files.update({k: v for k, v in item.raw.files.items() if k not in files})
-        found = _paths(files, folders.deriv_root, folders.raw_root)
-        return {role: p for role, p in found.items() if role in FUNC_READ_ROLES}
-
-    # the anchor is a run of the session, packed or not (``session.plan_session``)
-    anchor = next(r for r in plan.runs if r.run == plan.anchor.run)
-    anchor_paths = paths_of(anchor)
-    failed: dict[str, str] = {}
-    try:
-        anchor_rigid = connector.raw_to_anat(anchor.deriv, anchor_paths)
-    except _READ_ERRORS as err:
-        detail = f"the anchor's transform cannot be read: {_no_path(err, folders.deriv_root)}"
-        return [], {run: detail for run in items}, {}
-    out: list[RunPackInput] = []
-    work: dict[str, int] = {}
-    for run, item in items.items():
-        paths = paths_of(item)
-        try:
-            rigid = connector.raw_to_anat(item.deriv, paths)
-            raw_affine = session_.raw_affine_choice(
-                paths[FuncRole.RAW_BOLD], paths.get(FuncRole.REFERENCE)
-            )
-            motion = connector.motion(item.deriv, paths)
-            corrections = connector.corrections(item.deriv, paths)
-            tr_s = connector.repetition_time(item.deriv, paths)
-            n = int(nib.load(str(paths[FuncRole.PRE_BOLD])).shape[3])
-        except _READ_ERRORS as err:
-            failed[run] = _no_path(err, folders.deriv_root, folders.raw_root)
-            continue
-        grid = plan.grids[plan.grid_of[run]]
-        extra = list(session_inputs)
-        if run != plan.anchor.run:
-            extra.insert(0, ("anchor_xfm_to_anat", "deriv", anchor_paths[FuncRole.XFM_TO_ANAT]))
-        out.append(
-            RunPackInput(
-                run=run,
-                name=item.name,
-                files=paths,
-                grid=grid,
-                display_to_anat=geometry.compose(),
-                anchor_run=plan.anchor.run,
-                anchor_matrix=anchor_rigid.matrix,
-                raw_affine=raw_affine,
-                motion=motion,
-                corrections=corrections,
-                rigid=rigid,
-                tr_s=tr_s,
-                session_inputs=tuple(extra),  # pyrefly: ignore[bad-argument-type]
-            )
-        )
-        work[run] = n * grid.shape[0] * grid.shape[1] * grid.shape[2]
-    return out, failed, work
-
-
 # --- links among the inputs, and what the registration says ----------------------------------
-
-
-def _link_targets(planned: Sequence[_Session], folders: FuncFolders) -> list[tuple[str, Path]]:
-    """For every listed input file of the planned sessions that is a link, or is reached
-    through one, the directory that holds its target: the raw series and sidecars, the
-    derivative's files of every run (selected or not) and of the session, and the FreeSurfer
-    files of the contours. From the listing and ``realpath`` alone; no file is opened."""
-    paths: list[Path] = []
-    for item in planned:
-        for run in item.plan.runs:
-            files: dict[FuncRole, object] = dict(run.deriv.files)
-            if run.raw is not None:
-                files.update({k: v for k, v in run.raw.files.items() if k not in files})
-            paths += _paths(files, folders.deriv_root, folders.raw_root).values()
-        paths += _paths(dict(item.plan.files), folders.deriv_root, folders.raw_root).values()
-        if item.plan.fs_subject is not None and folders.fs_subjects_dir is not None:
-            try:
-                found = patterns.resolve_subject_files(
-                    folders.fs_subjects_dir / item.plan.fs_subject
-                )
-            except OSError:
-                found = {}
-            paths += [found[role] for role in _FS_FILES if role in found]
-    places: dict[Path, str] = {}
-    for path in paths:
-        written = Path(os.path.abspath(path))
-        real = Path(os.path.realpath(path))
-        if real != written and real.parent not in places:
-            places[real.parent] = f"the directory that the link {path.name} leads into,"
-    return [(what, place) for place, what in places.items()]
 
 
 def refuse_in_sources_of_links(
     out: Path, planned: Sequence[_Session], folders: FuncFolders
 ) -> None:
     """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory that
-    holds the target of a linked input file (:func:`_link_targets`), as the renderer refuses
-    an output beside the target of a linked input. Per-file links are the layout of DataLad
+    holds the target of a linked input file (``func.inventory.link_targets``), as the
+    renderer refuses an output beside the target of a linked input. Per-file links are the
+    layout of DataLad
     and git-annex clones, whose object store holds the targets."""
     from surfcensus.sources.local import refuse_in_sources
 
-    refuse_in_sources(out, [], what="output", also=_link_targets(planned, folders))
+    also = link_targets([item.plan for item in planned], folders)
+    refuse_in_sources(out, [], what="output", also=also)
 
 
 def _registration_lines(planned: Sequence[_Session], participant: str) -> list[str]:
@@ -763,7 +179,7 @@ def _registration_lines(planned: Sequence[_Session], participant: str) -> list[s
         plan = item.plan
         if plan.anchor is None:
             continue
-        text = _session_label(participant, item.label)
+        text = session_text(participant, item.label)
         names = {r.run: r.name for r in plan.runs}
         anchor = names.get(plan.anchor.run, plan.anchor.run)
         reasons = {r.run: r.reason for r in plan.runs}
@@ -794,16 +210,6 @@ def _registration_lines(planned: Sequence[_Session], participant: str) -> list[s
 
 
 # --- packing --------------------------------------------------------------------------------
-
-
-def _shown(path: Path, base: Path) -> str:
-    """``path`` relative to ``base`` when it lies inside it (``.`` for ``base`` itself), else
-    as it is."""
-    if path == base:
-        return "."
-    if path.is_relative_to(base):
-        return path.relative_to(base).as_posix()
-    return str(path)
 
 
 def _plural(n: int, word: str) -> str:
@@ -860,13 +266,8 @@ def epi_subject(
     refuse_out(out, folders)
     connector = connectors_.connector(folders.match.connector)
     deriv, raw_root = folders.deriv_root, folders.raw_root
-    try:
-        druns_all = connector.list_runs(deriv, participant, folders.match)
-        rruns_all = bids.list_raw_runs(raw_root, participant) if raw_root is not None else []
-    except ConnectorError as err:
-        raise SourceError("unreadable", f"{deriv}: {err.detail}") from None
-    except OSError as err:
-        raise SourceError("unreadable", str(err)) from None
+    listing = list_participant(folders, connector, participant)
+    druns_all = listing.deriv_runs
     if not druns_all:
         raise SourceError(
             "not found", f"{participant} has no functional run in {_shown(deriv, given)}"
@@ -893,65 +294,42 @@ def epi_subject(
 
     previous = _previous(out, participant)
     secret = key if key else secrets.token_bytes(32)
-    unfetched_deriv = _placeholders(deriv, participant, [deriv / participant / "figures"])
-    unfetched_raw = _placeholders(raw_root, participant) if raw_root is not None else {}
-    dangling_deriv = _dangling(deriv, participant)
-    dangling_raw = _dangling(raw_root, participant) if raw_root is not None else {}
+    probes = probe_participant(folders, participant)
 
     planned: list[_Session] = []
     for label in labels:
-        text = _session_label(participant, label)
+        text = session_text(participant, label)
         sid = (
             previous.sessions.get(text)
             if key is None and text in previous.sessions
             else func_id(secret, "session", participant, label or "")
         )
         assert sid is not None
-        druns = [r for r in druns_all if r.entities.ses == label]
-        rruns = [r for r in rruns_all if r.entities.ses == label]
+        druns, rruns = listing.of(label)
         run_ids = {}
         for r in druns:
-            reused = previous.runs.get((text, _run_name(r))) if key is None else None
+            reused = previous.runs.get((text, run_name(r))) if key is None else None
             run_ids[r.key] = reused or func_id(secret, "run", participant, label or "", r.key)
-        withheld: dict[str, tuple[str, str | None]] = {}
-        for r in druns:
-            files = unfetched_deriv.get((label, r.key), []) + unfetched_raw.get((label, r.key), [])
-            if (label, r.key) not in chosen:
-                withheld[r.key] = (
-                    NOT_SELECTED,
-                    f"--epi-runs leaves it out ({', '.join(patterns_)})",
-                )
-            elif files:
-                withheld[r.key] = (NOT_FETCHED, _not_fetched(files))
-        fs_subject = _fs_subject(folders.fs_subjects_dir, participant, label)
-        try:
-            plan = session_.plan_session(
-                participant,
-                label,
-                druns,
-                rruns,
-                connector,
-                deriv,
-                raw_root,
-                run_ids,
-                fs_subject,
-                config.frame_limit_mm,
-                withheld=withheld,
-            )
-        except _READ_ERRORS as err:
-            detail = f"the session cannot be planned: {_no_path(err, deriv, raw_root)}"
-            plan = _failed_plan(participant, label, druns, run_ids, connector, detail)
-            plan = _with_withheld(plan, withheld)
-        plan = _dangling_details(plan, dangling_raw, dangling_deriv)
-        if raw_root is None:
-            hint = "no raw BIDS dataset was found for the derivative; give it with --raw DIR"
-            details = dict(plan.details)
-            for r in plan.runs:
-                if r.reason == NO_RAW_SERIES and r.run not in details:
-                    details[r.run] = hint
-            plan = replace(plan, details=details)
-        contours, note, session_inputs = _contours(plan, folders, connector)
-        inputs, failed, work = _inputs(plan, folders, connector, session_inputs)
+        withheld = withheld_of(label, druns, probes, patterns_, chosen)
+        plan = plan_one(
+            folders,
+            connector,
+            participant,
+            label,
+            druns,
+            rruns,
+            run_ids,
+            withheld,
+            config.frame_limit_mm,
+            probes,
+        )
+        job, note, session_inputs = contour_job(plan, folders, connector)
+        contours = None
+        if job is not None:
+            contours, note = cut_contours(job, plan, folders.deriv_root)
+            if contours is None:
+                session_inputs = []
+        inputs, failed, work = pack_inputs(plan, folders, connector, session_inputs)
         if failed:
             plan = replace(plan, details={**plan.details, **failed})
         planned.append(_Session(label, sid, plan, inputs, contours, note, work))
@@ -1016,7 +394,7 @@ def epi_subject(
     out.mkdir(parents=True, exist_ok=True)
     infos: list[SessionInfo] = []
     for item in planned:
-        text = _session_label(participant, item.label)
+        text = session_text(participant, item.label)
         names = {r.run: r.name for r in item.plan.runs}
 
         kept_here: list[str] = []

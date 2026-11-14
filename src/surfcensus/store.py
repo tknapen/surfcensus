@@ -19,6 +19,7 @@ missing a pandas nullable integer, and a float has NaN.
 from __future__ import annotations
 
 import json
+import math
 import os
 import random
 import re
@@ -28,6 +29,7 @@ import threading
 import uuid
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Literal, cast
@@ -40,17 +42,23 @@ import pyarrow.parquet as pq
 from surfcensus import __version__
 from surfcensus._io import atomic_path, canonical_json
 from surfcensus.config import ConfigError
+from surfcensus.func.model import corrections_info
 from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
 from surfcensus.records import (
+    ConnectorMatch,
+    FuncFileRef,
     FuncLeaseFacts,
+    FuncRunRow,
     FuncSessionRow,
     FuncSourceRecord,
+    Grid,
     PackRow,
     Provenance,
     RawFound,
     RenderRow,
     WorkRow,
+    func_signature,
 )
 from surfcensus.schemas import KEYS, SCHEMAS, split_flags
 from surfcensus.sources import base
@@ -68,7 +76,7 @@ from surfcensus.sources.base import (
     SubjectRecord,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CATALOG_FILE = "catalog.sqlite"
 MEDIA_DIR = "media"
 EPI_DIR = "epi"
@@ -416,10 +424,19 @@ modification times and digests, ``input_signature`` and ``content_digest`` of a 
 census run also labels, names and details (the EPI phases do not run there; the views follow
 the rule of ``public_subjects`` all the same)."""
 
-MIGRATIONS: tuple[str, ...] = (_MIGRATION_1,)
+MIGRATIONS: tuple[str, ...] = (_MIGRATION_1, _MIGRATION_2)
 """Migration ``n`` (1-based) brings a catalog from ``user_version`` ``n - 1`` to ``n``. The
 tables of milestones 3 and 5 (``templates``, ``dataset_files``) are in the first one, so
 those milestones add none. In a migration every statement ends at the end of a line."""
+
+READONLY_OLDEST = 1
+"""The oldest schema that a read-only opener reads without a migration. Every migration
+after it is additive (only ``CREATE TABLE`` and ``CREATE VIEW``), so such a catalog is read
+as one without what the later migrations add: a catalog of schema 1 as a run without
+functional data. A migration that changes what an older table holds raises this number."""
+
+FUNC_SCHEMA = 2
+"""The schema from which a catalog has the functional tables of migration 2."""
 
 PUBLIC_META: tuple[str, ...] = (
     "run_id",
@@ -521,6 +538,53 @@ _SELECTION_COLUMNS: _Columns = (
     ("seed", "int"),
 )
 _FAILURE_COLUMNS: _Columns = _columns("str", "unit", "phase", "reason", "detail")
+_FUNC_SOURCE_COLUMNS: _Columns = (
+    *_columns("str", "dataset", "connector", "pipeline_version", "generation", "deriv_found"),
+    ("raw_found", "str"),
+    ("present", "bool"),
+)
+_FUNC_PARTICIPANT_COLUMNS: _Columns = (
+    *_columns("str", "participant_uid", "dataset", "participant", "session_order"),
+    ("n_sessions", "int"),
+    ("present", "bool"),
+)
+_FUNC_SESSION_COLUMNS: _Columns = (
+    *_columns("str", "session_uid", "participant_uid", "session_label"),
+    ("stream_order", "int"),
+    *_columns("str", "subject_uid", "fs_subject", "anchor_run_uid", "anchor_rule"),
+    ("anchor_note", "str"),
+    ("frame_limit_mm", "float"),
+    *_columns("bool?", "shared_frame_plausible", "anchor_is_outlier"),
+    *_columns("int", "n_runs", "n_packable", "n_grids"),
+    ("problem", "str"),
+    ("present", "bool"),
+)
+_FUNC_RUN_COLUMNS: _Columns = (
+    *_columns("str", "run_uid", "session_uid", "name"),
+    *_columns("int?", "session_order", "acquisition_order"),
+    *_columns("bool", "anchor", "selected", "packable"),
+    *_columns("str", "reason", "detail", "missing_roles"),
+    ("n_volumes", "int?"),
+    ("tr_s", "float"),
+    ("echoes", "int"),
+    *_columns("str", "display_layout", "grid_key", "grid_shape", "voxel_mm"),
+    ("oblique_deg", "float"),
+    ("raw_affine", "str"),
+    *_columns("bool?", "reference_image", "rigid"),
+    ("dof", "int?"),
+    *_columns("str", "corrections", "motion_state", "sdc", "sdc_method", "slice_timing"),
+    *_columns(
+        "float", "frame_mean_mm", "frame_max_mm", "frame_rotation_deg", "frame_translation_mm"
+    ),
+    ("flagged", "bool?"),
+    ("present", "bool"),
+)
+_PACK_COLUMNS: _Columns = (
+    *_columns("str", "run_uid", "session_uid", "config_hash", "pack_key", "status", "reason"),
+    ("path", "str"),
+    *_columns("int?", "n_volumes", "bytes"),
+    *_columns("str", "anchor_run_uid", "grid_key", "packed_at"),
+)
 
 
 def _frame(columns: _Columns, rows: Sequence[Sequence[object]]) -> pd.DataFrame:
@@ -560,6 +624,237 @@ def _check_digests(digests: Mapping[FileRole, str]) -> None:
     for role, digest in digests.items():
         if not _SHA256.fullmatch(digest):
             raise ValueError(f"not a SHA-256 digest for {role.value}: {digest!r}")
+
+
+ANCHOR_XFM_ROLE = "anchor_xfm_to_anat"
+"""The role under which :meth:`PublicCatalog.pack_signature` writes the anchor's stored
+transform, as ``RunPackInput.session_inputs`` names it in ``pack.json``."""
+
+SESSION_ORDER = "session label"
+"""``func_participants.session_order``: how the sessions of a participant's stream are put in
+order (``func.model.StreamInfo.order``; the ``ses-`` labels, numbers compared as numbers)."""
+
+# the FreeSurfer files that the contours of a session are cut from, in FileRole order
+_CONTOUR_ROLES: tuple[FileRole, ...] = tuple(
+    role
+    for role in FileRole
+    if role
+    in {FileRole.T1, FileRole.LH_WHITE, FileRole.RH_WHITE, FileRole.LH_PIAL, FileRole.RH_PIAL}
+)
+
+
+def _check_uid(uid: str, what: str) -> None:
+    if not _UID.fullmatch(uid):
+        raise ValueError(f"a {what} is 16 hex characters, got {uid!r}")
+
+
+def _require_func(db: _Db) -> None:
+    """A functional writer on a catalog that has no functional tables: only a read-only
+    opening of a catalog of schema 1 is such a catalog, since a writer migrates it."""
+    if db.version < FUNC_SCHEMA:
+        raise ConfigError(
+            "invalid",
+            f"catalog schema {db.version} has no functional tables; run any phase command once",
+        )
+
+
+def _func_source_record(row: sqlite3.Row) -> FuncSourceRecord:
+    return FuncSourceRecord(
+        connector=row["connector"],
+        match=ConnectorMatch(
+            connector=row["connector"],
+            pipeline_version=row["pipeline_version"],
+            generation=row["generation"],
+        ),
+        deriv_root=row["deriv_root"],
+        deriv_identity=row["deriv_identity"],
+        raw_root=row["raw_root"],
+        deriv_found=row["deriv_found"],
+        raw_found=row["raw_found"],
+    )
+
+
+def _upsert(conn: sqlite3.Connection, table: str, key: str, values: Mapping[str, object]) -> None:
+    names = list(values)
+    updates = ", ".join(f"{name} = excluded.{name}" for name in names if name != key)
+    conn.execute(
+        f"INSERT INTO {table} ({', '.join(names)}) VALUES ({', '.join('?' for _ in names)}) "
+        f"ON CONFLICT({key}) DO UPDATE SET {updates}",
+        list(values.values()),
+    )
+
+
+def _grid_numbers(grid: Grid) -> tuple[list[float], float]:
+    """Voxel size per axis and obliqueness of a grid, as ``func.geometry.voxel_mm`` and
+    ``oblique_deg`` compute them (in Python floats; that module loads numpy and nibabel)."""
+    columns = [tuple(grid.affine[r][axis] for r in range(3)) for axis in range(3)]
+    sizes = [math.sqrt(sum(c * c for c in column)) for column in columns]
+    worst = 0.0
+    for column, size in zip(columns, sizes, strict=True):
+        if size > 0.0:
+            cosine = min(1.0, max(abs(c) for c in column) / size)
+            worst = max(worst, math.degrees(math.acos(cosine)))
+    return sizes, worst
+
+
+def _session_values(row: FuncSessionRow, now: str) -> dict[str, object]:
+    frame = row.frame
+    return {
+        "session_uid": row.session_uid,
+        "participant_uid": row.participant_uid,
+        "session_label": row.session,
+        "stream_order": row.stream_order,
+        "subject_uid": row.subject_uid,
+        "fs_subject": row.fs_subject,
+        "anchor_run_uid": row.anchor.run if row.anchor is not None else None,
+        "anchor_rule": row.anchor.rule if row.anchor is not None else None,
+        "anchor_why": row.anchor.why if row.anchor is not None else None,
+        "anchor_note": row.anchor_note,
+        "frame_limit_mm": frame.limit_mm if frame is not None else None,
+        "shared_frame_plausible": _flag(frame.shared_frame_plausible)
+        if frame is not None
+        else None,
+        "anchor_is_outlier": _flag(frame.anchor_is_outlier) if frame is not None else None,
+        "n_runs": len(row.runs),
+        "n_packable": sum(run.packable for run in row.runs),
+        "n_grids": row.n_grids,
+        "problem": row.problem,
+        "present": 1,
+        "inventory_hash": row.inventory_hash,
+        "inventoried_at": now,
+    }
+
+
+def _run_values(run: FuncRunRow, now: str) -> dict[str, object]:
+    grid, frame, corrections = run.grid, run.frame, run.corrections
+    sizes, oblique = _grid_numbers(grid) if grid is not None else (None, None)
+    return {
+        "run_uid": run.run_uid,
+        "session_uid": run.session_uid,
+        "run_key": run.run_key,
+        "name": run.name,
+        "entities": canonical_json(asdict(run.entities)),
+        "session_order": run.session_order,
+        "acquisition_order": run.acquisition_order,
+        "anchor": int(run.anchor),
+        "selected": int(run.selected),
+        "packable": int(run.packable),
+        "reason": run.reason,
+        "detail": run.detail,
+        "missing_roles": ",".join(role.value for role in FuncRole if role in run.missing_roles),
+        "n_volumes": run.n_volumes,
+        "tr_s": run.tr_s,
+        "echoes": run.echoes,
+        "display_layout": run.display.layout,
+        "display_space": run.display.space,
+        "spaces": ",".join(run.spaces),
+        "grid_key": grid.key if grid is not None else None,
+        "grid_shape": json.dumps(list(grid.shape)) if grid is not None else None,
+        "voxel_mm": json.dumps(sizes) if sizes is not None else None,
+        "oblique_deg": oblique,
+        "raw_affine": run.raw_affine,
+        "reference_image": _flag(run.reference_image),
+        "rigid": _flag(run.rigid),
+        "dof": run.dof,
+        "corrections": (
+            canonical_json(corrections_info(corrections).model_dump(mode="json"))
+            if corrections is not None
+            else None
+        ),
+        "motion_state": corrections.motion.state if corrections is not None else None,
+        "sdc": corrections.sdc.state if corrections is not None else None,
+        "sdc_method": corrections.sdc_method if corrections is not None else None,
+        "slice_timing": corrections.slice_timing.state if corrections is not None else None,
+        "frame_mean_mm": frame.mean_mm if frame is not None else None,
+        "frame_max_mm": frame.max_mm if frame is not None else None,
+        "frame_rotation_deg": frame.rotation_deg if frame is not None else None,
+        "frame_translation_mm": frame.translation_mm if frame is not None else None,
+        "flagged": _flag(frame.flagged) if frame is not None else None,
+        "present": 1,
+        "inventoried_at": now,
+    }
+
+
+def _replace_func_files(
+    conn: sqlite3.Connection,
+    owner_kind: Literal["run", "session"],
+    owner: str,
+    files: Sequence[FuncFileRef],
+) -> None:
+    """Replace the files of a run or session; a file whose location, variant, size and
+    modification time are unchanged keeps its digest."""
+    if len({ref.role for ref in files}) != len(files):
+        raise ValueError(f"a role is listed twice for {owner_kind} {owner}")
+    kept = {
+        r["role"]: r
+        for r in conn.execute(
+            "SELECT role, base, location, variant, size, etag_or_mtime, sha256 FROM func_files "
+            "WHERE owner_kind = ? AND owner = ?",
+            (owner_kind, owner),
+        )
+    }
+    conn.execute("DELETE FROM func_files WHERE owner_kind = ? AND owner = ?", (owner_kind, owner))
+    for ref in files:
+        old = kept.get(ref.role.value)
+        same = old is not None and (
+            ref.base,
+            ref.location,
+            ref.variant,
+            ref.size,
+            ref.etag_or_mtime,
+        ) == (old["base"], old["location"], old["variant"], old["size"], old["etag_or_mtime"])
+        conn.execute(
+            "INSERT INTO func_files (owner_kind, owner, role, base, location, variant, size, "
+            "etag_or_mtime, sha256) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                owner_kind,
+                owner,
+                ref.role.value,
+                ref.base,
+                ref.location,
+                ref.variant,
+                ref.size,
+                ref.etag_or_mtime,
+                old["sha256"] if same and old is not None else None,
+            ),
+        )
+
+
+def _func_refs(db: _Db, owner_kind: str, owner: str) -> list[FuncFileRef]:
+    """The stored files of a run or a session, in ``FuncRole`` order."""
+    rows = db.rows(
+        "SELECT role, base, location, size, etag_or_mtime, variant FROM func_files "
+        "WHERE owner_kind = ? AND owner = ?",
+        (owner_kind, owner),
+    )
+    refs = {
+        FuncRole(r["role"]): FuncFileRef(
+            role=FuncRole(r["role"]),
+            base=r["base"],
+            location=r["location"],
+            size=r["size"],
+            etag_or_mtime=r["etag_or_mtime"],
+            variant=r["variant"],
+        )
+        for r in rows
+    }
+    return [refs[role] for role in FuncRole if role in refs]
+
+
+def _func_line(ref: FuncFileRef, role: str) -> str:
+    """The line of :func:`records.func_signature` for a functional file, under ``role``."""
+    fields = ["f", ref.base, role, ref.location, str(ref.size), ref.etag_or_mtime]
+    if ref.variant is not None:
+        fields.append(ref.variant)
+    return "\t".join(fields)
+
+
+def _fs_line(ref: FileRef) -> str:
+    """The line of :func:`records.func_signature` for a FreeSurfer file."""
+    fields = ["fs", ref.role.value, ref.location, str(ref.size), ref.etag_or_mtime]
+    if ref.variant is not None:
+        fields.append(ref.variant)
+    return "\t".join(fields)
 
 
 def _statements(script: str) -> Iterator[str]:
@@ -779,6 +1074,7 @@ class _Db:
         self.path = path
         self.readonly = readonly
         self.mode: Mode = "local"  # until the file says
+        self.version = 0  # the schema the file has, once it is opened
         self._lock = threading.RLock()
         target = f"{path.resolve().as_uri()}?mode=ro" if readonly else str(path)
         self._conn = sqlite3.connect(
@@ -826,12 +1122,18 @@ class _Db:
             raise ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
         if version < SCHEMA_VERSION:
             if self.readonly:
-                raise ConfigError(
-                    "invalid",
-                    f"catalog schema {version} is older than this version; run any phase "
-                    "command once",
-                )
-            _migrate(self._conn)
+                if version < READONLY_OLDEST:
+                    raise ConfigError(
+                        "invalid",
+                        f"catalog schema {version} is older than this version; run any phase "
+                        "command once",
+                    )
+                # read as it is: what the later migrations add is absent, and nothing is
+                # written, so the file keeps every byte
+            else:
+                _migrate(self._conn)
+                version = SCHEMA_VERSION
+        self.version = version
         self.mode = mode
         busy = _BUSY_MS[self.mode]
         if self.readonly and self.mode == "census":
@@ -1501,22 +1803,110 @@ class Catalog:
 
     # --- the EPI interface (step 2; work package E2.A writes these) -------------------------
 
+    def _func(self) -> bool:
+        return self._db.version >= FUNC_SCHEMA
+
     def upsert_func_source(self, dataset_id: int, record: FuncSourceRecord) -> int:
         """Insert or update the functional source of a dataset and return its ``func_id``.
         A stored source keeps its ``deriv_identity`` (decision D21): a record whose identity
         differs from the stored one of the same dataset and connector is
         ``ConfigError("key", ...)``; roots and how they were found are replaced."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if record.connector != record.match.connector:
+            raise ValueError(
+                f"the record names connector {record.connector} and its match "
+                f"{record.match.connector}"
+            )
+        _require_func(self._db)
+        with self._db.write() as conn:
+            known = conn.execute("SELECT 1 FROM datasets WHERE dataset_id = ?", (dataset_id,))
+            if known.fetchone() is None:
+                raise KeyError(f"no dataset {dataset_id} in the catalog")
+            row = conn.execute(
+                "SELECT func_id, deriv_identity FROM func_sources "
+                "WHERE dataset_id = ? AND connector = ?",
+                (dataset_id, record.connector),
+            ).fetchone()
+            values = (
+                record.match.pipeline_version,
+                record.match.generation,
+                record.deriv_root,
+                record.deriv_found,
+                record.raw_root,
+                record.raw_found,
+                _now(),
+            )
+            if row is None:
+                cursor = conn.execute(
+                    "INSERT INTO func_sources (pipeline_version, generation, deriv_root, "
+                    "deriv_found, raw_root, raw_found, listed_at, dataset_id, connector, "
+                    "deriv_identity, present) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)",
+                    (*values, dataset_id, record.connector, record.deriv_identity),
+                )
+                return cast(int, cursor.lastrowid)
+            if row["deriv_identity"] != record.deriv_identity:
+                raise ConfigError(
+                    "key",
+                    "the functional source of this dataset is stored under another identity; "
+                    "its participants, sessions and runs would get other identifiers",
+                )
+            conn.execute(
+                "UPDATE func_sources SET pipeline_version = ?, generation = ?, deriv_root = ?, "
+                "deriv_found = ?, raw_root = ?, raw_found = ?, listed_at = ?, present = 1 "
+                "WHERE func_id = ?",
+                (*values, row["func_id"]),
+            )
+            return row["func_id"]
 
     def func_source(self, dataset_id: int) -> FuncSourceRecord | None:
         """The functional source of a dataset, or None (also on a catalog of schema 1)."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return None
+        row = self._db.one(
+            "SELECT * FROM func_sources WHERE dataset_id = ? ORDER BY present DESC, func_id "
+            "LIMIT 1",
+            (dataset_id,),
+        )
+        return None if row is None else _func_source_record(row)
 
     def upsert_func_participant(
         self, func_id: int, participant_uid: str, participant: str, n_sessions: int
     ) -> None:
         """Insert or update a participant of a functional source; sets ``present``."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _check_uid(participant_uid, "participant_uid")
+        _require_func(self._db)
+        with self._db.write() as conn:
+            known = conn.execute("SELECT 1 FROM func_sources WHERE func_id = ?", (func_id,))
+            if known.fetchone() is None:
+                raise KeyError(f"no functional source {func_id} in the catalog")
+            holder = conn.execute(
+                "SELECT func_id, participant FROM func_participants WHERE participant_uid = ?",
+                (participant_uid,),
+            ).fetchone()
+            if holder is not None and tuple(holder) != (func_id, participant):
+                raise ConfigError(
+                    "invalid",
+                    f"participant_uid {participant_uid} of {participant} already names "
+                    f"{holder['participant']}: two participants with one identifier",
+                )
+            stored = conn.execute(
+                "SELECT participant_uid FROM func_participants WHERE func_id = ? AND "
+                "participant = ?",
+                (func_id, participant),
+            ).fetchone()
+            if stored is not None and stored["participant_uid"] != participant_uid:
+                raise ConfigError(
+                    "key",
+                    f"{participant} is {stored['participant_uid']} in the catalog and "
+                    f"{participant_uid} with the key given: the run was made with another key",
+                )
+            conn.execute(
+                "INSERT INTO func_participants (participant_uid, func_id, participant, "
+                "session_order, n_sessions, present, listed_at) VALUES (?, ?, ?, ?, ?, 1, ?) "
+                "ON CONFLICT(participant_uid) DO UPDATE SET session_order = "
+                "excluded.session_order, n_sessions = excluded.n_sessions, present = 1, "
+                "listed_at = excluded.listed_at",
+                (participant_uid, func_id, participant, SESSION_ORDER, n_sessions, _now()),
+            )
 
     def upsert_func_session(self, row: FuncSessionRow) -> None:
         """Store a session with its files and every one of its runs with theirs, in one
@@ -1524,11 +1914,65 @@ class Catalog:
         ``packs`` row as well, after the pack phase removed the pack: a run that left keeps
         its row until then, marked ``present = 0``), a file that keeps its location, size and
         modification time keeps its ``sha256``."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _check_uid(row.session_uid, "session_uid")
+        for run in row.runs:
+            _check_uid(run.run_uid, "run_uid")
+            if run.session_uid != row.session_uid:
+                raise ValueError(f"run {run.run_uid} is of another session")
+        if len({run.run_uid for run in row.runs}) != len(row.runs):
+            raise ValueError("a run is named twice in the session")
+        _require_func(self._db)
+        now = _now()
+        session = _session_values(row, now)
+        with self._db.write() as conn:
+            known = conn.execute(
+                "SELECT 1 FROM func_participants WHERE participant_uid = ?",
+                (row.participant_uid,),
+            ).fetchone()
+            if known is None:
+                raise KeyError(f"no participant {row.participant_uid} in the catalog")
+            holder = conn.execute(
+                "SELECT participant_uid FROM func_sessions WHERE session_uid = ?",
+                (row.session_uid,),
+            ).fetchone()
+            if holder is not None and holder["participant_uid"] != row.participant_uid:
+                raise ConfigError(
+                    "invalid", f"session_uid {row.session_uid} already names another session"
+                )
+            _upsert(conn, "func_sessions", "session_uid", session)
+            _replace_func_files(conn, "session", row.session_uid, row.files)
+            for run in row.runs:
+                _upsert(conn, "func_runs", "run_uid", _run_values(run, now))
+                _replace_func_files(conn, "run", run.run_uid, run.files)
+            kept = {run.run_uid for run in row.runs}
+            left = [
+                r["run_uid"]
+                for r in conn.execute(
+                    "SELECT run_uid FROM func_runs WHERE session_uid = ? ORDER BY run_uid",
+                    (row.session_uid,),
+                )
+                if r["run_uid"] not in kept
+            ]
+            for uid in left:
+                # a run that left has no files any more; that is what tells it from a run of
+                # a session that is absent as a whole (mark_func_absent)
+                conn.execute(
+                    "DELETE FROM func_files WHERE owner_kind = 'run' AND owner = ?", (uid,)
+                )
+                packed = conn.execute("SELECT 1 FROM packs WHERE run_uid = ?", (uid,)).fetchone()
+                if packed is None:
+                    conn.execute("DELETE FROM func_runs WHERE run_uid = ?", (uid,))
+                else:
+                    conn.execute("UPDATE func_runs SET present = 0 WHERE run_uid = ?", (uid,))
 
     def func_inventory_hash(self, session_uid: str) -> str | None:
         """``func_sessions.inventory_hash`` of a session, or None."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return None
+        row = self._db.one(
+            "SELECT inventory_hash FROM func_sessions WHERE session_uid = ?", (session_uid,)
+        )
+        return None if row is None else row["inventory_hash"]
 
     def mark_func_absent(
         self, func_id: int, present_participants: Collection[str], present_sessions: Collection[str]
@@ -1536,24 +1980,123 @@ class Catalog:
         """Set ``present`` of the participants, sessions and runs of a functional source from
         the listing, in both directions; returns the ``session_uid``s that became absent.
         Rows, packs and their ledger rows stay (the pack phase removes the packs)."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _require_func(self._db)
+        participants, sessions = set(present_participants), set(present_sessions)
+        with self._db.write() as conn:
+            for r in conn.execute(
+                "SELECT participant_uid, present FROM func_participants WHERE func_id = ?",
+                (func_id,),
+            ).fetchall():
+                listed = int(r["participant_uid"] in participants)
+                if listed != r["present"]:
+                    conn.execute(
+                        "UPDATE func_participants SET present = ? WHERE participant_uid = ?",
+                        (listed, r["participant_uid"]),
+                    )
+            rows = conn.execute(
+                "SELECT s.session_uid, s.present FROM func_sessions s "
+                "JOIN func_participants p USING (participant_uid) WHERE p.func_id = ? "
+                "ORDER BY s.session_uid",
+                (func_id,),
+            ).fetchall()
+            gone = [
+                r["session_uid"] for r in rows if r["present"] and r["session_uid"] not in sessions
+            ]
+            back = [
+                r["session_uid"] for r in rows if not r["present"] and r["session_uid"] in sessions
+            ]
+            for uid in gone:
+                conn.execute("UPDATE func_sessions SET present = 0 WHERE session_uid = ?", (uid,))
+                conn.execute("UPDATE func_runs SET present = 0 WHERE session_uid = ?", (uid,))
+            for uid in back:
+                conn.execute("UPDATE func_sessions SET present = 1 WHERE session_uid = ?", (uid,))
+                # the runs the session had when it was last stored: those with files (a run
+                # that had left it before has none, see upsert_func_session)
+                conn.execute(
+                    "UPDATE func_runs SET present = 1 WHERE session_uid = ? AND EXISTS "
+                    "(SELECT 1 FROM func_files f WHERE f.owner_kind = 'run' "
+                    "AND f.owner = func_runs.run_uid)",
+                    (uid,),
+                )
+        return gone
 
     def relocate_func(
         self, func_id: int, deriv_root: str, raw_root: str | None, raw_found: RawFound | None
     ) -> None:
         """Replace the roots of a functional source and nothing else, so every identifier
         stays (``--relocate``)."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _require_func(self._db)
+        with self._db.write() as conn:
+            cursor = conn.execute(
+                "UPDATE func_sources SET deriv_root = ?, raw_root = ?, raw_found = ? "
+                "WHERE func_id = ?",
+                (deriv_root, raw_root, raw_found, func_id),
+            )
+            if cursor.rowcount == 0:
+                raise KeyError(f"no functional source {func_id} in the catalog")
 
     def func_lease_facts(self, session_uid: str) -> FuncLeaseFacts:
         """What the lease of a session needs (``records.FuncLeaseFacts``); KeyError for an
         unknown session."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            raise KeyError(f"no session {session_uid} in the catalog")
+        with self._db.read():
+            session = self._db.one(
+                "SELECT s.session_uid, s.participant_uid, s.session_label, s.subject_uid, "
+                "s.fs_subject, s.inventory_hash, p.participant, p.func_id "
+                "FROM func_sessions s JOIN func_participants p USING (participant_uid) "
+                "WHERE s.session_uid = ?",
+                (session_uid,),
+            )
+            if session is None:
+                raise KeyError(f"no session {session_uid} in the catalog")
+            source = self._db.one(
+                "SELECT * FROM func_sources WHERE func_id = ?", (session["func_id"],)
+            )
+            runs = self._db.rows(
+                "SELECT run_key, run_uid FROM func_runs WHERE session_uid = ? ORDER BY run_key",
+                (session_uid,),
+            )
+            fs_subjects_dir = None
+            if session["subject_uid"] is not None:
+                subject = self._db.one(
+                    "SELECT d.root, s.fs_dir FROM subjects s JOIN datasets d USING (dataset_id) "
+                    "WHERE s.subject_uid = ?",
+                    (session["subject_uid"],),
+                )
+                if subject is not None:
+                    fs_subjects_dir = str(Path(subject["root"], subject["fs_dir"]).parent)
+            elif session["fs_subject"] is not None:
+                dataset = self._db.one(
+                    "SELECT root, fs_root FROM datasets WHERE dataset_id = ?",
+                    (source["dataset_id"],),
+                )
+                assert dataset is not None  # the foreign key
+                fs_subjects_dir = str(Path(dataset["root"], dataset["fs_root"]))
+        assert source is not None  # the foreign key
+        return FuncLeaseFacts(
+            source=_func_source_record(source),
+            participant_uid=session["participant_uid"],
+            session_uid=session["session_uid"],
+            participant=session["participant"],
+            session=session["session_label"],
+            run_ids={r["run_key"]: r["run_uid"] for r in runs},
+            fs_subjects_dir=fs_subjects_dir,
+            fs_subject=session["fs_subject"],
+            subject_uid=session["subject_uid"],
+            inventory_hash=session["inventory_hash"],
+        )
 
     def func_participant_uids(self) -> dict[str, str]:
         """``participant_uid`` -> participant label of every present participant, for the
         lines that ``review`` and ``inventory`` print (local run)."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return {}
+        rows = self._db.rows(
+            "SELECT participant_uid, participant FROM func_participants WHERE present = 1 "
+            "ORDER BY participant_uid"
+        )
+        return {r["participant_uid"]: r["participant"] for r in rows}
 
     def public(self) -> PublicCatalog:
         """The public side on this catalog's connection; closing it leaves this one open."""
@@ -1883,37 +2426,101 @@ class PublicCatalog:
     # On a catalog of schema 1, opened read-only, each reader answers as for a run without
     # functional data (an empty frame, False, None) and each writer raises ConfigError.
 
+    def _func(self) -> bool:
+        return self._db.version >= FUNC_SCHEMA
+
     def has_func(self) -> bool:
         """Whether the run has a functional source with a present participant."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return False
+        row = self._db.one(
+            "SELECT 1 FROM func_participants p JOIN func_sources f USING (func_id) "
+            "WHERE p.present = 1 AND f.present = 1 LIMIT 1"
+        )
+        return row is not None
 
     def func_sources(self) -> pd.DataFrame:
         """The view ``public_func_sources``, ordered by dataset pseudonym."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return _frame(_FUNC_SOURCE_COLUMNS, [])
+        rows = self._db.rows(
+            f"SELECT {_names(_FUNC_SOURCE_COLUMNS)} FROM public_func_sources "
+            "ORDER BY dataset, connector, generation, deriv_found"
+        )
+        return _frame(_FUNC_SOURCE_COLUMNS, rows)
 
     def func_participants(self) -> pd.DataFrame:
         """The view ``public_func_participants``, ordered by ``participant_uid``;
         ``participant`` is empty in a census run."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return _frame(_FUNC_PARTICIPANT_COLUMNS, [])
+        rows = self._db.rows(
+            f"SELECT {_names(_FUNC_PARTICIPANT_COLUMNS)} FROM public_func_participants "
+            "ORDER BY participant_uid"
+        )
+        return _frame(_FUNC_PARTICIPANT_COLUMNS, rows)
 
     def func_sessions(self, participant_uid: str | None = None) -> pd.DataFrame:
         """The view ``public_func_sessions``, of one participant or of all, ordered by
         participant, then ``stream_order``."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return _frame(_FUNC_SESSION_COLUMNS, [])
+        where, params = (
+            ("WHERE participant_uid = ? ", (participant_uid,)) if participant_uid else ("", ())
+        )
+        rows = self._db.rows(
+            f"SELECT {_names(_FUNC_SESSION_COLUMNS)} FROM public_func_sessions {where}"
+            "ORDER BY participant_uid, stream_order, session_uid",
+            params,
+        )
+        return _frame(_FUNC_SESSION_COLUMNS, rows)
 
     def func_runs(self, session_uid: str | None = None) -> pd.DataFrame:
         """The view ``public_func_runs``, of one session or of all, ordered by session, then
         ``acquisition_order``."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return _frame(_FUNC_RUN_COLUMNS, [])
+        where, params = ("WHERE session_uid = ? ", (session_uid,)) if session_uid else ("", ())
+        rows = self._db.rows(
+            f"SELECT {_names(_FUNC_RUN_COLUMNS)} FROM public_func_runs {where}"
+            "ORDER BY session_uid, acquisition_order, run_uid",
+            params,
+        )
+        return _frame(_FUNC_RUN_COLUMNS, rows)
 
     def packs(self) -> pd.DataFrame:
         """The view ``public_packs``, ordered by ``run_uid``; ``detail`` in a local run only."""
-        raise NotImplementedError("work package E2.A: store.py")
+        columns = (*_PACK_COLUMNS, ("detail", "str")) if self._local() else _PACK_COLUMNS
+        if not self._func():
+            return _frame(columns, [])
+        rows = self._db.rows(f"SELECT {_names(columns)} FROM public_packs ORDER BY run_uid")
+        return _frame(columns, rows)
 
     def pack(self, run_uid: str) -> PackRow | None:
         """The ``packs`` row of a run, with its input signature to pass back and without its
         ``content_digest``; None when it has none."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            return None
+        row = self._db.one("SELECT * FROM packs WHERE run_uid = ?", (run_uid,))
+        if row is None:
+            return None
+        return PackRow(
+            run_uid=row["run_uid"],
+            session_uid=row["session_uid"],
+            config_hash=row["config_hash"],
+            input_signature=row["input_signature"],
+            status=row["status"],
+            pack_key=row["pack_key"],
+            reason=row["reason"],
+            detail=row["detail"] if self._local() else None,
+            path=row["path"],
+            n_volumes=row["n_volumes"],
+            bytes=row["bytes"],
+            content_digest=None,
+            anchor_run_uid=row["anchor_run_uid"],
+            grid_key=row["grid_key"],
+            packed_at=row["packed_at"],
+        )
 
     def pack_signature(self, run_uid: str) -> str:
         """The input signature of the pack of a run (``records.func_signature``), from the
@@ -1925,24 +2532,110 @@ class PublicCatalog:
         ``grid\t<grid_key>``, ``fs\t<subject_uid or ->``. A changed anchor, surface or grid
         therefore changes it. May be passed back to :meth:`record_packs` and nothing else.
         KeyError for an unknown or unpackable run."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            raise KeyError(f"no run {run_uid} in the catalog")
+        with self._db.read():  # the run, its session and their files of one inventory
+            return self._pack_signature(run_uid)
+
+    def _pack_signature(self, run_uid: str) -> str:
+        run = self._db.one(
+            "SELECT r.packable, r.grid_key, r.session_uid, s.anchor_run_uid, s.subject_uid "
+            "FROM func_runs r JOIN func_sessions s USING (session_uid) WHERE r.run_uid = ?",
+            (run_uid,),
+        )
+        if run is None:
+            raise KeyError(f"no run {run_uid} in the catalog")
+        if not run["packable"]:
+            raise KeyError(f"run {run_uid} cannot be packed")
+        anchor, subject = run["anchor_run_uid"], run["subject_uid"]
+        lines = [_func_line(ref, ref.role.value) for ref in _func_refs(self._db, "run", run_uid)]
+        if anchor is not None and anchor != run_uid:
+            lines.extend(
+                _func_line(ref, ANCHOR_XFM_ROLE)
+                for ref in _func_refs(self._db, "run", anchor)
+                if ref.role == FuncRole.XFM_TO_ANAT
+            )
+        session = _func_refs(self._db, "session", run["session_uid"])
+        lines.extend(_func_line(ref, ref.role.value) for ref in session)
+        if subject is not None:
+            refs = _file_refs(self._db, subject)
+            lines.extend(_fs_line(refs[role]) for role in _CONTOUR_ROLES if role in refs)
+        lines.extend(
+            (f"anchor\t{anchor or '-'}", f"grid\t{run['grid_key'] or '-'}", f"fs\t{subject or '-'}")
+        )
+        return func_signature((), None, lines)
 
     def epi_session_signature(self, session_uid: str) -> str:
         """The input signature of the session unit: ``inventory\t<inventory_hash>`` and the
         :meth:`pack_signature` of every packable run in acquisition order, hashed as one
         :func:`records.func_signature` of extra lines. May be passed back to
         :meth:`work_done` and :meth:`record_work` and nothing else."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if not self._func():
+            raise KeyError(f"no session {session_uid} in the catalog")
+        with self._db.read():
+            session = self._db.one(
+                "SELECT inventory_hash FROM func_sessions WHERE session_uid = ?", (session_uid,)
+            )
+            if session is None:
+                raise KeyError(f"no session {session_uid} in the catalog")
+            runs = self._db.rows(
+                "SELECT run_uid FROM func_runs WHERE session_uid = ? AND packable = 1 "
+                "AND present = 1 ORDER BY acquisition_order, run_uid",
+                (session_uid,),
+            )
+            lines = [f"inventory\t{session['inventory_hash']}"]
+            lines.extend(
+                f"pack\t{r['run_uid']}\t{self._pack_signature(r['run_uid'])}" for r in runs
+            )
+        return func_signature((), None, lines)
 
     def record_packs(self, rows: Sequence[PackRow]) -> None:
         """Record the outcome of packs, replacing their earlier rows, in one transaction. A
         row without a time gets the current time."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _require_func(self._db)
+        now = _now()
+        with self._db.write() as conn:
+            conn.executemany(
+                "INSERT OR REPLACE INTO packs (run_uid, session_uid, config_hash, "
+                "input_signature, pack_key, status, reason, detail, path, n_volumes, bytes, "
+                "content_digest, anchor_run_uid, grid_key, packed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        row.run_uid,
+                        row.session_uid,
+                        row.config_hash,
+                        row.input_signature,
+                        row.pack_key,
+                        row.status,
+                        row.reason,
+                        row.detail,
+                        row.path,
+                        row.n_volumes,
+                        row.bytes,
+                        row.content_digest,
+                        row.anchor_run_uid,
+                        row.grid_key,
+                        row.packed_at or now,
+                    )
+                    for row in rows
+                ],
+            )
 
     def forget_packs(self, run_uids: Collection[str]) -> None:
         """Remove the ``packs`` rows of runs whose packs were removed (a run that left, that
         is no longer packable or no longer selected), in one transaction."""
-        raise NotImplementedError("work package E2.A: store.py")
+        _require_func(self._db)
+        with self._db.write() as conn:
+            for uid in sorted(set(run_uids)):
+                conn.execute("DELETE FROM packs WHERE run_uid = ?", (uid,))
+                # a run that left its session (upsert_func_session kept it, without files,
+                # for this): its row goes with its pack
+                conn.execute(
+                    "DELETE FROM func_runs WHERE run_uid = ? AND present = 0 AND NOT EXISTS "
+                    "(SELECT 1 FROM func_files f WHERE f.owner_kind = 'run' AND f.owner = ?)",
+                    (uid, uid),
+                )
 
     def set_func_digests(
         self, owner_kind: Literal["run", "session"], owner: str, digests: Mapping[FuncRole, str]
@@ -1950,7 +2643,20 @@ class PublicCatalog:
         """Store SHA-256 digests of functional files that a pack read in full
         (``PackInfo.inputs``). Write-only; a role the owner does not have is ignored. The
         FreeSurfer files go through :meth:`set_file_digests`."""
-        raise NotImplementedError("work package E2.A: store.py")
+        if owner_kind not in ("run", "session"):
+            raise ValueError(f"an owner is a run or a session, not {owner_kind!r}")
+        for role, digest in digests.items():
+            if not _SHA256.fullmatch(digest):
+                raise ValueError(f"not a SHA-256 digest for {FuncRole(role).value}: {digest!r}")
+        _require_func(self._db)
+        with self._db.write() as conn:
+            conn.executemany(
+                "UPDATE func_files SET sha256 = ? WHERE owner_kind = ? AND owner = ? AND role = ?",
+                [
+                    (digest, owner_kind, owner, FuncRole(role).value)
+                    for role, digest in digests.items()
+                ],
+            )
 
 
 # --- parquet tables -----------------------------------------------------------------------

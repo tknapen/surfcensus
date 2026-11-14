@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block title %}EPI movies: participants{% endblock %}
+{% block body %}
+<main id="epi-index" class="epi-index" data-api="{{ api }}" data-state="loading">
+  <header class="review-head">
+    <a id="rate-link" href="{{ rate_url }}">rating screen</a>
+    <h1>EPI movies</h1>
+    <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b>, one continuous stream per participant</span>
+  </header>
+  <p id="index-packing" class="hint" role="status" hidden></p>
+  <p id="index-message" class="message" role="status" hidden></p>
+  <div class="table-wrap epi-index-wrap">
+    <table id="participants" class="subjects">
+      <thead>
+        <tr><th scope="col">participant</th><th scope="col">sessions</th><th scope="col">runs</th><th scope="col">packed</th><th scope="col">waiting</th><th scope="col">failed</th><th scope="col">flagged</th><th scope="col">stream</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="hint">Each stream plays every packed run of a participant, session after session, as one moving picture:
+    the raw series placed once per session in the anatomy, and the series as the pipeline wrote it, on the same slices
+    with the white and pial contours. A run is <b>flagged</b> when its own registration would put it more than the
+    limit elsewhere than the session's one registration does; that is a statement about the raw data.</p>
+</main>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="{{ static }}/js/epi/index.js?v={{ version }}"></script>
+{% endblock %}

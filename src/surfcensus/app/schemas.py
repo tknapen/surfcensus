@@ -1,7 +1,8 @@
 """The shapes of the rater app's API: what the pages send and receive. See docs/rater_app.md.
 
 The server and the frontend are both written against this module. It needs pydantic only
-and imports ``protocol.py`` and ``render/model.py``, nothing from the rest of ``app/``.
+and imports ``protocol.py``, ``render/model.py`` and ``app/epi_schemas.py`` (the shapes of
+the EPI pages, whose routes are among :data:`ROUTES`), nothing else of ``app/``.
 
 Blindness is a property of these shapes: nothing a rating route returns (``SessionOut``,
 ``NextOut``, ``RatingOut``; a skip is answered with a ``NextOut``) has a field for a
@@ -19,6 +20,7 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut
 from surfcensus.protocol import CriterionId, MarkClass, Protocol
 from surfcensus.render.model import (
     BoxInfo,
@@ -306,6 +308,11 @@ class SessionOut(_Shape):
     examples: tuple[ExampleOut, ...] = ()
     """Empty when the run has no calibration set, and for a rater who has not finished
     calibration."""
+    epi_url: str | None = None
+    """``/epi``, the index of the EPI movies of the run, when the server offers them to this
+    rater now (a local run with functional data whose unblinded routes are open to the
+    rater); None otherwise. It names no subject: the one link of the rating screen to the
+    EPI interface (docs/epi_interface.md, "The app in a run directory")."""
 
 
 # --- the queue ------------------------------------------------------------------------------
@@ -639,11 +646,24 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/api/review/{subject_uid}", SubjectOut, unblinded=True),
     Route("GET", "/api/stats", StatsOut, unblinded=True),
     Route("GET", "/api/export", unblinded=True),
+    Route("GET", "/epi", unblinded=True),
+    Route("GET", "/api/epi", EpiIndexOut, unblinded=True),
+    Route("GET", "/epi/{participant_uid}", unblinded=True),
+    Route("GET", "/api/epi/{participant_uid}", EpiStreamOut, unblinded=True),
+    Route("GET", "/epi-media/{participant_uid}/{session_uid}/{path}", unblinded=True),
 )
-"""Every route of the app in milestone 4 (local mode). The server serves these and no
-other, and the frontend calls none that is not here: ``/`` and ``/review`` are the pages,
-``/static`` the frontend files, ``/media`` the files of a render that :data:`MEDIA_FILE`
-names, ``/api/export`` the ratings as CSV.
+"""Every route of the app (local mode). The server serves these and no other, and the
+frontend calls none that is not here: ``/`` and ``/review`` are the pages, ``/static`` the
+frontend files, ``/media`` the files of a render that :data:`MEDIA_FILE` names,
+``/api/export`` the ratings as CSV.
+
+The EPI pages of a run directory (step 2 of docs/epi_interface.md): ``/epi`` the index of
+the participants with functional data, ``/epi/<participant_uid>`` the page of one
+participant's stream (decision D38), ``/epi-media/<participant_uid>/<session_uid>/...`` the
+files of its packs, by the patterns and rules of ``app.epi``. They are unblinded, and they
+answer only in a local run with functional data whose EPI interface is on; otherwise they
+answer as a route that does not exist (404), so a run without functional data and a census
+run are answered as before step 2.
 
 ``POST /api/skip`` answers 404 for an assignment that does not exist, 403 for another
 rater's, and 409 for one that is not open for the rater: one that has a submission, or

@@ -210,6 +210,7 @@ class RatePage {
       if (!this.note.value.trim()) this.noteBox.hidden = true;
     });
     byId("review-link").hidden = session.settings.blind;
+    this.showEpiLink(session);
 
     installKeys(
       window,
@@ -336,6 +337,9 @@ class RatePage {
       this.leave();
       this.setState("done");
       byId("review-link").hidden = false;
+      // the EPI movies open for a rater who has nothing left to rate (asked again: the
+      // session said whether they were open when the page was loaded)
+      api.getSession().then((session) => this.showEpiLink(session)).catch(() => {});
       this.say(
         `Nothing is left to rate: ${next.progress.done_total} done. ` +
           "Backspace goes back to the last subject.",
@@ -345,6 +349,14 @@ class RatePage {
     this.say("");
     this.open(next.assignment);
     this.viewer.prefetch(next.prefetch);
+  }
+
+  // One link to the EPI movies of the run, which names no subject; shown only when the
+  // server offers them to this rater now (session.epi_url).
+  showEpiLink(session) {
+    const link = byId("epi-link");
+    if (session.epi_url) link.href = session.epi_url;
+    link.hidden = !session.epi_url;
   }
 
   leave() {

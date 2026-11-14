@@ -42,7 +42,7 @@ import shutil
 import stat
 import time
 import zlib
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -89,7 +89,7 @@ from surfcensus.func.model import (
     info_text,
     read_info,
 )
-from surfcensus.func.packread import inflate_checked, stream_bytes
+from surfcensus.func.packread import inflate_checked, pack_on_disk, read_pack, stream_bytes
 from surfcensus.records import (
     IDENTITY4,
     NO_BRAIN_MASK,
@@ -888,6 +888,7 @@ def pack_session(
     progress: Callable[[str, PackInfo | None, str | None, float, bool], None] | None = None,
     *,
     force: bool = False,
+    keep: Collection[str] | None = None,
 ) -> SessionInfo:
     """Pack a whole session into ``<out_dir>/<session_id>/``: the contours of each grid
     (``contours`` by grid key; None without a FreeSurfer subject), every run of ``runs``, then
@@ -900,6 +901,14 @@ def pack_session(
     (:func:`current_pack`: whole on disk, made by this version of the package and format
     from the same inputs, by role, base, size and SHA-256, the session's inputs included,
     with the same settings, anchor and grid); ``force`` packs every run again.
+
+    ``keep`` is for a run directory (step 2), whose skip decision comes from the catalog and
+    not from the files (``func.batch.pack_plan``): the runs it names are taken from their
+    ``pack.json`` as they are, without hashing their inputs, when the pack is whole on disk
+    (``func.packread.pack_on_disk``) and of this session and config hash, else packed; every
+    other run of ``runs`` is packed, and :func:`current_pack` is not asked. A kept run need not
+    be among ``runs``. ``force`` packs every run again here as well. Without ``keep`` (None)
+    the rule of :func:`current_pack` holds, as in step 1.
 
     What a reader of the directory sees while this runs: the earlier ``session.json`` stays
     until the new one is renamed over it, last, so a page that is served from the directory
@@ -947,11 +956,16 @@ def pack_session(
     for item in plan.runs:
         if item.reason is not None:
             reasons[item.run] = item.reason
-        elif item.run not in given:
+            continue
+        started = time.perf_counter()
+        kept = None
+        if keep is not None and not force and item.run in keep:
+            kept = _kept_pack(session_dir, item.run, config)
+        if kept is None and item.run not in given:
             reasons[item.run] = PACK_FAILURE
         else:
-            started = time.perf_counter()
-            kept = None if force else current_pack(session_dir, given[item.run], config)
+            if kept is None and keep is None and not force:
+                kept = current_pack(session_dir, given[item.run], config)
             try:
                 packs[item.run] = (
                     kept if kept is not None else pack_run(session_dir, given[item.run], config)
@@ -1066,6 +1080,20 @@ def _remove_unlisted(session_dir: Path, packed: set[str], grid_keys: set[str]) -
     for entry in grids:
         if re.fullmatch(r"[0-9a-f]{12}", entry.name) and entry.name not in grid_keys:
             shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _kept_pack(session_dir: Path, run: str, config: EpiConfig) -> PackInfo | None:
+    """The pack of ``run`` as ``pack.json`` holds it, when the catalog says it is current
+    (``pack_session(..., keep=...)``): whole on disk by directory listings, of this session
+    and of this config hash. Its inputs are not hashed; the catalog's input signature stands
+    for them. None otherwise, and the run is packed."""
+    session_dir = Path(session_dir)
+    if not pack_on_disk(session_dir, run):
+        return None
+    info = read_pack(session_dir, run)
+    if info is None or info.session != session_dir.name or info.config_hash != config.pack_hash():
+        return None
+    return info
 
 
 def _whole(session_dir: Path, info: PackInfo) -> bool:

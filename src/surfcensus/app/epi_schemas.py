@@ -13,14 +13,17 @@ within a session, the packed runs of :attr:`EpiSessionOut.runs` in order; ``firs
 index of a run's first volume within its session. A session names its media URL, so that the
 same page is served from a run directory in step 2 with only the URLs changing.
 
-This module needs pydantic, ``func.model`` and ``app.schemas`` (for ``HealthOut``).
+In a run directory (step 2) the main app serves the same page for each participant of the
+run and an index of them (:class:`EpiIndexOut`), so ``app.schemas.ROUTES`` names these shapes.
+
+This module needs pydantic, ``func.model`` and ``records``, and nothing of ``app/``: it is
+imported by ``app.schemas``.
 """
 
 from __future__ import annotations
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from surfcensus.app.schemas import HealthOut
 from surfcensus.func.model import CorrectionsInfo, FrameInfo
 from surfcensus.records import AffineChoice, AnchorRule
 
@@ -163,13 +166,56 @@ class EpiStreamOut(_Shape):
     sessions: tuple[EpiSessionOut, ...]
 
 
-EPI_ROUTES: tuple[tuple[str, str, type[BaseModel] | None], ...] = (
-    ("GET", "/", None),
-    ("GET", "/epi", None),
-    ("GET", "/api/epi/stream", EpiStreamOut),
-    ("GET", "/epi-media/{session_uid}/{path}", None),
-    ("GET", "/static/{path}", None),
-    ("GET", "/healthz", HealthOut),
-)
-"""Every route of the pack-only server, and the shape it answers with (None: a page or a
-file)."""
+# --- the index of a run directory (step 2) -------------------------------------------------
+
+
+class EpiIndexSessionOut(_Shape):
+    """A session of a participant in the index: what the catalog says of its runs, and
+    whether the page shows it now (its ``session.json`` is in the run directory)."""
+
+    session_uid: str
+    label: str
+    """The ``ses-`` label without ``ses-``; empty for a participant without sessions."""
+    n_runs: int = Field(ge=0)
+    """The runs listed (present), packable or not."""
+    n_packable: int = Field(ge=0)
+    """Those that the pack phase makes a pack of (packable and selected)."""
+    n_packed: int = Field(ge=0)
+    n_pending: int = Field(ge=0)
+    """Packable runs with no pack of the present settings yet, done or failed."""
+    n_failed: int = Field(ge=0)
+    n_flagged: int = Field(ge=0)
+    shown: bool
+    """Whether the stream of the page holds this session now."""
+
+
+class EpiParticipantOut(_Shape):
+    """A participant of the run in ``GET /api/epi``, with the link to its stream."""
+
+    participant_uid: str
+    label: str | None
+    """The BIDS participant label in a local run; None otherwise."""
+    subject_uids: tuple[str, ...]
+    """The FreeSurfer subjects of its sessions in the surface catalog, sorted."""
+    n_sessions: int = Field(ge=0)
+    n_runs: int = Field(ge=0)
+    n_packable: int = Field(ge=0)
+    n_packed: int = Field(ge=0)
+    n_pending: int = Field(ge=0)
+    n_failed: int = Field(ge=0)
+    n_flagged: int = Field(ge=0)
+    can_open: bool
+    """Whether its stream shows a packed run now; the link is offered all the same."""
+    url: str
+    """``/epi/<participant_uid>``."""
+    sessions: tuple[EpiIndexSessionOut, ...]
+    """In stream order."""
+
+
+class EpiIndexOut(_Shape):
+    """``GET /api/epi``: the participants of the run with functional data, by label."""
+
+    participants: tuple[EpiParticipantOut, ...]
+    n_pending: int = Field(ge=0)
+    """Runs of the whole run that wait for their pack: the page says that packs are still
+    being made, and asks again."""

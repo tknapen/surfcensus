@@ -70,6 +70,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import surfcensus
 from surfcensus.app import schemas
 from surfcensus.app.db import get_or_create_rater, open_app_db, store_submission
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiIndexSessionOut, EpiParticipantOut
 from surfcensus.app.events import record_setting, store_events
 from surfcensus.app.finalize import record_single, sync_unratable
 from surfcensus.app.marks import MarkError, VertexIndex, check_snap_radius, resolve_mark
@@ -90,7 +91,7 @@ from surfcensus.app.queue import (
 )
 from surfcensus.app.schemas import AppMode
 from surfcensus.calibration import CalibrationSet, load_calibration, validate_calibration
-from surfcensus.config import ConfigError, load_config
+from surfcensus.config import ConfigError, epi_settings, load_config
 from surfcensus.export.tables import frame_csv, marks_frame, ratings_frame, subjects_frame
 from surfcensus.log import get_logger
 from surfcensus.privacy import scrub
@@ -105,6 +106,7 @@ from surfcensus.store import (
     MEDIA_DIR,
     PublicCatalog,
     clusters_with_native,
+    epi_participant_dir,
     media_dir,
     queue_scores,
 )
@@ -128,7 +130,10 @@ PAGES: dict[str, str] = {"/": "rate.html", "/review": "review.html"}
 """Route -> template. A page is rendered with ``static`` (:data:`STATIC_URL`, the prefix of
 every script and stylesheet it loads), ``version`` (the package version, which a page
 appends to those URLs as ``?v=``) and ``mode``, and with nothing about a subject:
-everything else arrives through the API."""
+everything else arrives through the API. The EPI pages are not among them:
+:meth:`_App.epi_page` renders the index (``epi_index.html``) with the address of its API, and
+the page of a participant's stream (``epi.html``) with the address of the stream, its links
+and how often it asks again."""
 
 MEDIA_CACHE = "private, max-age=31536000, immutable"
 """For a file of a render that was asked for with ``?v=<render_key>`` of the render the
@@ -152,12 +157,29 @@ _SETTINGS = ("blind", "require_marks", "mark_max_dist_mm")
 _CLOSED_PAGE = (
     '<!doctype html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n'
     '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
-    "<title>surfcensus: review</title>\n"
+    "<title>surfcensus: {title}</title>\n"
     '<link rel="icon" href="data:,">\n<link rel="stylesheet" href="{static}/app.css">\n'
     '</head>\n<body>\n<main class="review">\n<p class="message" role="status">{message}</p>\n'
     '<p><a href="/">Back to the rating screen</a></p>\n</main>\n</body>\n</html>\n'
 )
 _INT64 = 2**63
+_NO_ROUTE = "there is no such route"
+_CLOSED = {
+    "review": "you still have subjects to rate; the review opens when none is left",
+    "epi": "you still have subjects to rate; the EPI movies open when none is left",
+}
+EPI_INDEX_URL = "/epi"
+EPI_API = "/api/epi"
+EPI_MEDIA_URL = "/epi-media"
+EPI_POLL_S = 5
+"""How often, in seconds, the EPI pages of a participant whose packs are still being made
+ask the server again (the stream grows behind the app)."""
+EPI_MEMORY_MIB = 512
+"""The decoded-chunk limit the EPI page of a run holds for a whole stream (that of
+``surfcensus epi-session --serve``)."""
+_EPI_PARTICIPANTS_S = 1.0
+"""How long the participants of the catalog are taken as known between two requests (the
+files of a pack are asked for many at a time)."""
 
 _Model = TypeVar("_Model", bound=BaseModel)
 
@@ -494,8 +516,13 @@ class _App:
         self._synced: object = None
         self._lock = threading.Lock()
         self._closed = False
+        self._packs: dict[str, Any] = {}
+        self._epi_participants: tuple[float, pd.DataFrame] | None = None
 
         self.public = PublicCatalog.open(self.run_dir)
+        # the EPI pages: a local run whose EPI interface is on (a census run has no EPI
+        # phases, and its routes answer as routes that do not exist)
+        self.epi_on = self.public.mode() == "local" and epi_settings(self.config).enabled
         self.engine: Engine | None = None
         try:
             install_protocol(self.run_dir)
@@ -679,16 +706,25 @@ class _App:
         applies = self.mode == "team" or self.config.app.blind or n_raters > 1
         return applies and has_work_left(session, rater, plan)
 
-    def gate(self) -> None:
+    def gate(self, what: str = "review") -> None:
+        """403 for an unblinded route while it is closed to the rater (:meth:`closed_to`);
+        ``what`` names the screens in the refusal."""
         plan = self.plan()
         with self.session() as (session, rater):
             closed = self.closed_to(session, rater, plan)
         if closed:
-            raise _Refused(
-                403,
-                "request",
-                "you still have subjects to rate; the review opens when none is left",
-            )
+            raise _Refused(403, "request", _CLOSED[what])
+
+    def epi_gate(self) -> None:
+        """:meth:`gate` for the EPI routes, which a page asks many files of: the queue is
+        looked at only where the rule can close the routes (a blind run, or several raters)."""
+        with self.session() as (session, rater):
+            n_raters = session.exec(select(func.count()).select_from(Rater)).one()
+            if not (self.config.app.blind or n_raters > 1):
+                return
+            closed = has_work_left(session, rater, self.plan())
+        if closed:
+            raise _Refused(403, "request", _CLOSED["epi"])
 
     # --- shapes ---------------------------------------------------------------------------------
 
@@ -825,6 +861,7 @@ class _App:
         plan = self.plan()
         with self.session() as (session, rater):
             examples = self.examples(session, plan)
+            offered = self.epi_offered() and not self.closed_to(session, rater, plan)
             body = schemas.SessionOut(
                 mode=self.mode,
                 rater=schemas.RaterOut.model_validate(
@@ -838,6 +875,7 @@ class _App:
                     mark_show_mm=self.config.app.mark_show_mm, blind=self.config.app.blind
                 ),
                 examples=examples,
+                epi_url=EPI_INDEX_URL if offered else None,
             )
         return _json(body)
 
@@ -1173,19 +1211,29 @@ class _App:
         that asked for the page itself (``to_a_reader``) gets the reason as a page with a
         way back, not as JSON."""
         if route == "/review":
-            try:
-                self.gate()
-            except _Refused as refused:
-                if not to_a_reader:
-                    raise
-                said = " ".join(message for _, message in refused.problems)
-                text = _CLOSED_PAGE.format(static=STATIC_URL, message=html.escape(said))
-                return HTMLResponse(
-                    text, status_code=refused.status, headers={"Cache-Control": NO_STORE}
-                )
+            closed = self._closed_page("review", self.gate, to_a_reader)
+            if closed is not None:
+                return closed
         template = self.pages.get_template(PAGES[route])
         text = template.render(static=STATIC_URL, version=self.version, mode=self.mode)
         return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
+
+    def _closed_page(
+        self, title: str, gate: Callable[[], None], to_a_reader: bool
+    ) -> Response | None:
+        """None when ``gate`` lets the request through; the refusal as a page for a browser
+        that asked for a page; the refusal raised (an ``ErrorsOut``) otherwise."""
+        try:
+            gate()
+        except _Refused as refused:
+            if not to_a_reader:
+                raise
+            said = " ".join(message for _, message in refused.problems)
+            text = _CLOSED_PAGE.format(static=STATIC_URL, title=title, message=html.escape(said))
+            return HTMLResponse(
+                text, status_code=refused.status, headers={"Cache-Control": NO_STORE}
+            )
+        return None
 
     def static(self, path: str) -> Response:
         missing = _Refused(404, "path", "there is no such file")
@@ -1380,6 +1428,199 @@ class _App:
             },
         )
 
+    # --- the EPI pages (step 2 of docs/epi_interface.md) -----------------------------------------
+
+    def epi_offered(self) -> bool:
+        """Whether the run has EPI pages at all: a local run whose EPI interface is on and
+        whose catalog has a functional source with a present participant."""
+        return self.epi_on and self.public.has_func()
+
+    def epi_available(self) -> None:
+        """A route of the EPI pages on a run without them answers as a route that does not
+        exist, as it did before step 2."""
+        if not self.epi_offered():
+            raise _Refused(404, "request", _NO_ROUTE)
+
+    def epi_participants(self) -> pd.DataFrame:
+        """The present participants of the catalog, read again after a second."""
+        now = time.monotonic()
+        cached = self._epi_participants
+        if cached is not None and now - cached[0] < _EPI_PARTICIPANTS_S:
+            return cached[1]
+        frame = self.public.func_participants()
+        frame = frame[[_true(v) for v in frame["present"]]] if len(frame) else frame
+        self._epi_participants = (now, frame)
+        return frame
+
+    def epi_participant(self, participant_uid: str) -> dict[str, Any]:
+        """The catalog row of a present participant; 404 for anything else."""
+        missing = _Refused(404, "participant_uid", "there is no such participant")
+        if _UID.fullmatch(participant_uid) is None:
+            raise missing
+        frame = self.epi_participants()
+        rows = frame[frame["participant_uid"] == participant_uid]
+        if not len(rows):
+            raise missing
+        return {name: _plain(value) for name, value in rows.iloc[0].items()}
+
+    def packs_of(self, participant_uid: str) -> Any:
+        """``app.epi.Packs`` on ``epi/<participant_uid>/`` of the run, with the media URLs of
+        this app. Kept per participant, for the files it has parsed."""
+        from surfcensus.app.epi import Packs  # app.epi imports this module
+
+        with self._lock:
+            packs = self._packs.get(participant_uid)
+            if packs is None:
+                packs = Packs(
+                    epi_participant_dir(self.run_dir, participant_uid),
+                    memory_mib=EPI_MEMORY_MIB,
+                    media_url=f"{EPI_MEDIA_URL}/{participant_uid}",
+                )
+                self._packs[participant_uid] = packs
+        return packs
+
+    def epi_index(self) -> EpiIndexOut:
+        """``EpiIndexOut`` from the catalog (what is listed, packed, waiting, failed,
+        flagged) and the run directory (what the stream of each participant shows now)."""
+        participants = self.epi_participants()
+        sessions = self.public.func_sessions()
+        runs = self.public.func_runs()
+        packs = self.public.packs()
+        pack_hash = epi_settings(self.config).pack_hash()
+        state: dict[str, str] = {}
+        for row in _records(packs):
+            if row.get("config_hash") == pack_hash and row.get("status") in ("done", "failed"):
+                state[str(row["run_uid"])] = str(row["status"])
+        runs_of: dict[str, list[dict[str, Any]]] = {}
+        for row in _records(runs):
+            if _true(row.get("present")):
+                runs_of.setdefault(str(row["session_uid"]), []).append(row)
+        sessions_of: dict[str, list[dict[str, Any]]] = {}
+        for row in _records(sessions):
+            if _true(row.get("present")):
+                sessions_of.setdefault(str(row["participant_uid"]), []).append(row)
+        out = []
+        local = self.public.mode() == "local"
+        for row in _records(participants):
+            uid = str(row["participant_uid"])
+            packs_dir = self.packs_of(uid)
+            shown = set(packs_dir.shown_sessions())
+            own = sorted(
+                sessions_of.get(uid, []),
+                key=lambda s: (s.get("stream_order") or 0, str(s["session_uid"])),
+            )
+            listed = []
+            for session_row in own:
+                session_uid = str(session_row["session_uid"])
+                counts = _epi_counts(runs_of.get(session_uid, []), state)
+                listed.append(
+                    EpiIndexSessionOut(
+                        session_uid=session_uid,
+                        label=str(session_row.get("session_label") or ""),
+                        shown=session_uid in shown,
+                        **counts,
+                    )
+                )
+            totals = {
+                name: sum(getattr(s, name) for s in listed)
+                for name in ("n_runs", "n_packable", "n_packed", "n_pending", "n_failed")
+            }
+            label = row.get("participant") if local else None
+            out.append(
+                EpiParticipantOut(
+                    participant_uid=uid,
+                    label=None if label is None else str(label),
+                    subject_uids=tuple(
+                        sorted({str(s["subject_uid"]) for s in own if s.get("subject_uid")})
+                    ),
+                    n_sessions=len(listed),
+                    n_flagged=sum(s.n_flagged for s in listed),
+                    can_open=packs_dir.has_packed_run(),
+                    url=f"{EPI_INDEX_URL}/{uid}",
+                    sessions=tuple(listed),
+                    **totals,
+                )
+            )
+        out.sort(key=lambda p: (p.label or "", p.participant_uid))
+        return EpiIndexOut(participants=tuple(out), n_pending=sum(p.n_pending for p in out))
+
+    def get_epi_index(self) -> Response:
+        self.epi_available()
+        self.epi_gate()
+        return _json(self.epi_index())
+
+    def epi_waiting(self, participant_uid: str) -> bool:
+        """Whether packs of the participant are still to be made: a packable run without a
+        pack of the present settings, or a session that ``stream.json`` lists and the stream
+        does not hold yet."""
+        if self.packs_of(participant_uid).waiting() > 0:
+            return True
+        index = self.epi_index()
+        return any(
+            p.n_pending > 0 for p in index.participants if p.participant_uid == participant_uid
+        )
+
+    def epi_page(self, participant_uid: str | None, to_a_reader: bool) -> Response:
+        """The index (``participant_uid`` None) or the EPI page of one participant's stream.
+        Closed as ``/review`` is; a browser that asks for a closed page gets the reason as a
+        page with a way back."""
+        self.epi_available()
+        closed = self._closed_page("EPI movies", self.epi_gate, to_a_reader)
+        if closed is not None:
+            return closed
+        if participant_uid is None:
+            text = self.pages.get_template("epi_index.html").render(
+                static=STATIC_URL, version=self.version, mode=self.mode, api=EPI_API, rate_url="/"
+            )
+            return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
+        self.epi_participant(participant_uid)
+        text = self.pages.get_template("epi.html").render(
+            static=STATIC_URL,
+            version=self.version,
+            mode=self.mode,
+            api=f"{EPI_API}/{participant_uid}",
+            index_url=EPI_INDEX_URL,
+            rate_url="/",
+            poll_s=EPI_POLL_S if self.epi_waiting(participant_uid) else 0,
+        )
+        return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
+
+    def get_epi_stream(self, participant_uid: str) -> Response:
+        """``EpiStreamOut`` of one participant: the sessions of its ``stream.json`` whose
+        ``session.json`` is there, or none while nothing is packed yet."""
+        from surfcensus.app.epi import _Missing  # app.epi imports this module
+
+        self.epi_available()
+        self.epi_gate()
+        row = self.epi_participant(participant_uid)
+        packs = self.packs_of(participant_uid)
+        try:
+            body = packs.shape()
+        except _Missing:
+            label = row.get("participant") or participant_uid
+            body = packs.empty_shape(str(label), str(row.get("session_order") or "session label"))
+        return _json(body)
+
+    def epi_media(
+        self, participant_uid: str, session_uid: str, path: str, version: str | None
+    ) -> Response:
+        """A file of a pack of the participant, by the rules of ``app.epi.Packs.media``: a
+        name of the patterns that its session lists, inside the session's directory."""
+        from surfcensus.app.epi import _Missing  # app.epi imports this module
+
+        self.epi_available()
+        self.epi_gate()
+        self.epi_participant(participant_uid)
+        try:
+            target, current = self.packs_of(participant_uid).media(session_uid, path, version)
+        except _Missing:
+            raise _Refused(404, "path", "there is no such file") from None
+        return FileResponse(
+            target,
+            media_type="application/octet-stream",
+            headers={"Cache-Control": MEDIA_CACHE if current else NO_CACHE},
+        )
+
     # --- every route goes through here ----------------------------------------------------------
 
     def answer(
@@ -1434,6 +1675,34 @@ def _records(frame: pd.DataFrame) -> list[dict[str, Any]]:
         {name: _plain(value) for name, value in zip(names, values, strict=True)}
         for values in frame.itertuples(index=False, name=None)
     ]
+
+
+def _true(value: object) -> bool:
+    """A flag of a catalog frame: missing reads as false."""
+    if value is None or value is pd.NA:
+        return False
+    try:
+        if pd.isna(value):  # type: ignore[arg-type]
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
+def _epi_counts(runs: Sequence[Mapping[str, Any]], state: Mapping[str, str]) -> dict[str, int]:
+    """The counts of :class:`EpiIndexSessionOut` of the present runs of a session; ``state``
+    is the status of the pack of each run that has one under the present settings."""
+    packable = [r for r in runs if _true(r.get("packable")) and _true(r.get("selected"))]
+    packed = sum(state.get(str(r["run_uid"])) == "done" for r in packable)
+    failed = sum(state.get(str(r["run_uid"])) == "failed" for r in packable)
+    return {
+        "n_runs": len(runs),
+        "n_packable": len(packable),
+        "n_packed": packed,
+        "n_pending": len(packable) - packed - failed,
+        "n_failed": failed,
+        "n_flagged": sum(_true(r.get("flagged")) for r in runs),
+    }
 
 
 def _review_rating(row: Mapping[str, Any]) -> schemas.ReviewRating:
@@ -1610,6 +1879,37 @@ def create_app(
     @app.get("/api/export")
     def export() -> Response:
         return state.answer(state.get_export, unblinded=True)
+
+    # the EPI pages of a run directory: unblinded, and routes that do not exist (404) where
+    # the run has none
+    @app.get(EPI_INDEX_URL)
+    def epi_index_page(request: Request) -> Response:
+        reader = "text/html" in request.headers.get("accept", "")
+        return state.answer(state.epi_page, None, reader, unblinded=True)
+
+    @app.get(EPI_API)
+    def epi_index() -> Response:
+        return state.answer(state.get_epi_index, unblinded=True)
+
+    @app.get(EPI_INDEX_URL + "/{participant_uid}")
+    def epi_page(participant_uid: str, request: Request) -> Response:
+        reader = "text/html" in request.headers.get("accept", "")
+        return state.answer(state.epi_page, participant_uid, reader, unblinded=True)
+
+    @app.get(EPI_API + "/{participant_uid}")
+    def epi_stream(participant_uid: str) -> Response:
+        return state.answer(state.get_epi_stream, participant_uid, unblinded=True)
+
+    @app.get(EPI_MEDIA_URL + "/{participant_uid}/{session_uid}/{path:path}")
+    def epi_media(participant_uid: str, session_uid: str, path: str, request: Request) -> Response:
+        return state.answer(
+            state.epi_media,
+            participant_uid,
+            session_uid,
+            path,
+            request.query_params.get("v"),
+            unblinded=True,
+        )
 
     return app
 

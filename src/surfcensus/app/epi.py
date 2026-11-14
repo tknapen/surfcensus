@@ -101,6 +101,11 @@ _ID = re.compile(ID_PATTERN)
 _Info = TypeVar("_Info", SessionInfo, PackInfo, TracesInfo, StreamInfo)
 
 
+PACK_ONLY_PAGE: dict[str, object] = {"index_url": None, "rate_url": None, "poll_s": 0}
+"""What ``epi.html`` gets beside ``api`` from the pack-only server: no link to an index or a
+rating screen, and no asking again for a stream that grows (a ``--out`` is written whole)."""
+
+
 class _Missing(Exception):
     """A request that is answered with 404."""
 
@@ -126,15 +131,45 @@ def _grid_files(grid: GridInfo) -> list[tuple[str, str]]:
     return [(grid.contours[plane].file, grid.contours[plane].sha256) for plane in PLANES]
 
 
+EPI_ROUTES: tuple[tuple[str, str, type[BaseModel] | None], ...] = (
+    ("GET", "/", None),
+    ("GET", "/epi", None),
+    ("GET", API_STREAM, shapes.EpiStreamOut),
+    ("GET", MEDIA_URL + "/{session_uid}/{path}", None),
+    ("GET", STATIC_URL + "/{path}", None),
+    ("GET", "/healthz", HealthOut),
+)
+"""Every route of the pack-only server, and the shape it answers with (None: a page or a
+file). The routes of the EPI pages in a run directory are in ``app.schemas.ROUTES``."""
+
+
 class Packs:
     """A directory of packs, read as it is on each request. Parsed files are kept, keyed by
-    their path, size and modification time, so a file that is written again is read again."""
+    their path, size and modification time, so a file that is written again is read again.
 
-    def __init__(self, out_dir: Path | str, *, memory_mib: int = DEFAULT_MEMORY_MIB) -> None:
+    ``media_url`` is the prefix of the media URLs of the answer: a session's files are under
+    ``<media_url>/<session_uid>/``. The pack-only server uses :data:`MEDIA_URL`; the app of a
+    run directory ``/epi-media/<participant_uid>``, so that the same page plays both with
+    only its URLs changing.
+
+    In a run directory ``stream.json`` lists the sessions packed or not yet (the pack phase
+    writes it after every batch); :meth:`shape` holds those whose ``session.json`` is there,
+    so that the stream of an open page grows as packs are made behind the app."""
+
+    def __init__(
+        self,
+        out_dir: Path | str,
+        *,
+        memory_mib: int = DEFAULT_MEMORY_MIB,
+        media_url: str = MEDIA_URL,
+    ) -> None:
         self.out_dir = Path(out_dir)
         if memory_mib < 1:
             raise ConfigError("invalid", f"a memory limit of {memory_mib} MiB is too small")
+        if not media_url.startswith("/") or media_url.endswith("/"):
+            raise ValueError(f"a media URL starts with / and does not end with one: {media_url!r}")
         self.memory_mib = int(memory_mib)
+        self.media_url = media_url
         self._cache: dict[tuple[str, type], tuple[tuple[int, int], Any]] = {}
         self._lock = threading.Lock()
 
@@ -198,6 +233,31 @@ class Packs:
                 return None
         return info
 
+    def shown_sessions(self) -> list[str]:
+        """The sessions of ``stream.json`` that the stream holds now, in stream order: those
+        whose ``session.json`` is there and reads. Empty without ``stream.json``."""
+        stream = self.stream_info()
+        if stream is None:
+            return []
+        return [s for s in stream.sessions if self.session(s) is not None]
+
+    def waiting(self) -> int:
+        """How many sessions ``stream.json`` lists that the stream does not hold yet."""
+        stream = self.stream_info()
+        if stream is None:
+            return 0
+        return len(stream.sessions) - len(self.shown_sessions())
+
+    def has_packed_run(self) -> bool:
+        """Whether a session of the stream holds a run whose pack is whole on disk."""
+        for session_id in self.shown_sessions():
+            session = self.session(session_id)
+            assert session is not None
+            for run in session.runs:
+                if run.reason is None and self.pack(session_id, run.run) is not None:
+                    return True
+        return False
+
     def traces(self, session_id: str, run: str) -> TracesInfo | None:
         return self._read(self.out_dir / session_id / run / TRACES_JSON, TracesInfo)
 
@@ -208,6 +268,22 @@ class Packs:
         stream = self.stream_info()
         if stream is None:
             raise _Missing(f"{STREAM_JSON} is not there or does not read as one of this version")
+        return self._shape(stream)
+
+    def empty_shape(self, label: str, order: str) -> shapes.EpiStreamOut:
+        """The answer for a stream that has no ``stream.json`` yet (a participant of a run
+        whose packs are still to be made): no session."""
+        return shapes.EpiStreamOut(
+            label=label,
+            order=order,
+            reading=READING,
+            memory_mib=self.memory_mib,
+            rules=dict(RULES),
+            contour_unit=CONTOUR_UNIT,
+            sessions=(),
+        )
+
+    def _shape(self, stream: StreamInfo) -> shapes.EpiStreamOut:
         sessions = []
         rules: dict[str, str] = dict(RULES)
         for session_id in stream.sessions:
@@ -271,7 +347,7 @@ class Packs:
         return shapes.EpiSessionOut(
             session_uid=info.session,
             label=info.label,
-            media_url=f"{MEDIA_URL}/{info.session}/",
+            media_url=f"{self.media_url}/{info.session}/",
             fd_threshold_mm=info.fd_threshold_mm,
             registration=registration,
             grids=grids,
@@ -369,7 +445,7 @@ def create_epi_app(
     allowed_hosts: tuple[str, ...] | None = None,
 ) -> FastAPI:
     """The pack-only app on ``out_dir`` (a directory with ``stream.json``). It serves the
-    routes of :data:`app.epi_schemas.EPI_ROUTES` and no other. ``memory_mib`` is the limit of
+    routes of :data:`EPI_ROUTES` and no other. ``memory_mib`` is the limit of
     decoded chunks the page holds for the whole stream. Raises ``ConfigError("missing", ...)``
     when ``out_dir`` has no ``stream.json`` of this version."""
     packs = Packs(out_dir, memory_mib=memory_mib)
@@ -393,7 +469,7 @@ def create_epi_app(
 
     def page() -> Response:
         text = pages.get_template(EPI_PAGE).render(
-            static=STATIC_URL, version=version, mode="local", api=API_STREAM
+            static=STATIC_URL, version=version, mode="local", api=API_STREAM, **PACK_ONLY_PAGE
         )
         return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
 

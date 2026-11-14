@@ -81,7 +81,7 @@ let stalled = false;
 let segOnScreen = -1;
 let allGrids = [];
 let errorShown = null; // the error the status line says, until a later load succeeds
-let noticeKind = ''; // what #notice says: '' (nothing), 'waiting' (packs being made) or 'stale'
+let noticeKind = ''; // what #notice says: '' (nothing), 'waiting' (packs being made), 'stale' or 'grown'
 let helpReturn = null; // the element that had the focus when the help was opened
 const contoursOf = new Map(); // grid key -> [three decoded files] while loading or loaded; null without contours
 const sliceBuffers = [];
@@ -588,9 +588,7 @@ function recovered() {
   }
 }
 
-function tokensOf(s) {
-  return JSON.stringify(s.sessions.map((x) => [x.session_uid, x.grids.map((g) => g.token), x.runs.map((r) => (r.pack ? r.pack.token : null))]));
-}
+const GROWN = 'More of this stream has been packed since the page was opened. What is on screen plays on; reload the page to play the rest.';
 
 let checking = null;
 
@@ -606,10 +604,15 @@ function checkStream() {
           'waiting',
           'The packs are being made again: the server has no stream to give now. The page goes on when the files are back; reload it when they are made, to see what was made.',
         );
-      } else if (response.ok && tokensOf(await response.json()) !== tokensOf(stream)) {
-        store.stop();
-        state.playing = false;
-        showNotice('stale', 'The packs were made again since this page was opened: the files on disk are no longer those this page lists, so it has stopped. Reload the page to see them.');
+      } else if (response.ok) {
+        const verdict = compareStreams(stream, await response.json());
+        if (verdict === 'changed') {
+          store.stop();
+          state.playing = false;
+          showNotice('stale', 'The packs were made again since this page was opened: the files on disk are no longer those this page lists, so it has stopped. Reload the page to see them.');
+        } else if (verdict === 'grown' && noticeKind !== 'grown') {
+          showNotice('grown', GROWN);
+        }
       }
     } catch {
       // the server is not there: the status line says the error
@@ -617,6 +620,64 @@ function checkStream() {
       checking = null;
     }
   })();
+}
+
+// In a run directory the packs are made behind the app, and the stream of a participant grows
+// while its page is open: the server lists the sessions whose session.json is there. The page
+// is told how often to ask (data-poll, seconds; 0 from the pack-only server, whose --out is
+// written whole). A stream that only grew (a session or a packed run more, every file the page
+// holds as it was) is said in the notice, and what is on screen plays on; one whose files
+// changed is the stale case of checkStream.
+function compareStreams(old, now) {
+  const before = new Map(old.sessions.map((s) => [s.session_uid, s]));
+  let grew = false;
+  const after = new Map(now.sessions.map((s) => [s.session_uid, s]));
+  for (const [uid, s] of before) {
+    const n = after.get(uid);
+    if (!n) return 'changed';
+    const grids = new Map(n.grids.map((g) => [g.grid_key, g.token]));
+    for (const g of s.grids) if (grids.get(g.grid_key) !== g.token) return 'changed';
+    const runs = new Map(n.runs.map((r) => [r.run_uid, r.pack ? r.pack.token : null]));
+    for (const r of s.runs) {
+      const was = r.pack ? r.pack.token : null;
+      if (!runs.has(r.run_uid)) return 'changed';
+      const is = runs.get(r.run_uid);
+      if (was !== null && is !== was) return 'changed';
+      if (was === null && is !== null) grew = true;
+    }
+    if (n.runs.length > s.runs.length) grew = true;
+  }
+  if (now.sessions.length > old.sessions.length) grew = true;
+  return grew ? 'grown' : 'same';
+}
+
+function watchGrowth(api, seconds) {
+  if (!(seconds > 0)) return;
+  const ask = async () => {
+    if (noticeKind === 'stale' || noticeKind === 'grown') return;
+    try {
+      const response = await fetch(api, { headers: { Accept: 'application/json' } });
+      if (response.ok) {
+        const verdict = compareStreams(stream, await response.json());
+        if (verdict === 'grown' && timeline.total === 0) {
+          window.location.reload(); // nothing was on screen: nothing to keep
+          return;
+        }
+        if (verdict === 'grown') {
+          showNotice('grown', GROWN);
+          return;
+        }
+        if (verdict === 'changed') {
+          checkStream();
+          return;
+        }
+      }
+    } catch {
+      // the server is not there now: ask again later
+    }
+    setTimeout(ask, seconds * 1000);
+  };
+  setTimeout(ask, seconds * 1000);
 }
 
 function showNotice(kind, text) {
@@ -1033,8 +1094,14 @@ async function start() {
   stream = await fetchJson(api);
   page.timing.stream = performance.now();
   timeline = buildTimeline(stream.sessions);
+  const pollS = Number(document.querySelector('main[data-api]').dataset.poll || 0);
+  watchGrowth(api, pollS);
   if (timeline.total === 0) {
-    $('status').textContent = 'No run of this subject is packed: there is nothing to show.';
+    $('status').textContent =
+      pollS > 0
+        ? 'No run of this participant is packed yet: the page opens by itself when the first one is.'
+        : 'No run of this subject is packed: there is nothing to show.';
+    if (stream.label) $('subject').textContent = stream.label;
     return;
   }
   allGrids = stream.sessions.flatMap((s) => s.grids);

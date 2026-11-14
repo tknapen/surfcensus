@@ -1685,3 +1685,59 @@ body.no-traces .epi #traces {
   padding: 3px 8px 3px 0;
   border-top: 1px solid var(--line);
 }
+
+/* the EPI page of a run directory: links to the index and to the rating screen, and the word
+   that packs are still being made; neither depends on the run on screen */
+.epi .epi-nav {
+  display: flex;
+  gap: 10px;
+  white-space: nowrap;
+}
+
+.epi .epi-packing {
+  color: var(--warn-line);
+  white-space: nowrap;
+}
+
+/* --- the index of the EPI movies of a run (epi_index.html) ---------------------------------- */
+
+.epi-index {
+  padding: var(--pad);
+  height: 100%;
+  overflow: auto;
+}
+
+.epi-index .tagline {
+  color: var(--muted);
+}
+
+.epi-index .tagline b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.epi-index .epi-index-wrap {
+  max-height: none;
+  margin: 8px 0;
+}
+
+.epi-index .subjects td {
+  white-space: normal;
+}
+
+.epi-index .subjects tbody tr {
+  cursor: default;
+}
+
+.epi-index .epi-not-yet {
+  color: var(--muted);
+}
+
+#index-packing {
+  color: var(--warn-line);
+}
+
+/* the link of the rating screen to the EPI movies: in the progress line, beside the review */
+.progress .epi-link {
+  margin-left: 12px;
+}

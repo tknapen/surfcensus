@@ -351,6 +351,34 @@ def fetch_line(
     return f"Fetch {them}{amount} with: {command}"
 
 
+def fetch_commands(files: Sequence[tuple[Path, int | None]]) -> list[tuple[str, int]]:
+    """Shell lines that fetch ``files`` (absolute paths of git-annex placeholders with the
+    sizes from their keys), one per repository that holds them, with the bytes each fetches
+    (0 when no key has a size): ``datalad -C <dataset> get <paths>`` in the innermost DataLad
+    dataset that holds a file, else ``git -C <repository> annex get <paths>`` in the
+    innermost git repository; paths relative to it. A raw BIDS dataset and its derivative
+    are often two DataLad datasets, so the functional runs of one participant can take two
+    lines. Files in no repository give no line. From the names alone (no file is opened);
+    in the order of the first file of each repository."""
+    groups: dict[tuple[Path, bool], list[tuple[Path, int | None]]] = {}
+    for path, size in files:
+        file = Path(os.path.abspath(path))
+        try:
+            found = _fetch_root(file, None)
+        except OSError:
+            continue
+        if found is None or not file.is_relative_to(found[0]):
+            continue
+        groups.setdefault(found, []).append((file, size))
+    out = []
+    for (root, datalad), items in groups.items():
+        paths = " ".join(shlex.quote(f.relative_to(root).as_posix()) for f, _ in items)
+        tool = "datalad -C {root} get" if datalad else "git -C {root} annex get"
+        total = sum(size for _, size in items if size is not None)
+        out.append((f"{tool.format(root=shlex.quote(str(root)))} {paths}", total))
+    return out
+
+
 _RENDERED_ROLES = (*RENDER_ROLES, FileRole.BRAINMASK)
 """The roles a render reads from a subject directory, without the template's spheres."""
 
@@ -458,6 +486,18 @@ def source_places(subjects_dir: Path | str) -> list[tuple[str, Path]]:
     return places
 
 
+def functional_places(subjects_dir: Path | str) -> list[tuple[str, Path]]:
+    """The derivative and the raw dataset that the functional side reads with the FreeSurfer
+    subjects of ``subjects_dir``, found by rule from it (``func.discover``, "Which folders are
+    found by rule"), as ``(what, directory)`` pairs, with what a link at their top level leads
+    to: an fMRIPrep output with functional runs that holds the subjects, and its raw BIDS
+    dataset. Empty when there is none. A run directory or an export there is refused like
+    one in the subjects directory (step 2 of the EPI interface; decision D35 extended)."""
+    from surfcensus.func.discover import places_of_subjects_dir
+
+    return places_of_subjects_dir(subjects_dir)
+
+
 def freesurfer_template_places(env: Mapping[str, str] = os.environ) -> list[tuple[str, Path]]:
     """``$FREESURFER_HOME/subjects/fsaverage`` as a place of :func:`place_holding`, when the
     variable is set: the template of a run may have been read from there."""
@@ -497,10 +537,14 @@ def refuse_in_sources(
     also: Iterable[tuple[str, Path]] = (),
 ) -> None:
     """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, a directory
-    that a local source reads (:func:`source_places` of each of ``subjects_dirs``) or one
-    of ``also``: sources are only read, so nothing the package writes goes there. ``what``
-    says which directory ``target`` is, for the message."""
-    places = [place for directory in subjects_dirs for place in source_places(directory)]
+    that a local source reads (:func:`source_places` and :func:`functional_places` of each
+    of ``subjects_dirs``) or one of ``also``: sources are only read, so nothing the package
+    writes goes there. ``what`` says which directory ``target`` is, for the message."""
+    places = [
+        place
+        for directory in subjects_dirs
+        for place in (*source_places(directory), *functional_places(directory))
+    ]
     found = place_holding(target, [*places, *also])
     if found is None:
         return
@@ -608,8 +652,13 @@ def refuse_run_in_sources(run_dir: Path | str, config: RunConfig) -> None:
     lies inside, a directory that one of its sources reads: a run that was moved into its
     own data is not written to. For the commands that open a run without building its
     sources (the rater app, ``finalize``, ``calibration freeze``)."""
+    from surfcensus.func.discover import stored_read_places
+
     refuse_in_sources(
-        run_dir, stored_subjects_dirs(config), what="run", also=freesurfer_template_places()
+        run_dir,
+        stored_subjects_dirs(config),
+        what="run",
+        also=[*freesurfer_template_places(), *stored_read_places(config)],
     )
 
 
@@ -1346,6 +1395,14 @@ def _list_files(directory: Path) -> tuple[dict[FileRole, FileRef], dict[FileRole
             variant=variant_name(role, path) if len(ROLE_CANDIDATES[role]) > 1 else None,
         )
     return files, unfetched
+
+
+def subject_file_refs(directory: Path | str) -> dict[FileRole, FileRef]:
+    """One :class:`FileRef` per role that a FreeSurfer subject directory has, from ``stat()``
+    alone, as the source lists them (a git-annex link without content is no file): for the
+    inventory hash of a functional session, which covers the FreeSurfer files of its
+    contours (``func.inventory.session_hash``). Raises ``OSError`` as the listing does."""
+    return _list_files(Path(directory))[0]
 
 
 def _check_unchanged(ref: FileRef, stat: os.stat_result) -> None:

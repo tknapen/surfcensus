@@ -33,6 +33,9 @@ from surfcensus.log import get_logger
 from surfcensus.sources.base import FileRole
 
 R = TypeVar("R")
+L = TypeVar("L")
+"""What a lease yields for a unit: the local paths of its files (``Files``) for the phases of
+the surfaces, a ``records.SessionWork`` for the pack phase of the EPI interface."""
 
 Files = dict[FileRole, Path]
 
@@ -183,9 +186,7 @@ class _Finished(Generic[R]):
     records: tuple[logging.LogRecord, ...]
 
 
-def _in_worker(
-    work: Callable[[str, Mapping[FileRole, Path]], R], unit: str, files: Files
-) -> _Finished[R]:
+def _in_worker(work: Callable[[str, L], R], unit: str, files: L) -> _Finished[R]:
     outcome: R | _Raised
     try:
         outcome = work(unit, files)
@@ -201,9 +202,7 @@ class _Workers(Generic[R]):
         self._processes = processes
         self._executor: ProcessPoolExecutor | None = None
 
-    def submit(
-        self, work: Callable[[str, Mapping[FileRole, Path]], R], unit: str, files: Files
-    ) -> Future[_Finished[R]]:
+    def submit(self, work: Callable[[str, L], R], unit: str, files: L) -> Future[_Finished[R]]:
         if self._executor is None:
             self._executor = ProcessPoolExecutor(
                 self._processes,
@@ -233,8 +232,8 @@ def _unwrap(finished: _Finished[R]) -> R | Exception:
 
 def _in_pool(
     workers: _Workers[R],
-    work: Callable[[str, Mapping[FileRole, Path]], R],
-    leased: Sequence[tuple[int, str, Files]],
+    work: Callable[[str, L], R],
+    leased: Sequence[tuple[int, str, L]],
     tick: Callable[[], None],
 ) -> dict[int, R | Exception]:
     """The outcome of ``work`` for each leased subject, keyed by its position in the batch."""
@@ -277,8 +276,8 @@ def _in_pool(
 
 
 def _in_process(
-    work: Callable[[str, Mapping[FileRole, Path]], R],
-    leased: Sequence[tuple[int, str, Files]],
+    work: Callable[[str, L], R],
+    leased: Sequence[tuple[int, str, L]],
     tick: Callable[[], None],
 ) -> dict[int, R | Exception]:
     outcomes: dict[int, R | Exception] = {}
@@ -293,8 +292,8 @@ def _in_process(
 
 def run_batches(
     units: Sequence[str],
-    lease: Callable[[str], AbstractContextManager[Mapping[FileRole, Path]]],
-    work: Callable[[str, Mapping[FileRole, Path]], R],
+    lease: Callable[[str], AbstractContextManager[L]],
+    work: Callable[[str, L], R],
     commit: Callable[[Sequence[tuple[str, R | BaseException]]], None],
     *,
     batch_subjects: int,
@@ -302,8 +301,10 @@ def run_batches(
     progress: str | None = None,
     stop: Callable[[], bool] | None = None,
 ) -> None:
-    """Per batch of ``units`` (pending ``subject_uid``s, in order): lease every subject, run
-    ``work`` on each, call ``commit`` once in the parent, release the leases.
+    """Per batch of ``units`` (pending ``subject_uid``s, in order; for the pack phase
+    ``session_uid``s): lease every subject, run ``work`` on each with what its lease yields
+    (the local paths of its files, or a ``records.SessionWork``), call ``commit`` once in the
+    parent, release the leases.
 
     ``commit`` receives one ``(unit, outcome)`` per subject of the batch, in the order of
     ``units``; an outcome is what ``work`` returned, or the exception that ``lease`` or
@@ -357,10 +358,10 @@ def run_batches(
             batch = units[start : start + batch_subjects]
             with ExitStack() as leases:
                 outcomes: dict[int, R | Exception] = {}
-                leased: list[tuple[int, str, Files]] = []
+                leased: list[tuple[int, str, L]] = []
                 for position, unit in enumerate(batch):
                     try:
-                        files = dict(leases.enter_context(lease(unit)))
+                        files = _held(leases.enter_context(lease(unit)))
                     except Exception as exc:
                         outcomes[position] = exc
                         tick()
@@ -376,6 +377,15 @@ def run_batches(
                         workers.stop()
                         raise
                 commit([(unit, outcomes[position]) for position, unit in enumerate(batch)])
+
+
+def _held(value: L) -> L:
+    """What a lease yields, as it is handed to ``work``: a mapping of files as a plain
+    ``dict`` (as before step 2 of the EPI interface; a mapping proxy would not pickle), any
+    other value as it is."""
+    if isinstance(value, Mapping):
+        return dict(value)
+    return value
 
 
 def _progress_bar(description: str | None, total: int, cleanup: ExitStack) -> Callable[[], None]:
