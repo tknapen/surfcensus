@@ -92,6 +92,7 @@ export class Views {
 
   // Sizes every panel for the space the views have. Returns the scale in px per mm.
   layout() {
+    this.overlayKey = null; // resizing a canvas clears it
     const n = this.groups.size || 1;
     const availW = this.root.clientWidth;
     const availH = Math.max(this.handlers.availableHeight(), 200);
@@ -127,7 +128,12 @@ export class Views {
 
   // The layer over the voxels: contours of the slices on screen and the crosshair of the other
   // two planes. contours: per plane the decoded file, or null.
+  // It changes only with the slices and the switches, not with the volume, so it is drawn again
+  // only when one of those, the layout or the contours that are loaded have changed.
   overlay(slices, contours, showContours, showCrosshair, active) {
+    const key = [slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active].join('|');
+    if (key === this.overlayKey) return;
+    this.overlayKey = key;
     for (const group of this.groups.values()) {
       group.panels.forEach((panel, plane) => {
         const spec = SPEC[plane];
