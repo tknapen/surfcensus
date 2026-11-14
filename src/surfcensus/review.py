@@ -44,6 +44,7 @@ from surfcensus.sources.base import RENDER_ROLES, SourceError
 from surfcensus.sources.local import (
     LAYOUT_WORDS,
     LocalSource,
+    datalad_dataset_holding,
     dataset_holding,
     detect_layout,
     fetch_line,
@@ -104,7 +105,10 @@ def default_run_dir(path: Path | str) -> Path:
     ``<dataset>/../surfcensus-run``, never into it, whether ``path`` is the dataset or a
     folder inside it; a dataset, which may be a DataLad dataset, gets no files unless a run
     directory in it is asked for. A run of this data that an earlier version made inside
-    the dataset, beside the folder that was named, is still found and used. When the
+    the dataset, beside the folder that was named, is still found and used. The same holds
+    when the place beside ``path`` lies inside a DataLad dataset
+    (``sources.local.datalad_dataset_holding``, a directory with ``.git`` and ``.datalad``):
+    the run goes beside the outermost such dataset, which gets no untracked files. When the
     place beside the dataset cannot be written to, the run goes to ``./surfcensus-run``,
     and when the current directory lies inside the dataset the call is refused
     (``ConfigError("invalid", ...)``), since only ``run_dir`` can then say where.
@@ -122,6 +126,13 @@ def default_run_dir(path: Path | str) -> Path:
         if beside == inside or inside in beside.parents:
             beside = inside.parent
     dataset = dataset_holding(record, path)
+    datalad = datalad_dataset_holding(beside)
+    if datalad is not None:
+        # beside the path lies inside a DataLad dataset (a clone of an fMRIPrep output, say):
+        # the run goes beside the outermost one, as beside a BIDS dataset
+        datalad = datalad.resolve()
+        if dataset is None or datalad == dataset or datalad in dataset.parents:
+            dataset = datalad
     if dataset is None:
         candidate = beside / DEFAULT_RUN_DIR
         if (candidate / "config.yaml").is_file() or os.access(beside, os.W_OK | os.X_OK):
@@ -475,6 +486,19 @@ def rateable(run: Run) -> int:
     return done + pending
 
 
+def _fetch_said(run: Run, path: Path | str | None) -> bool:
+    """Whether :func:`_say_inventory` gave a command that fetches files of the run's
+    present subjects whose content is not there (git-annex)."""
+    subjects = run.public().subjects()
+    present = subjects[subjects["present"].to_numpy(dtype=bool)]
+    problems = {
+        str(row.subject_label): row.problem
+        for row in present.itertuples(index=False)
+        if is_unfetched_problem(row.problem)
+    }
+    return bool(problems) and fetch_line(run.config, problems, path) is not None
+
+
 def _render_first(run: Run, wanted: int, jobs: int) -> PhaseReport:
     """Render subjects in queue order until ``wanted`` renders of the selection are done or
     none is left to try; returns the last report. The incomplete subjects get their
@@ -669,7 +693,11 @@ def open_review(
         if failed:
             _say_failures(run, rendered, "not rendered")
         if done + pending == 0:
-            _say("No subject of this run can be rendered, so there is nothing to rate.")
+            line = "No subject of this run can be rendered, so there is nothing to rate."
+            if _fetch_said(run, path):
+                # the fetch line above is the remedy: say what comes after it
+                line += " Fetch the files as said above, then run the same command again."
+            _say(line)
             return run, None
         if not serve:
             return run, None

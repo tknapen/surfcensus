@@ -163,6 +163,18 @@ def _is_dataset(folder: Path) -> bool:
         return False
 
 
+def datalad_dataset_holding(path: Path | str) -> Path | None:
+    """The outermost DataLad dataset (a directory with ``.git`` and ``.datalad``) that is,
+    or holds, ``path``, made absolute without following links; None when there is none or
+    it cannot be told. A run directory is not made inside it unless it is asked for
+    (``review.default_run_dir``): untracked files would make the dataset dirty."""
+    found = None
+    for folder in _ancestors(Path(os.path.abspath(path))):
+        if _is_dataset(folder):
+            found = folder
+    return found
+
+
 def uninstalled_subdataset(folder: Path | str) -> Path | None:
     """The repository whose ``.gitmodules`` registers ``folder``, when ``folder`` is an
     empty directory: a subdataset (a git submodule) that is not installed, as a fresh

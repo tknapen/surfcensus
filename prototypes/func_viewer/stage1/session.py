@@ -282,16 +282,70 @@ def session_volume(
     return resample_voxels(vol, vox, grid_shape, order=order)
 
 
+def reference_of(raw_path):
+    """The BOLD-space reference image that fMRIPrep made of a raw run, when it lies beside it.
+
+    In the layout of DATA (raw/ and deriv/ side by side, as pipeline/fetch.py, session_fetch.py
+    and fetch_run.py write it) that is deriv/<stem>_boldref.nii.gz of the derivative run with the
+    same session and run_key. None when there is none.
+    """
+    path = Path(raw_path)
+    if path.parent.name != "raw":
+        return None
+    stem = path.name.split(".nii")[0]
+    stem = stem[: -len("_bold")] if stem.endswith("_bold") else stem
+    want = (session_of(parse_name(stem)), run_key(parse_name(stem)))
+    for ref in sorted((path.parent.parent / "deriv").glob("*_boldref.nii.gz")):
+        ref_stem = ref.name[: -len("_boldref.nii.gz")]
+        ent = parse_name(ref_stem)
+        if "space" not in ent and (session_of(ent), run_key(ent)) == want:
+            return ref
+    return None
+
+
+def raw_affine(raw_path, img=None):
+    """The voxel-to-scanner affine of a raw series in the frame of its stored transform.
+
+    The stored from-scanner_to-T1w transform maps to the scanner space of fMRIPrep's reference
+    image of the run, which fMRIPrep made after validating the raw header. nibabel's img.affine
+    prefers the sform; fMRIPrep sometimes keeps the sform and sometimes overwrites it with the
+    qform when the two differ. So the affine of the run's BOLD-space reference image decides:
+    img.affine when they agree (to 1e-4), else the qform when that agrees, else the reference
+    image's affine. Without a reference image, or with one on another grid, img.affine.
+
+    Added in the integration of stage 1 (2026-11-14). Of the 15 raw series of the selected
+    sessions, five store a qform and an sform (code 2) that differ by 4 to 25 mm: in four of one
+    session fMRIPrep's reference image has the qform, in one of another session the sform. Through
+    img.affine alone the raw stream of the first session lay about 22 mm from the anatomy
+    (temporal-mean r 0.27 against fMRIPrep's series). The worked example's headers agree.
+    """
+    img = nib.load(raw_path) if img is None else img
+    ref = reference_of(raw_path)
+    if ref is None:
+        return img.affine
+    ref_img = nib.load(ref)
+    if tuple(ref_img.shape[:3]) != tuple(img.shape[:3]):
+        return img.affine
+    if np.allclose(ref_img.affine, img.affine, atol=1e-4):
+        return img.affine
+    qform = img.header.get_qform()
+    if np.allclose(ref_img.affine, qform, atol=1e-4):
+        return qform
+    return ref_img.affine
+
+
 def raw_volumes(raw_path):
     """(array proxy of the stored values, affine, slope, intercept) of a raw series.
 
     The values are scaled per volume, as pipeline/make_videos.py does:
-    vol = stored[..., t].astype(float32) * slope + intercept.
+    vol = stored[..., t].astype(float32) * slope + intercept. The affine is the one fMRIPrep
+    of the run's stored transform (raw_affine), which is img.affine whenever the reference image
+    agrees with it.
     """
     img = nib.load(raw_path)
     return (
         img.dataobj.get_unscaled(),
-        img.affine,
+        raw_affine(raw_path, img),
         float(img.dataobj.slope),
         float(img.dataobj.inter),
     )

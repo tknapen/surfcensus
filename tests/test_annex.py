@@ -27,13 +27,14 @@ from synth_annex import (  # pyrefly: ignore[missing-import]
 )
 from synth_tree import (  # pyrefly: ignore[missing-import]
     write_bids_dataset,
+    write_light_template,
     write_tier_a,
     write_tree,
 )
 from typer.testing import CliRunner, Result
 
 from surfcensus.cli import app
-from surfcensus.review import default_run_dir, render_counts, review
+from surfcensus.review import DEFAULT_RUN_DIR, default_run_dir, render_counts, review
 from surfcensus.run import Run
 from surfcensus.sources.base import TIER_B, UNFETCHED, FileRole, SourceError, Unfetched
 from surfcensus.sources.local import (
@@ -56,6 +57,7 @@ from surfcensus.sources.patterns import (
     unfetched_said,
 )
 from surfcensus.store import CATALOG_FILE, Catalog
+from surfcensus.templates import TemplateNotFound, build_template
 
 # the two keys of the DataLad 1.8.0 clone of 2026-11-14 and their directories, as
 # `git annex examinekey --format='${hashdirmixed}'` gave them
@@ -389,7 +391,10 @@ def test_when_every_subject_lacks_content_review_says_so_once_with_one_command(
         " && datalad get derivatives/freesurfer/sub-0*/mri/T1.mgz "
     )
     assert fetch_said.count("sub-0*/") == 13 and "sub-01/" not in fetch_said
-    assert "No subject of this run can be rendered, so there is nothing to rate." in said
+    assert (
+        "No subject of this run can be rendered, so there is nothing to rate. Fetch the files "
+        "as said above, then run the same command again."
+    ) in said
     assert snapshot_links(root) == before
 
 
@@ -570,3 +575,60 @@ def test_a_freesurfer_7_subject_is_fetched_by_the_names_of_its_pial_files(
     found = unfetched_files(row.problem)
     assert found is not None and found[0] == ["surf/lh.pial.T1", "surf/rh.pial.T1"]
     assert not row.complete
+
+
+def test_a_template_whose_files_are_not_fetched_says_so_and_how_to_fetch_them(
+    tmp_path: Path,
+) -> None:
+    root = dataset(tmp_path / "ds", ["sub-01"])
+    derivatives = root / "derivatives"
+    template = derivatives / "freesurfer" / "fsaverage"
+    write_light_template(template)
+    wanted = ["surf/lh.sphere.reg", "label/rh.aparc.annot"]
+    unfetch(derivatives, [template / name for name in wanted])
+    with pytest.raises(TemplateNotFound) as info:
+        build_template(template, "adjacent")
+    paths = " ".join(f"freesurfer/fsaverage/{name}" for name in wanted)
+    command = f"datalad -C {shlex.quote(str(derivatives.resolve()))} get {paths}"
+    assert info.value.looked_in == (
+        (
+            "adjacent",
+            str(template),
+            f"not fetched (git-annex): {', '.join(wanted)}; fetch them with: {command}",
+        ),
+    )
+    # a file that is absent as well: the directory is incomplete, as without git-annex
+    (template / "surf" / "rh.white").unlink()
+    with pytest.raises(TemplateNotFound) as info:
+        build_template(template, "adjacent")
+    assert info.value.looked_in[0][2] == (
+        "incomplete: surf/lh.sphere.reg, surf/rh.white, label/rh.aparc.annot"
+    )
+
+
+def test_the_default_run_directory_is_beside_a_datalad_dataset_never_inside_it(
+    tmp_path: Path, no_tools: Path
+) -> None:
+    """A DataLad clone of an fMRIPrep output (as OpenNeuroDerivatives hands one out) is no
+    BIDS dataset with ``derivatives/``; a folder inside it, given as path, still puts the
+    run beside the clone, not into it."""
+    clone = make_repository(write_tree(tmp_path / "data" / "ds-fmriprep", "fmriprep", LABELS))
+    subjects = clone / "sourcedata" / "freesurfer"
+    beside = tmp_path / "data" / DEFAULT_RUN_DIR
+    for path in (clone, subjects, subjects / "sub-01"):
+        assert default_run_dir(path) == beside, path
+    # inside a superdataset, beside the outermost one
+    outer = make_repository(tmp_path / "studies")
+    nested = make_repository(write_tree(outer / "ds-nested", "fmriprep", LABELS))
+    assert default_run_dir(nested / "sourcedata" / "freesurfer") == tmp_path / DEFAULT_RUN_DIR
+    # a git-annex repository that is no DataLad dataset is not told apart: beside the path
+    plain = make_repository(
+        write_tree(tmp_path / "plain" / "out", "fmriprep", LABELS), datalad=False
+    )
+    assert default_run_dir(plain / "sourcedata" / "freesurfer") == (
+        plain / "sourcedata" / DEFAULT_RUN_DIR
+    )
+    before = snapshot_links(clone)
+    with review(subjects, serve=False, jobs=1) as run:
+        assert run.run_dir == beside
+    assert snapshot_links(clone) == before

@@ -61,6 +61,23 @@ ZERO, POS, NEG = (24, 24, 24), ((214, 48, 39), (255, 224, 144)), ((33, 102, 172)
 # ---- the values, computed here ----------------------------------------------------------------
 
 
+def raw_affine(img, reference):
+    """The affine of a raw series in the frame of its stored transform, decided by the run's
+    BOLD-space reference image (deriv/<stem>_boldref.nii.gz) when DATA has it: the raw header's
+    sform-first affine when the reference agrees with it, else its qform when that agrees, else
+    the reference's own. Written here apart from session.raw_affine, which follows the same rule,
+    so that the check reads the files itself; on the worked example both give img.affine."""
+    if not reference.is_file():
+        return img.affine
+    ref = nib.load(reference)
+    if tuple(ref.shape[:3]) != tuple(img.shape[:3]):
+        return img.affine
+    for candidate in (img.affine, img.header.get_qform()):
+        if np.allclose(ref.affine, candidate, atol=1e-4):
+            return candidate
+    return ref.affine
+
+
 def q8(v, hi):
     """value = clip(floor(v * 255 / hi + 0.5), 0, 255) in float32 (the manifest's rule)."""
     x = v.astype(np.float32) * np.float32(255.0 / hi) + np.float32(0.5)
@@ -116,6 +133,7 @@ class Source:
                 {
                     "pre": pre,
                     "raw": raw_img,
+                    "raw_affine": raw_affine(raw_img, data / "deriv" / f"{stem}_boldref.nii.gz"),
                     "mask": np.asarray(mask.dataobj) > 0,
                     "hi": None,
                     "n": pre.shape[3],
@@ -145,7 +163,7 @@ class Source:
         if stream == "pre":
             return self._volume(r["pre"], t)
         vol = self._volume(r["raw"], t)
-        return resample(vol, r["raw"].affine, self.shape, self.affine, self.anchor_xfm, order=3)
+        return resample(vol, r["raw_affine"], self.shape, self.affine, self.anchor_xfm, order=3)
 
     def volume(self, run, stream, t):
         return q8(self.floats(run, stream, t), self.window(run))

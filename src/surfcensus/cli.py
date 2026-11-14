@@ -694,8 +694,9 @@ def _app_stops_with_exit_2() -> Iterator[None]:
     stays locked.
 
     The app's packages are dependencies of the package (decision O20), so an installation
-    lacks one only when it is broken or was stripped (``pip install --no-deps``, a package
-    removed by hand). The line names the package and the command that puts it back."""
+    lacks one only when it is broken or was stripped (``pip install --no-deps`` beside the
+    core packages, a package removed by hand). The line names the package and the command
+    that puts it back."""
     from surfcensus.config import ConfigError
 
     with _stops_with_exit_2():

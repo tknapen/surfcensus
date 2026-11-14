@@ -218,8 +218,10 @@ class TemplateNotFound(Exception):
 
     ``looked_in`` holds one ``(origin, where, state)`` per place that was looked at, in the
     order of the lookup. ``where`` is a path or a description such as ``bundled copy``;
-    ``state`` is ``not set``, ``absent``, ``incomplete: <files>``, ``not shipped``, or
-    ``unreadable: <error>`` for a directory that cannot be examined.
+    ``state`` is ``not set``, ``absent``, ``incomplete: <files>``, ``not shipped``,
+    ``unreadable: <error>`` for a directory that cannot be examined, or, when every missing
+    file is a git-annex link without content, ``not fetched (git-annex): <files>`` with the
+    command that fetches them.
     """
 
     def __init__(self, looked_in: tuple[tuple[str, str, str], ...]) -> None:
@@ -613,7 +615,30 @@ def _state(directory: Path) -> str | None:
         missing = [name for name in _REQUIRED if not is_file(directory / name)]
     except OSError as exc:
         return f"unreadable: {exc.strerror or type(exc).__name__}"
-    return "incomplete: " + ", ".join(missing) if missing else None
+    if not missing:
+        return None
+    unfetched = _not_fetched(directory, missing)
+    if unfetched is not None:
+        return unfetched
+    return "incomplete: " + ", ".join(missing)
+
+
+def _not_fetched(directory: Path, missing: list[str]) -> str | None:
+    """For a template whose missing files are all git-annex links without content (a
+    DataLad clone that was not fetched): what they are and the command that fetches them,
+    ``not fetched (git-annex): <files>; fetch them with: datalad -C <dataset> get <paths>``.
+    None otherwise. Reads links only, as the listing of a subject does."""
+    from surfcensus.sources.local import fetch_command
+    from surfcensus.sources.patterns import annex_link
+
+    try:
+        if not all(annex_link(directory / name) is not None for name in missing):
+            return None
+        command = fetch_command(directory.parent, {directory.name: missing}, directory)
+    except OSError:
+        return None
+    said = f"not fetched (git-annex): {', '.join(missing)}"
+    return said if command is None else f"{said}; fetch them with: {command}"
 
 
 def _where(origin: Origin, directory: Path) -> str:

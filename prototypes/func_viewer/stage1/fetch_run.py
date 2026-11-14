@@ -7,7 +7,8 @@ SELECTION  the directory of select_runs.py (selection.parquet)
 ID         a neutral id of the selection: H01 to H06, Q01, Q02
 OUT        a directory for the files; not in the repository. It gets:
              deriv/   the T1w-space series, brain masks, scanner-to-T1w transforms, confounds
-                      tables and derivative sidecars of the runs, and the fsnative transform
+                      tables, BOLD-space reference images and derivative sidecars of the runs,
+                      and the fsnative transform
              raw/     the raw series of the runs and their own sidecars, when they have one
              fs/      mri/T1.mgz and surf/{lh,rh}.{white,pial} (a pial variant such as
                       lh.pial.T1 is stored as lh.pial, the name pack_run.py reads)
@@ -142,9 +143,13 @@ def plan_files(rows, listing, fs_dir_name="fs"):
                 getattr(row, f"{kind}_etag"),
             )
         sidecar = row.preproc_key[: -len(".nii.gz")] + ".json"
-        if sidecar in deriv_index:  # the derivative's sidecar holds RepetitionTime
-            size, etag = deriv_index[sidecar]
-            files["deriv/" + sidecar.rsplit("/", 1)[1]] = (DERIV, sidecar, size, etag)
+        # the BOLD-space reference image: its affine is the raw frame of the stored transform
+        # (session.raw_affine); the derivative's sidecar holds RepetitionTime
+        boldref = row.preproc_key[: -len(PREPROC)] + "_boldref.nii.gz"
+        for key in (sidecar, boldref):
+            if key in deriv_index:
+                size, etag = deriv_index[key]
+                files["deriv/" + key.rsplit("/", 1)[1]] = (DERIV, key, size, etag)
         files["raw/" + row.raw_key.rsplit("/", 1)[1]] = (
             RAW,
             row.raw_key,

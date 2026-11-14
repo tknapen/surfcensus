@@ -38,6 +38,7 @@ from session import (
     name_order,
     parse_name,
     pick_anchor,
+    raw_affine,
     read_itk_ras,
     run_key,
     session_of,
@@ -89,7 +90,7 @@ def corr(a, b, mask):
 
 def volume(path):
     img = nib.load(path)
-    return np.asarray(img.dataobj, dtype=np.float32), img.affine
+    return np.asarray(img.dataobj, dtype=np.float32), raw_affine(path, img)
 
 
 def temporal_mean(series, mean):

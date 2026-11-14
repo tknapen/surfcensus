@@ -6,28 +6,38 @@ Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the s
 
 ## Status
 
-Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
+Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`, which since the quick-start follow-up installs in one line and finds the subjects of a downloaded or DataLad-cloned dataset by itself. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
 
 ## Quick start
 
 One line, with [uv](https://docs.astral.sh/uv/), and nothing to install first:
 
 ```
-uvx --from git+https://github.com/tknapen/surfcensus surfcensus review /path/to/SUBJECTS_DIR
+uvx --from git+https://github.com/tknapen/surfcensus surfcensus review /path/to/your/data
 ```
 
 Or install the package into an environment of yours (Python 3.11 or later) and run the command:
 
 ```
 pip install git+https://github.com/tknapen/surfcensus
-surfcensus review /path/to/SUBJECTS_DIR
+surfcensus review /path/to/your/data
 ```
 
-The package is not on PyPI yet, so both lines name the repository and need `git`. Once it is, they are `uvx surfcensus review PATH` and `pip install surfcensus`.
+The package is not on PyPI yet, so both lines name the repository and need `git`. Once it is, they are `uvx surfcensus review PATH` and `pip install surfcensus`. That is the whole install: the rating app is part of the package and needs no extra (`"surfcensus[app]"`, the form these docs gave earlier, installs the same). No FreeSurfer installation or licence is needed.
 
-That is the whole install: the rating app is part of the package and needs no extra. (`pip install "surfcensus[app]"`, the line these docs gave earlier, still works and installs the same.) No FreeSurfer installation or licence is needed. Your data is only read: nothing is written into a subject directory or into the directory that holds your subjects.
+What the folder may be. `review` finds the FreeSurfer subjects itself in any of these:
 
-What to expect, measured on 2026-11-14 on one 4-core Linux machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
+- a FreeSurfer `SUBJECTS_DIR` (folders with `mri/` and `surf/`), or one subject directory;
+- an fMRIPrep output folder (`sourcedata/freesurfer/`, or the older `freesurfer/` beside `fmriprep/`);
+- a BIDS dataset as OpenNeuro hands it out, with the FreeSurfer subjects below `derivatives/`: `derivatives/freesurfer/`, `derivatives/fmriprep/sourcedata/freesurfer/`, `derivatives/fmriprep/freesurfer/`, and the same under other folder names (`derivatives/fmriprep-21.0.2/...`). The first line it prints says where it found them, for example `Found 2 subjects in derivatives/fmriprep/sourcedata/freesurfer (fMRIPrep layout, FreeSurfer 6.0.1, 7.3.2).` When subjects lie in more than one place, it takes the first and names the others with the folder to give for each.
+
+What happens. The command lists and scores the subjects, renders the first one and opens the rating app in your browser at `http://127.0.0.1:8765/`; the other subjects are rendered while you rate. Measured on 2026-11-14 on one 4-core Linux machine, in an environment just made from the wheel: 17 s from the command to the app for a BIDS dataset root over two real subjects, of which the first imports of a fresh environment take part; 1 s when you come back to the same run.
+
+Files that are not fetched. A dataset cloned with DataLad (or `git clone` of a git-annex repository) holds its files by name before their content is fetched. `review` fetches nothing and changes nothing in the dataset: it names the subjects whose files have no content, the size, and one command that fetches them, for example `Fetch them (28.5 MB) with: datalad -C /data/ds000102 get derivatives/fmriprep/sourcedata/freesurfer/sub-01/mri/T1.mgz ...`. A subdataset that is not installed (an empty `derivatives/`) gets the command that installs it (`datalad -C /data/ds000102 get -n derivatives`). Run the command, then the same `review` again: the subjects are picked up without further options. A subject that cannot be rendered is shown to nobody and is listed as unratable with its reason.
+
+Where your work goes. Your data is only read: nothing is written into the dataset, a subject directory or the directory that holds your subjects. Everything goes into a run directory, `surfcensus-run` beside the folder you named, or beside the BIDS or DataLad dataset that holds it, never inside it (`--run-dir DIR` puts it elsewhere). Ratings and marks are in `app.sqlite` there; `surfcensus export --run-dir /path/to/surfcensus-run` writes them as tables (below). Ctrl-C stops the app, and the same command again continues where you were.
+
+What the install costs, measured on 2026-11-14 on the same machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
 
 ## What works today
 
@@ -125,7 +135,7 @@ The renderer's frames have not yet been compared by eye with Freeview. Details a
 ## Planned
 
 - The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.
-- `pip install surfcensus` from PyPI, and `review` on a downloaded OpenNeuro dataset without naming its subfolder.
+- `pip install surfcensus` from PyPI, and `surfcensus review openneuro:dsXXXXXX` on a dataset that is not on disk, streamed from the public bucket (decision O20).
 - A normative reference to score small sets against, built from rated census subjects.
 - The OpenNeuro census: the same pipeline over FreeSurfer outputs in public OpenNeuro derivatives, to measure how common these errors are and how often quantitative checks miss them. See `docs/phases.md`.
 
