@@ -618,3 +618,17 @@ def test_nothing_the_rating_routes_answer_holds_anything_of_the_epi_interface(
     # the one link of the rating page, which names no subject
     page = ok(client.get("/")).text
     assert '<a id="epi-link" class="epi-link" href="/epi" hidden>EPI movies</a>' in page
+
+
+def test_a_session_that_stream_json_lists_without_its_session_json_is_waited_for(
+    client: TestClient, epi_run: EpiRun
+) -> None:
+    # every pack of FULL is recorded as done; the pack phase is writing its second session
+    # again, which stream.json lists and whose session.json is not there yet
+    page = ok(client.get(f"/epi/{FULL}", headers=PAGE)).text
+    assert 'data-poll="0"' in page
+    (epi_run.run_dir / EPI_DIR / FULL / epi_run.sessions[FULL][1] / SESSION_JSON).unlink()
+    page = ok(client.get(f"/epi/{FULL}", headers=PAGE)).text
+    assert 'data-poll="5"' in page
+    body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
+    assert [s["session_uid"] for s in body["sessions"]] == [epi_run.sessions[FULL][0]]
