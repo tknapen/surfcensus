@@ -19,7 +19,7 @@
 set -euo pipefail
 
 usage() {
-    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//' >&2
+    sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//' >&2
     exit 2
 }
 [ $# -ge 3 ] || usage

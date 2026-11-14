@@ -4,8 +4,19 @@ usage: check_player.py PACK MAP DATA OUT [--only PART[,PART...]] [--seconds 10] 
                        [--mem MB] [--seed 1]
 
 PACK  a pack of pack_run.py           MAP   the table that pack_run.py wrote with --map
-DATA  the local files the pack was made from (deriv/, raw/), for the independent values
+DATA  the local files the pack was made from (deriv/, raw/), for the expected values
 OUT   a directory for check_player.json and shots/*.png; not in the repository
+
+What "exact" checks, and what it does not. The expected values are computed here from the
+NIfTI files, but with the transform reader and the resampler of pipeline/geom.py, which are the
+ones the pack was made with (session.py uses the same expression), and with the same rule for
+the raw header's affine. So it checks that the pack and the page show the values that the
+prototype's own resampling gives: encoding, decoding, windows, layout and display. It cannot
+catch an error in reading the transform, in its direction or in placing the raw series, since
+such an error would be in both. On the first try of one selected session, whose raw stream lay
+about 22 mm from the anatomy, it passed every check, and it passes on a copy of the worked
+example packed with a wrong raw affine on purpose (README, stage 1). check_geometry.py is the
+independent check of where the raw stream lies.
 
 The parts, all of them unless --only names some:
   node     the logic of the page that needs no page, under Node (player/logic_test.mjs)
@@ -14,8 +25,8 @@ The parts, all of them unless --only names some:
   exact    for --volumes random volumes, three random combinations each of plane, slice and
            stream (raw, preprocessed, difference; a third of them in the side-by-side view): the
            pixels of the canvas against the 8-bit values computed here from the NIfTI files
-           with numpy, scipy and pipeline/geom.py; then twelve of them once more as the pixels
-           of a screenshot
+           with numpy, scipy and pipeline/geom.py (the pack's own resampling, see above); then
+           twelve of them once more as the pixels of a screenshot
   stills   the same for the mean and SD stills of every run and stream (reads every volume)
   fps      volumes painted per second at 12, 30 and 60 asked, --seconds each, single stream
            and side by side (and the difference at 60), from the page's log of what it drew
