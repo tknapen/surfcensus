@@ -7,13 +7,16 @@ modules that its fields name are imported for the type checker alone.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Collection, Mapping
+import hashlib
+import json
+import math
+from collections.abc import Callable, Collection, Iterable, Mapping
 from contextlib import AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
-from surfcensus.sources.base import FileRole, Hemi
+from surfcensus.sources.base import FileRole, FuncRole, Hemi
 
 if TYPE_CHECKING:
     import pandas as pd
@@ -161,3 +164,414 @@ class RunContext:
     """``render_key(tile_hash, digests)``: ``privacy.render_key`` with the run secret bound."""
     scrub: Callable[[str], str]
     """``privacy.scrub`` with this run's pseudonyms and roots."""
+
+
+# --- the EPI movie interface (docs/epi_interface.md) ----------------------------------------
+#
+# The records below are what the connector, the session stage, the pack and the page of step 1
+# hand each other. They hold Python values only (no numpy array), so that they compare, hash
+# and pickle as plain data: a 4x4 matrix is a :data:`Matrix4` of Python floats, which is also
+# the form in which the portable voxel map is computed (docs/epi_interface.md, Determinism).
+
+Row4 = tuple[float, float, float, float]
+Matrix4 = tuple[Row4, Row4, Row4, Row4]
+"""A 4x4 affine as four rows of Python floats."""
+
+IDENTITY4: Matrix4 = (
+    (1.0, 0.0, 0.0, 0.0),
+    (0.0, 1.0, 0.0, 0.0),
+    (0.0, 0.0, 1.0, 0.0),
+    (0.0, 0.0, 0.0, 1.0),
+)
+
+
+def to_matrix4(rows: Iterable[Iterable[float]]) -> Matrix4:
+    """A :data:`Matrix4` from four rows of four numbers (a list, a tuple or a numpy array).
+
+    Raises ``ValueError`` for another shape, a value that is not finite, or a last row that is
+    not ``0 0 0 1``: every matrix of the EPI interface is an affine point map.
+    """
+    values = [[float(x) for x in row] for row in rows]
+    if len(values) != 4 or any(len(row) != 4 for row in values):
+        raise ValueError("an affine has 4 rows of 4 numbers")
+    if not all(math.isfinite(x) for row in values for x in row):
+        raise ValueError("an affine has finite numbers only")
+    if values[3] != [0.0, 0.0, 0.0, 1.0]:
+        raise ValueError("the last row of an affine is 0 0 0 1")
+
+    def row(r: list[float]) -> Row4:
+        return (r[0], r[1], r[2], r[3])
+
+    return (row(values[0]), row(values[1]), row(values[2]), row(values[3]))
+
+
+FuncBase = Literal["raw", "deriv"]
+"""Which root a functional file lies under: the raw BIDS dataset or the derivative."""
+
+DisplayLayout = Literal["anat", "native"]
+"""``anat``: the preprocessed series lies in the anatomy's world (``space-T1w``);
+``native``: in the run's own reference frame (docs/epi_interface.md, The display geometry)."""
+
+Generation = Literal["scanner-T1w", "boldref-T1w"]
+"""The layout of an fMRIPrep derivative: below 23.2, and 23.2 and later."""
+
+CorrectionState = Literal["applied", "not applied", "unknown"]
+
+AffineChoice = Literal["header", "qform", "reference", "header, unchecked"]
+"""Which affine the raw stream of a run used (``session.raw_affine_choice``): the header's
+``img.affine`` that the reference image agrees with; the qform, which it agrees with when
+``img.affine`` does not; the reference image's own affine when neither does; ``img.affine``
+without a usable reference image."""
+
+AnchorRule = Literal["acquisition_time", "name_order"]
+
+# Why a run is listed and not packed (docs/epi_interface.md, "The pack as a stage"). The first
+# nine are decided from the listing and the headers, the last two when a pack is made.
+NO_RAW_SERIES = "no raw series"
+NO_PREPROCESSED_SERIES = "no preprocessed series"
+STANDARD_SPACE_ONLY = "standard space only"
+NATIVE_SPACE_ONLY = "native space only"
+"""Not in the list of the spec: a run whose only preprocessed series is in its own frame, which
+step 1 does not pack (decision 1 for Tomas)."""
+NO_TRANSFORM = "no transform to the anatomy"
+NO_BRAIN_MASK = "no brain mask"
+VOLUME_COUNTS_DIFFER = "volume counts differ"
+RUNS_ON_DIFFERENT_GRIDS = "runs on different grids"
+MULTI_ECHO = "multi-echo"
+SOURCE_CHANGED = "source changed"
+PACK_FAILURE = "pack failure"
+
+PACK_REASONS: tuple[str, ...] = (
+    NO_RAW_SERIES,
+    NO_PREPROCESSED_SERIES,
+    STANDARD_SPACE_ONLY,
+    NATIVE_SPACE_ONLY,
+    NO_TRANSFORM,
+    NO_BRAIN_MASK,
+    VOLUME_COUNTS_DIFFER,
+    RUNS_ON_DIFFERENT_GRIDS,
+    MULTI_ECHO,
+    SOURCE_CHANGED,
+    PACK_FAILURE,
+)
+"""Every reason a run is listed and not packed, or its pack failed."""
+
+DISPLAY_REASONS: tuple[str, ...] = (
+    NO_PREPROCESSED_SERIES,
+    STANDARD_SPACE_ONLY,
+    NATIVE_SPACE_ONLY,
+    MULTI_ECHO,
+)
+"""The reasons a connector's ``display`` can give for a run without a display grid."""
+
+
+@dataclass(frozen=True)
+class RunEntities:
+    """The BIDS entities that key a functional run (docs/epi_interface.md, The unit).
+
+    Labels are kept as written (``run`` is ``"01"`` for ``run-01``); ``func.bids.run_key``
+    compares the run index as a number. A missing entity is None.
+    """
+
+    sub: str
+    ses: str | None = None
+    task: str | None = None
+    acq: str | None = None
+    ce: str | None = None
+    rec: str | None = None
+    dir: str | None = None
+    run: str | None = None
+    echo: str | None = None
+
+
+@dataclass(frozen=True)
+class FuncFileRef:
+    """One file of a functional run or session as a listing describes it. Nothing was opened."""
+
+    role: FuncRole
+    base: FuncBase
+    location: str
+    """POSIX path relative to the root of ``base`` (the raw dataset or the derivative)."""
+    size: int
+    etag_or_mtime: str
+    """Local: ``st_mtime_ns`` in decimal, as ``FileRef.etag_or_mtime``."""
+    variant: str | None = None
+    """For a role with several candidate names: the one that was listed, for example
+    ``desc-coreg_boldref`` among the reference images of fMRIPrep 23.2 and later."""
+
+
+@dataclass(frozen=True)
+class RawRun:
+    """A raw BIDS series and its sidecar, from the listing of the raw dataset (``func.bids``)."""
+
+    entities: RunEntities
+    key: str
+    """``func.bids.run_key``: equal for the raw series and its derivative files."""
+    order: tuple[str | int, ...]
+    """``func.bids.name_order``, the sort key of the name-order rule."""
+    stem: str
+    """The BIDS stem without ``_bold``: ``sub-01_ses-1_task-rest_run-1``."""
+    files: Mapping[FuncRole, FuncFileRef]
+    """``raw_bold`` and, when there is one, ``raw_sidecar``."""
+
+
+@dataclass(frozen=True)
+class DerivRun:
+    """A functional run as a connector lists it in a derivative (``Connector.list_runs``)."""
+
+    entities: RunEntities
+    key: str
+    order: tuple[str | int, ...]
+    stem: str
+    """The derivative's BIDS stem of the run, without space, desc and suffix."""
+    spaces: tuple[str, ...]
+    """The spaces of the preprocessed series the derivative has for the run, sorted; ``""``
+    for the run's own frame. Empty when it has none."""
+    files: Mapping[FuncRole, FuncFileRef]
+    """The files of every role the run has, for the display layout the connector chose:
+    ``pre_bold`` and ``pre_mask`` are those of that layout."""
+    echoes: int = 1
+    """Echoes of the raw acquisition when the connector can tell; more than one is
+    ``multi-echo``."""
+
+
+@dataclass(frozen=True)
+class ConnectorMatch:
+    """What ``Connector.detect`` says about a folder that is a derivative of its pipeline."""
+
+    connector: str
+    pipeline_version: str | None
+    generation: Generation
+
+
+@dataclass(frozen=True)
+class Display:
+    """Which preprocessed series of a run is its display grid (``Connector.display``)."""
+
+    layout: DisplayLayout | None
+    """None: the run has no display grid, and ``reason`` says why."""
+    space: str | None = None
+    """The space entity of the series, ``""`` for the run's own frame."""
+    reason: str | None = None
+    """One of :data:`DISPLAY_REASONS` when ``layout`` is None."""
+
+
+@dataclass(frozen=True)
+class RigidPath:
+    """The stored transform of a run, read as a point map (``Connector.raw_to_anat``)."""
+
+    matrix: Matrix4
+    """From the anatomy's world to the scanner world of the run's reference image, RAS mm."""
+    dof: int | None
+    """The degrees of freedom of the registration when a file states them."""
+    shear_scale: float
+    """The largest deviation of a singular value of the 3x3 part from 1; 0 for a rigid one."""
+    rigid: bool
+    """``shear_scale`` within 1e-3. A transform that is not rigid is used as stored."""
+    source: FuncRole
+    reference: FuncRole | None
+    """The role of the image that arbitrates the raw affine, or None when the run has none."""
+
+
+@dataclass(frozen=True)
+class Motion:
+    """The pipeline's motion estimates of a run (``Connector.motion``)."""
+
+    fd: tuple[float | None, ...]
+    """Framewise displacement per volume in mm; None where the table has no number."""
+    dvars: tuple[float | None, ...]
+    """Standardised DVARS per volume."""
+    non_steady: tuple[int, ...]
+    """Indices of the volumes marked as non-steady-state, ascending."""
+    source: FuncRole
+
+
+@dataclass(frozen=True)
+class Statement:
+    """One statement about a correction, with where it was read."""
+
+    state: CorrectionState
+    words: str | None
+    """The words read, tags removed (``FLB ("fieldmap-less", SyN-based)``, ``Skipped (too few
+    volumes)``); None when nothing was read."""
+    source: FuncRole | None
+    """The role of the file the words were read from; None for a statement by the pipeline's
+    design (head-motion correction in fMRIPrep) or when nothing was read."""
+    note: str | None = None
+    """One sentence for the page, for example why a state is ``unknown``."""
+
+
+@dataclass(frozen=True)
+class Corrections:
+    """What the pipeline did to the preprocessed series of a run (``Connector.corrections``)."""
+
+    motion: Statement
+    sdc: Statement
+    sdc_method: str | None
+    slice_timing: Statement
+    registration: Statement
+    """``applied`` with the report's words (``FreeSurfer <code>bbregister</code> ...`` with
+    the tags removed), or ``unknown``."""
+    dof: int | None
+    """Degrees of freedom as the registration line states them."""
+    sdc_figure_listed: bool | None
+    """Whether the listing has the distortion figure of the run, kept as a cross-check."""
+
+
+@dataclass(frozen=True)
+class RawAffine:
+    """The affine the raw stream of a run used (``session.raw_affine_choice``)."""
+
+    matrix: Matrix4
+    choice: AffineChoice
+    reference_image: bool
+    """Whether a reference image of the run was there at all."""
+
+
+@dataclass(frozen=True)
+class AnchorCandidate:
+    """A run that can be the anchor of its session: one with a stored transform."""
+
+    run: str
+    """The id of the run (a ``run_uid`` from step 2)."""
+    order: tuple[str | int, ...]
+    """``func.bids.name_order`` of the run."""
+    acquisition_time: str | None
+    """``AcquisitionTime`` of the raw sidecar as written, None when it has none."""
+
+
+@dataclass(frozen=True)
+class Anchor:
+    run: str
+    rule: AnchorRule
+    why: str
+    """One line: what the rule saw. Under the time rule it holds an acquisition time, so it is
+    shown on the local machine only and is not written into a pack."""
+
+
+@dataclass(frozen=True)
+class FrameDisplacement:
+    """How far a run, drawn through the anchor's transform, lies from where its own puts it."""
+
+    mean_mm: float
+    max_mm: float
+    rotation_deg: float
+    translation_mm: float
+    translation_ras: tuple[float, float, float]
+    shear_scale: float
+    n_voxels: int
+    flagged: bool
+
+
+@dataclass(frozen=True)
+class FrameCheck:
+    """The frame check of one session (``session.check_frame``)."""
+
+    anchor: str
+    limit_mm: float
+    runs: Mapping[str, FrameDisplacement]
+    """Run id -> its displacement; the anchor's entry is all zeros."""
+    flagged: tuple[str, ...]
+    shared_frame_plausible: bool
+    anchor_is_outlier: bool
+
+
+@dataclass(frozen=True)
+class Grid:
+    """A display grid: the shape and the voxel-to-world affine of a preprocessed series."""
+
+    shape: tuple[int, int, int]
+    affine: Matrix4
+
+    @property
+    def key(self) -> str:
+        """12 hex characters over shape and affine: the name of the grid's contour folder.
+
+        The SHA-256 of the canonical JSON of ``{"affine": rows, "shape": list}`` with every
+        number written by ``repr`` (``json.dumps``), so equal grids give equal keys on every
+        machine. Two grids whose affines differ in the last bit get two keys; whether two runs
+        lie on one grid is decided with a tolerance elsewhere (``geometry.same_grid``).
+        """
+        text = json.dumps(
+            {"affine": [list(row) for row in self.affine], "shape": list(self.shape)},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return hashlib.sha256(text.encode()).hexdigest()[:12]
+
+
+@dataclass(frozen=True)
+class PlaneContours:
+    """The contours of one plane of one grid, as ``func.contours`` makes them."""
+
+    plane: str
+    """``sagittal``, ``coronal`` or ``axial``: the slice axis is voxel axis 0, 1 or 2."""
+    data: bytes
+    """The file of the plane, uncompressed (the layout of stage 1's ``pack_contours.py``)."""
+    slices: int
+    lines: int
+    points: int
+
+
+@dataclass(frozen=True)
+class SessionRun:
+    """A run of a session as the session stage sees it: paired, ordered, packable or not."""
+
+    run: str
+    """The id of the run."""
+    name: str
+    """The BIDS name without the subject (``ses-1_task-rest_run-1``), for a local run's pages."""
+    deriv: DerivRun
+    raw: RawRun | None
+    display: Display
+    reason: str | None
+    """One of :data:`PACK_REASONS` when the run cannot be packed, else None."""
+    missing: tuple[FuncRole, ...] = ()
+    """Roles of :data:`~surfcensus.sources.base.PACK_REQUIRED` that the run lacks."""
+
+
+@dataclass(frozen=True)
+class SessionPlan:
+    """One session: its runs in acquisition order, its anchor, frame check and grids."""
+
+    participant: str
+    """``sub-01``."""
+    session: str | None
+    """The ``ses-`` label without ``ses-``; None in a dataset without sessions."""
+    fs_subject: str | None
+    """The name of the FreeSurfer subject in the subjects directory, or None: then the
+    session is packed without contours."""
+    runs: tuple[SessionRun, ...]
+    """Every run of the session, those that cannot be packed included, in acquisition order
+    with the anchor first; runs that cannot be packed follow in name order."""
+    anchor: Anchor | None
+    """None when no run of the session can be packed."""
+    frame: FrameCheck | None
+    grids: Mapping[str, Grid]
+    """``Grid.key`` -> grid, for the packable runs."""
+    grid_of: Mapping[str, str]
+    """Run id -> the key of its grid, for the packable runs."""
+    files: Mapping[FuncRole, FuncFileRef] = field(default_factory=dict)
+    """The session's own files (``xfm_anat_fsnative``)."""
+
+
+@dataclass(frozen=True)
+class RunPackInput:
+    """Everything ``func.pack.pack_run`` needs about one run, with local paths."""
+
+    run: str
+    name: str
+    files: Mapping[FuncRole, Path]
+    """Local paths of the roles the run has (a lease in step 2, the files in place in step 1)."""
+    grid: Grid
+    display_to_anat: Matrix4
+    """``P_r`` of the display geometry: the identity in the anatomy-space layout."""
+    anchor_run: str
+    anchor_matrix: Matrix4
+    """``S_a``: the anchor's :attr:`RigidPath.matrix`."""
+    raw_affine: RawAffine
+    motion: Motion | None
+    corrections: Corrections
+    rigid: RigidPath
+    """The run's own stored transform."""
+    tr_s: float | None

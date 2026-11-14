@@ -159,9 +159,15 @@ def _start_worker(level: int) -> None:
     a worker ends the subject it is on, so that no lease is released under a worker that
     still reads its files. The package logger gets the level it has in the parent and
     collects its records for the parent.
+
+    SIGTERM gets its default: a command that has taken its SIGTERM ignores the signal
+    (``stopping``), and a process spawned after that would inherit the ignoring, so that
+    neither a process manager nor the pool itself (which ends broken workers with SIGTERM)
+    could end it.
     """
     global _collector
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
     _collector = _Collector()
     logger = get_logger()
     logger.handlers[:] = [_collector]

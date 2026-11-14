@@ -217,6 +217,49 @@ class AppConfig(_Frozen):
     media_base_url: str | None = None
 
 
+class EpiConfig(_Frozen):
+    """Settings of the EPI movie interface (docs/epi_interface.md, Configuration).
+
+    Step 1 (``surfcensus epi-session``) has no run directory and uses this model on its own;
+    the section ``epi`` of :class:`RunConfig` follows with the run directory (step 2), so that
+    no ``config.yaml`` written before then gains a key that an earlier version refuses.
+    """
+
+    enabled: bool = True
+    """False with ``--no-epi``: no functional table gets a row and nothing is packed."""
+    runs: tuple[str, ...] = ()
+    """Globs of ``--epi-runs`` on the BIDS name of a run; empty means all."""
+    portable_voxel_map: bool = True
+    """The voxel map of the raw stream in Python floats (decision 3 for Tomas)."""
+    frame_limit_mm: float = Field(default=10.0, gt=0)
+    """A run is flagged when its frame displacement exceeds this somewhere in its mask."""
+    fd_threshold_mm: float = Field(default=0.5, gt=0)
+    """Framewise displacement above which the page marks a volume."""
+    chunk_bytes: int = Field(default=4 * 1024 * 1024, ge=1)
+    """Decoded size that a chunk of a stream aims at."""
+    max_gb: float | None = Field(default=None, gt=0)
+    """Stop before packing when the estimate of the packs exceeds this; None: no limit."""
+
+    def pack_hash(self) -> str:
+        """The config hash of a pack: the settings that change its bytes."""
+        payload = {name: getattr(self, name) for name in EPI_PACK_FIELDS}
+        return stage_hash("pack", STAGE_SCHEMAS["pack"], payload)
+
+    def session_hash(self) -> str:
+        """The config hash of the session unit (registration, frame check, contours): the
+        settings that change ``session.json`` and what the page is told."""
+        payload = {name: getattr(self, name) for name in EPI_SESSION_FIELDS}
+        return stage_hash("epi_session", STAGE_SCHEMAS["epi_session"], payload)
+
+
+EPI_PACK_FIELDS: tuple[str, ...] = ("portable_voxel_map", "chunk_bytes")
+"""Fields of :class:`EpiConfig` that change the bytes of a pack."""
+
+EPI_SESSION_FIELDS: tuple[str, ...] = ("frame_limit_mm", "fd_threshold_mm")
+"""Fields of :class:`EpiConfig` that change only what is shown: part of the session unit's
+hash and of the shape the page receives, not of a pack's."""
+
+
 class RemoteConfig(_Frozen):
     """Not hashed into any stage."""
 
@@ -474,6 +517,8 @@ STAGE_SCHEMAS: dict[str, int] = {
     "select": 1,
     "native": 1,
     "intensity": 1,
+    "pack": 1,  # the EPI interface: one functional run (docs/epi_interface.md)
+    "epi_session": 1,  # the EPI interface: the registration, frame check and contours
 }
 """Schema number of each stage: raised when the stage's output changes for equal settings."""
 

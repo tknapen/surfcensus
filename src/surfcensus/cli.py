@@ -5,9 +5,7 @@ from __future__ import annotations
 import math
 import re
 import secrets
-import signal
 import sqlite3
-import threading
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -23,6 +21,7 @@ from surfcensus.log import configure_cli_logging
 if TYPE_CHECKING:
     from surfcensus.records import PhaseReport
     from surfcensus.run import Run
+    from surfcensus.stopping import CommandSignals
 
 app = typer.Typer(
     no_args_is_help=True,
@@ -93,7 +92,7 @@ def render_subject(
     template = None if no_template else "auto" if fsaverage is None else fsaverage
     start = time.perf_counter()
     try:
-        with _terminated_like_interrupted():
+        with _stops_at_signals("the render is not complete, and the next call makes it"):
             info = three_plane(
                 subject_dir, target, template=template, video=not no_video, force=force
             )
@@ -109,83 +108,28 @@ def render_subject(
     typer.echo(f"{target}: {counts} slices, {time.perf_counter() - start:.1f} s")
 
 
-@contextmanager
-def _interrupted_is_exit_130() -> Iterator[None]:
-    """A phase stopped by Ctrl-C ends with 130, as a shell reports it, not with the 1 that
-    click gives an abort and that here means "some units failed"."""
-    try:
-        yield
-    except KeyboardInterrupt:
-        typer.echo("interrupted; what was recorded stays, and the next call goes on", err=True)
-        raise typer.Exit(130) from None
+_RECORDED_STAYS = "what was recorded stays, and the next call goes on"
 
 
 @contextmanager
-def _terminated_like_interrupted() -> Iterator[None]:
-    """Turn SIGTERM into SystemExit(143) for the duration, so that a render stopped by a
-    scheduler removes its temporary files as one stopped by Ctrl-C does."""
-    if threading.current_thread() is not threading.main_thread():
-        yield  # signal handlers can only be set from the main thread
-        return
+def _stops_at_signals(what: str = _RECORDED_STAYS) -> Iterator[CommandSignals]:
+    """SIGTERM and Ctrl-C of a command (``stopping.command_signals``).
 
-    def stop(signum: int, frame: object) -> None:
-        raise SystemExit(128 + signum)
+    While the command works, a SIGTERM ends it as Ctrl-C does, through
+    ``KeyboardInterrupt``, which the batches and leases are written for, so that a render
+    stopped by a scheduler removes its temporary files as one stopped by Ctrl-C does. The
+    command then says so in one line and ends with 143 for a SIGTERM and with 130 for
+    Ctrl-C, as a shell reports them, not with the 1 that click gives an abort and that here
+    means "some units failed". A command that serves the app sets ``serving`` once the app
+    runs; from then on a SIGTERM only stops the app in order."""
+    from surfcensus.stopping import TERMINATED, command_signals
 
-    before = signal.signal(signal.SIGTERM, stop)
-    try:
-        yield
-    finally:
-        if before is not None:  # None: a handler that was not set from Python
-            signal.signal(signal.SIGTERM, before)
+    def said(signals: CommandSignals) -> None:
+        word = "terminated" if signals.exit_code() == TERMINATED else "interrupted"
+        typer.echo(f"{word}; {what}", err=True)
 
-
-class _StopSignals:
-    """SIGTERM for a command that serves the rater app, from its start to the end of the
-    process.
-
-    While the command prepares (``serving`` is false), the first SIGTERM ends it as it
-    ends a phase command: ``SystemExit(143)``, so that a render removes its temporary
-    files. Once the app runs, SIGTERM sets ``stop``, which ends the serving in order: the
-    server, the batch the renderer is on, the closing line, the exit code of the work.
-    Every later SIGTERM changes nothing, whenever it comes.
-    """
-
-    def __init__(self) -> None:
-        self.stop = threading.Event()
-        self.serving = False
-
-    def __call__(self, signum: int, frame: object) -> None:
-        first = not self.stop.is_set()
-        self.stop.set()
-        if first and not self.serving:
-            raise SystemExit(128 + signum)
-
-
-@contextmanager
-def _stop_signals() -> Iterator[_StopSignals]:
-    """Handle SIGTERM with a :class:`_StopSignals` for a command that serves the app.
-
-    After a SIGTERM, and after the app was served to its end, the handler is not taken
-    away again: the process is about to end, and with the default back in place a SIGTERM
-    that comes a moment late (a process manager that signals a whole group, a wrapper
-    that passes the signal on) killed a command that had stopped in order and printed its
-    closing line. A stop that hangs is ended with Ctrl-C or SIGKILL. In every other case
-    (nothing was served, or the command was refused) the earlier handler is put back, so
-    a caller in the same process, such as a test, keeps its own.
-    """
-    signals = _StopSignals()
-    if threading.current_thread() is not threading.main_thread():
-        yield signals  # signal handlers can only be set from the main thread
-        return
-    before = signal.signal(signal.SIGTERM, signals)
-    served = False
-    try:
+    with command_signals(said) as signals:
         yield signals
-        served = signals.serving
-    finally:
-        # None: a handler that was not set from Python, which cannot be put back
-        if not (served or signals.stop.is_set()) and before is not None:
-            signal.signal(signal.SIGTERM, before)
 
 
 class _RelocateCommand(TyperCommand):
@@ -449,7 +393,7 @@ def inventory(
                 f"--field-strength is in tesla, positive and finite, not {field_strength}",
             )
         run = _open_for_inventory(run_dir, source, subjects, field_strength, moved)
-        with run, _interrupted_is_exit_130(), _terminated_like_interrupted():
+        with run, _stops_at_signals():
             report = run.inventory(datasets=dataset or None, force=force)
             _print_inventory(run, source)
             _print_report(run, report)
@@ -519,7 +463,7 @@ def metrics(
 
     with _stops_with_exit_2(), Run(run_dir) as run:
         _with_fsaverage(run, fsaverage)
-        with _interrupted_is_exit_130(), _terminated_like_interrupted():
+        with _stops_at_signals():
             report = run.metrics(
                 datasets=dataset or None,
                 stages=stage or None,
@@ -596,7 +540,7 @@ def render(
                 typer.echo(f"{summary}: {listing} and {listing.with_suffix('.html').name}")
                 raise typer.Exit()
             _with_fsaverage(run, fsaverage)
-            with _interrupted_is_exit_130(), _terminated_like_interrupted():
+            with _stops_at_signals():
                 report = run.render(
                     jobs=jobs,
                     datasets=dataset or None,
@@ -815,7 +759,7 @@ def review_command(
     with _app_stops_with_exit_2():
         if not no_serve:
             import surfcensus.app.server  # noqa: F401  (before the work, not after it)
-        with _interrupted_is_exit_130(), _stop_signals() as signals:
+        with _stops_at_signals() as signals:
             run, served = reviewing.open_review(
                 path,
                 run_dir=run_dir,
@@ -838,6 +782,7 @@ def review_command(
                 reviewing.serve_review(
                     run, served, rater=rater, open_browser=not no_browser, stop=signals.stop
                 )
+                signals.served()  # the closing line is out: no signal ends the process now
         with run:
             nothing = reviewing.rateable(run) == 0
             if no_serve and not nothing:
@@ -872,7 +817,7 @@ def serve_command(
 
         if mode is None:
             mode = "local" if load_config(run_dir).mode == "local" else "team"
-        with _stop_signals() as signals:
+        with _stops_at_signals() as signals:
             signals.serving = True  # nothing to undo before the app: SIGTERM only stops it
             serve(
                 run_dir,
@@ -883,6 +828,7 @@ def serve_command(
                 open_browser=not no_browser,
                 stop=signals.stop,
             )
+            signals.served()  # the server has stopped: no signal ends the process now
 
 
 @app.command(

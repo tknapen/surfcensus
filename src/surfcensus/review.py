@@ -52,6 +52,7 @@ from surfcensus.sources.local import (
     where_subjects_lie,
 )
 from surfcensus.sources.patterns import ROLE_CANDIDATES, is_unfetched_problem, unfetched_said
+from surfcensus.stopping import StopFlag, StopRequest
 from surfcensus.store import queue_order, queue_scores
 
 if TYPE_CHECKING:
@@ -822,10 +823,12 @@ def review(
         return run
     # SIGTERM stops the app as Ctrl-C does, from before the app is announced until the
     # closing line is out: a second one (a process manager that signals the whole group)
-    # must not end the call in the middle of stopping. The handler that was there is put
-    # back when the call returns, as a function owes its caller. A process that is about
-    # to end must not do that (see :func:`serve_review`).
-    stop = threading.Event()
+    # must not end the call in the middle of stopping. The handler sets a flag and takes
+    # no lock (``stopping.StopFlag``): a signal that arrives while a handler holds a lock
+    # would wait for it for good. The handler that was there is put back when the call
+    # returns, as a function owes its caller. A process that is about to end must not do
+    # that (see :func:`serve_review`).
+    stop = StopFlag()
     in_main = threading.current_thread() is threading.main_thread()
     earlier: Any = signal.signal(signal.SIGTERM, lambda *_: stop.set()) if in_main else None
     try:
@@ -842,22 +845,23 @@ def serve_review(
     *,
     rater: str | None = None,
     open_browser: bool = True,
-    stop: threading.Event | None = None,
+    stop: StopRequest | None = None,
 ) -> None:
     """The second half of :func:`review`, for the run and the running app that
     :func:`open_review` returned: name the address, open the browser, wait, stop the app
     and say how far the rater got.
 
-    The wait ends at Ctrl-C, when the server ends, and when ``stop`` is set. The call sets
-    no signal handler: whoever wants SIGTERM to stop the app sets ``stop`` from a handler
-    of its own, as :func:`review` does for the length of its call. The command line keeps
-    its handler until the process ends, because a handler that is taken away after the
-    closing line leaves a moment in which a SIGTERM that comes late (a process manager
-    that signals a whole group, a wrapper that passes the signal on) kills a command that
-    had stopped in order. The server is stopped first, then the renderer, which finishes
-    the batch it is on.
+    The wait ends at Ctrl-C, when the server ends, and when ``stop`` is set (a
+    ``stopping.StopFlag``, which a signal handler can set without a lock, or a
+    ``threading.Event`` of a caller). The call sets no signal handler: whoever wants
+    SIGTERM to stop the app sets ``stop`` from a handler of its own, as :func:`review` does
+    for the length of its call. The command line ignores SIGTERM from the first one on,
+    and SIGINT too once this call has returned, because a SIGTERM that comes late (a
+    process manager that signals a whole group, a wrapper that passes the signal on) would
+    otherwise kill a command that had stopped in order (``stopping``). The server is
+    stopped first, then the renderer, which finishes the batch it is on.
     """
-    stop = threading.Event() if stop is None else stop
+    stop = StopFlag() if stop is None else stop
     try:
         _say(f"Rating app: {app.url} (Ctrl-C to stop)")
         _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")

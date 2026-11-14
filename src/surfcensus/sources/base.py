@@ -95,6 +95,59 @@ TIER_B_REQUIRED: tuple[FileRole, ...] = (
 )
 """The annotation is used when present."""
 
+
+class FuncRole(StrEnum):
+    """A file of a functional run, or of the session it belongs to (docs/epi_interface.md,
+    "File roles of a functional run").
+
+    The FreeSurfer files that a pack reads stay roles of the FreeSurfer subject
+    (:class:`FileRole`). ``raw_*`` roles lie in the raw BIDS dataset, the others in the
+    derivative; :data:`FUNC_RAW_ROLES` says which.
+    """
+
+    RAW_BOLD = "raw_bold"
+    RAW_SIDECAR = "raw_sidecar"
+    """The JSON sidecar of the raw series, beside it or inherited from a higher level."""
+    PRE_BOLD = "pre_bold"
+    """The preprocessed series of the display layout the connector chose."""
+    PRE_SIDECAR = "pre_sidecar"
+    PRE_MASK = "pre_mask"
+    """The brain mask on the grid of ``pre_bold``."""
+    XFM_TO_ANAT = "xfm_to_anat"
+    """The stored transform between the run's scanner (or boldref) frame and the anatomy."""
+    REFERENCE = "reference"
+    """The BOLD-space reference image that arbitrates the raw affine."""
+    CONFOUNDS = "confounds"
+    SUMMARY_REPORT = "summary_report"
+    VALIDATION_REPORT = "validation_report"
+    SDC_FIGURE = "sdc_figure"
+    """Listed, never read: whether it is there is the cross-check of the report."""
+    XFM_ANAT_FSNATIVE = "xfm_anat_fsnative"
+    """Per session: the transform between the anatomy and FreeSurfer's scanner RAS."""
+
+
+FUNC_RAW_ROLES: tuple[FuncRole, ...] = (FuncRole.RAW_BOLD, FuncRole.RAW_SIDECAR)
+"""The roles whose files lie in the raw BIDS dataset; every other role lies in the derivative."""
+
+FUNC_SESSION_ROLES: tuple[FuncRole, ...] = (FuncRole.XFM_ANAT_FSNATIVE,)
+"""Roles of a session, not of a run."""
+
+PACK_REQUIRED: tuple[FuncRole, ...] = (
+    FuncRole.RAW_BOLD,
+    FuncRole.PRE_BOLD,
+    FuncRole.PRE_MASK,
+    FuncRole.XFM_TO_ANAT,
+    FuncRole.CONFOUNDS,
+)
+"""Roles of a run that a pack cannot do without. ``reference`` is used when present (without
+it the raw affine is unchecked); the sidecars and the reports are read when present."""
+
+FUNC_READ_ROLES: tuple[FuncRole, ...] = tuple(
+    role for role in FuncRole if role not in (FuncRole.SDC_FIGURE, FuncRole.XFM_ANAT_FSNATIVE)
+)
+"""Roles of a run whose files a pack reads when they are there (every role but the listed-only
+figure), in definition order. The session's ``xfm_anat_fsnative`` is read by the contours."""
+
 SourceKind = Literal["local", "openneuro-derivatives", "openneuro-embedded"]
 Layout = Literal["subjects_dir", "fmriprep", "fmriprep_legacy", "bids_derivatives"]
 

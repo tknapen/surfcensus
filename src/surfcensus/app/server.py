@@ -100,6 +100,7 @@ from surfcensus.render.model import RenderInfo, read_render
 from surfcensus.render.vertexmap import read_vertex_map
 from surfcensus.schemas import SCHEMAS
 from surfcensus.sources.local import refuse_run_in_sources
+from surfcensus.stopping import StopFlag, StopRequest
 from surfcensus.store import (
     MEDIA_DIR,
     PublicCatalog,
@@ -1750,13 +1751,15 @@ def serve(
     mode: AppMode = "local",
     rater: str | None = None,
     open_browser: bool = True,
-    stop: threading.Event | None = None,
+    stop: StopRequest | None = None,
 ) -> None:
     """:func:`start_server`, print the URL, open the browser, wait for Ctrl-C or SIGTERM in
-    the main thread, stop. With ``stop`` the call sets no SIGTERM handler and serves until
-    the event is set (or Ctrl-C): the caller sets it from a handler of its own, which the
-    command line keeps until the process ends, so that a SIGTERM that comes after the
-    server has stopped cannot kill a command that stopped in order. Refuses to start
+    the main thread, stop. With ``stop`` (a ``stopping.StopFlag``, or a ``threading.Event``
+    of a caller) the call sets no SIGTERM handler and serves until it is set (or Ctrl-C):
+    the caller sets it from a handler of its own; the command line ignores SIGTERM from
+    the first one on, so that a SIGTERM that comes after the server has stopped cannot
+    kill a command that stopped in order. Without ``stop``, in the main thread, SIGTERM
+    sets a flag for the length of the call; the handler takes no lock. Refuses to start
     (``ConfigError("invalid", ...)``) when renders of the selection are out of date:
     ``N renders are out of date; run surfcensus render --run-dir DIR``. Says on stderr when
     selected subjects are not rendered yet, and when the queue is empty because the run
@@ -1796,7 +1799,7 @@ def serve(
             flush=True,
         )
     handle = start_server(run_dir, host=host, port=port, mode=mode, rater=rater)
-    waits = threading.Event() if stop is None else stop
+    waits = StopFlag() if stop is None else stop
     # the caller's event: the caller's handler. Otherwise SIGTERM for the length of the call.
     in_main = stop is None and threading.current_thread() is threading.main_thread()
     earlier = signal.signal(signal.SIGTERM, lambda *_: waits.set()) if in_main else None
