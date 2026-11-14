@@ -4,6 +4,7 @@ synthetic folder of ``tests/synth_func.py`` in both generations."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 from pathlib import Path
@@ -255,7 +256,8 @@ def test_names_that_are_no_raw_run_are_passed_over(tmp_path: Path) -> None:
         (func / name).write_bytes(b"x")
     (func / "sub-01_task-rest_run-6_bold.nii.gz").mkdir()  # a folder is no file
     os.symlink(tmp_path / "absent", func / "sub-01_task-rest_run-7_bold.nii.gz")  # dangling
-    os.close(os.open(os.fsencode(func) + b"/sub-01_task-r\xe9st_run-8_bold.nii.gz", os.O_CREAT))
+    with contextlib.suppress(OSError):  # a file system that refuses such a name has no such file
+        os.close(os.open(os.fsencode(func) + b"/sub-01_task-r\xe9st_run-8_bold.nii.gz", os.O_CREAT))
     listed = bids.list_raw_runs(tmp_path, "sub-01")
     assert [r.files[FuncRole.RAW_BOLD].location.rsplit("/", 1)[1] for r in listed] == [
         "sub-01_task-rest_run-1_bold.nii.gz",

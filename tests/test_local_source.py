@@ -377,7 +377,13 @@ def test_a_subjects_directory_without_search_permission(tmp_path: Path) -> None:
             ("sub-02", "unreadable: Permission denied"),
         ]
         (tree / "sub-01").chmod(0)
-        with pytest.raises(SourceError, match=r"^layout: .*Could not be examined: sub-01, sub-02$"):
+        with pytest.raises(
+            SourceError,
+            match=(
+                r"^layout: .*Could not be examined: sub-01 \(Permission denied\), "
+                r"sub-02 \(Permission denied\)$"
+            ),
+        ):
             LocalSource(tree)
         tree.chmod(0)
         with pytest.raises(SourceError, match=r"^unreadable: "):

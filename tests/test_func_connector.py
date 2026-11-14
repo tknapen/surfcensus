@@ -5,6 +5,7 @@ names, and confounds tables with the newer and the older column names."""
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
@@ -252,7 +253,8 @@ def test_names_that_are_no_run_do_not_break_the_listing(
         "sub-02_task-rest_run-9.nii.gz",
     ):
         (func / name).write_bytes(b"")
-    os.close(os.open(os.fsencode(func) + b"/sub-02_task-r\xe9st_run-1_bold.nii.gz", os.O_CREAT))
+    with contextlib.suppress(OSError):  # a file system that refuses such a name has no such file
+        os.close(os.open(os.fsencode(func) + b"/sub-02_task-r\xe9st_run-1_bold.nii.gz", os.O_CREAT))
     (func / "sub-02_task-dir_run-1_desc-preproc_bold.nii.gz").mkdir()
     os.symlink(tmp_path / "absent", func / "sub-02_task-gone_run-1_desc-preproc_bold.nii.gz")
     made = FmriprepConnector()
