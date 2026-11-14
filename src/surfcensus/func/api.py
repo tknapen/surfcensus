@@ -59,11 +59,13 @@ from surfcensus.func.inventory import (
     cut_contours,
     link_targets,
     list_participant,
+    order_words,
     pack_inputs,
     plan_one,
     probe_participant,
     run_name,
     session_key,
+    session_order_of,
     session_text,
     withheld_of,
 )
@@ -238,8 +240,11 @@ def epi_subject(
     """Pack every session of ``subject`` (``sub-01`` or ``01``) found under ``path``, or the
     sessions named (``1`` or ``ses-1``), into ``<out>/<session_id>/``, and write
     ``<out>/stream.json`` last: the sessions in the order of the subject's one continuous
-    stream (decision D38), by :func:`session_key` (no session first, then the labels with
-    numbers compared as numbers). Within a session the runs follow in acquisition order.
+    stream (decision D38), by their acquisition dates in the raw dataset when every session
+    named has one, else by :func:`session_key` (no session first, then the labels with
+    numbers compared as numbers), the rule of ``func.inventory.session_order_of`` (decision
+    D42) over the sessions packed; ``StreamInfo.order`` names the rule. Within a session the
+    runs follow in acquisition order.
 
     ``runs`` restricts the runs packed to those whose derivative stem matches one of the
     shell patterns (``*task-rest*``); the other runs of the sessions that hold a selected run
@@ -291,6 +296,9 @@ def epi_subject(
                 "invalid", f"{participant} has no session {', '.join(unknown)}; sessions: {have}"
             )
         labels = [lab for lab in labels if lab in wanted]
+    # the order of the stream: by acquisition date when every session has one (D42)
+    order = session_order_of(raw_root, participant, labels)
+    labels = list(order.labels)
 
     previous = _previous(out, participant)
     secret = key if key else secrets.token_bytes(32)
@@ -362,6 +370,8 @@ def epi_subject(
     if n_left_out:
         line += f", {n_left_out} not selected (--epi-runs)"
     say(line + ".")
+    if len(labels) > 1:
+        say(f"{participant}: {len(labels)} sessions {order_words(order)}.")
     for line in _registration_lines(planned, participant):
         say(line)
     kept = (
@@ -438,7 +448,7 @@ def epi_subject(
         surfcensus_version=__version__,
         label=participant,
         sessions=tuple(item.sid for item in planned),
-        order=SESSION_ORDER,
+        order=order.rule,
     )
     with atomic_path(out / STREAM_JSON) as tmp:
         tmp.write_text(info_text(stream))

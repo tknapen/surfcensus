@@ -302,7 +302,9 @@ def test_a_session_that_leaves_is_marked_absent_and_comes_back(
     for here, there in moved:
         shutil.move(str(here), str(there))
     report = bench.func()
-    assert (report.done, report.skipped) == (0, 2)
+    # ses-1 is planned again: the list of the participant's sessions is part of its hash, so
+    # its place in the stream follows (decision D42)
+    assert (report.done, report.skipped) == (1, 1)
     assert any("no longer listed" in note for note in report.notes)
     present = dict(
         (str(row[0]), int(row[1]))
@@ -314,7 +316,8 @@ def test_a_session_that_leaves_is_marked_absent_and_comes_back(
     for here, there in moved:
         shutil.move(str(there), str(here))
     report = bench.func()
-    assert (report.done, report.skipped, report.notes) == (0, 3, ())
+    # ses-1 again (the list of sessions changed back); ses-2 has the hash it had before it left
+    assert (report.done, report.skipped, report.notes) == (1, 2, ())
     assert set(bench.rows("SELECT present FROM func_sessions")) == {(1,)}
     assert set(bench.rows("SELECT present FROM func_runs")) == {(1,)}
 

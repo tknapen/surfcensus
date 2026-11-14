@@ -6,7 +6,9 @@ Without options this is a small real example, ds000102 sub-01 (two runs of the f
 task, fMRIPrep 21.0.2, FreeSurfer 6.0.1; 40 files, about 160 MB).
 
 Writes OUT/<dataset>/ with the raw functional series of the subject and their sidecars,
-and below derivatives/fmriprep/ what surfcensus reads of the fMRIPrep derivative that
+the subject's sessions.tsv and the scans.tsv of its sessions when the dataset has them (the
+EPI interface orders sessions by the acquisition dates they hold), and below
+derivatives/fmriprep/ what surfcensus reads of the fMRIPrep derivative that
 OpenNeuroDerivatives publishes for the dataset: the T1w-space preprocessed series, their
 masks, reference images, confounds tables, transforms and summary reports, and the
 FreeSurfer subject in sourcedata/freesurfer/. The two public buckets are listed and read
@@ -111,7 +113,11 @@ def wanted(dataset: str, subject: str) -> tuple[dict[str, tuple[str, int]], int]
         for key, size in list_keys(client, RAW_BUCKET, f"{raw_root}{sub}/").items():
             name = key[len(raw_root) :]
             series = name.endswith(("_bold.nii.gz", "_bold.nii")) and "/func/" in name
-            if series or name.endswith("_bold.json"):
+            # the tables the acquisition dates of sessions are read from (decision D42)
+            dates = name == f"{sub}/{sub}_sessions.tsv" or (
+                name.startswith(f"{sub}/ses-") and name.endswith("_scans.tsv")
+            )
+            if series or dates or name.endswith("_bold.json"):
                 out[name] = (RAW_BUCKET + key, size)
         d = "derivatives/fmriprep/"
         description = deriv_root + "dataset_description.json"

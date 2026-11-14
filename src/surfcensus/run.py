@@ -1048,6 +1048,15 @@ class Run:
         )
         return [dict(row) for row in rows]
 
+    def func_order_lines(self) -> list[str]:
+        """``func.inventory.func_order_lines``: which rule ordered the sessions of each
+        participant with more than one (decision D42); empty in a census run."""
+        from surfcensus.func.inventory import func_order_lines
+
+        if self.config.mode != "local" or not self.public().has_func():
+            return []
+        return func_order_lines(self._catalog)
+
     def func_fetch_lines(self) -> list[str]:
         """``func.inventory.func_fetch_lines``: the functional runs with git-annex
         placeholders and the commands that fetch their files; empty in a census run."""

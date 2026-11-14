@@ -1044,3 +1044,35 @@ def write_review_folder(
         placeholders=dataset.placeholders,
         fsnative_files=dataset.fsnative_files,
     )
+
+
+def write_session_dates(
+    raw_root: Path,
+    participant: str,
+    *,
+    sessions: Mapping[str, str] | None = None,
+    scans: Mapping[str, Sequence[str]] | None = None,
+) -> list[Path]:
+    """Write the tables the acquisition dates of a participant's sessions are read from
+    (decision D42) into the raw dataset: ``sessions`` as ``sub-X/sub-X_sessions.tsv`` with one
+    row ``ses-<label>`` and its ``acq_time`` value as given (a date such as
+    ``1900-01-02T10:00:00``, with ``Z`` or fractional seconds, ``n/a`` or any text; a label
+    left out has no row), and ``scans`` as ``sub-X/ses-<label>/sub-X_ses-<label>_scans.tsv``
+    with one row per value (the file names are made up). Returns the files written."""
+    root = Path(raw_root) / participant
+    written = []
+    if sessions is not None:
+        path = root / f"{participant}_sessions.tsv"
+        rows = ["session_id\tacq_time"] + [f"ses-{lab}\t{value}" for lab, value in sessions.items()]
+        path.write_text("\n".join(rows) + "\n")
+        written.append(path)
+    for label, values in (scans or {}).items():
+        path = root / f"ses-{label}" / f"{participant}_ses-{label}_scans.tsv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = ["filename\tacq_time"] + [
+            f"func/{participant}_ses-{label}_task-x_run-{n}_bold.nii.gz\t{value}"
+            for n, value in enumerate(values, 1)
+        ]
+        path.write_text("\n".join(rows) + "\n")
+        written.append(path)
+    return written

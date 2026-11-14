@@ -306,9 +306,11 @@ class StreamInfo(_Frozen):
     sessions: tuple[str, ...]
     """The session ids (the names of the session directories), in stream order."""
     order: str = "session label"
-    """How the sessions were put in order: ``session label`` (the ``ses-`` labels, numbers
-    within them compared as numbers, so ``ses-2`` before ``ses-10``; a dataset without
-    sessions has one), or ``as named`` when the sessions were given by name."""
+    """How the sessions were put in order (decision D42): ``acquisition time`` (every session
+    has an acquisition date in the raw dataset, from ``sessions.tsv`` or ``scans.tsv``; by
+    date, ties by label) or ``session label`` (the ``ses-`` labels, numbers within them
+    compared as numbers, so ``ses-2`` before ``ses-10``; a dataset without sessions has one).
+    The dates themselves are never written."""
 
 
 class TracesInfo(_Frozen):

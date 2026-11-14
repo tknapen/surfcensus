@@ -870,7 +870,8 @@ class FuncSessionRow:
     participant_uid: str
     session: str | None
     stream_order: int
-    """The place of the session in its participant's stream (``func.api.session_key``)."""
+    """The place of the session in its participant's stream (``func.inventory.session_order_of``:
+    by acquisition date when every session has one, else by label; decision D42)."""
     subject_uid: str | None
     """The FreeSurfer subject of the session in the surface catalog, or None."""
     fs_subject: str | None

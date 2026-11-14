@@ -569,7 +569,8 @@ def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
     """What ``review`` and ``inventory`` say about the functional runs of a run after the
     functional inventory: where the derivative and the raw dataset were found, how many runs
     of how many sessions and participants, how many can be packed and why the others cannot,
-    the sessions that could not be planned, what the one registration of each session finds
+    which rule ordered the sessions of a participant with more than one (decision D42), the
+    sessions that could not be planned, what the one registration of each session finds
     in the raw data (flagged runs, an anchor that is the outlier or is not packed: statements
     about the raw data, as ``epi-session`` makes them), and the commands that fetch functional
     files whose content is not there (after the surface fetch line).
@@ -652,6 +653,7 @@ def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
     if left_out:
         line += f", {left_out} not selected (--epi-runs)"
     lines = [line + "."]
+    lines += [f"  {line}" for line in run.func_order_lines()]
     by_session: dict[str, list[dict[str, Any]]] = {}
     for row in runs:
         by_session.setdefault(row["session_uid"], []).append(row)
@@ -713,6 +715,22 @@ def pack_counts(run: Run) -> tuple[int, int, int]:
     if not run.public().has_func():
         return 0, 0, 0
     return pack_status(run.context())
+
+
+def sessions_pending(run: Run) -> bool:
+    """Whether a functional session is pending in the pack phase although every run's pack is
+    current: a session whose inventory changed in a way that keeps its packs, such as its
+    place in the stream (decision D42). Its ``session.json`` and the participant's
+    ``stream.json`` are written again and nothing is packed; :func:`pack_counts`, which counts
+    runs, does not see it. False where :func:`pack_counts` gives zeros."""
+    from surfcensus.config import epi_settings
+    from surfcensus.func.batch import pack_pending
+
+    if run.config.mode != "local" or not epi_settings(run.config).enabled:
+        return False
+    if not run.public().has_func():
+        return False
+    return bool(pack_pending(run.context()))
 
 
 def viewable(run: Run) -> int:
@@ -1139,7 +1157,7 @@ def open_review(
                 report = run.pack(jobs=jobs, sessions=first)
                 if report.failed:
                     _say_pack_failures(run, report)
-        elif not serve and epi_pending:
+        elif not serve and (epi_pending or sessions_pending(run)):
             report = run.pack(jobs=jobs)
             if report.failed:
                 _say_pack_failures(run, report)
@@ -1156,10 +1174,13 @@ def open_review(
         install_protocol(run.run_dir)
         handle = start_server(run.run_dir, port=port, rater=rater)
         app = ReviewApp(handle, run.run_dir, time.perf_counter() - started, epi=shown > 0)
-        if pending or epi_pending:
+        # a session can be pending with every pack current (its place in the stream moved,
+        # D42): behind the app its session.json and stream.json are written again
+        epi_behind = epi_pending > 0 or sessions_pending(run)
+        if pending or epi_behind:
             thread = threading.Thread(
                 target=_render_rest,
-                args=(run.run_dir, jobs, fsaverage, app, len(uids), pending > 0, epi_pending > 0),
+                args=(run.run_dir, jobs, fsaverage, app, len(uids), pending > 0, epi_behind),
                 name="surfcensus-renderer",
                 daemon=True,
             )

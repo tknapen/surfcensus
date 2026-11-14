@@ -560,7 +560,9 @@ STAGE_SCHEMAS: dict[str, int] = {
     "intensity": 1,
     "pack": 1,  # the EPI interface: one functional run (docs/epi_interface.md)
     "epi_session": 1,  # the EPI interface: the registration, frame check and contours
-    "func_inventory": 1,  # the EPI interface in a run: phase 2f, func_sessions.inventory_hash
+    # the EPI interface in a run: phase 2f, func_sessions.inventory_hash; 2 since the session
+    # order follows the acquisition dates (decision D42)
+    "func_inventory": 2,
 }
 """Schema number of each stage: raised when the stage's output changes for equal settings."""
 

@@ -101,7 +101,13 @@ METHODS: dict[str, dict[str, tuple[str, ...]]] = {
     "Catalog": {
         "upsert_func_source": ("dataset_id", "record"),
         "func_source": ("dataset_id",),
-        "upsert_func_participant": ("func_id", "participant_uid", "participant", "n_sessions"),
+        "upsert_func_participant": (
+            "func_id",
+            "participant_uid",
+            "participant",
+            "n_sessions",
+            "session_order",
+        ),
         "upsert_func_session": ("row",),
         "func_inventory_hash": ("session_uid",),
         "mark_func_absent": ("func_id", "present_participants", "present_sessions"),
@@ -561,7 +567,7 @@ def test_the_phases_and_the_states() -> None:
         "cannot be packed",
         "not selected",
     )
-    assert cfg.STAGE_SCHEMAS["func_inventory"] == 1
+    assert cfg.STAGE_SCHEMAS["func_inventory"] == 2  # raised for the session order (decision D42)
 
 
 def test_the_settings_of_the_epi_interface_in_a_run(tmp_path: Path) -> None:
@@ -570,7 +576,7 @@ def test_the_settings_of_the_epi_interface_in_a_run(tmp_path: Path) -> None:
     census = new_census_config(privacy.HashKey(b"\x01" * 32, "dataset-key"))
     assert epi_settings(census).enabled is False
     assert cfg.EPI_INVENTORY_FIELDS == ("runs", "frame_limit_mm")
-    assert EpiConfig().inventory_hash() == "bc6236057a95"  # pinned: a line of every session hash
+    assert EpiConfig().inventory_hash() == "5ae1f2914378"  # pinned: a line of every session hash
     for name, value in (
         ("runs", ("*task-rest*",)),
         ("frame_limit_mm", 5.0),

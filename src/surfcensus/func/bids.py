@@ -505,3 +505,166 @@ def session_labels(runs: Sequence[RawRun | DerivRun]) -> list[str | None]:
     labels = {run.entities.ses for run in runs}
     named = sorted(label for label in labels if label is not None)
     return ([None] if None in labels else []) + list(named)
+
+
+# --- acquisition dates of sessions ----------------------------------------------------------
+
+ACQ_TIME_COLUMN = "acq_time"
+"""The column of ``sessions.tsv`` and ``scans.tsv`` that holds a date and time (BIDS)."""
+_TABLE_MAX_BYTES = 4 * 1024 * 1024
+"""A larger file named like a sessions or scans table is not read: it gives no date."""
+_BIDS_DATETIME = re.compile(
+    r"([0-9]{4})-([0-9]{2})-([0-9]{2})T([0-9]{2}):([0-9]{2}):([0-9]{2})"
+    r"(?:\.([0-9]{1,12}))?(Z|[+-][0-9]{2}:[0-9]{2})?"
+)
+
+
+def parse_acq_time(value: object) -> datetime.datetime | None:
+    """A BIDS ``acq_time`` (``YYYY-MM-DDThh:mm:ss[.ffffff][Z]``, or an offset ``+hh:mm``) as a
+    naive date and time: a value with a time zone is brought to UTC, one without is taken as
+    it is. ``n/a``, an empty value and anything else that does not parse is None. Years such
+    as 1900 (dates shifted for anonymisation) are dates like any other."""
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    m = _BIDS_DATETIME.fullmatch(value.strip())
+    if m is None:
+        return None
+    year, month, day, hour, minute, second = (int(m.group(i)) for i in range(1, 7))
+    micro = int((m.group(7) or "0")[:6].ljust(6, "0"))
+    try:
+        stamp = datetime.datetime(year, month, day, hour, minute, second, micro)
+    except ValueError:
+        return None
+    zone = m.group(8)
+    if zone and zone != "Z":
+        sign = 1 if zone[0] == "+" else -1
+        hours, minutes = int(zone[1:3]), int(zone[4:6])
+        if hours > 23 or minutes > 59:
+            return None
+        try:
+            stamp -= sign * datetime.timedelta(hours=hours, minutes=minutes)
+        except OverflowError:
+            return None
+    return stamp
+
+
+def session_date_files(
+    raw_root: Path, participant: str, labels: Sequence[str | None]
+) -> list[Path]:
+    """The files an acquisition date of a session is read from, whether they exist or not:
+    ``sub-X/sub-X_sessions.tsv``, then ``sub-X/ses-Y/sub-X_ses-Y_scans.tsv`` for each label.
+    Names only; nothing is examined."""
+    subject = Path(raw_root) / participant
+    out = [subject / f"{participant}_sessions.tsv"]
+    out += [
+        subject / f"ses-{label}" / f"{participant}_ses-{label}_scans.tsv"
+        for label in labels
+        if label is not None
+    ]
+    return out
+
+
+def session_date_lines(raw_root: Path, participant: str, labels: Sequence[str | None]) -> list[str]:
+    """The listing facts of :func:`session_date_files` for an inventory hash: one line per
+    file that is there (``date<TAB>location<TAB>size<TAB>mtime_ns``), or a link whose target
+    is missing (``date<TAB>location<TAB>link<TAB>target``, a git-annex placeholder), so that
+    fetching, adding, changing or removing such a file changes the hash. ``stat`` and
+    ``readlink`` only; no file is opened."""
+    lines = []
+    for path in session_date_files(raw_root, participant, labels):
+        location = _relative(path, Path(raw_root))
+        try:
+            st = os.stat(path)
+        except OSError:
+            try:
+                target = os.readlink(path)
+            except OSError:
+                continue
+            lines.append(f"date\t{location}\tlink\t{target}")
+            continue
+        if stat.S_ISREG(st.st_mode):
+            lines.append(f"date\t{location}\t{st.st_size}\t{st.st_mtime_ns}")
+    return lines
+
+
+def _table(path: Path) -> tuple[list[str], list[list[str]]] | None:
+    """The header and rows of a TSV file, None when it is not there, cannot be read, is a
+    git-annex placeholder (a link without content, a pointer file) or is larger than 4 MiB."""
+    from surfcensus.sources import patterns
+
+    try:
+        if patterns.annex_link(path) is not None and not path.exists():
+            return None
+        with open(path, "rb") as handle:
+            data = handle.read(_TABLE_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return None
+    if len(data) > _TABLE_MAX_BYTES:
+        return None
+    if patterns.annex_pointer(data[: patterns.POINTER_PROBE_BYTES], len(data)) is not None:
+        return None
+    try:
+        text = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        return None
+    lines = [line.rstrip("\r") for line in text.split("\n")]
+    lines = [line for line in lines if line.strip()]
+    if not lines:
+        return None
+    header = [cell.strip() for cell in lines[0].split("\t")]
+    rows = [[cell.strip() for cell in line.split("\t")] for line in lines[1:]]
+    return header, rows
+
+
+def _column(table: tuple[list[str], list[list[str]]], name: str) -> int | None:
+    header, _ = table
+    return header.index(name) if name in header else None
+
+
+def session_dates(
+    raw_root: Path, participant: str, labels: Sequence[str | None]
+) -> dict[str | None, datetime.datetime | None]:
+    """The acquisition date of each session of ``labels`` in the raw BIDS dataset, from the
+    first source that gives one: the ``acq_time`` of the row ``session_id`` = ``ses-<label>``
+    of ``sub-X/sub-X_sessions.tsv`` (the earliest when several rows name it), else the
+    earliest ``acq_time`` over the rows of ``sub-X/ses-Y/sub-X_ses-Y_scans.tsv``. None for a
+    session without one, and for ``None`` (no session). A file that is a git-annex
+    placeholder or cannot be read gives no date, without an error. The JSON field
+    ``AcquisitionTime`` is a time of day and is not used here; NIfTI headers hold no date.
+
+    Dates are private: they order a stream and are never written, printed or logged."""
+    files = session_date_files(raw_root, participant, [])
+    sessions = _table(files[0])
+    from_sessions: dict[str, datetime.datetime] = {}
+    if sessions is not None:
+        sid, acq = _column(sessions, "session_id"), _column(sessions, ACQ_TIME_COLUMN)
+        if sid is not None and acq is not None:
+            for row in sessions[1]:
+                if len(row) <= max(sid, acq):
+                    continue
+                stamp = parse_acq_time(row[acq])
+                name = row[sid]
+                if stamp is None or not name.startswith("ses-"):
+                    continue
+                label = name[4:]
+                if label not in from_sessions or stamp < from_sessions[label]:
+                    from_sessions[label] = stamp
+    out: dict[str | None, datetime.datetime | None] = {}
+    for label in labels:
+        if label is None:
+            out[label] = None
+            continue
+        if label in from_sessions:
+            out[label] = from_sessions[label]
+            continue
+        scans = _table(session_date_files(raw_root, participant, [label])[1])
+        found: datetime.datetime | None = None
+        if scans is not None:
+            acq = _column(scans, ACQ_TIME_COLUMN)
+            if acq is not None:
+                for row in scans[1]:
+                    stamp = parse_acq_time(row[acq]) if len(row) > acq else None
+                    if stamp is not None and (found is None or stamp < found):
+                        found = stamp
+        out[label] = found
+    return out

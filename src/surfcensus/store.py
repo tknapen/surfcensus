@@ -632,7 +632,12 @@ transform, as ``RunPackInput.session_inputs`` names it in ``pack.json``."""
 
 SESSION_ORDER = "session label"
 """``func_participants.session_order``: how the sessions of a participant's stream are put in
-order (``func.model.StreamInfo.order``; the ``ses-`` labels, numbers compared as numbers)."""
+order (``func.model.StreamInfo.order``): by the ``ses-`` labels, numbers compared as numbers,
+when not every session has an acquisition date (decision D42)."""
+ACQUISITION_ORDER = "acquisition time"
+"""``func_participants.session_order`` when every session has an acquisition date in the raw
+dataset: by date, ties by label (decision D42). The date itself is never stored."""
+SESSION_ORDERS = (SESSION_ORDER, ACQUISITION_ORDER)
 
 # the FreeSurfer files that the contours of a session are cut from, in FileRole order
 _CONTOUR_ROLES: tuple[FileRole, ...] = tuple(
@@ -1879,9 +1884,20 @@ class Catalog:
         return None if row is None else _func_source_record(row)
 
     def upsert_func_participant(
-        self, func_id: int, participant_uid: str, participant: str, n_sessions: int
+        self,
+        func_id: int,
+        participant_uid: str,
+        participant: str,
+        n_sessions: int,
+        session_order: str | None = None,
     ) -> None:
-        """Insert or update a participant of a functional source; sets ``present``."""
+        """Insert or update a participant of a functional source; sets ``present``.
+        ``session_order`` is the rule that ordered its sessions (:data:`SESSION_ORDER` or
+        :data:`ACQUISITION_ORDER`, decision D42); None keeps the stored rule, and a new row
+        gets :data:`SESSION_ORDER` (the inventory passes None when it planned no session of
+        the participant, so it read no date)."""
+        if session_order is not None and session_order not in SESSION_ORDERS:
+            raise ValueError(f"no rule of the session order: {session_order!r}")
         _check_uid(participant_uid, "participant_uid")
         _require_func(self._db)
         with self._db.write() as conn:
@@ -1913,9 +1929,17 @@ class Catalog:
                 "INSERT INTO func_participants (participant_uid, func_id, participant, "
                 "session_order, n_sessions, present, listed_at) VALUES (?, ?, ?, ?, ?, 1, ?) "
                 "ON CONFLICT(participant_uid) DO UPDATE SET session_order = "
-                "excluded.session_order, n_sessions = excluded.n_sessions, present = 1, "
-                "listed_at = excluded.listed_at",
-                (participant_uid, func_id, participant, SESSION_ORDER, n_sessions, _now()),
+                "COALESCE(?, func_participants.session_order), n_sessions = "
+                "excluded.n_sessions, present = 1, listed_at = excluded.listed_at",
+                (
+                    participant_uid,
+                    func_id,
+                    participant,
+                    session_order or SESSION_ORDER,
+                    n_sessions,
+                    _now(),
+                    session_order,
+                ),
             )
 
     def upsert_func_session(self, row: FuncSessionRow) -> None:

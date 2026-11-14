@@ -97,7 +97,12 @@ FS_FILES: tuple[FileRole, ...] = (
 """The FreeSurfer files the contours are cut from, inputs of every pack with contours."""
 
 SESSION_ORDER = "session label"
-"""The rule of the order of a subject's sessions in its stream (``StreamInfo.order``)."""
+"""The rule of the order of a subject's sessions in its stream (``StreamInfo.order``) when
+not every session has an acquisition date: the labels, numbers compared as numbers."""
+
+ACQUISITION_ORDER = "acquisition time"
+"""The rule when every session of the participant has an acquisition date in the raw dataset
+(decision D42): by date, ties by the label order."""
 
 
 def _read_errors() -> tuple[type[BaseException], ...]:
@@ -268,6 +273,63 @@ def session_key(label: str | None) -> tuple[int, tuple[tuple[int, int, str], ...
     return (0, ()) if label is None else (1, _natural(label))
 
 
+@dataclass(frozen=True)
+class SessionOrder:
+    """How the sessions of a participant's stream are ordered (decision D42)."""
+
+    rule: str
+    """:data:`ACQUISITION_ORDER` or :data:`SESSION_ORDER`."""
+    labels: tuple[str | None, ...]
+    """The sessions in stream order."""
+    undated: tuple[str, ...]
+    """The labels of the sessions without an acquisition date, in label order: empty when
+    every session has one (and for a participant without sessions)."""
+
+
+def order_sessions(
+    labels: Sequence[str | None], dates: Mapping[str | None, object] | None = None
+) -> SessionOrder:
+    """The stream order of ``labels`` (decision D42): when every one is a session (not None)
+    with a date in ``dates``, by date, ties by :func:`session_key`; otherwise by
+    :func:`session_key` for all of them, with no mixing. Dates are compared as given (the
+    naive ``datetime`` of ``bids.session_dates``) and are not kept in the result."""
+    by_label = sorted(dict.fromkeys(labels), key=session_key)
+    found = dates or {}
+    undated = tuple(lab for lab in by_label if lab is not None and found.get(lab) is None)
+    named = [lab for lab in by_label if lab is not None]
+    if named and len(named) == len(by_label) and not undated:
+        ordered = sorted(by_label, key=lambda lab: (found[lab], session_key(lab)))
+        return SessionOrder(ACQUISITION_ORDER, tuple(ordered), ())
+    return SessionOrder(SESSION_ORDER, tuple(by_label), undated)
+
+
+def session_order_of(
+    raw_root: Path | None, participant: str, labels: Sequence[str | None]
+) -> SessionOrder:
+    """:func:`order_sessions` with the dates of the raw dataset (``bids.session_dates``);
+    label order without a raw dataset or without a labelled session. Reads the participant's
+    ``sessions.tsv`` and the ``scans.tsv`` of its sessions."""
+    if raw_root is None or not any(lab is not None for lab in labels):
+        return order_sessions(labels)
+    return order_sessions(labels, bids.session_dates(raw_root, participant, labels))
+
+
+def order_words(order: SessionOrder) -> str:
+    """``in the order of their acquisition times``, or ``in the order of their labels (no
+    acquisition date for ses-2 in the raw dataset)``: what the commands say of a participant
+    with more than one session. Names no date."""
+    if order.rule == ACQUISITION_ORDER:
+        return "in the order of their acquisition times"
+    named = [lab for lab in order.labels if lab is not None]
+    if not named or len(order.undated) == len(named):
+        return "in the order of their labels (no acquisition date in the raw dataset)"
+    lacking = ", ".join(f"ses-{lab}" for lab in order.undated)
+    return (
+        f"in the order of their labels, not of their acquisition times (no acquisition date "
+        f"for {lacking} in the raw dataset)"
+    )
+
+
 def run_name(run: DerivRun) -> str:
     """The BIDS name of a run without the subject (``ses-1_task-rest_run-1``)."""
     first, _, rest = run.stem.partition("_")
@@ -291,7 +353,8 @@ class Listing:
     raw_runs: tuple[RawRun, ...]
 
     def labels(self) -> list[str | None]:
-        """The sessions of the participant's derivative runs, in stream order."""
+        """The sessions of the participant's derivative runs, in label order
+        (:func:`session_key`); the stream order is :func:`session_order_of`."""
         return sorted({r.entities.ses for r in self.deriv_runs}, key=session_key)
 
     def of(self, label: str | None) -> tuple[list[DerivRun], list[RawRun]]:
@@ -713,7 +776,12 @@ def session_hash(
     name order (its own files in ``FuncRole`` order, then those of every raw run of its key,
     the echoes included), the session's own files, the FreeSurfer files of the contours, and
     the extra lines ``EpiConfig.inventory_hash()``, the FreeSurfer subject's name, the raw
-    dataset's presence and the run ids. Opens no file: ``scandir`` and ``stat`` only."""
+    dataset's presence and the run ids. For a participant with sessions also the list of its
+    session labels and the listing facts of the files its sessions' acquisition dates are read
+    from (``bids.session_date_lines``: ``sessions.tsv`` and every ``scans.tsv``), so that a
+    change of either plans every session of the participant again and its stored
+    ``stream_order`` follows (decision D42). Opens no file: ``scandir``, ``stat`` and
+    ``readlink`` only."""
     druns, rruns = listing.of(label)
     refs: list[FuncFileRef] = []
     for run in sorted(druns, key=lambda r: (r.order, r.stem)):
@@ -731,6 +799,11 @@ def session_hash(
         f"raw\t{'yes' if folders.raw_root is not None else 'no'}",
         *(f"run\t{key}\t{uid}" for key, uid in sorted(run_ids.items())),
     ]
+    labels = listing.labels()
+    if any(lab is not None for lab in labels):
+        extra.append("sessions\t" + "\t".join(lab or "" for lab in labels))
+        if folders.raw_root is not None:
+            extra += bids.session_date_lines(folders.raw_root, listing.participant, labels)
     return func_signature(refs, _fs_refs(folders, fs_subject), extra)
 
 
@@ -1011,13 +1084,15 @@ def run_func_inventory(
             participant = listing.participant
             puid = uid_of.participant(participant)
             labels = listing.labels()
-            catalog.upsert_func_participant(func_id, puid, participant, len(labels))
             present_participants.append(puid)
             probes: Probes | None = None
-            for stream_order, label in enumerate(labels):
+            # the hashes first, from the listing; the dates are read only when a session of
+            # the participant is planned (decisions D21, D42)
+            pending: list[tuple[str | None, str, dict[str, str], str]] = []
+            for label in labels:
                 suid = uid_of.session(participant, label)
                 present_sessions.append(suid)
-                druns, rruns = listing.of(label)
+                druns, _ = listing.of(label)
                 run_ids = {r.key: uid_of.run(participant, label, r.key) for r in druns}
                 digest = session_hash(
                     item.folders, item.connector, listing, label, run_ids, settings
@@ -1025,6 +1100,21 @@ def run_func_inventory(
                 if not force and catalog.func_inventory_hash(suid) == digest:
                     skipped += 1
                     continue
+                pending.append((label, suid, run_ids, digest))
+            order: SessionOrder | None = None
+            if pending:
+                order = session_order_of(item.folders.raw_root, participant, labels)
+            catalog.upsert_func_participant(
+                func_id,
+                puid,
+                participant,
+                len(labels),
+                session_order=None if order is None else order.rule,
+            )
+            for label, suid, run_ids, digest in pending:
+                assert order is not None
+                stream_order = order.labels.index(label)
+                druns, rruns = listing.of(label)
                 if probes is None:
                     probes = probe_participant(item.folders, participant)
                 withheld = withheld_of(label, druns, probes, settings.runs)
@@ -1173,6 +1263,65 @@ def session_work(facts: FuncLeaseFacts, config: EpiConfig) -> SessionWork:
         contours=job,
         contour_note=note,
     )
+
+
+# --- the order lines ------------------------------------------------------------------------
+
+GROUP_ABOVE = 3
+"""Participants whose order lines would read alike are named in one line when there are more
+than this many of them."""
+
+
+def func_order_lines(catalog: Catalog) -> list[str]:
+    """What ``review`` and ``inventory`` say of the order of the sessions of each present
+    participant with more than one present session (decision D42): ``sub-01: 2 sessions in
+    the order of their acquisition times``, or ``... in the order of their labels (no
+    acquisition date in the raw dataset)``; more than :data:`GROUP_ABOVE` participants with
+    the same words in one line (``12 participants: their sessions in the order of ...``). A
+    participant whose sessions fell back to labels because some, not all, have a date is
+    named on its own with the sessions that lack one.
+
+    The rule is the stored one (``func_participants.session_order``); which sessions lack a
+    date is read again from the raw dataset for the participants ordered by label (their
+    ``sessions.tsv`` and ``scans.tsv``), as the fetch lines read the placeholders again. No
+    date is printed."""
+    rows = catalog.query(
+        "SELECT p.participant, p.session_order, f.raw_root, s.session_label "
+        "FROM func_sessions s JOIN func_participants p USING (participant_uid) "
+        "JOIN func_sources f USING (func_id) "
+        "WHERE s.present = 1 AND p.present = 1 AND f.present = 1 "
+        "ORDER BY p.participant, s.stream_order"
+    )
+    by: dict[str, tuple[str, str | None, list[str | None]]] = {}
+    for row in rows:
+        entry = by.setdefault(row["participant"], (str(row["session_order"]), row["raw_root"], []))
+        entry[2].append(row["session_label"])
+    alike: dict[str, list[tuple[str, int]]] = {}
+    single: list[str] = []
+    for participant, (rule, raw_root, labels) in by.items():
+        if len(labels) < 2:
+            continue
+        if rule == ACQUISITION_ORDER:
+            words = order_words(SessionOrder(rule, tuple(labels), ()))
+        else:
+            raw = None if raw_root is None else Path(raw_root)
+            found = session_order_of(raw, participant, labels)
+            if found.undated:
+                words = order_words(SessionOrder(SESSION_ORDER, tuple(labels), found.undated))
+            else:  # the raw dataset changed since the inventory: say only the rule
+                words = "in the order of their labels"
+            named = [lab for lab in labels if lab is not None]
+            if found.undated and len(found.undated) < len(named):
+                single.append(f"{participant}: {len(labels)} sessions {words}")
+                continue
+        alike.setdefault(words, []).append((participant, len(labels)))
+    lines: list[str] = []
+    for words, members in alike.items():
+        if len(members) > GROUP_ABOVE:
+            lines.append(f"{len(members)} participants: their sessions {words}")
+        else:
+            lines += [f"{participant}: {n} sessions {words}" for participant, n in members]
+    return [f"{line}." for line in sorted(lines + single)]
 
 
 # --- the fetch lines ------------------------------------------------------------------------
