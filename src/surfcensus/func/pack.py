@@ -672,20 +672,24 @@ def _sha(data: bytes) -> str:
 
 def _defining_json(info: PackInfo) -> str:
     """The JSON that defines a pack: ``pack.json`` without the content digest, without the
-    version of the package that wrote it, and without the compressed size and SHA-256 of every
-    file entry (an object with a ``file`` key), which depend on the zlib build."""
+    version of the package that wrote it, without the ids of the run, its session and its
+    anchor (keyed names, drawn anew per call in step 1; what the anchor is shows in the raw
+    values), and without the name, compressed size and SHA-256 of every file entry (an object
+    with a ``file`` key): names hold the run id, sizes and digests depend on the zlib build.
+    What stays of a file entry is what it says about the values (``first`` and ``count`` of a
+    chunk)."""
 
     def strip(value: Any) -> Any:
         if isinstance(value, dict):
-            drop = {"bytes", "sha256"} if "file" in value else set()
+            drop = {"file", "bytes", "sha256"} if "file" in value else set()
             return {k: strip(v) for k, v in value.items() if k not in drop}
         if isinstance(value, list):
             return [strip(v) for v in value]
         return value
 
     data = info.model_dump(mode="json")
-    data.pop("content_digest")
-    data.pop("surfcensus_version")
+    for key in ("content_digest", "surfcensus_version", "run", "session", "anchor_run"):
+        data.pop(key)
     return canonical_json(strip(data))
 
 

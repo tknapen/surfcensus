@@ -558,6 +558,8 @@ def _write_session_json(directory: Path, plan: SessionPlan, info: PackInfo) -> N
         config_hash="x",
         fd_threshold_mm=0.5,
         registration=None,
+        window=None,
+        sd_window=None,
         grids=(
             GridInfo(
                 grid_key=grid.key,
@@ -566,6 +568,8 @@ def _write_session_json(directory: Path, plan: SessionPlan, info: PackInfo) -> N
                 oblique_deg=0.0,
                 edge_letters={},
                 contours=None,
+                slice_axis={},
+                slice_mm={},
             ),
         ),
         runs=(),
@@ -636,8 +640,8 @@ def test_two_packs_of_one_input_have_one_digest_and_the_same_bytes(
     assert a.content_digest == b.content_digest
     # here, on one machine with one zlib, the compressed files are the same bytes too; that
     # is not promised across machines or zlib builds, which is why the digest is decoded
-    files_a = _files(tmp_path / "a")
-    assert files_a == _files(tmp_path / "b") and len(files_a) > 6
+    files_a = _files(tmp_path / "a", same_name=True)
+    assert files_a == _files(tmp_path / "b", same_name=True) and len(files_a) > 6
 
 
 def test_a_pack_made_in_another_process_has_the_same_digest(
@@ -663,15 +667,20 @@ def test_a_pack_made_in_another_process_has_the_same_digest(
         text=True,
     )
     assert out.stdout.strip() == here.content_digest
-    assert _files(tmp_path / "here") == _files(tmp_path / "there")
+    assert _files(tmp_path / "here", same_name=True) == _files(tmp_path / "there", same_name=True)
 
 
-def _files(session_dir: Path) -> dict[str, bytes]:
-    return {
-        p.relative_to(session_dir).as_posix(): p.read_bytes()
-        for p in sorted(session_dir.rglob("*"))
-        if p.is_file()
-    }
+def _files(session_dir: Path, *, same_name: bool = False) -> dict[str, bytes]:
+    """Every file under a session directory. ``same_name``: ``pack.json`` with the name of the
+    session directory taken out, to compare packs made into two directories."""
+    out = {}
+    for p in sorted(session_dir.rglob("*")):
+        if p.is_file():
+            data = p.read_bytes()
+            if same_name and p.name == PACK_JSON:
+                data = data.replace(f'"session": "{session_dir.name}"'.encode(), b"")
+            out[p.relative_to(session_dir).as_posix()] = data
+    return out
 
 
 def _rewrite(session_dir: Path, info: PackInfo, stream: str, index: int, data: bytes) -> PackInfo:
@@ -701,13 +710,13 @@ def test_the_digest_ignores_compressed_bytes_and_notices_one_changed_value(
     same = _rewrite(tmp_path, info, "raw", 0, data)
     assert (tmp_path / chunk.file).read_bytes() != zlib.compress(data, 6)
     assert content_digest(tmp_path, same) == info.content_digest
+    # the JSON that defines a pack counts too: another window is another pack
+    moved = same.model_copy(update={"window": (0.0, info.window[1] + 1)})
+    assert content_digest(tmp_path, moved) != info.content_digest
     changed = bytearray(data)
     changed[1234] = (changed[1234] + 1) % 256
     other = _rewrite(tmp_path, info, "raw", 0, bytes(changed))
     assert content_digest(tmp_path, other) != info.content_digest
-    # the JSON that defines a pack counts too: another window is another pack
-    moved = same.model_copy(update={"window": (0.0, info.window[1] + 1)})
-    assert content_digest(tmp_path, moved) != info.content_digest
     # and a file that is not the one pack.json lists is refused, not digested
     with pytest.raises(ValueError, match="SHA-256"):
         content_digest(tmp_path, info)
@@ -754,13 +763,16 @@ def test_pack_json_is_written_last_and_an_interrupted_pack_leaves_the_earlier_on
     run = run_id(runs[0])
     before = _files(tmp_path)
 
+    real_raw_stream = geometry.raw_stream
+
     def broken(*args: Any, **kwargs: Any) -> Iterator[tuple[int, np.ndarray]]:
-        for t, vol in geometry.raw_stream(*args, **kwargs):
+        for t, vol in real_raw_stream(*args, **kwargs):
             if t == 7:
                 raise RuntimeError("interrupted")
             yield t, vol
 
     monkeypatch.setattr(packmod.geometry, "raw_stream", broken)
+    assert real_raw_stream is not broken
     with pytest.raises(RuntimeError, match="interrupted"):
         pack_run(tmp_path, replace(inp, tr_s=3.0), EpiConfig())
     monkeypatch.undo()
@@ -913,7 +925,8 @@ def test_an_unreadable_series_is_a_pack_failure_without_a_path(
     broken = tmp_path / "broken" / "x_bold.nii.gz"
     broken.parent.mkdir()
     broken.write_bytes(b"not a nifti")
-    inp = run_input(runs[0], anchor, pre_bold=broken)
+    inp = run_input(runs[0], anchor)
+    inp = replace(inp, files={**inp.files, FuncRole.PRE_BOLD: broken})
     with pytest.raises(PackError) as err:
         pack_run(tmp_path / "out", inp, EpiConfig())
     assert err.value.reason == PACK_FAILURE and str(tmp_path) not in err.value.detail
