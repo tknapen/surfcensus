@@ -20,7 +20,9 @@ anchor run (D36). These are statements about the raw data, recorded per run and 
 from __future__ import annotations
 
 import math
+import os
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from pathlib import Path
 
 import nibabel as nib
@@ -28,7 +30,7 @@ import numpy as np
 from jaxtyping import Bool, Float
 
 from surfcensus.func import bids
-from surfcensus.func.connectors.base import Connector
+from surfcensus.func.connectors.base import Connector, ConnectorError
 from surfcensus.func.geometry import compose, grid_of, inverse, same_grid
 from surfcensus.records import (
     MULTI_ECHO,
@@ -38,6 +40,7 @@ from surfcensus.records import (
     NO_PREPROCESSED_SERIES,
     NO_RAW_SERIES,
     NO_TRANSFORM,
+    PACK_FAILURE,
     VOLUME_COUNTS_DIFFER,
     AffineChoice,
     Anchor,
@@ -95,6 +98,27 @@ def _seconds(runs: Sequence[AnchorCandidate]) -> tuple[dict[str, float] | None, 
     return {r.run: t[1] for r, t in zip(runs, times, strict=True) if t is not None}, ""
 
 
+def session_order(runs: Sequence[AnchorCandidate]) -> tuple[AnchorRule, str, tuple[str, ...]]:
+    """The rule of a session, what it saw, and every run id in acquisition order by it.
+
+    The time rule applies when every run has an ``AcquisitionTime`` that
+    ``func.bids.acquisition_seconds`` reads, all of one kind (times of day, or dates and
+    times); the runs are then in time order, equal times by name order. Otherwise they are in
+    name order (``AnchorCandidate.order``, then the run id). Raises ``ValueError`` for no runs
+    or a run given twice. :func:`plan_session` gives it every run of the session, so that
+    neither the rule nor the order depends on which runs are packed."""
+    if not runs:
+        raise ValueError("a session without runs has no anchor")
+    if len({r.run for r in runs}) != len(runs):
+        raise ValueError("a run is given twice")
+    by_name = _by_name(runs)
+    seconds, why = _seconds(runs)
+    if seconds is None:
+        return RULE_NAME, why, tuple(r.run for r in by_name)
+    ordered = sorted(by_name, key=lambda r: seconds[r.run])  # stable: ties keep name order
+    return RULE_TIME, f"earliest AcquisitionTime of {len(runs)} runs", tuple(r.run for r in ordered)
+
+
 def pick_anchor(runs: Sequence[AnchorCandidate]) -> Anchor:
     """The anchor of ONE session among the runs that have a stored transform. Runs with equal
     times go by name order. Raises ``ValueError`` for no runs.
@@ -104,20 +128,11 @@ def pick_anchor(runs: Sequence[AnchorCandidate]) -> Anchor:
     times); the anchor is then the earliest. Otherwise the anchor is the first run in name
     order (``AnchorCandidate.order``, then the run id). ``why`` says what the rule saw; under
     the time rule it holds the anchor's time as written."""
-    if not runs:
-        raise ValueError("a session without runs has no anchor")
-    if len({r.run for r in runs}) != len(runs):
-        raise ValueError("a run is given twice")
-    by_name = _by_name(runs)
-    seconds, why = _seconds(runs)
-    if seconds is None:
-        return Anchor(run=by_name[0].run, rule=RULE_NAME, why=why)
-    first = min(by_name, key=lambda r: seconds[r.run])  # min keeps the first of equal times
-    return Anchor(
-        run=first.run,
-        rule=RULE_TIME,
-        why=f"earliest AcquisitionTime of {len(runs)} runs ({first.acquisition_time})",
-    )
+    rule, why, order = session_order(runs)
+    first = next(r for r in runs if r.run == order[0])
+    if rule == RULE_TIME:
+        why = f"{why} ({first.acquisition_time})"
+    return Anchor(run=first.run, rule=rule, why=why)
 
 
 def acquisition_order(runs: Sequence[AnchorCandidate], anchor: Anchor) -> tuple[str, ...]:
@@ -260,9 +275,11 @@ def check_frame(
     limit_mm: float = FRAME_LIMIT_MM,
 ) -> FrameCheck:
     """The frame check of one session: ``transforms`` and ``masks`` by run id, for every
-    packable run; the anchor's own entry is all zeros.
+    packable run and the anchor; the anchor's own entry is all zeros.
 
-    Each run's displacement is taken over its own brain mask. ``shared_frame_plausible``: no
+    Each run's displacement is taken over its own brain mask. The anchor need not have a mask
+    (an anchor that is not packed, because it was not selected or lacks its mask, say): its
+    entry is all zeros either way, with ``n_voxels`` 0 when it has none. ``shared_frame_plausible``: no
     run is flagged. ``anchor_is_outlier``: at least two runs besides the anchor, every one of
     them flagged, and no pair of them flagged against each other (over the mask of the first
     of the pair in the order of ``transforms``): then the anchor, or its stored transform, is
@@ -270,18 +287,19 @@ def check_frame(
     anchor or a run's mask is missing."""
     if anchor not in transforms:
         raise ValueError("the anchor is not among the runs")
-    missing = [run for run in transforms if run not in masks]
+    missing = [run for run in transforms if run not in masks and run != anchor]
     if missing:
         raise ValueError(f"no brain mask for {len(missing)} of the runs")
     runs: dict[str, FrameDisplacement] = {}
     for run, own in transforms.items():
-        mask, affine = masks[run]
-        found = frame_displacement(own, transforms[anchor], mask, affine, limit_mm)
         if run == anchor:
-            found = FrameDisplacement(
-                0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, found.n_voxels, False
+            n_voxels = int(np.count_nonzero(masks[run][0])) if run in masks else 0
+            runs[run] = FrameDisplacement(
+                0.0, 0.0, 0.0, 0.0, (0.0, 0.0, 0.0), 0.0, n_voxels, False
             )
-        runs[run] = found
+            continue
+        mask, affine = masks[run]
+        runs[run] = frame_displacement(own, transforms[anchor], mask, affine, limit_mm)
     others = [run for run in transforms if run != anchor]
     flagged = tuple(run for run in others if runs[run].flagged)
     outlier = False
@@ -368,9 +386,25 @@ def plan_session(
     run_ids: Mapping[str, str],
     fs_subject: str | None,
     frame_limit_mm: float = FRAME_LIMIT_MM,
+    *,
+    withheld: Mapping[str, tuple[str, str | None]] | None = None,
 ) -> SessionPlan:
     """The plan of one session from the listings: runs paired by ``key``, the reason of every
-    run that cannot be packed, the anchor among the packable ones, the frame check, the grids.
+    run that cannot be packed, the anchor, the frame check, the grids.
+
+    The anchor (decision D36: one rigid transform per session, that of its anchor run) is
+    chosen among EVERY run of the session, before any reason a run is not packed: the runs
+    are put in acquisition order by the rule of :func:`session_order` over all of them, and
+    the anchor is the first in that order whose stored transform to the anatomy is listed and
+    reads (``connector.raw_to_anat``). So which runs are packed, selected or fetched does not
+    move the raw data: a run without its confounds table, its mask, an equal volume count or
+    its raw series, a run that ``withheld`` holds back, and a native-space, standard-space or
+    multi-echo run are anchors like any other when they come first. When the first run by the
+    rule has no readable transform, the next one that has is the anchor and
+    ``SessionPlan.anchor_note`` says so. ``withheld`` maps a run ``key`` to the reason and
+    detail of a run that is listed and not packed whatever its files say (``not selected``
+    for a run that ``--epi-runs`` leaves out, ``not fetched`` for a run with git-annex
+    placeholders); of such a run only the raw sidecar and the stored transform are read.
 
     ``deriv_runs`` and ``raw_runs`` are those of the session (``entities.ses`` equal to
     ``session``); ``run_ids`` maps a run ``key`` to its id. Reads the raw sidecars, the stored
@@ -391,21 +425,28 @@ def plan_session(
       step 1 does not pack); ``multi-echo``; the first missing role of ``PACK_REQUIRED`` (raw
       series, preprocessed series, transform, brain mask, confounds table, the last
       ``no confounds table``); a brain mask on another grid than the series
-      (``no brain mask``); volume counts that differ.
+      (``no brain mask``); volume counts that differ; a stored transform that does not read
+      (``pack failure``, with the error in ``details``). A run in ``withheld`` has the reason
+      given there and no other.
     * Runs whose preprocessed series lie on different grids are all packed: each distinct
       grid (equal shape, affines within ``geometry.GRID_TOLERANCE``) is a group of its own,
       named in ``grids`` and ``grid_of`` by the key of its first run in acquisition order. No
       run gets ``runs on different grids``.
-    * ``runs`` holds the packable runs first, in :func:`acquisition_order`, which is the order
-      of the session's one continuous stream (D38), then the others in name order.
+    * ``runs`` holds the packable runs first, in the session's acquisition order
+      (:func:`session_order` over every run, ``SessionPlan.order``) restricted to them, which
+      is the order of the session's one continuous stream (D38), then the others in name
+      order. The anchor need not be packed, so it need not come first among the packed runs.
+    * The frame check is over the packable runs, each over its own brain mask, against the
+      anchor's transform, whether the anchor is packed or not.
     * The session's own files come from ``connector.session_files``, with the match that
       ``connector.detect`` gives for ``deriv_root`` (empty when it gives none).
-    * An unreadable file raises (``OSError``, nibabel's errors, ``ConnectorError``): the plan
-      of a session is all or nothing.
+    * An unreadable file raises (``OSError``, nibabel's errors, ``ConnectorError``), but for a
+      stored transform: the plan of a session is otherwise all or nothing.
     """
     raw_by_key: dict[str, list[RawRun]] = {}
     for raw in sorted(raw_runs, key=lambda r: (r.order, r.stem)):
         raw_by_key.setdefault(raw.key, []).append(raw)
+    held = dict(withheld or {})
 
     def run_id(run: DerivRun) -> str:
         found = run_ids.get(run.key)
@@ -414,6 +455,8 @@ def plan_session(
         return found
 
     listed: list[SessionRun] = []
+    details: dict[str, str] = {}
+    all_paths: dict[str, dict[FuncRole, Path]] = {}
     packable: dict[str, tuple[SessionRun, dict[FuncRole, Path], Grid]] = {}
     for run in sorted(deriv_runs, key=lambda r: (r.order, r.stem)):
         echoes = raw_by_key.get(run.key, [])
@@ -426,7 +469,11 @@ def plan_session(
         display = connector.display(run)
         reason: str | None = None
         multi = len(echoes) > 1 or run.echoes > 1 or any(r.entities.echo for r in echoes)
-        if display.layout is None:
+        if run.key in held:
+            reason, detail = held[run.key]
+            if detail:
+                details[run_id(run)] = detail
+        elif display.layout is None:
             reason = display.reason or NO_PREPROCESSED_SERIES
         elif display.layout == "native":
             reason = NATIVE_SPACE_ONLY
@@ -457,47 +504,83 @@ def plan_session(
             missing=missing,
         )
         listed.append(item)
+        all_paths[item.run] = paths
         if reason is None and grid is not None:
             packable[item.run] = (item, paths, grid)
 
+    # the stored transforms of every run that lists one, and the order of the session
+    by_id = {item.run: item for item in listed}
+    rigid_of: dict[str, RigidPath] = {}
+    unreadable: dict[str, str] = {}
+    for run_uid, item in by_id.items():
+        paths = all_paths[run_uid]
+        if FuncRole.XFM_TO_ANAT not in paths:
+            continue
+        try:
+            rigid_of[run_uid] = connector.raw_to_anat(item.deriv, paths)
+        except _TRANSFORM_ERRORS as err:
+            unreadable[run_uid] = _error_words(err, deriv_root, raw_root)
+    for run_uid, words in unreadable.items():
+        if run_uid in packable:  # a packable run is one whose transform reads
+            item = packable.pop(run_uid)[0]
+            item = replace(item, reason=PACK_FAILURE)
+            by_id[run_uid] = item
+            details[run_uid] = f"its stored transform to the anatomy cannot be read: {words}"
+
     anchor = None
+    anchor_note = None
     frame = None
     grids: dict[str, Grid] = {}
     grid_of_run: dict[str, str] = {}
     order: tuple[str, ...] = ()
-    if packable:
-        candidates = [
-            AnchorCandidate(
-                run=run,
-                order=item.deriv.order,
-                acquisition_time=(
-                    bids.sidecar_time(paths[FuncRole.RAW_SIDECAR])
-                    if FuncRole.RAW_SIDECAR in paths
-                    else None
-                ),
+    session_runs: tuple[str, ...] = ()
+    candidates = [
+        AnchorCandidate(
+            run=run_uid,
+            order=item.deriv.order,
+            acquisition_time=(
+                bids.sidecar_time(all_paths[run_uid][FuncRole.RAW_SIDECAR])
+                if FuncRole.RAW_SIDECAR in all_paths[run_uid]
+                else None
+            ),
+        )
+        for run_uid, item in by_id.items()
+    ]
+    if candidates and rigid_of:
+        rule, why, session_runs = session_order(candidates)
+        first = next(r for r in session_runs if r in rigid_of)
+        time_of = {c.run: c.acquisition_time for c in candidates}
+        if rule == RULE_TIME:
+            why = f"{why} ({time_of[first]})"
+        anchor = Anchor(run=first, rule=rule, why=why)
+        skipped = session_runs[: session_runs.index(first)]
+        if skipped:
+            names = ", ".join(by_id[r].name for r in skipped)
+            words = "has" if len(skipped) == 1 else "have"
+            anchor_note = (
+                f"the first {_plural_runs(len(skipped))} by the rule ({names}) {words} no "
+                f"readable stored transform to the anatomy, so the anchor is the next run, "
+                f"{by_id[first].name}"
             )
-            for run, (item, paths, _) in packable.items()
-        ]
-        anchor = pick_anchor(candidates)
-        order = acquisition_order(candidates, anchor)
-        transforms: dict[str, Matrix4] = {}
+    if packable and anchor is not None:
+        order = tuple(r for r in session_runs if r in packable)
+        transforms: dict[str, Matrix4] = {anchor.run: rigid_of[anchor.run].matrix}
         masks: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for run in order:
-            item, paths, grid = packable[run]
-            rigid: RigidPath = connector.raw_to_anat(item.deriv, paths)
-            transforms[run] = rigid.matrix
-            masks[run] = _mask(paths[FuncRole.PRE_MASK])
+        for run_uid in order:
+            item, paths, grid = packable[run_uid]
+            transforms[run_uid] = rigid_of[run_uid].matrix
+            masks[run_uid] = _mask(paths[FuncRole.PRE_MASK])
             key = next((k for k, g in grids.items() if same_grid(g, grid)), None)
             if key is None:
                 key = grid.key
                 grids[key] = grid
-            grid_of_run[run] = key
+            grid_of_run[run_uid] = key
         frame = check_frame(transforms, anchor.run, masks, frame_limit_mm)
 
-    position = {run: n for n, run in enumerate(order)}
+    position = {run_uid: n for n, run_uid in enumerate(order)}
     runs = tuple(
         sorted(
-            listed,
+            by_id.values(),
             key=lambda r: (
                 (0, position[r.run], (), "")
                 if r.run in position
@@ -521,4 +604,23 @@ def plan_session(
         grids=grids,
         grid_of=grid_of_run,
         files=session_files,
+        details=details,
+        order=session_runs if anchor is not None else (),
+        anchor_note=anchor_note,
     )
+
+
+def _plural_runs(n: int) -> str:
+    return "run" if n == 1 else f"{n} runs"
+
+
+_TRANSFORM_ERRORS = (OSError, ValueError, EOFError, ConnectorError)
+
+
+def _error_words(err: BaseException, *roots: Path | None) -> str:
+    """The text of an error without the roots of the paths it may hold."""
+    text = str(getattr(err, "detail", None) or getattr(err, "strerror", None) or err)
+    for root in roots:
+        if root is not None:
+            text = text.replace(f"{root}{os.sep}", "").replace(str(root), ".")
+    return text

@@ -53,8 +53,10 @@ from surfcensus.func import session as session_
 from surfcensus.func.connectors.base import Connector, ConnectorError
 from surfcensus.func.model import SessionInfo, StreamInfo, info_text, read_info
 from surfcensus.records import (
+    NO_PREPROCESSED_SERIES,
     NO_RAW_SERIES,
     NOT_FETCHED,
+    NOT_SELECTED,
     PACK_FAILURE,
     ConnectorMatch,
     DerivRun,
@@ -352,6 +354,67 @@ def _placeholders(
     return found
 
 
+def _dangling(root: Path, participant: str) -> dict[tuple[str | None, str], list[str]]:
+    """The links of a participant's ``func/`` folders under ``root`` whose target is missing
+    and that are no git-annex links (those are placeholders, :func:`_placeholders`): for each
+    ``(session, run key)`` the file names. From the listing and ``readlink`` alone."""
+    found: dict[tuple[str | None, str], list[str]] = {}
+    try:
+        places = list(bids.func_dirs(root, participant))
+    except OSError:
+        return found
+    for session, folder in places:
+        try:
+            entries = sorted(os.scandir(folder), key=lambda e: e.name)
+        except OSError:
+            continue
+        for entry in entries:
+            key = _stem_key(entry.name)
+            if key is None:
+                continue
+            try:
+                if not entry.is_symlink() or os.path.exists(entry.path):
+                    continue
+                if patterns.annex_link(Path(entry.path)) is not None:
+                    continue
+            except OSError:
+                continue
+            found.setdefault((session, key), []).append(entry.name)
+    return found
+
+
+_SERIES_REASONS = {
+    NO_RAW_SERIES: ("raw", ("_bold.nii.gz", "_bold.nii")),
+    NO_PREPROCESSED_SERIES: ("preprocessed", ("_desc-preproc_bold.nii.gz", "_desc-preproc_bold.nii")),
+}
+"""A missing series, what it is called, and the ends of the names of such a series."""
+
+
+def _dangling_details(
+    plan: SessionPlan,
+    raw_links: Mapping[tuple[str | None, str], list[str]],
+    deriv_links: Mapping[tuple[str | None, str], list[str]],
+) -> SessionPlan:
+    """The detail of a run whose series is missing because the file there is a link whose
+    target is missing: that it is, so that ``no preprocessed series`` (or ``no raw series``)
+    does not read as "the pipeline wrote none"."""
+    details = dict(plan.details)
+    for item in plan.runs:
+        if item.reason not in _SERIES_REASONS or item.run in details:
+            continue
+        what, ends = _SERIES_REASONS[item.reason]
+        links = (raw_links if what == "raw" else deriv_links).get(
+            (plan.session, item.deriv.key), []
+        )
+        names = [n for n in links if n.endswith(ends) and (what == "raw" or "_space-" in n)]
+        if names:
+            words = "is a link" if len(names) == 1 else "are links"
+            details[item.run] = (
+                f"the {what} series {', '.join(names)} {words} whose target is missing"
+            )
+    return replace(plan, details=details)
+
+
 def _not_fetched(files: Sequence[tuple[str, int | None]]) -> str:
     names = ", ".join(name for name, _ in files)
     known = [size for _, size in files if size is not None]
@@ -495,33 +558,24 @@ def _failed_plan(
     )
 
 
-def _with_unfetched(
-    plan: SessionPlan,
-    unfetched: Sequence[tuple[DerivRun, RawRun | None, str]],
-    run_ids: Mapping[str, str],
-    connector: Connector,
-) -> SessionPlan:
-    if not unfetched:
+def _with_withheld(plan: SessionPlan, withheld: Mapping[str, tuple[str, str | None]]) -> SessionPlan:
+    """A failed plan whose withheld runs keep their own reason and detail."""
+    if not withheld:
         return plan
-    extra = [
-        SessionRun(
-            run=run_ids[d.key],
-            name=_run_name(d),
-            deriv=d,
-            raw=r,
-            display=connector.display(d),
-            reason=NOT_FETCHED,
-        )
-        for d, r, _ in unfetched
-    ]
-    packed = [r for r in plan.runs if r.reason is None]
-    others = sorted(
-        [r for r in plan.runs if r.reason is not None] + extra,
-        key=lambda r: (r.deriv.order, r.deriv.stem),
+    key_of = {r.run: r.deriv.key for r in plan.runs}
+    runs = tuple(
+        replace(r, reason=withheld[key_of[r.run]][0]) if key_of[r.run] in withheld else r
+        for r in plan.runs
     )
     details = dict(plan.details)
-    details.update({run_ids[d.key]: text for d, _, text in unfetched})
-    return replace(plan, runs=tuple(packed + others), details=details)
+    for r in runs:
+        if r.deriv.key in withheld:
+            detail = withheld[r.deriv.key][1]
+            if detail:
+                details[r.run] = detail
+            else:
+                details.pop(r.run, None)
+    return replace(plan, runs=runs, details=details)
 
 
 _READ_ERRORS = (OSError, ValueError, EOFError, ConnectorError, nib.filebasedimages.ImageFileError)
@@ -600,7 +654,8 @@ def _inputs(
         found = _paths(files, folders.deriv_root, folders.raw_root)
         return {role: p for role, p in found.items() if role in FUNC_READ_ROLES}
 
-    anchor = items[plan.anchor.run]
+    # the anchor is a run of the session, packed or not (``session.plan_session``)
+    anchor = next(r for r in plan.runs if r.run == plan.anchor.run)
     anchor_paths = paths_of(anchor)
     failed: dict[str, str] = {}
     try:
@@ -723,11 +778,15 @@ def epi_subject(
             "not found", f"{participant} has no functional run in {_shown(deriv, given)}"
         )
     patterns_ = tuple(runs or ())
-    if patterns_:
-        druns_all = [r for r in druns_all if any(fnmatch.fnmatchcase(r.stem, p) for p in patterns_)]
-        if not druns_all:
-            raise ConfigError("invalid", f"no run of {participant} matches {', '.join(patterns_)}")
-    labels = sorted({r.entities.ses for r in druns_all}, key=session_key)
+    selected = [r for r in druns_all if any(fnmatch.fnmatchcase(r.stem, p) for p in patterns_)]
+    if patterns_ and not selected:
+        raise ConfigError("invalid", f"no run of {participant} matches {', '.join(patterns_)}")
+    if not patterns_:
+        selected = list(druns_all)
+    chosen = {(r.entities.ses, r.key) for r in selected}
+    # the sessions of the runs selected; within them every run is planned, the others as
+    # ``not selected``, so that the anchor and the order of a session do not follow the filter
+    labels = sorted({r.entities.ses for r in selected}, key=session_key)
     if sessions:
         wanted = [s.removeprefix("ses-") for s in sessions]
         unknown = [s for s in wanted if s not in labels]
@@ -742,6 +801,8 @@ def epi_subject(
     secret = key if key else secrets.token_bytes(32)
     unfetched_deriv = _placeholders(deriv, participant, [deriv / participant / "figures"])
     unfetched_raw = _placeholders(raw_root, participant) if raw_root is not None else {}
+    dangling_deriv = _dangling(deriv, participant)
+    dangling_raw = _dangling(raw_root, participant) if raw_root is not None else {}
 
     planned: list[_Session] = []
     for label in labels:
@@ -758,21 +819,19 @@ def epi_subject(
         for r in druns:
             reused = previous.runs.get((text, _run_name(r))) if key is None else None
             run_ids[r.key] = reused or func_id(secret, "run", participant, label or "", r.key)
-        held: list[tuple[DerivRun, RawRun | None, str]] = []
-        clean: list[DerivRun] = []
+        withheld: dict[str, tuple[str, str | None]] = {}
         for r in druns:
             files = unfetched_deriv.get((label, r.key), []) + unfetched_raw.get((label, r.key), [])
-            if files:
-                raw_of = next((x for x in rruns if x.key == r.key), None)
-                held.append((r, raw_of, _not_fetched(files)))
-            else:
-                clean.append(r)
+            if (label, r.key) not in chosen:
+                withheld[r.key] = (NOT_SELECTED, f"--epi-runs leaves it out ({', '.join(patterns_)})")
+            elif files:
+                withheld[r.key] = (NOT_FETCHED, _not_fetched(files))
         fs_subject = _fs_subject(folders.fs_subjects_dir, participant, label)
         try:
             plan = session_.plan_session(
                 participant,
                 label,
-                clean,
+                druns,
                 rruns,
                 connector,
                 deriv,
@@ -780,11 +839,13 @@ def epi_subject(
                 run_ids,
                 fs_subject,
                 config.frame_limit_mm,
+                withheld=withheld,
             )
         except _READ_ERRORS as err:
             detail = f"the session cannot be planned: {_no_path(err, deriv, raw_root)}"
-            plan = _failed_plan(participant, label, clean, run_ids, connector, detail)
-        plan = _with_unfetched(plan, held, run_ids, connector)
+            plan = _failed_plan(participant, label, druns, run_ids, connector, detail)
+            plan = _with_withheld(plan, withheld)
+        plan = _dangling_details(plan, dangling_raw, dangling_deriv)
         if raw_root is None:
             hint = "no raw BIDS dataset was found for the derivative; give it with --raw DIR"
             details = dict(plan.details)

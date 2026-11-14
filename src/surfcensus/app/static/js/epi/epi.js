@@ -9,6 +9,7 @@
 // changes beside the pictures.
 import {
   boundaries,
+  boundaryFraction,
   buildTimeline,
   clamp,
   CONTOUR_UNIT,
@@ -22,6 +23,7 @@ import {
   intensityTables,
   KINDS,
   locate,
+  movePlace,
   PLANES,
   planeSize,
   playbackStep,
@@ -78,6 +80,9 @@ let lastFlip = 'pre';
 let stalled = false;
 let segOnScreen = -1;
 let allGrids = [];
+let errorShown = null; // the error the status line says, until a later load succeeds
+let noticeKind = ''; // what #notice says: '' (nothing), 'waiting' (packs being made) or 'stale'
+let helpReturn = null; // the element that had the focus when the help was opened
 const contoursOf = new Map(); // grid key -> [three decoded files] while loading or loaded; null without contours
 const sliceBuffers = [];
 const waiters = [];
@@ -200,7 +205,15 @@ function render(reason = 'other') {
   writeControls();
   if (!vols) {
     setPending(true, reason);
-    if (!store.stillsNow(k)) store.stills(k).then(() => pending && render(pendingReason), fail);
+    if (!store.stillsNow(k)) {
+      store.stills(k).then(
+        () => pending && render(pendingReason),
+        (err) => {
+          fail(err);
+          if (!store.stopped) setTimeout(() => pending && render(pendingReason), 500); // asked again
+        },
+      );
+    }
     writeStatus();
     return false;
   }
@@ -323,7 +336,7 @@ function writeControls() {
   const k = segOf(state.g);
   const { t } = localVolume(state.g);
   const run = runOf(k);
-  for (const b of $('runs').querySelectorAll('button[data-seg]')) b.setAttribute('aria-pressed', String(Number(b.dataset.seg) === k));
+  for (const b of $('segments').querySelectorAll('button[data-seg]')) b.setAttribute('aria-pressed', String(Number(b.dataset.seg) === k));
   for (const b of $('views-buttons').children) b.setAttribute('aria-pressed', String(b.dataset.view === state.view));
   for (const b of $('kinds-buttons').children) b.setAttribute('aria-pressed', String(b.dataset.kind === state.kind));
   $('normalize').setAttribute('aria-pressed', String(state.normalized));
@@ -334,11 +347,12 @@ function writeControls() {
   time.disabled = state.kind !== 'series';
   $('play-text').textContent = state.playing ? 'pause' : 'play';
   $('rate').value = String(state.rate);
-  const tr = run.tr_s ? `, ${(t * run.tr_s).toFixed(1)} s into the run` : '';
-  $('readout').textContent =
+  const tr = run.tr_s ? `, ${(t * run.tr_s).toFixed(1)} s` : '';
+  $('readout-run').textContent = run.name;
+  $('readout-volume').textContent =
     state.kind === 'series'
-      ? `volume ${state.g} of 0 to ${timeline.total - 1} of the stream; ${t} of 0 to ${run.n_volumes - 1} of ${run.name}${tr}`
-      : `still of ${run.name} over ${run.pack.stills_volumes} of ${run.n_volumes} volumes`;
+      ? `volume ${t} of 0 to ${run.n_volumes - 1} of the run${tr} · ${state.g} of 0 to ${timeline.total - 1} of the stream`
+      : `still over ${run.pack.stills_volumes} of ${run.n_volumes} volumes of the run`;
   const grid = gridOf(k);
   for (const label of $('slices').children) {
     const input = label.querySelector('input');
@@ -355,6 +369,17 @@ function writeControls() {
   document.body.classList.toggle('no-traces', !state.traces);
 }
 
+function badge(text, title, kind = '') {
+  const el = document.createElement('span');
+  el.className = `badge ${kind}`.trim();
+  el.textContent = text;
+  el.title = title;
+  return el;
+}
+
+// What is said about the run on screen: one strip of fixed height under the timeline (two
+// lines, cut with an ellipsis, the whole text in their tooltips) and the whole text in the
+// details, which open over the views and move nothing.
 function writeRun() {
   const k = segOf(state.g);
   const run = runOf(k);
@@ -364,37 +389,58 @@ function writeRun() {
   const f = run.frame;
   const anchorName = reg ? (session.runs.find((r) => r.run_uid === reg.anchor) || {}).name : null;
   let note;
+  let where;
   if (run.anchor) {
     note = `${session.label}, ${run.name}: the anchor run of the session (${rule}); the raw stream of every run of the session is drawn through its stored registration to the anatomy.`;
+    where = `anchor of ${session.label} (${rule})`;
   } else if (f) {
     note =
       `${session.label}, ${run.name}: drawn through the registration of the anchor run ${anchorName}, it lies ${f.mean_mm.toFixed(2)} mm on average and ` +
       `${f.max_mm.toFixed(2)} mm at most (over its brain mask) from where its own stored registration puts it: ` +
       `a rotation of ${f.rotation_deg.toFixed(2)} degrees and a shift of ${f.translation_mm.toFixed(2)} mm.`;
+    where = `${session.label}, through the anchor's registration: ${f.max_mm.toFixed(2)} mm at most (${f.mean_mm.toFixed(2)} mean) from its own`;
   } else {
     note = `${session.label}, ${run.name}.`;
+    where = session.label;
   }
   $('run-note').textContent = note;
+  $('run-name').textContent = run.name;
+  $('run-where').textContent = where;
+  $('run-where').title = note;
+  const badges = [];
   const warnings = [];
   if (f && f.flagged) {
-    warnings.push(
-      `${run.name} is FLAGGED (raw data): drawn through the session's one registration, it lies more than ${reg.limit_mm} mm somewhere in the brain from where its own registration puts it. ` +
-        'The head moved that much since the anchor run, the run may not share its scanner frame, or a stored registration failed. It is shown through the session\'s registration all the same.',
-    );
+    const text =
+      `${run.name} is flagged. It is shown through the session's registration (that of the anchor run ${anchorName}); its own stored registration would put it up to ` +
+      `${f.max_mm.toFixed(1)} mm elsewhere in its brain mask, beyond the limit of ${reg.limit_mm} mm. This is a statement about the raw data: the head moved that far between runs, ` +
+      "the run may not share the anchor's scanner frame, or one of the stored registrations is off.";
+    warnings.push(text);
+    badges.push(badge(`flagged: ${f.max_mm.toFixed(1)} mm`, text, 'flag'));
   }
   if (reg && reg.anchor_is_outlier) {
-    warnings.push(`Every other run of ${session.label} is flagged against the anchor ${anchorName} and they agree with each other: the anchor, or its stored registration, is the odd one.`);
+    const text = `Every other run of ${session.label} is flagged against the anchor ${anchorName} and they agree with each other: the anchor, or its stored registration, is the odd one.`;
+    warnings.push(text);
+    badges.push(badge('anchor is the odd one', text, 'flag'));
   }
   if (run.pack.raw_affine === 'header, unchecked') {
-    warnings.push(`The raw affine of ${run.name} is unchecked: the pipeline wrote no reference image to compare the header with, so the raw stream may lie off by a disagreement between qform and sform.`);
+    const text = `The raw affine of ${run.name} is unchecked: the pipeline wrote no reference image to compare the header with, so the raw stream may lie off by a disagreement between qform and sform.`;
+    warnings.push(text);
+    badges.push(badge('raw affine unchecked', text, 'flag'));
   }
-  if (!run.pack.rigid) warnings.push(`${run.name}: affine registration, not rigid; it is used as stored.`);
+  if (!run.pack.rigid) {
+    const text = `${run.name}: affine registration, not rigid; it is used as stored.`;
+    warnings.push(text);
+    badges.push(badge('affine registration', text, 'flag'));
+  }
   $('warning').hidden = warnings.length === 0;
   $('warning').textContent = warnings.join(' ');
   const missing = session.runs.filter((r) => r.reason !== null);
-  $('session-note').textContent = missing.length
+  const sessionNote = missing.length
     ? `${session.label}: ${missing.length} run(s) not in the stream: ${missing.map((r) => `${r.name} (${r.reason}${r.detail ? `: ${r.detail}` : ''})`).join('; ')}.`
     : `${session.label}: every listed run is in the stream.`;
+  $('session-note').textContent = sessionNote;
+  if (missing.length) badges.push(badge(`${missing.length} of ${session.label} not in the stream`, sessionNote));
+  $('badges').replaceChildren(...badges);
   writeCorrections();
 }
 
@@ -402,14 +448,35 @@ function statementText(s, applied, notApplied, unknown) {
   return s.state === 'applied' ? applied : s.state === 'not applied' ? notApplied : unknown;
 }
 
+function sourceName(role) {
+  return role.replace(/_/g, ' ');
+}
+
+// Where a statement about a correction comes from: the file and the words read there, or the
+// note that says why no file states it (head-motion correction is fMRIPrep's design).
+function sourceOf(st) {
+  if (st.source) return st.words ? `${sourceName(st.source)}: "${st.words}"` : sourceName(st.source);
+  if (st.note) return st.note;
+  return st.state === 'unknown' ? 'nothing read' : 'stated by no file';
+}
+
 function correctionsText(run) {
   const c = run.pack.corrections;
-  const steps = ['head-motion correction'];
-  steps.push(statementText(c.sdc, `distortion correction, ${c.sdc_method || 'method not stated'}`, 'no distortion correction', 'distortion correction not stated'));
-  steps.push(statementText(c.slice_timing, 'slice-timing correction', 'no slice-timing correction', 'slice-timing correction not stated'));
-  const reg = c.registration.words ? `; registration: ${c.registration.words}${c.dof ? `, ${c.dof} dof` : ''}` : '';
-  const source = [c.sdc.source, c.slice_timing.source].filter(Boolean)[0];
-  let text = `Preprocessing of ${run.name}: ${steps.join('; ')}${reg}${source ? ` (as stated in the ${source.replace(/_/g, ' ')})` : ''}. The raw stream has none of these, only the session's one placement.`;
+  const parts = [
+    `${statementText(c.motion, 'head-motion correction', 'no head-motion correction', 'head-motion correction not stated')} (${sourceOf(c.motion)})`,
+    `${statementText(c.sdc, `distortion correction, ${c.sdc_method || 'method not stated'}`, 'no distortion correction', 'distortion correction not stated')} (${sourceOf(c.sdc)})`,
+    `${statementText(c.slice_timing, 'slice-timing correction', 'no slice-timing correction', 'slice-timing correction not stated')} (${sourceOf(c.slice_timing)})`,
+  ];
+  if (c.registration.words) {
+    // the degrees of freedom once: the report's words often state them already
+    const stated = c.dof && new RegExp(`\\b${c.dof}\\s*dof\\b`).test(c.registration.words);
+    const dof = c.dof && !stated ? `, ${c.dof} dof` : '';
+    const from = c.registration.source ? sourceName(c.registration.source) : sourceOf(c.registration);
+    parts.push(`registration ${c.registration.words}${dof} (${from})`);
+  } else if (c.registration.note) {
+    parts.push(`registration not stated (${c.registration.note})`);
+  }
+  let text = `Preprocessing of ${run.name}: ${parts.join('; ')}. The raw stream has none of these, only the session's one rigid placement.`;
   if (c.sdc.state === 'applied') {
     text += ' So the raw stream shows the distortion as acquired against the contours, and the preprocessed stream how well the correction brought the series onto them.';
   }
@@ -420,8 +487,15 @@ function writeCorrections() {
   const { level, text } = correctionsText(runOf(segOf(state.g)));
   const box = $('corrections');
   box.textContent = text;
+  box.title = text;
   box.dataset.level = level;
   box.dataset.strong = String(state.view !== 'pre');
+  $('corrections-full').textContent = text;
+}
+
+function setDetails(open) {
+  $('run-details').hidden = !open;
+  $('run-more').setAttribute('aria-expanded', String(open));
 }
 
 // What the gray levels on screen stand for, and the scale of the difference, under the
@@ -438,7 +512,7 @@ function legendText() {
   if (state.view !== 'diff') return scope;
   return (
     `${scope} Difference raw minus preprocessed of the gray levels on screen, the effect of preprocessing on this run: the colour saturates at ${state.diffScale} gray levels ` +
-    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}). Blue: raw lower. Red: raw higher.`
+    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}). Blue: raw lower. Red: raw higher. Contours here: white surface green, pial magenta, on a dark outline.`
   );
 }
 
@@ -460,6 +534,7 @@ function writeLegend() {
   }
   bar.hidden = state.view !== 'diff';
   $('legend-text').textContent = legendText();
+  $('legend').title = $('legend-text').textContent;
   $('legend').dataset.normalized = String(state.normalized);
 }
 
@@ -488,13 +563,65 @@ function writeStatus(vols, k) {
   const s = store.stats();
   parts.push(`${formatBytes(s.decodedChunkBytes + s.stillBytes)} decoded in memory (chunks limited to ${formatBytes(s.limitBytes)})`);
   if (s.unchecked) parts.push('the SHA-256 of the files could not be checked (no secure context)');
-  if (page.errors.length) parts.push(`ERROR: ${page.errors[page.errors.length - 1]}`);
+  if (errorShown) parts.push(`ERROR: ${errorShown}`);
   $('status').textContent = parts.join(' · ');
+  $('status').title = $('status').textContent;
 }
 
+// An error is said in the status line until a later file loads; one that may mean the packs
+// were made again since the page was opened (a file that is gone, or whose bytes are not those
+// listed) makes the page ask the server for the stream again.
 function fail(err) {
-  page.errors.push(String(err && err.message ? err.message : err));
+  const text = String(err && err.message ? err.message : err);
+  page.errors.push(text);
+  errorShown = text;
   if (store) writeStatus();
+  if (stream && /status (404|503)|not those the session lists/.test(text)) checkStream();
+}
+
+function recovered() {
+  if (noticeKind === 'waiting') showNotice('', '');
+  if (errorShown !== null) {
+    errorShown = null;
+    writeStatus();
+  }
+}
+
+function tokensOf(s) {
+  return JSON.stringify(s.sessions.map((x) => [x.session_uid, x.grids.map((g) => g.token), x.runs.map((r) => (r.pack ? r.pack.token : null))]));
+}
+
+let checking = null;
+
+function checkStream() {
+  if (checking || noticeKind === 'stale') return;
+  checking = (async () => {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    try {
+      const api = document.querySelector('main[data-api]').dataset.api;
+      const response = await fetch(api, { headers: { Accept: 'application/json' } });
+      if (response.status === 503) {
+        showNotice(
+          'waiting',
+          'The packs are being made again: the server has no stream to give now. The page goes on when the files are back; reload it when they are made, to see what was made.',
+        );
+      } else if (response.ok && tokensOf(await response.json()) !== tokensOf(stream)) {
+        store.stop();
+        state.playing = false;
+        showNotice('stale', 'The packs were made again since this page was opened: the files on disk are no longer those this page lists, so it has stopped. Reload the page to see them.');
+      }
+    } catch {
+      // the server is not there: the status line says the error
+    } finally {
+      checking = null;
+    }
+  })();
+}
+
+function showNotice(kind, text) {
+  noticeKind = kind;
+  $('notice-text').textContent = text;
+  $('notice').hidden = !kind;
 }
 
 // ---- changes of state ----------------------------------------------------------------------------
@@ -530,10 +657,11 @@ function placeFromSlices() {
   state.place = pointOf(gridOf(segOf(state.g)), state.slices);
 }
 
+// A step of one plane moves the place along that plane's normal only (logic.movePlace).
 function setSlice(plane, index) {
   const grid = gridOf(segOf(state.g));
   state.slices[plane] = clamp(index, 0, grid.shape[plane] - 1);
-  placeFromSlices();
+  state.place = movePlace(grid, state.place, plane, state.slices[plane]);
   render('other');
 }
 
@@ -569,19 +697,32 @@ function setDiffScale(scale) {
   render('other');
 }
 
+// The help is a modal dialog: the focus goes into it, Tab goes round its buttons, and on
+// closing the focus goes back to what had it before (or nowhere, when nothing had it).
 function setHelp(on) {
+  if (on === state.help) return;
   state.help = on;
   $('help').hidden = !on;
   if (on) {
+    helpReturn = document.activeElement;
     state.playing = false;
+    setDetails(false);
     writeControls();
     $('help-close').focus({ preventScroll: true });
   } else {
-    $('help-button').focus();
+    const back = helpReturn;
+    helpReturn = null;
+    if (back && back !== document.body && back.isConnected && typeof back.focus === 'function') back.focus({ preventScroll: true });
+    else if (document.activeElement && document.activeElement !== document.body) document.activeElement.blur();
   }
 }
 
+function helpStops() {
+  return [...$('help').querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')].filter((el) => !el.disabled);
+}
+
 function tick(now) {
+  if (store.stopped) state.playing = false;
   if (state.playing && state.kind === 'series' && !state.help) {
     const step = playbackStep(nextDue, now, state.rate);
     if (step.advance) {
@@ -623,7 +764,17 @@ function onKeyDown(event) {
     if (key === 'Escape' || key === '?') {
       event.preventDefault();
       setHelp(false);
+    } else if (key === 'Tab') {
+      const stops = helpStops();
+      const at = stops.indexOf(document.activeElement);
+      event.preventDefault();
+      stops[(at + (event.shiftKey ? -1 : 1) + stops.length) % stops.length].focus();
     }
+    return;
+  }
+  if (key === 'Escape' && !$('run-details').hidden) {
+    event.preventDefault();
+    setDetails(false);
     return;
   }
   const target = event.target;
@@ -703,46 +854,60 @@ function onKeyUp(event) {
 
 let windows = { value: [], sd: [] };
 
-function buildRuns() {
-  const box = $('runs');
+// Where a fraction of the slider's travel lies along the track: the thumb's centre runs from
+// half its width to the width less half its width (THUMB px; app.css #time).
+const THUMB = 10;
+
+function along(fraction) {
+  return `calc(${THUMB / 2}px + ${fraction} * (100% - ${THUMB}px))`;
+}
+
+// The timeline under the views: one labelled segment per packed run, in stream order, each a
+// button that jumps to its first volume, with the boundaries of the stream as marks on the
+// slider (thin between runs, thick between sessions). Its height does not change with the
+// number of runs.
+function buildSegments() {
+  const box = $('segments');
   box.replaceChildren();
-  stream.sessions.forEach((session, si) => {
-    const group = document.createElement('div');
-    group.className = 'session';
-    group.dataset.session = String(si);
-    const head = document.createElement('span');
-    head.className = 'session-label';
-    head.textContent = session.label;
-    group.append(head);
-    session.runs.forEach((run, ri) => {
-      const k = timeline.segments.findIndex((seg) => seg.session === si && seg.run === ri);
-      const b = document.createElement('button');
-      b.type = 'button';
-      const away = document.createElement('span');
-      away.className = 'away';
-      if (k < 0) {
-        b.disabled = true;
-        b.textContent = `${run.name} `;
-        away.textContent = run.reason || 'no pack';
-        b.title = run.detail ? `not in the stream: ${run.detail}` : 'not in the stream';
-      } else {
-        b.dataset.seg = String(k);
-        b.textContent = `${run.name} `;
-        const where = run.anchor ? 'anchor' : run.frame ? `${run.frame.max_mm.toFixed(1)} mm` : '';
-        away.textContent = run.frame && run.frame.flagged ? `${where}, flagged` : where;
-        b.classList.toggle('flagged', Boolean(run.frame && run.frame.flagged));
-        b.title = `jump to volume ${segment(k).first} of the stream`;
-        b.addEventListener('click', () => jumpToSegment(k));
-      }
-      b.append(away);
-      group.append(b);
-    });
-    box.append(group);
+  const total = timeline.total;
+  const stops = [];
+  timeline.segments.forEach((seg, k) => {
+    const session = stream.sessions[seg.session];
+    const run = session.runs[seg.run];
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.dataset.seg = String(k);
+    b.textContent = run.name;
+    const left = k === 0 ? '0px' : along(boundaryFraction(seg.first, total));
+    const next = timeline.segments[k + 1];
+    const right = next ? along(boundaryFraction(next.first, total)) : '100%';
+    b.style.left = left;
+    b.style.width = `calc(${right} - ${left})`;
+    const flagged = Boolean(run.frame && run.frame.flagged);
+    b.classList.toggle('flagged', flagged);
+    b.classList.toggle('session-start', seg.startsSession && k > 0);
+    const where = run.anchor ? 'anchor' : run.frame ? `${run.frame.max_mm.toFixed(1)} mm from its own registration` : '';
+    b.title = `${session.label}, ${run.name}${where ? ` (${where}${flagged ? ', flagged' : ''})` : ''}: volumes ${seg.first} to ${seg.first + seg.n - 1} of the stream; jumps to its first volume`;
+    b.addEventListener('click', () => jumpToSegment(k));
+    box.append(b);
+    if (k > 0) {
+      const at = along(boundaryFraction(seg.first, total));
+      const half = seg.startsSession ? 1.5 : 0.5;
+      const colour = seg.startsSession ? '#ffffff' : '#c9d1db';
+      stops.push(`transparent calc(${at} - ${half}px), ${colour} calc(${at} - ${half}px), ${colour} calc(${at} + ${half}px), transparent calc(${at} + ${half}px)`);
+    }
   });
+  $('time').style.setProperty('--ticks', stops.length ? `linear-gradient(to right, ${stops.join(', ')})` : 'none');
 }
 
 function buildControls() {
-  buildRuns();
+  buildSegments();
+  $('run-more').addEventListener('click', () => setDetails($('run-details').hidden));
+  document.addEventListener('pointerdown', (event) => {
+    if (!$('run-details').hidden && event.target instanceof Node && !$('run-strip').contains(event.target)) setDetails(false);
+  });
+  $('notice-reload').addEventListener('click', () => window.location.reload());
+  $('notice-close').addEventListener('click', () => showNotice('', ''));
   for (const b of $('views-buttons').children) b.addEventListener('click', () => setView(b.dataset.view));
   for (const b of $('kinds-buttons').children) b.addEventListener('click', () => setKind(b.dataset.kind));
   $('normalize').addEventListener('click', () => setNormalized(!state.normalized));
@@ -807,12 +972,14 @@ function buildControls() {
   $('help-window').textContent = `${stream.rules.window}; ${stream.rules.quantise}. ${stream.rules.common_scale}.`;
 }
 
+// The height the views may take: the window less everything else on the page, measured (the
+// page's height less that of the views), so that nothing is forgotten and the page does not
+// overflow. On a narrow window the views come first and take most of a screen.
 function availableHeight() {
-  const used = ['bar', 'reading', 'runs', 'run-note', 'session-note', 'corrections', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
-  const warn = $('warning').hidden ? 0 : $('warning').offsetHeight;
-  const tr = state.traces ? $('traces').offsetHeight : 0;
-  if (window.innerWidth < 700) return 0.9 * window.innerHeight;
-  return Math.max(window.innerHeight - used - warn - tr - 70, 0.4 * window.innerHeight);
+  if (window.innerWidth < 700) return Math.max(0.92 * window.innerHeight - $('bar').offsetHeight, 200);
+  const epi = document.querySelector('.epi');
+  const rest = epi.getBoundingClientRect().height - $('views').getBoundingClientRect().height;
+  return Math.max(window.innerHeight - rest - 2, 0.3 * window.innerHeight);
 }
 
 async function fetchJson(url) {
@@ -882,6 +1049,7 @@ async function start() {
     if (pending) render(pendingReason);
   };
   store.onerror = fail;
+  store.onload = recovered;
   document.title = `EPI movie: ${stream.label}`;
   $('subject').textContent = stream.label;
   $('reading').textContent = stream.reading;
@@ -892,9 +1060,14 @@ async function start() {
   views = new Views($('views'), streamPanelSizesMm(allGrids), {
     pick: (plane, a, b) => {
       state.active = plane;
-      state.slices[SPEC[plane].h] = a;
-      state.slices[SPEC[plane].v] = b;
-      placeFromSlices();
+      const grid = gridOf(segOf(state.g));
+      for (const [axis, index] of [
+        [SPEC[plane].h, a],
+        [SPEC[plane].v, b],
+      ]) {
+        state.slices[axis] = index;
+        state.place = movePlace(grid, state.place, axis, index);
+      }
       render('other');
     },
     wheel: (plane, direction) => {
@@ -967,6 +1140,11 @@ window.__epi = {
       state.slices = change.slices.map((v, k) => clamp(v, 0, grid.shape[k] - 1));
       placeFromSlices();
     }
+    if ('step' in change) {
+      // one plane to one slice, as the slider and the arrow keys do: [plane, index]
+      const [plane, index] = change.step;
+      setSlice(plane, index);
+    }
     if ('diffScale' in change) setDiffScale(change.diffScale);
     if ('rate' in change) setRate(change.rate);
     for (const k of ['contours', 'crosshair']) if (k in change) state[k] = change[k];
@@ -1017,6 +1195,9 @@ window.__epi = {
     const k = segOf(state.g);
     const c = contoursOf.get(contourKey(k));
     return { grid: gridOf(k).grid_key, contours: contourKey(k), loaded: Array.isArray(c) && c.every((x) => x !== null), key: views.overlayKey };
+  },
+  get place() {
+    return state.place.slice();
   },
   texts: () => ({
     runNote: $('run-note').textContent,

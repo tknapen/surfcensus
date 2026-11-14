@@ -28,10 +28,12 @@ from surfcensus.func import PACK_FORMAT, PACK_VERSION
 from surfcensus.records import AffineChoice, AnchorRule, Corrections, CorrectionState
 
 READING = (
-    "Raw: the raw BIDS series, placed once per session by the anchor run's registration,"
-    " nothing else done to it. Preprocessed: the series as the pipeline wrote it. Their"
-    " difference, and how each lies on the white and pial contours, is what this page shows:"
-    " quality control of the raw data and of the preprocessing."
+    "Raw: the raw BIDS series, resampled once (cubic interpolation) onto the grid of the"
+    " preprocessed series by the session's one rigid placement, that of the anchor run's"
+    " registration, and nothing else done to it; that resampling smooths single-volume detail"
+    " slightly and enters the difference. Preprocessed: the series as the pipeline wrote it."
+    " Their difference, and how each lies on the white and pial contours, is what this page"
+    " shows: quality control of the raw data and of the preprocessing."
 )
 """What the page says under its title (docs/epi_interface.md, The page in the package)."""
 
@@ -62,7 +64,7 @@ RULES: dict[str, str] = {
     "common_scale": (
         "with intensity normalization off, one linear window for the whole stream: 0 to the"
         " largest hi of its runs (H); a stored value b of a run with window (0, hi) is shown"
-        " as floor(b * hi / H + 0.5), clipped to 0..255"
+        " as floor(b * (hi / H) + 0.5), clipped to 0..255"
     ),
     "stream": (
         "the movie of a subject is its sessions in order and, within a session, its packed"
@@ -217,6 +219,14 @@ class RegistrationInfo(_Frozen):
     anchor_is_outlier: bool
     portable_voxel_map: bool
     reading: str = READING
+    anchor_packed: bool = True
+    """Whether the anchor is among the packed runs. It need not be: the anchor is the first run
+    of the session by its rule that has a readable stored transform, whatever else it lacks or
+    whether it was selected (``session.plan_session``), and is listed in :attr:`SessionInfo.runs`
+    with its reason when it is not packed."""
+    note: str | None = None
+    """When the first run by the rule has no readable stored transform, so that a later run is
+    the anchor: one sentence that says so, by run names. None otherwise."""
 
 
 class SessionRunInfo(_Frozen):
@@ -250,6 +260,10 @@ class SessionRunInfo(_Frozen):
     detail: str | None = None
     """For a run that is not packed: one sentence beside the reason, when there is more to
     say (which files are not fetched; what a failed pack met). None otherwise."""
+    session_order: int | None = None
+    """The place of the run among ALL runs of its session (packed or not, selected or not) in
+    acquisition order by the anchor's rule, from 0; the same whatever ``--epi-runs`` selects.
+    None when the session has no anchor."""
 
 
 class SessionInfo(_Frozen):

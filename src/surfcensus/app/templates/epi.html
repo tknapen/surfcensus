@@ -4,6 +4,7 @@
 <div class="epi">
   <header id="bar">
     <h1><span class="what">EPI movie</span> <strong id="subject"></strong></h1>
+    <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b></span>
     <div id="views-buttons" class="buttons" role="group" aria-label="streams shown">
       <button type="button" data-view="raw"><kbd>1</kbd> raw</button>
       <button type="button" data-view="pre"><kbd>2</kbd> preprocessed</button>
@@ -15,27 +16,35 @@
       <button type="button" data-kind="mean"><kbd>w</kbd> mean</button>
       <button type="button" data-kind="sd"><kbd>e</kbd> SD</button>
     </div>
-    <button type="button" id="normalize" aria-pressed="false"><kbd>n</kbd> intensity normalization <span id="normalize-text">off</span></button>
+    <button type="button" id="normalize" aria-pressed="false"><kbd>n</kbd> normalization <span id="normalize-text">off</span></button>
     <button type="button" id="help-button"><kbd>?</kbd> help</button>
   </header>
-  <p id="reading"></p>
-  <p class="uses">Quality control of the <b>raw data</b> (motion, artefacts in single volumes, distortion and dropout as acquired, movement between runs) and of the <b>preprocessing</b> (what was corrected, what remains, how the preprocessed series fits the white and pial contours).</p>
-  <nav id="runs" aria-label="the runs of the stream, by session"></nav>
-  <p id="run-note"></p>
-  <p id="session-note"></p>
-  <p id="warning" role="alert" hidden></p>
-  <p id="corrections" role="note"></p>
+
   <main id="views" data-api="{{ api }}"></main>
-  <p id="legend"><span id="legend-text"></span> <canvas id="legend-bar" width="255" height="10" hidden></canvas></p>
+
+  <section id="timeline" aria-label="the stream of every run, session after session">
+    <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
+    <label class="epi-rate">rate <select id="rate" aria-label="volumes per second"></select>/s</label>
+    <div id="track">
+      <div id="segments" role="group" aria-label="the runs of the stream; each jumps to its first volume"></div>
+      <input id="time" type="range" min="0" max="0" step="1" value="0" aria-label="volume of the stream">
+    </div>
+    <p id="readout" aria-live="off"><b id="readout-run"></b> <span id="readout-volume"></span></p>
+  </section>
+
+  <section id="run-strip" aria-label="the run on screen">
+    <p class="line"><b id="run-name"></b> <span id="run-where"></span> <span id="badges"></span>
+      <button type="button" id="run-more" aria-expanded="false" aria-controls="run-details">details</button></p>
+    <p class="line" id="corrections"></p>
+    <div id="run-details" hidden role="region" aria-label="what is said about the run on screen">
+      <p id="run-note"></p>
+      <p id="warning" hidden></p>
+      <p id="corrections-full"></p>
+      <p id="session-note"></p>
+    </div>
+  </section>
+
   <section id="controls" aria-label="controls">
-    <div class="row">
-      <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
-      <label>rate <select id="rate"></select> volumes per s <kbd>[</kbd> <kbd>]</kbd></label>
-      <output id="readout"></output>
-    </div>
-    <div class="row">
-      <label class="wide">volume of the stream <input id="time" type="range" min="0" max="0" step="1" value="0"></label>
-    </div>
     <div class="row" id="slices">
       <label>sagittal <input type="range" data-plane="0" min="0" max="0" step="1"> <output></output></label>
       <label>coronal <input type="range" data-plane="1" min="0" max="0" step="1"> <output></output></label>
@@ -44,13 +53,23 @@
     <div class="row">
       <label><input type="checkbox" id="contours" checked> contours <kbd>s</kbd></label>
       <label><input type="checkbox" id="crosshair" checked> crosshair <kbd>c</kbd></label>
-      <label><input type="checkbox" id="traces-on" checked> traces and markers <kbd>t</kbd></label>
-      <label>difference scale, gray levels <select id="diff-scale"></select></label>
+      <label><input type="checkbox" id="traces-on" checked> traces <kbd>t</kbd></label>
+      <label>difference scale <select id="diff-scale" aria-label="difference scale, gray levels"></select></label>
       <label>FD threshold, mm <input type="number" id="fd-limit" min="0" step="0.1" value="0.5"></label>
     </div>
   </section>
+  <p id="legend"><canvas id="legend-bar" width="255" height="10" hidden></canvas> <span id="legend-text"></span></p>
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
+  <section id="about" aria-label="what the two streams are">
+    <p id="reading"></p>
+    <p class="uses">Quality control of the <b>raw data</b>: motion, artefacts in single volumes, distortion and dropout as acquired, movement between runs. Quality control of the <b>preprocessing</b>: what was corrected, what remains, how the preprocessed series fits the white and pial contours.</p>
+  </section>
+
+  <div id="notice" hidden role="alertdialog" aria-labelledby="notice-text">
+    <p id="notice-text"></p>
+    <p><button type="button" id="notice-reload">reload the page</button> <button type="button" id="notice-close">close</button></p>
+  </div>
 
   <div id="help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
     <div class="sheet">
@@ -59,32 +78,37 @@
         page serves two kinds of quality control at once: of the <b>raw data</b>, and of the <b>preprocessing</b>. Two
         streams of every run lie on the same slices, with the white and pial surfaces of FreeSurfer as contours:</p>
       <ul>
-        <li><b>raw</b>: the raw BIDS series with nothing done to it but one rigid placement into the anatomy per
-          session (the stored registration of the session's anchor run). No motion, slice-timing or distortion
-          correction, and no other processing. It shows head motion within a run, artefacts confined to single volumes,
-          distortion and dropout as acquired, and how far the head moved between runs.</li>
-        <li><b>preprocessed</b>: the series as the pipeline wrote it. It shows what remains after the pipeline's
-          corrections, and how the corrected series fits the contours.</li>
+        <li><b>raw</b>: the raw BIDS series, resampled once (cubic interpolation) onto the grid of the preprocessed
+          series by the session's one rigid placement (the stored registration of the session's anchor run), and
+          nothing else. No motion, slice-timing or distortion correction, and no other processing. That one resampling
+          smooths single-volume detail slightly, and it enters the difference. The raw stream shows head motion within
+          a run, artefacts confined to single volumes, distortion and dropout as acquired, and how far the head moved
+          between runs.</li>
+        <li><b>preprocessed</b>: the series as the pipeline wrote it, voxel for voxel on its own grid. It shows what
+          remains after the pipeline's corrections, and how the corrected series fits the contours.</li>
       </ul>
       <p><b>The difference</b> between the two streams, and the raw stream's misfit to the contours, are what the page
-        exists to show. The line under the run list says what the pipeline did to the run on screen, as its report
-        states it.</p>
+        exists to show. The strip under the timeline says what the pipeline did to the run on screen, each statement
+        with where it was read; <b>details</b> gives the whole text.</p>
       <p><b>One stream.</b> The runs follow each other without a stop: playing runs on from the last volume of a run to
         the first of the next, and from the last run of a session to the first of the next session (sessions put in order by: <span id="help-order"></span>). At a boundary
         nothing changes but the pictures: the slices stay at the same place in the anatomy (on a run with another
-        voxel grid, the slices nearest to that place), and the view, the layers and the rate stay. The voxel grid
-        moves between sessions, since each session has its own one placement. Boundaries are lines in the traces
-        (dashed between runs, solid between sessions). A run button jumps to the run's first volume.</p>
+        voxel grid, the slices nearest to that place), the panels keep their place and size, and the view, the layers
+        and the rate stay. The voxel grid moves between sessions, since each session has its own one placement.
+        Boundaries are marked on the timeline and in the traces: a dashed line between runs, a thick solid line between
+        sessions; the current volume is the magenta cursor. A run on the timeline jumps to its first volume.</p>
       <p>A run that is not the anchor is drawn through the anchor's registration, so the raw stream shows how far the
-        head moved since the anchor run. A run beyond <span id="help-limit"></span> mm is flagged: that is a statement
-        about the raw data under one registration, not a fault of the page.</p>
+        head moved since the anchor run. A run that its own registration would put more than <span id="help-limit"></span> mm
+        elsewhere is marked <b>flagged</b>: that is a statement about the raw data under one registration, not a fault
+        of the page.</p>
       <p><b>Intensity normalization</b> (<kbd>n</kbd>), off by default. Off: one linear window for the whole stream,
         so that a run that is brighter or darker than another is seen as it is. On: each run under its own window.
-        The legend under the views says which is on and what the gray levels stand for. The difference is taken of the
-        gray levels on screen, and its scale is given in gray levels and in units of signal under either setting.
+        The legend under the controls says which is on and what the gray levels stand for. The difference is taken of
+        the gray levels on screen, and its scale is given in gray levels and in units of signal under either setting.
         <span id="help-window"></span></p>
       <p><b>Exact values.</b> Every voxel on screen is one block of a stored 8-bit value (through the table of the common
-        window when normalization is off), no smoothing.</p>
+        window when normalization is off), no smoothing. The orientation letters lie in a margin outside the
+        picture.</p>
       <p><b>Markers.</b> A volume whose framewise displacement exceeds the threshold has a band in the traces, and the
         frame carries a red marker that stays for at least <span id="help-hold"></span> ms. Volumes that the confounds
         table marks as non-steady-state have an amber band and marker.</p>
@@ -111,7 +135,9 @@
         <tr><td><kbd>t</kbd></td><td>traces and markers on, off</td></tr>
         <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
       </table>
-      <p>Contours: white surface red, pial surface yellow, both hemispheres, cut at the centre of the slice.</p>
+      <p>Contours: white surface red, pial surface yellow, both hemispheres, cut at the centre of the slice. In the
+        difference view, whose colours run to red and yellow, they are green (white surface) and magenta (pial), each
+        on a dark outline.</p>
       <p><button type="button" id="help-close">close</button></p>
     </div>
   </div>

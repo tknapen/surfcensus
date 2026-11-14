@@ -39,6 +39,7 @@ import os
 import re
 import secrets
 import shutil
+import stat
 import time
 import zlib
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -59,6 +60,7 @@ from surfcensus.func import (
     CONTOURS_DIR,
     ID_PATTERN,
     PACK_JSON,
+    PACK_VERSION,
     PLANES,
     SESSION_JSON,
     STILLS,
@@ -85,6 +87,7 @@ from surfcensus.func.model import (
     TracesInfo,
     corrections_info,
     info_text,
+    read_info,
 )
 from surfcensus.func.packread import inflate_checked, stream_bytes
 from surfcensus.records import (
@@ -768,7 +771,9 @@ def write_contours(
     ``func.model.ContourFile`` of it.
 
     Each file is the plane's data compressed with zlib at :data:`ZLIB_LEVEL`, written
-    atomically. ``planes`` must hold each of the three planes once; the result is in the
+    atomically, and only when the file there does not hold those bytes already (a second call
+    into the same directory leaves unchanged contours as they are, under a page that serves
+    them). ``planes`` must hold each of the three planes once; the result is in the
     order of ``func.PLANES``.
     """
     by_plane = {p.plane: p for p in planes}
@@ -779,8 +784,14 @@ def write_contours(
         item = by_plane[plane]
         relative = contour_file(grid_key, plane)
         blob = zlib.compress(item.data, ZLIB_LEVEL)
-        with atomic_path(Path(session_dir) / relative) as tmp:
-            tmp.write_bytes(blob)
+        target = Path(session_dir) / relative
+        try:
+            same = target.is_file() and not target.is_symlink() and target.read_bytes() == blob
+        except OSError:
+            same = False
+        if not same:  # a file that a page may be reading is replaced only when it changes
+            with atomic_path(target) as tmp:
+                tmp.write_bytes(blob)
         out[plane] = ContourFile(
             file=relative,
             bytes=len(blob),
@@ -865,14 +876,31 @@ def pack_session(
     runs: Sequence[RunPackInput],
     contours: Mapping[str, Sequence[PlaneContours]] | None,
     config: EpiConfig,
-    progress: Callable[[str, PackInfo | None, str | None, float], None] | None = None,
+    progress: Callable[[str, PackInfo | None, str | None, float, bool], None] | None = None,
+    *,
+    force: bool = False,
 ) -> SessionInfo:
     """Pack a whole session into ``<out_dir>/<session_id>/``: the contours of each grid
     (``contours`` by grid key; None without a FreeSurfer subject), every run of ``runs``, then
     ``session.json`` last. A run that raises :class:`PackError` is listed in ``session.json``
     with its reason and the others are packed. ``progress`` is called after each run of
     ``plan.runs`` without a reason, with its id, its pack (None when it failed), the reason
-    of a failure and the seconds it took.
+    of a failure, the seconds it took and whether its earlier pack was kept.
+
+    A run whose pack in the directory is current is kept and not packed again
+    (:func:`current_pack`: whole on disk, made by this version of the package and format
+    from the same inputs, by role, base, size and SHA-256, the session's inputs included,
+    with the same settings, anchor and grid); ``force`` packs every run again.
+
+    What a reader of the directory sees while this runs: the earlier ``session.json`` stays
+    until the new one is renamed over it, last, so a page that is served from the directory
+    keeps a whole session throughout. A run that is packed again is moved into place by two
+    renames under the ``flock`` of the session directory (the earlier pack aside, the new one
+    in), so between those two renames, and only then, the run's directory is not there. The
+    run directories that the new ``session.json`` does not list as packed (runs that are no
+    longer packed, runs that left the session, runs not selected) and the contours of grids
+    it no longer lists are removed after it is written, never before. An interrupted call
+    leaves the earlier ``session.json`` with every pack it lists whole, earlier or new.
 
     The session is one stretch of the subject's stream (decision D38): its packed runs one
     after the other in the order of ``plan.runs`` (acquisition order), each
@@ -883,8 +911,8 @@ def pack_session(
     the anatomy (:func:`slice_planes`), so that the page keeps one place in the anatomy across
     grids and sessions without the affine. A run of ``plan.runs`` without a reason that
     ``runs`` does not hold is listed as ``pack failure``. A run that is not packed loses a
-    pack directory that an earlier call left. ``session.json`` is removed before anything is
-    written and written again last, so it marks a session whose every pack is in place.
+    pack directory that an earlier call left, after the new ``session.json`` is written.
+    ``session.json`` is written last, so it marks a session whose every pack is in place.
 
     Like :func:`pack_run`, this writes the tool's display cache only, under ``out_dir``: no
     image volume, and nothing into or beside the data.
@@ -893,7 +921,6 @@ def pack_session(
         raise ValueError(f"not a session id: {session_id!r}")
     session_dir = Path(out_dir) / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
-    (session_dir / SESSION_JSON).unlink(missing_ok=True)
 
     grid_keys = list(dict.fromkeys(plan.grid_of[r.run] for r in plan.runs if r.run in plan.grid_of))
     grid_keys += [k for k in plan.grids if k not in grid_keys]
@@ -915,8 +942,11 @@ def pack_session(
             reasons[item.run] = PACK_FAILURE
         else:
             started = time.perf_counter()
+            kept = None if force else current_pack(session_dir, given[item.run], config)
             try:
-                packs[item.run] = pack_run(session_dir, given[item.run], config)
+                packs[item.run] = (
+                    kept if kept is not None else pack_run(session_dir, given[item.run], config)
+                )
             except PackError as err:
                 reasons[item.run] = err.reason
                 details[item.run] = err.detail
@@ -926,9 +956,8 @@ def pack_session(
                     packs.get(item.run),
                     reasons.get(item.run),
                     time.perf_counter() - started,
+                    kept is not None,
                 )
-    for run in reasons:
-        _remove_run_dir(session_dir, run)
 
     listed: list[SessionRunInfo] = []
     first = 0
@@ -947,6 +976,9 @@ def pack_session(
                 frame=frame,
                 reason=reasons.get(item.run),
                 detail=details.get(item.run) if item.run in reasons else None,
+                session_order=(
+                    plan.order.index(item.run) if item.run in plan.order else None
+                ),
                 n_volumes=None if pack is None else pack.n_volumes,
                 tr_s=None if pack is None else pack.tr_s,
                 first=None if pack is None else first,
@@ -961,6 +993,8 @@ def pack_session(
     if plan.anchor is not None and plan.frame is not None:
         registration = RegistrationInfo(
             anchor=plan.anchor.run,
+            anchor_packed=plan.anchor.run in packs,
+            note=plan.anchor_note,
             rule=plan.anchor.rule,
             limit_mm=plan.frame.limit_mm,
             shared_frame_plausible=plan.frame.shared_frame_plausible,
@@ -1002,4 +1036,88 @@ def pack_session(
     )
     with atomic_path(session_dir / SESSION_JSON) as tmp:
         tmp.write_text(info_text(info))
+    _remove_unlisted(session_dir, set(packs), {g.grid_key for g in grids})
+    return info
+
+
+def _remove_unlisted(session_dir: Path, packed: set[str], grid_keys: set[str]) -> None:
+    """Remove the run directories of ``session_dir`` that are not among ``packed`` and the
+    contour folders of grids not among ``grid_keys``: what an earlier call left that the new
+    ``session.json`` does not list. Only names that a pack writes are touched."""
+    try:
+        entries = list(os.scandir(session_dir))
+    except OSError:
+        return
+    for entry in entries:
+        if re.fullmatch(ID_PATTERN, entry.name) and entry.name not in packed:
+            _remove_run_dir(session_dir, entry.name)
+    folder = session_dir / CONTOURS_DIR
+    try:
+        grids = list(os.scandir(folder))
+    except OSError:
+        return
+    for entry in grids:
+        if re.fullmatch(r"[0-9a-f]{12}", entry.name) and entry.name not in grid_keys:
+            shutil.rmtree(entry.path, ignore_errors=True)
+
+
+def _whole(session_dir: Path, info: PackInfo) -> bool:
+    """Every file ``pack.json`` lists is a regular file of the size it lists."""
+    files: list[PackFile] = [info.traces]
+    for stream in STREAMS:
+        if stream not in info.streams:
+            return False
+        files += [getattr(info.streams[stream], still) for still in STILLS]
+        files += list(info.streams[stream].chunks)
+    for entry in files:
+        try:
+            st = os.stat(session_dir / entry.file)
+        except OSError:
+            return False
+        if not stat.S_ISREG(st.st_mode) or st.st_size != entry.bytes:
+            return False
+    return True
+
+
+def current_pack(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInfo | None:
+    """The pack of ``run`` in ``session_dir`` when it is what :func:`pack_run` would make now,
+    else None.
+
+    Current means: ``pack.json`` reads as a pack of this format and version, of this run and
+    session, written by this version of the package; every file it lists is there with the
+    size it lists; its config hash and settings are those of ``config``; its anchor and grid
+    are those of ``run``; its inputs (role, base, size and SHA-256 of every file, the anchor's
+    transform, the fsnative transform and the FreeSurfer files included) are those of the
+    files now; and what it states from them (raw affine, reference image, rigidity, TR,
+    corrections) is what they state now. The inputs are hashed (some 100 MB a run, seconds),
+    which is cheap beside packing; no volume is read. The contours are not compared: they are
+    made from inputs that are compared and from the settings."""
+    session_dir = Path(session_dir)
+    info = read_info(session_dir / run.run / PACK_JSON, PackInfo)
+    if (
+        info is None
+        or info.version != PACK_VERSION
+        or info.surfcensus_version != __version__
+        or info.run != run.run
+        or info.session != session_dir.name
+        or info.config_hash != config.pack_hash()
+        or info.settings != _settings(config)
+        or info.anchor_run != run.anchor_run
+        or info.grid_key != run.grid.key
+        or not _whole(session_dir, info)
+    ):
+        return None
+    try:
+        inputs = _inputs(run.files, run.session_inputs)
+    except PackError:
+        return None
+    if (
+        info.inputs != inputs
+        or info.raw_affine != run.raw_affine.choice
+        or info.reference_image != run.raw_affine.reference_image
+        or info.rigid != run.rigid.rigid
+        or info.tr_s != run.tr_s
+        or info.corrections != corrections_info(run.corrections)
+    ):
+        return None
     return info

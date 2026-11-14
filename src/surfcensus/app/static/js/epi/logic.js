@@ -159,6 +159,17 @@ export function slicesAt(grid, x) {
   });
 }
 
+// The place after a step of one plane to slice `index` of a grid (GridOut): the place moves
+// along that plane's normal n only, to the plane's distance d of the slice, place + (d - n .
+// place) n, so the place stays where it was along the other two planes. A step on a coarse
+// grid therefore does not move the other two planes when the stream comes back to a fine one.
+export function movePlace(grid, place, plane, index) {
+  const n = grid.slice_normal[PLANES[plane]];
+  const d = grid.slice_mm[PLANES[plane]][index];
+  const along = d - (n[0] * place[0] + n[1] * place[1] + n[2] * place[2]);
+  return [place[0] + along * n[0], place[1] + along * n[1], place[2] + along * n[2]];
+}
+
 // ---- intensity --------------------------------------------------------------------------------
 
 // The table by which a run with window (0, hi) is shown under one window (0, top) for the
@@ -427,13 +438,14 @@ export function streamPanelSizesMm(grids) {
 }
 
 // How to lay out nGroups groups of three panels in a box of availW x availH px (stage 1).
-export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4) {
+// pad: px on every side of each panel outside its picture (the margin of the edge letters).
+export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4, pad = 0) {
   let best = null;
   for (const panels of ['row', 'column']) {
     const gw = panels === 'row' ? sizes.reduce((a, s) => a + s[0], 0) : Math.max(...sizes.map((s) => s[0]));
     const gh = panels === 'row' ? Math.max(...sizes.map((s) => s[1])) : sizes.reduce((a, s) => a + s[1], 0);
-    const gapsW = (panels === 'row' ? 2 * gap : 0) + frame;
-    const gapsH = (panels === 'row' ? 0 : 2 * gap) + head + frame;
+    const gapsW = (panels === 'row' ? 2 * gap + 6 * pad : 2 * pad) + frame;
+    const gapsH = (panels === 'row' ? 2 * pad : 2 * gap + 6 * pad) + head + frame;
     for (const groups of nGroups > 1 ? ['row', 'column'] : ['row']) {
       const nw = groups === 'row' ? nGroups : 1;
       const nh = groups === 'row' ? 1 : nGroups;
@@ -462,6 +474,17 @@ export function panelToVoxel(plane, shape, x, y) {
   const r = clamp(Math.floor(y), 0, shape[s.v] - 1);
   return [s.flipH ? shape[s.h] - 1 - c : c, shape[s.v] - 1 - r];
 }
+
+// Where volume boundary b (the first volume after it) lies along a track of the stream, as a
+// fraction of the travel of a slider from 0 to total - 1: half-way between volumes b - 1 and b.
+export function boundaryFraction(b, total) {
+  return total > 1 ? clamp((b - 0.5) / (total - 1), 0, 1) : 0;
+}
+
+// The colours of the contours: in the series views those of the surface interface; in the
+// difference view, whose colours run to red and yellow, another pair, drawn on a dark outline.
+export const SURFACE_COLOURS = { white: '#FF3B30', pial: '#FFD400' };
+export const DIFF_SURFACE_COLOURS = { white: '#3DFF5A', pial: '#FF4DFF', outline: '#000000' };
 
 // ---- contours ---------------------------------------------------------------------------------
 

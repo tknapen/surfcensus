@@ -217,7 +217,7 @@ def byte_values(window: tuple[float, float]) -> np.ndarray:
 def common_scale(window: tuple[float, float], top: float) -> np.ndarray:
     """The table by which the page shows a run under one window ``(0, top)`` for the whole
     stream, with intensity normalization off (``RULES["common_scale"]``): stored value ``b``
-    of a run with window ``(0, hi)`` is shown as ``floor(b * hi / top + 0.5)``, clipped to
+    of a run with window ``(0, hi)`` is shown as ``floor(b * (hi / top) + 0.5)``, clipped to
     0..255, uint8. ``top`` is the largest upper limit of the runs of the stream; a run with
     that limit keeps its values."""
     if not window[0] == 0.0:

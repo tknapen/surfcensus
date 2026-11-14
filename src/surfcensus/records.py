@@ -248,6 +248,11 @@ NOT_FETCHED = "not fetched"
 """Not in the list of the spec: a file the pack would read is a git-annex placeholder (a link
 without its content, or a pointer file) in a DataLad or git-annex clone that was not fetched
 (decision D35). ``SessionPlan.details`` names the files; the fetch command is step 2."""
+NOT_SELECTED = "not selected"
+"""Not in the list of the spec: a run of the session that ``--epi-runs`` leaves out. It is still
+a run of the session: it is listed, it can be the session's anchor, and it takes its place in
+the session's acquisition order, so that the anchor and the order do not depend on the
+filter; it is not packed."""
 
 PACK_REASONS: tuple[str, ...] = (
     NO_RAW_SERIES,
@@ -263,6 +268,7 @@ PACK_REASONS: tuple[str, ...] = (
     PACK_FAILURE,
     NO_CONFOUNDS,
     NOT_FETCHED,
+    NOT_SELECTED,
 )
 """Every reason a run is listed and not packed, or its pack failed. ``runs on different
 grids`` is kept so that the list stays as pinned, and is given to no run: runs on different
@@ -573,6 +579,13 @@ class SessionPlan:
     details: Mapping[str, str] = field(default_factory=dict)
     """Run id -> one sentence that says more than the reason of a run that cannot be packed,
     for example which files are not fetched. Shown on the local machine only."""
+    order: tuple[str, ...] = ()
+    """Every run of the session (packable or not, selected or not) in its acquisition order by
+    the anchor's rule (``session.session_order``). Empty when the plan has no anchor."""
+    anchor_note: str | None = None
+    """When the first run by the anchor's rule has no readable stored transform to the
+    anatomy, so that a later run is the anchor: one sentence that says so, by run names.
+    None otherwise."""
 
 
 @dataclass(frozen=True)

@@ -36,6 +36,9 @@ export class Store {
     this.desiredKey = '';
     this.onchunk = () => {};
     this.onerror = () => {};
+    this.onload = () => {}; // any file loaded and checked (after an error: the page recovered)
+    this.stopped = false; // stop(): nothing more is asked for
+    this.retryAt = new Map(); // key -> time before which a chunk that failed is not asked again
     this.unchecked = false; // true once a file could not be checked (no crypto.subtle)
     this.counts = { requests: 0, fetchedBytes: 0, evictions: 0, chunkLoads: 0, chunkMs: 0, errors: 0, peakDecoded: 0 };
     this.jobs = 0;
@@ -85,6 +88,7 @@ export class Store {
           ),
         );
         this.stillsOf.set(seg, out);
+        this.onload();
         return out;
       };
       const promise = load();
@@ -141,10 +145,17 @@ export class Store {
     }
   }
 
+  // Nothing more is fetched: the files on disk are no longer those the page lists.
+  stop() {
+    this.stopped = true;
+  }
+
   pump() {
+    if (this.stopped) return;
+    const now = performance.now();
     for (const slot of this.workers) {
       if (slot.busy) continue;
-      const key = this.desired.find((k) => !this.chunks.has(k) && !this.inflight.has(k));
+      const key = this.desired.find((k) => !this.chunks.has(k) && !this.inflight.has(k) && !((this.retryAt.get(k) || 0) > now));
       if (!key) return;
       const [index, stream] = key.split('|');
       const item = this.chunkList[Number(index)];
@@ -192,9 +203,12 @@ export class Store {
     this.inflight.delete(job.key);
     if (!message.ok) {
       this.counts.errors += 1;
+      this.retryAt.set(job.key, performance.now() + 300); // asked again, not at every frame
+      setTimeout(() => this.pump(), 320);
       this.onerror(message.error);
       return;
     }
+    this.retryAt.delete(job.key);
     if (!message.checked) this.unchecked = true;
     this.counts.requests += 1;
     this.counts.fetchedBytes += message.fetched;
@@ -209,6 +223,7 @@ export class Store {
       const [index, stream] = job.key.split('|');
       this.onchunk(Number(index), stream);
     }
+    this.onload();
     this.pump();
   }
 

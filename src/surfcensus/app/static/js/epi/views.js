@@ -2,11 +2,29 @@
 // size for the whole stream that holds a canvas with one pixel per voxel of the grid on screen
 // and a second canvas over it for the contours and the crosshair. A grid with a smaller field
 // of view sits in the middle of its box; the scale in px per mm is that of the whole stream,
-// so at a boundary nothing moves but the pictures.
-import { diffToRgba, fitLayout, grayToRgba, panelSizesMm, panelToVoxel, planeSize, SPEC, voxelToPanel } from './logic.js';
+// so at a boundary nothing moves but the pictures. The orientation letters lie in a margin of
+// the box (PAD px on every side) outside the canvas, so that they cover no voxel.
+import {
+  DIFF_SURFACE_COLOURS,
+  diffToRgba,
+  fitLayout,
+  grayToRgba,
+  panelSizesMm,
+  panelToVoxel,
+  planeSize,
+  SPEC,
+  SURFACE_COLOURS,
+  voxelToPanel,
+} from './logic.js';
 
-const SURFACE_COLOURS = ['#FF3B30', '#FF3B30', '#FFD400', '#FFD400']; // lh, rh white; lh, rh pial
+export const PAD = 13;
 const EDGES = ['left', 'right', 'top', 'bottom'];
+
+// per surface of a contour file (lh, rh white; lh, rh pial): the colour in a group's panels
+function surfaceColours(group) {
+  const c = group === 'diff' ? DIFF_SURFACE_COLOURS : SURFACE_COLOURS;
+  return [c.white, c.white, c.pial, c.pial];
+}
 
 function crosshairColour() {
   const css = getComputedStyle(document.documentElement);
@@ -123,17 +141,17 @@ export class Views {
         panel.image = null;
       }
       if (!panel.image) panel.image = panel.ctx.createImageData(w, h);
-      const boxW = Math.max(8, Math.round(this.sizes[plane][0] * this.scale));
-      const boxH = Math.max(8, Math.round(this.sizes[plane][1] * this.scale));
-      const cw = Math.max(4, Math.round(mm[plane][0] * this.scale));
-      const ch = Math.max(4, Math.round(mm[plane][1] * this.scale));
-      panel.box.style.width = `${boxW}px`;
-      panel.box.style.height = `${boxH}px`;
+      const innerW = Math.max(8, Math.round(this.sizes[plane][0] * this.scale));
+      const innerH = Math.max(8, Math.round(this.sizes[plane][1] * this.scale));
+      const cw = Math.min(innerW, Math.max(4, Math.round(mm[plane][0] * this.scale)));
+      const ch = Math.min(innerH, Math.max(4, Math.round(mm[plane][1] * this.scale)));
+      panel.box.style.width = `${innerW + 2 * PAD}px`;
+      panel.box.style.height = `${innerH + 2 * PAD}px`;
       for (const canvas of [panel.gray, panel.over]) {
         canvas.style.width = `${cw}px`;
         canvas.style.height = `${ch}px`;
-        canvas.style.left = `${Math.floor((boxW - cw) / 2)}px`;
-        canvas.style.top = `${Math.floor((boxH - ch) / 2)}px`;
+        canvas.style.left = `${PAD + Math.floor((innerW - cw) / 2)}px`;
+        canvas.style.top = `${PAD + Math.floor((innerH - ch) / 2)}px`;
       }
       const ow = Math.round(cw * dpr);
       const oh = Math.round(ch * dpr);
@@ -154,7 +172,7 @@ export class Views {
     const n = this.groups.size || 1;
     const availW = this.root.clientWidth;
     const availH = Math.max(this.handlers.availableHeight(), 200);
-    const fit = fitLayout(this.sizes, n, availW, availH);
+    const fit = fitLayout(this.sizes, n, availW, availH, 8, 22, 4, PAD);
     this.scale = fit.scale;
     this.root.dataset.groups = fit.groups;
     for (const group of this.groups.values()) {
@@ -181,11 +199,14 @@ export class Views {
   // only when the slices, the grid, the switches, the layout or the loaded contours change.
   overlay(slices, contours, showContours, showCrosshair, active, contourKey = '') {
     const shape = this.grid.shape;
-    const key = [this.grid.grid_key, contourKey, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active].join('|');
+    const groups = [...this.groups.keys()].join('+');
+    const key = [this.grid.grid_key, contourKey, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active, groups].join('|');
     if (key === this.overlayKey) return;
     this.overlayKey = key;
     const dpr = window.devicePixelRatio || 1;
-    for (const group of this.groups.values()) {
+    for (const [groupKey, group] of this.groups.entries()) {
+      const colours = surfaceColours(groupKey);
+      const outlined = groupKey === 'diff';
       group.panels.forEach((panel, plane) => {
         const spec = SPEC[plane];
         const [w, h] = planeSize(shape, plane);
@@ -195,12 +216,10 @@ export class Views {
         ctx.clearRect(0, 0, panel.over.width, panel.over.height);
         const c = contours[plane];
         if (showContours && c) {
-          ctx.lineWidth = 1.25 * dpr;
           ctx.lineJoin = 'round';
           const slice = slices[spec.axis];
-          for (let surface = 0; surface < c.nSurfaces; surface++) {
+          const path = (surface) => {
             const cell = slice * c.nSurfaces + surface;
-            ctx.strokeStyle = SURFACE_COLOURS[surface];
             ctx.beginPath();
             for (let n = c.lineStart[cell]; n < c.lineStart[cell + 1]; n++) {
               for (let p = c.pointStart[n]; p < c.pointStart[n + 1]; p++) {
@@ -209,6 +228,21 @@ export class Views {
                 else ctx.lineTo(x * sx, y * sy);
               }
             }
+          };
+          if (outlined) {
+            // a dark outline under every line first, so that no line lies on a colour of the
+            // difference without an edge
+            ctx.strokeStyle = DIFF_SURFACE_COLOURS.outline;
+            ctx.lineWidth = 3.5 * dpr;
+            for (let surface = 0; surface < c.nSurfaces; surface++) {
+              path(surface);
+              ctx.stroke();
+            }
+          }
+          ctx.lineWidth = (outlined ? 1.5 : 1.25) * dpr;
+          for (let surface = 0; surface < c.nSurfaces; surface++) {
+            ctx.strokeStyle = colours[surface % colours.length];
+            path(surface);
             ctx.stroke();
           }
         }
