@@ -86,9 +86,9 @@ function stateKey(s) {
 function groupLabels() {
   const what = { series: '', mean: 'temporal mean: ', sd: 'temporal SD: ' }[state.kind];
   return {
-    raw: `${what}raw, one placement per session (the raw data)`,
-    pre: `${what}preprocessed, as stored (the pipeline's result)`,
-    diff: `${what}raw minus preprocessed (what preprocessing changed)`,
+    raw: `${what}raw data, one placement`,
+    pre: `${what}preprocessed, as stored`,
+    diff: `${what}raw minus preprocessed`,
   };
 }
 
