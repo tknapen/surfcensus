@@ -578,13 +578,13 @@ def test_stop_between_batches_and_the_stream_of_a_half_packed_participant(bench:
     assert stream is not None and list(stream.sessions) == mine
     # the page shows the sessions that have a session.json, and grows as they come
     shape = Packs(bench.run_dir / "epi" / participant).shape()
-    assert [s.session for s in shape.sessions] == [first]
+    assert [s.session_uid for s in shape.sessions] == [first]
     assert fb.pack_pending(bench.ctx()) == order[1:]
 
     rest = bench.pack()
     assert (rest.done, rest.skipped) == (N_PACKABLE - report.done, report.done)
     shape = Packs(bench.run_dir / "epi" / participant).shape()
-    assert [s.session for s in shape.sessions] == mine
+    assert [s.session_uid for s in shape.sessions] == mine
 
 
 # --- workers, digests -----------------------------------------------------------------------------
