@@ -38,8 +38,8 @@ Where a pack lives::
         traces.json                      framewise displacement, DVARS, non-steady-state volumes
 
 ``<out>`` is ``epi/<participant_uid>/`` of a run directory from step 2, and the ``--out``
-directory of ``surfcensus epi-session`` in step 1. ``session.json`` and ``pack.json`` are never served as
-files; the page receives a shape built from them.
+directory of ``surfcensus epi-session`` in step 1. ``session.json`` and ``pack.json`` are never
+served as files; the page receives a shape built from them.
 """
 
 from __future__ import annotations
