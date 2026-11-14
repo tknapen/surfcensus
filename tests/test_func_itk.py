@@ -37,7 +37,9 @@ def dataset(
     return write_func_dataset(tmp_path_factory.mktemp("func"), generation=request.param)
 
 
-def text_of(params: list[float], fixed: list[float], kind: str = "AffineTransform_double_3_3") -> str:
+def text_of(
+    params: list[float], fixed: list[float], kind: str = "AffineTransform_double_3_3"
+) -> str:
     numbers = " ".join(repr(float(x)) for x in params)
     centre = " ".join(repr(float(x)) for x in fixed)
     return (
@@ -151,9 +153,15 @@ def test_the_kinds_that_are_read() -> None:
         text_of([1.0, 0, 0, 1, 0, 0], [0, 0], "AffineTransform_double_2_2"),
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0], [0, 0, 0]),  # 11 numbers
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0]),
-        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace("1.0", "nan", 1),
-        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace("1.0", "inf", 1),
-        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace("1.0", "1_0", 1),
+        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
+            "Parameters: 1.0", "Parameters: nan"
+        ),
+        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
+            "Parameters: 1.0", "Parameters: inf"
+        ),
+        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
+            "Parameters: 1.0", "Parameters: 1_0"
+        ),
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace("1.0", "١", 1),
         text_of([1e300, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [1e300, 0, 0]),  # overflows
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(

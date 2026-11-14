@@ -113,7 +113,7 @@ def _needs(*functions: Any) -> None:
             function()
         except NotImplementedError as err:
             pytest.skip(f"not written yet: {err}")
-        except Exception:  # noqa: BLE001 - only the stub matters here
+        except Exception:
             pass
 
 

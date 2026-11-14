@@ -166,9 +166,7 @@ def test_every_raw_series_of_the_fixture_is_listed(dataset: SyntheticFuncDataset
     assert not bids.is_raw_dataset(dataset.root / "absent")
     for participant in ("sub-01", "sub-02"):
         listed = bids.list_raw_runs(root, participant)
-        expected = [
-            r for r in dataset.runs if r.design.participant == participant and r.raw_stem
-        ]
+        expected = [r for r in dataset.runs if r.design.participant == participant and r.raw_stem]
         by_key: dict[str, list] = {}
         for run in listed:
             by_key.setdefault(run.key, []).append(run)
