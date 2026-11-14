@@ -621,10 +621,16 @@ def test_the_default_run_directory_is_beside_a_datalad_dataset_never_inside_it(
     outer = make_repository(tmp_path / "studies")
     nested = make_repository(write_tree(outer / "ds-nested", "fmriprep", LABELS))
     assert default_run_dir(nested / "sourcedata" / "freesurfer") == tmp_path / DEFAULT_RUN_DIR
-    # a git-annex repository that is no DataLad dataset is not told apart: beside the path
+    # a git-annex repository that is no DataLad dataset is not told apart: as an fMRIPrep
+    # output with a dataset_description.json it is a dataset all the same (review of the
+    # quick start, F5), and without one the run goes beside the path
     plain = make_repository(
         write_tree(tmp_path / "plain" / "out", "fmriprep", LABELS), datalad=False
     )
+    assert default_run_dir(plain / "sourcedata" / "freesurfer") == (
+        tmp_path / "plain" / DEFAULT_RUN_DIR
+    )
+    (plain / "dataset_description.json").unlink()
     assert default_run_dir(plain / "sourcedata" / "freesurfer") == (
         plain / "sourcedata" / DEFAULT_RUN_DIR
     )

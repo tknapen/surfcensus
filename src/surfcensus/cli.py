@@ -789,9 +789,14 @@ def review_command(
             if served is not None:
                 signals.serving = True  # from here SIGTERM stops the app in order
                 reviewing.serve_review(
-                    run, served, rater=rater, open_browser=not no_browser, stop=signals.stop
+                    run,
+                    served,
+                    rater=rater,
+                    open_browser=not no_browser,
+                    stop=signals.stop,
+                    stopped=signals.served,  # from the closing line on, no signal ends it
                 )
-                signals.served()  # the closing line is out: no signal ends the process now
+                signals.served()  # also for a serve_review that did not call it
         with run:
             nothing = reviewing.rateable(run) == 0
             if no_serve and not nothing:
@@ -836,8 +841,9 @@ def serve_command(
                 rater=rater,
                 open_browser=not no_browser,
                 stop=signals.stop,
+                stopped=signals.served,  # the server has stopped: no signal ends it now
             )
-            signals.served()  # the server has stopped: no signal ends the process now
+            signals.served()
 
 
 @app.command(

@@ -124,8 +124,9 @@ class CommandSignals:
         return TERMINATED if self.terminated and not self.interrupted else INTERRUPTED
 
     def served(self) -> None:
-        """The app was served to its end and the closing line is out: from here on
-        neither SIGTERM nor SIGINT ends the process."""
+        """The app was served to its end (the server and the renderer have stopped, and
+        the closing line follows): from here on neither SIGTERM nor SIGINT ends the
+        process."""
         self.ended = True
         if threading.current_thread() is threading.main_thread():
             _ignore(signal.SIGTERM, signal.SIGINT)

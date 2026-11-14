@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -931,6 +931,7 @@ def serve_review(
     rater: str | None = None,
     open_browser: bool = True,
     stop: StopRequest | None = None,
+    stopped: Callable[[], None] | None = None,
 ) -> None:
     """The second half of :func:`review`, for the run and the running app that
     :func:`open_review` returned: name the address, open the browser, wait, stop the app
@@ -944,7 +945,9 @@ def serve_review(
     and SIGINT too once this call has returned, because a SIGTERM that comes late (a
     process manager that signals a whole group, a wrapper that passes the signal on) would
     otherwise kill a command that had stopped in order (``stopping``). The server is
-    stopped first, then the renderer, which finishes the batch it is on.
+    stopped first, then the renderer, which finishes the batch it is on. ``stopped`` is
+    called once both have stopped, before the closing line: the command line ignores both
+    signals from there on, so that no Ctrl-C lands between the closing line and the end.
     """
     stop = StopFlag() if stop is None else stop
     try:
@@ -958,6 +961,8 @@ def serve_review(
                 pass
     finally:
         app.stop()
+        if stopped is not None:
+            stopped()  # a second Ctrl-C up to here ended the command (130, no closing line)
     try:
         progress = _progress_of(run.run_dir, rater)
     except Exception:  # a closing line is not worth a traceback after the work is saved

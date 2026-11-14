@@ -1752,6 +1752,7 @@ def serve(
     rater: str | None = None,
     open_browser: bool = True,
     stop: StopRequest | None = None,
+    stopped: Callable[[], None] | None = None,
 ) -> None:
     """:func:`start_server`, print the URL, open the browser, wait for Ctrl-C or SIGTERM in
     the main thread, stop. With ``stop`` (a ``stopping.StopFlag``, or a ``threading.Event``
@@ -1759,7 +1760,8 @@ def serve(
     the caller sets it from a handler of its own; the command line ignores SIGTERM from
     the first one on, so that a SIGTERM that comes after the server has stopped cannot
     kill a command that stopped in order. Without ``stop``, in the main thread, SIGTERM
-    sets a flag for the length of the call; the handler takes no lock. Refuses to start
+    sets a flag for the length of the call; the handler takes no lock. ``stopped`` is called
+    once the server has stopped (the command line ignores both signals from there). Refuses to start
     (``ConfigError("invalid", ...)``) when renders of the selection are out of date:
     ``N renders are out of date; run surfcensus render --run-dir DIR``. Says on stderr when
     selected subjects are not rendered yet, and when the queue is empty because the run
@@ -1814,5 +1816,7 @@ def serve(
         pass
     finally:
         handle.stop()
+        if stopped is not None:
+            stopped()
         if in_main:
             signal.signal(signal.SIGTERM, earlier)
