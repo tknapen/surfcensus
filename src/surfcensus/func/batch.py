@@ -33,7 +33,6 @@ anything else of one run is a ``pack failure`` of that run.
 from __future__ import annotations
 
 import errno
-import logging
 import os
 import re
 import shutil
@@ -46,6 +45,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from surfcensus.func import ID_PATTERN, SESSION_JSON, STREAM_JSON
+from surfcensus.log import get_logger
 from surfcensus.records import (
     EPI_SESSION_PHASE,
     PACK_FAILURE,
@@ -70,7 +70,7 @@ if TYPE_CHECKING:
 # commands that only plan): the pack, the contours, the catalog's helpers and the
 # configuration are imported where they are used.
 
-_log = logging.getLogger("surfcensus")
+_log = get_logger()
 
 _SESSION_PREFIX = "session:"
 
@@ -300,12 +300,20 @@ def _plan(
     keep: dict[str, frozenset[str]] = {}
     failed: dict[str, tuple[str, str | None]] = {}
     current: set[str] = set()
+    statuses = {str(r["unit"]): r["status"] for r in _records(public.work(EPI_SESSION_PHASE))}
     for uid in asked:
         item = cat.sessions[uid]
+        unit = session_unit(uid)
         session_dir = _session_dir(ctx.run_dir, item.participant_uid, uid)
         sig = public.epi_session_signature(uid)
-        signatures[session_unit(uid)] = sig
+        signatures[unit] = sig
+        outcome = None if force else public.work_done(EPI_SESSION_PHASE, unit, session_hash, sig)
+        # the last outcome of the session was a failure of the whole session (its lease or
+        # its worker, recorded on every run it tried): the session's row decides, so that a
+        # change anywhere in the session (its signature) tries every such run again
+        whole = statuses.get(unit) == "failed"
         kept: set[str] = set()
+        rows: dict[str, PackRow] = {}
         settled = True
         for run in item.runs:
             run_sig = public.pack_signature(run)
@@ -314,7 +322,15 @@ def _plan(
             same = (
                 row is not None and row.config_hash == pack_hash and row.input_signature == run_sig
             )
-            if same and row is not None and row.status == "failed" and not retry_failed:
+            if row is not None and same:
+                rows[run] = row
+            if (
+                same
+                and row is not None
+                and row.status == "failed"
+                and not retry_failed
+                and not whole
+            ):
                 failed[run] = (row.reason or PACK_FAILURE, row.detail)
             elif (
                 same and row is not None and row.status == "done" and pack_on_disk(session_dir, run)
@@ -323,19 +339,25 @@ def _plan(
             else:
                 settled = False
         current |= kept
-        done = (
-            not force
-            and public.work_done(EPI_SESSION_PHASE, session_unit(uid), session_hash, sig) is True
-            and (session_dir / SESSION_JSON).is_file()
-        )
+        done = outcome is True and (session_dir / SESSION_JSON).is_file()
         # a packs row of a run that is no longer a packable run of this session: the session
         # is written again, so that its new session.json no longer lists the run before the
         # run's directory goes (pack_session removes it after that)
         leaving = any(
             row.get("session_uid") == uid and run not in item.runs for run, row in cat.packs.items()
         )
-        # settled and not kept at all: every run failed and is not tried again
-        if settled and not leaving and (done or not kept):
+        if whole and outcome is False and not retry_failed:
+            # the whole session failed on these files and is not tried again
+            for run in item.runs:
+                if run not in kept:
+                    row = rows.get(run)
+                    failed[run] = (
+                        PACK_FAILURE if row is None else row.reason or PACK_FAILURE,
+                        None if row is None else row.detail,
+                    )
+            skipped.append(uid)
+        elif not whole and settled and not leaving and (done or not kept):
+            # current; or every run failed on its own and is not tried again
             skipped.append(uid)
         else:
             pending.append(uid)
@@ -855,11 +877,24 @@ def run_pack(
             tried = [run for run in session.runs if run not in plan.failed]
             if isinstance(outcome, BaseException):
                 # the session's runs are recorded as failed, but for those whose packs are
-                # current: their rows and their packs stay as they are
+                # current: their rows and their packs stay as they are; and the session's row
+                # says that the whole session failed (pack_plan: not tried again until its
+                # signature changes, or with retry_failed)
                 reason, detail = _failure(outcome)
                 tried = [run for run in tried if run not in plan.keep.get(uid, frozenset())]
                 rows += [failed_row(uid, run, reason, detail) for run in tried]
                 failures.update(dict.fromkeys(tried, reason))
+                work_rows.append(
+                    WorkRow(
+                        phase=EPI_SESSION_PHASE,
+                        unit=session_unit(uid),
+                        config_hash=plan.session_hash,
+                        input_signature=plan.signatures[session_unit(uid)],
+                        status="failed",
+                        reason=reason,
+                        detail=ctx.scrub(detail),
+                    )
+                )
                 continue
             processed.add(uid)
             _store_digests(ctx, cat, uid, outcome.packs)

@@ -19,6 +19,9 @@ export const ROUTES = {
   exportCsv: ["GET", "/api/export"],
   ratePage: ["GET", "/"],
   reviewPage: ["GET", "/review"],
+  // the index of the EPI movies, the one link of the rating page to them (session.epi_url);
+  // the EPI pages call their own routes (js/epi/)
+  epiPage: ["GET", "/epi"],
 };
 
 const UNSENT_KEY = "surfcensus.unsent";

@@ -79,7 +79,7 @@ def _other(uid: str) -> str:
 
 
 def _copy_stream(
-    source: Path, target: Path, ids: dict[str, str], sessions: tuple[str, ...]
+    source: Path, target: Path, ids: dict[str, str], sessions: tuple[str, ...], label: str
 ) -> None:
     """Copy step 1's ``--out`` to ``target`` with every id renamed by ``ids``; only the
     session directories of ``sessions`` (old ids) are copied, ``stream.json`` lists them all."""
@@ -94,9 +94,9 @@ def _copy_stream(
         path.write_text(_HEX.sub(lambda m: ids.get(m.group(0), m.group(0)), text), encoding="utf-8")
     stream = read_info(source / STREAM_JSON, StreamInfo)
     assert stream is not None
+    changed = {"sessions": tuple(ids[s] for s in stream.sessions), "label": label}
     (target / STREAM_JSON).write_text(
-        info_text(stream.model_copy(update={"sessions": tuple(ids[s] for s in stream.sessions)})),
-        encoding="utf-8",
+        info_text(stream.model_copy(update=changed)), encoding="utf-8"
     )
 
 
@@ -168,8 +168,8 @@ def add_epi(run_dir: Path, packed: PackedStream, *, subject_uid: str | None = No
     for info in packed.infos.values():
         full_ids.update({r.run: r.run for r in info.runs})
     half_ids = {old: _other(old) for old in full_ids}
-    _copy_stream(packed.out, epi / FULL, full_ids, packed.sessions)
-    _copy_stream(packed.out, epi / HALF, half_ids, packed.sessions[:1])
+    _copy_stream(packed.out, epi / FULL, full_ids, packed.sessions, LABELS[FULL])
+    _copy_stream(packed.out, epi / HALF, half_ids, packed.sessions[:1], LABELS[HALF])
 
     config = EpiConfig()
     sessions: dict[str, tuple[str, ...]] = {}

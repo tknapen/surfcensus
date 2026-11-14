@@ -1687,16 +1687,16 @@ body.no-traces .epi #traces {
 }
 
 /* the EPI page of a run directory: links to the index and to the rating screen, and the word
-   that packs are still being made; neither depends on the run on screen */
+   that packs are still being made, in the section under everything else, so that the views
+   keep the place they have on the page of step 1; nothing of it depends on the run on screen */
 .epi .epi-nav {
   display: flex;
-  gap: 10px;
-  white-space: nowrap;
+  flex-wrap: wrap;
+  gap: 2px 12px;
 }
 
 .epi .epi-packing {
   color: var(--warn-line);
-  white-space: nowrap;
 }
 
 /* --- the index of the EPI movies of a run (epi_index.html) ---------------------------------- */
@@ -1738,6 +1738,10 @@ body.no-traces .epi #traces {
 }
 
 /* the link of the rating screen to the EPI movies: in the progress line, beside the review */
+.progress .links {
+  white-space: nowrap;
+}
+
 .progress .epi-link {
   margin-left: 12px;
 }

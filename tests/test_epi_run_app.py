@@ -375,7 +375,7 @@ def test_the_page_of_a_participant_plays_its_stream_from_the_run(
         session["media_url"] = session["media_url"].replace("/epi-media/", f"/epi-media/{FULL}/")
     assert body == alone
     assert [s["session_uid"] for s in body["sessions"]] == list(epi_run.sessions[FULL])
-    assert body["label"] == "sub-01"  # the label of step 1's stream.json, copied
+    assert body["label"] == LABELS[FULL]
 
 
 def test_a_half_packed_participant_shows_what_is_packed_and_asks_again(

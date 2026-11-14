@@ -176,6 +176,7 @@ def test_the_wheel_holds_the_app_and_the_protocol_and_nothing_else_beside_the_co
         assert {Path(name).name for name in templates} == {
             "base.html",
             "epi.html",
+            "epi_index.html",
             "rate.html",
             "review.html",
         }

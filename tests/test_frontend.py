@@ -76,9 +76,11 @@ USED_ROUTES = {
     ("GET", "/api/review"),
     ("GET", "/api/review/{subject_uid}"),
     ("GET", "/api/export"),
+    ("GET", "/epi"),
 }
-"""What ``api.js`` names. The pages also load ``/static/...`` and ``/media/...``; they call
-neither ``/api/stats`` nor ``/healthz``."""
+"""What ``api.js`` names (``/epi`` is the page the rating screen links to; the EPI pages call
+their own routes, tested in test_epi_run_app.py). The pages also load ``/static/...`` and
+``/media/...``; they call neither ``/api/stats`` nor ``/healthz``."""
 
 REVIEW_COLUMNS = frozenset(re.findall(r"``(\w+)``", schemas.ReviewOut.__doc__ or "")) | frozenset(
     table_schemas.SCORES.names
@@ -367,10 +369,11 @@ def test_the_frontend_files_are_those_of_the_contract() -> None:
     assert {path.name for path in TEMPLATES_DIR.iterdir()} == {
         "base.html",
         "epi.html",
+        "epi_index.html",
         "rate.html",
         "review.html",
     }
-    # nothing to build and nothing else to ship: scripts, one stylesheet, four pages (the
+    # nothing to build and nothing else to ship: scripts, one stylesheet, five pages (the
     # EPI page's modules are in js/epi/ and tested in test_epi_frontend.py)
     others = [
         str(path.relative_to(STATIC_DIR))

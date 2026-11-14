@@ -271,7 +271,9 @@ def test_a_touched_input_repacks_its_run_only(bench: Bench) -> None:
     anchor = bench.anchor_of(session)
     other = next(r for r in bench.packable(session) if r != anchor)
     digests = {
-        r: pack_.content_digest(bench.session_dir(session), packread.read_pack(bench.session_dir(session), r))  # type: ignore[arg-type]
+        r: pack_.content_digest(
+            bench.session_dir(session), packread.read_pack(bench.session_dir(session), r)
+        )  # type: ignore[arg-type]
         for r in bench.packable(session)
     }
     before = mtimes(bench.run_dir / "epi")
@@ -291,10 +293,16 @@ def test_a_touched_input_repacks_its_run_only(bench: Bench) -> None:
         for name in changed
     )
     assert {n.split("/")[2] for n in changed} <= {other, "session.json"}
-    assert any(n.startswith(f"{bench.sessions()[session]['participant_uid']}/{session}/{other}/") for n in changed)
+    assert any(
+        n.startswith(f"{bench.sessions()[session]['participant_uid']}/{session}/{other}/")
+        for n in changed
+    )
     # the same content: the same digest
     info = packread.read_pack(bench.session_dir(session), other)
-    assert info is not None and pack_.content_digest(bench.session_dir(session), info) == digests[other]
+    assert (
+        info is not None
+        and pack_.content_digest(bench.session_dir(session), info) == digests[other]
+    )
 
 
 def test_a_changed_anchor_transform_repacks_its_whole_session(bench: Bench) -> None:
@@ -363,9 +371,31 @@ def test_a_run_that_is_no_longer_selected_loses_its_pack_and_then_its_row(
         assert bench.rows()[run]["status"] == "done"
 
 
+def test_a_run_that_leaves_its_session_loses_its_pack_and_its_row(bench: Bench) -> None:
+    bench.pack()
+    session = bench.session_of("sub-01", "1")
+    names = {r["run_uid"]: r["name"] for r in bench.runs()}
+    gone = next(r for r in bench.packable(session) if "motor" in names[r])
+    for role in ("raw_bold", "raw_sidecar"):
+        bench.files(gone, role).unlink()
+    stem = bench.files(gone, "pre_bold").name.split("_space-")[0]
+    for path in list(bench.deriv.rglob(f"{stem}*")):
+        path.unlink()
+    bench.inventory()
+    assert gone not in bench.packable()
+    report = bench.pack()
+    assert report.failed == 0 and report.done == 0
+    assert not (bench.session_dir(session) / gone).exists()
+    assert gone not in bench.rows()
+    info = packread.read_session(bench.session_dir(session))
+    assert info is not None and gone not in {r.run for r in info.runs}
+
+
 def test_a_participant_that_leaves_loses_its_directory_and_its_rows(bench: Bench) -> None:
     bench.pack()
-    (participant,) = [p["participant_uid"] for p in bench.participants() if p["participant"] == "sub-02"]
+    (participant,) = [
+        p["participant_uid"] for p in bench.participants() if p["participant"] == "sub-02"
+    ]
     session = bench.session_of("sub-02", None)
     assert (bench.run_dir / "epi" / participant).is_dir()
     shutil.rmtree(bench.deriv / "sub-02")
@@ -434,7 +464,10 @@ def test_files_that_changed_since_the_inventory_are_recorded_as_source_changed(
     assert {bench.rows()[r]["reason"] for r in bench.packable(session)} == {SOURCE_CHANGED}
     assert report.done == N_PACKABLE - report.failed
     # not tried again until the inventory saw the change
+    leased = len(bench.leased)
     assert bench.pack().failed == report.failed
+    assert len(bench.leased) == leased
+    assert fb.pack_failures(bench.ctx()).keys() == set(bench.packable(session))
     bench.inventory()
     final = bench.pack()
     assert (final.done, final.failed) == (len(bench.packable(session)), 0)
@@ -450,6 +483,15 @@ class _Exploding:
         if name in ("code", "filename") or name.startswith("__"):
             raise AttributeError(name)
         raise OSError(self.code, os.strerror(self.code), self.filename)
+
+
+def _forged(work: SessionWork, **values: object) -> SessionWork:
+    """``work`` with fields that no real lease gives (past the runtime type checks of the
+    tests, which ``dataclasses.replace`` would meet)."""
+    work = dataclasses.replace(work)
+    for name, value in values.items():
+        object.__setattr__(work, name, value)
+    return work
 
 
 class _Killer:
@@ -494,7 +536,7 @@ def test_a_full_disk_in_a_worker_process_stops_the_phase(bench: Bench) -> None:
     def explode(session_uid: str, work: SessionWork) -> SessionWork:
         if session_uid != order[1]:
             return work
-        return dataclasses.replace(work, inputs=(_Exploding(errno.ENOSPC, None),))  # type: ignore[arg-type]
+        return _forged(work, inputs=(_Exploding(errno.ENOSPC, None),))
 
     bench.alter = explode
     with pytest.raises(ConfigError, match="No space left on device"):
@@ -511,7 +553,7 @@ def test_a_worker_that_dies_fails_the_runs_of_its_session_only(bench: Bench) -> 
     def kill(session_uid: str, work: SessionWork) -> SessionWork:
         if session_uid != order[0]:
             return work
-        return dataclasses.replace(work, contour_note=_Killer())  # type: ignore[arg-type]
+        return _forged(work, contour_note=_Killer())
 
     bench.alter = kill
     report = bench.pack(jobs=2)
@@ -636,8 +678,7 @@ def test_the_digests_of_what_a_pack_read_end_up_in_the_catalog(bench: Bench) -> 
         for role in roles:
             path = bench.files(run, role)
             (stored,) = query(
-                "SELECT sha256 FROM func_files WHERE owner_kind = 'run' AND owner = ? "
-                "AND role = ?",
+                "SELECT sha256 FROM func_files WHERE owner_kind = 'run' AND owner = ? AND role = ?",
                 (run, role),
             )
             assert stored["sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
@@ -692,3 +733,49 @@ def _counts_by(rows: Mapping[str, Mapping[str, Any]]) -> dict[str, int]:
     for row in rows.values():
         out[row["status"]] = out.get(row["status"], 0) + 1
     return out
+
+
+def test_a_whole_session_that_fails_keeps_the_rows_of_its_current_packs(bench: Bench) -> None:
+    bench.pack()
+    session = bench.session_of("sub-01", "1")
+    anchor = bench.anchor_of(session)
+    other = next(r for r in bench.packable(session) if r != anchor)
+    touch(bench.files(other, "confounds"))
+    bench.inventory()
+
+    def fails(session_uid: str, work: SessionWork) -> SessionWork:
+        raise OSError(errno.EIO, "Input/output error")  # of the source, not of the cache
+
+    bench.alter = fails
+    report = bench.pack()
+    assert report.failures == ((other, PACK_FAILURE),)
+    rows = bench.rows()
+    assert rows[other]["status"] == "failed" and "Input/output error" in rows[other]["detail"]
+    assert all(rows[r]["status"] == "done" for r in bench.packable() if r != other)
+    work = bench.ctx().public.work(EPI_SESSION_PHASE).set_index("unit")["status"]
+    assert work[session_unit(session)] == "failed"
+    leased = len(bench.leased)
+    assert bench.pack().failed == 1 and len(bench.leased) == leased  # not tried again
+    bench.alter = None
+    assert bench.pack(retry_failed=True).done == 1
+
+
+def test_a_stale_run_of_a_session_not_packed_yet_waits_for_it(bench: Bench) -> None:
+    bench.pack()
+    session = bench.session_of("sub-01", "1")
+    names = {r["run_uid"]: r["name"] for r in bench.runs()}
+    gone = next(r for r in bench.packable(session) if "motor" in names[r])
+    bench.inventory(runs=("*rest*", "*sub-01_ses-2*", "*sub-02*"))
+    # the globs are part of every session's inventory hash: each session is written again,
+    # its packs kept
+    plan = fb.pack_plan(bench.ctx())
+    assert session in plan.pending and gone in plan.stale
+
+    leased = len(bench.leased)
+    report = bench.pack(stop=lambda: True)  # stopped before the first batch
+    assert report.done == 0 and len(bench.leased) == leased
+    # the session.json that lists the run is still the one there, so its pack stays
+    assert packread.pack_on_disk(bench.session_dir(session), gone)
+    assert gone in bench.rows()
+    bench.pack()
+    assert not (bench.session_dir(session) / gone).exists() and gone not in bench.rows()

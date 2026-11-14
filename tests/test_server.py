@@ -386,6 +386,8 @@ def test_the_session_is_the_protocol_the_rater_and_the_settings(
     assert shipped_protocol.require_marks_for_positive and body["require_marks"] is False
     assert body["settings"] == {"mark_show_mm": 3.0, "blind": False}
     assert body["examples"] == []
+    # a run without functional data has no EPI pages to link to
+    assert body["epi_url"] is None
     assert rows(app_run, "SELECT name, role, token_hash FROM raters") == [("local", "lead", None)]
 
 
@@ -1848,7 +1850,10 @@ def unblinded_paths(run_dir: Path) -> list[str]:
 
 def test_the_unblinded_routes_are_those_of_the_schemas() -> None:
     marked = {route.path for route in schemas.ROUTES if route.unblinded}
-    assert marked == {*UNBLINDED, "/api/review/{subject_uid}"}
+    # the EPI pages, whose rules are tested in test_epi_run_app.py
+    epi = {route.path for route in schemas.ROUTES if "epi" in route.path}
+    assert len(epi) == 5
+    assert marked == {*UNBLINDED, "/api/review/{subject_uid}", *epi}
 
 
 def test_a_researcher_alone_with_their_own_data_can_look_at_any_time(

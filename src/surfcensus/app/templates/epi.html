@@ -5,8 +5,6 @@
   <header id="bar">
     <h1><span class="what">EPI movie</span> <strong id="subject"></strong></h1>
     <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b></span>
-    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}</nav>{% endif %}
-    {% if poll_s %}<span id="packing" class="epi-packing" title="The stream shows what is packed; the page says when there is more.">packs are still being made</span>{% endif %}
     <div id="views-buttons" class="buttons" role="group" aria-label="streams shown">
       <button type="button" data-view="raw"><kbd>1</kbd> raw</button>
       <button type="button" data-view="pre"><kbd>2</kbd> preprocessed</button>
@@ -64,6 +62,7 @@
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
   <section id="about" aria-label="what the two streams are">
+    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if poll_s %} <span id="packing" class="epi-packing">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
     <p id="reading"></p>
   </section>
 

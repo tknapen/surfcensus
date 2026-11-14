@@ -82,6 +82,7 @@ from surfcensus.sources.base import (
 if TYPE_CHECKING:
     from surfcensus.config import EpiConfig, RunConfig
     from surfcensus.privacy import HashKey
+    from surfcensus.records import AffineChoice
     from surfcensus.sources.base import DatasetRecord, Source
     from surfcensus.store import Catalog
 
@@ -735,7 +736,7 @@ def session_hash(
 class _Facts:
     n_volumes: int | None = None
     tr_s: float | None = None
-    raw_affine: str | None = None
+    raw_affine: AffineChoice | None = None
     reference_image: bool | None = None
     rigid: bool | None = None
     dof: int | None = None
@@ -747,7 +748,8 @@ def _run_facts(
 ) -> tuple[_Facts, str | None]:
     """The statements of a run from its headers, sidecars, reports and transform, each read
     on its own (a file that is missing or cannot be read leaves its fact empty), and the
-    error of the first fact of a packable run that could not be read. Reads no volume."""
+    error of the first fact of a packable run that could not be read. Reads no volume; of a
+    run whose files are git-annex placeholders nothing is read."""
     import nibabel as nib
 
     from surfcensus.func import session as session_
@@ -756,49 +758,42 @@ def _run_facts(
         return _Facts(), None
     found = _paths(run_files(item), folders.deriv_root, folders.raw_root)
     paths = {role: p for role, p in found.items() if role in FUNC_READ_ROLES}
-    error: str | None = None
-    values: dict[str, object] = {}
+    errors: list[str] = []
+    caught = _read_errors()
 
-    def attempt(name: str, needs: FuncRole | None, read: object) -> None:
-        nonlocal error
-        if needs is not None and needs not in paths:
-            return
+    def failed(err: BaseException) -> None:
+        errors.append(_no_path(err, folders.deriv_root, folders.raw_root))
+
+    facts = _Facts()
+    series = paths.get(FuncRole.PRE_BOLD, paths.get(FuncRole.RAW_BOLD))
+    if series is not None:
         try:
-            values[name] = read()  # pyrefly: ignore[not-callable]
-        except _read_errors() as err:
-            if error is None and item.reason is None:
-                error = _no_path(err, folders.deriv_root, folders.raw_root)
-
-    def n_volumes() -> int:
-        series = paths.get(FuncRole.PRE_BOLD, paths.get(FuncRole.RAW_BOLD))
-        return int(nib.load(str(series)).shape[3])
-
-    def rigid() -> tuple[bool, int | None]:
-        path = connector.raw_to_anat(item.deriv, paths)
-        return path.rigid, path.dof
-
-    def affine() -> tuple[str, bool]:
-        choice = session_.raw_affine_choice(paths[FuncRole.RAW_BOLD], paths.get(FuncRole.REFERENCE))
-        return choice.choice, choice.reference_image
-
-    has_series = FuncRole.PRE_BOLD in paths or FuncRole.RAW_BOLD in paths
-    attempt("n_volumes", None if has_series else FuncRole.PRE_BOLD, n_volumes)
-    attempt("tr_s", None, lambda: connector.repetition_time(item.deriv, paths))
-    attempt("rigid", FuncRole.XFM_TO_ANAT, rigid)
-    attempt("affine", FuncRole.RAW_BOLD, affine)
-    attempt("corrections", None, lambda: connector.corrections(item.deriv, paths))
-    rigid_dof = values.get("rigid")
-    choice = values.get("affine")
-    facts = _Facts(
-        n_volumes=values.get("n_volumes"),  # pyrefly: ignore[bad-argument-type]
-        tr_s=values.get("tr_s"),  # pyrefly: ignore[bad-argument-type]
-        raw_affine=None if choice is None else choice[0],  # pyrefly: ignore[bad-index]
-        reference_image=None if choice is None else choice[1],  # pyrefly: ignore[bad-index]
-        rigid=None if rigid_dof is None else rigid_dof[0],  # pyrefly: ignore[bad-index]
-        dof=None if rigid_dof is None else rigid_dof[1],  # pyrefly: ignore[bad-index]
-        corrections=values.get("corrections"),  # pyrefly: ignore[bad-argument-type]
-    )
-    return facts, error
+            facts = replace(facts, n_volumes=int(nib.load(str(series)).shape[3]))
+        except caught as err:
+            failed(err)
+    try:
+        facts = replace(facts, tr_s=connector.repetition_time(item.deriv, paths))
+    except caught as err:
+        failed(err)
+    if FuncRole.XFM_TO_ANAT in paths:
+        try:
+            rigid = connector.raw_to_anat(item.deriv, paths)
+            facts = replace(facts, rigid=rigid.rigid, dof=rigid.dof)
+        except caught as err:
+            failed(err)
+    if FuncRole.RAW_BOLD in paths:
+        try:
+            choice = session_.raw_affine_choice(
+                paths[FuncRole.RAW_BOLD], paths.get(FuncRole.REFERENCE)
+            )
+            facts = replace(facts, raw_affine=choice.choice, reference_image=choice.reference_image)
+        except caught as err:
+            failed(err)
+    try:
+        facts = replace(facts, corrections=connector.corrections(item.deriv, paths))
+    except caught as err:
+        failed(err)
+    return facts, errors[0] if errors and item.reason is None else None
 
 
 def _echoes(item: SessionRun, raw_runs: Sequence[RawRun]) -> int:
@@ -852,7 +847,7 @@ def session_row(
                 display=item.display,
                 spaces=item.deriv.spaces,
                 grid=grid,
-                raw_affine=facts.raw_affine,  # pyrefly: ignore[bad-argument-type]
+                raw_affine=facts.raw_affine,
                 reference_image=facts.reference_image,
                 rigid=facts.rigid,
                 dof=facts.dof,
@@ -1185,7 +1180,7 @@ def func_fetch_lines(catalog: Catalog) -> list[str]:
     (decision D35). A raw dataset and a derivative are often two DataLad datasets; the command
     names each. Empty when no present run has placeholders.
 
-    One line per such run (``sub-01 ses-1 task-rest_run-1: not fetched: ...``), then one
+    One line per such run (``sub-01 ses-1_task-rest_run-1: not fetched: ...``), then one
     ``Fetch the functional files (<size>) with: <command>`` per dataset (the innermost DataLad
     dataset, else git repository, that holds the files; ``sources.local.fetch_commands``).
     The files are found again from the listing and the heads of the small files of the
@@ -1208,9 +1203,7 @@ def func_fetch_lines(catalog: Catalog) -> list[str]:
     scanned: dict[tuple[str, str | None, str], tuple[Placeholders, Placeholders]] = {}
     for row in rows:
         participant, label = row["participant"], row["session_label"]
-        lines.append(
-            f"{session_text(participant, label)} {row['name']}: {NOT_FETCHED}: {row['detail']}"
-        )
+        lines.append(f"{participant} {row['name']}: {NOT_FETCHED}: {row['detail']}")
         deriv = Path(row["deriv_root"])
         raw = None if row["raw_root"] is None else Path(row["raw_root"])
         cache = (str(deriv), row["raw_root"], participant)

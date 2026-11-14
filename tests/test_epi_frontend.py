@@ -30,7 +30,9 @@ from surfcensus.records import Grid, to_matrix4
 # the files of the package that is imported (a copy on PYTHONPATH as well)
 APP_DIR = Path(surfcensus.app.__file__).resolve().parent
 EPI_JS = APP_DIR / "static" / "js" / "epi"
-JS_FILES = ("epi.js", "logic.js", "store.js", "traces.js", "views.js", "worker.js")
+JS_FILES = ("epi.js", "index.js", "logic.js", "store.js", "traces.js", "views.js", "worker.js")
+"""The modules of ``js/epi/``: the page of a stream and its parts, and ``index.js``, the
+index of the participants of a run directory (``templates/epi_index.html``)."""
 
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node is not installed")
@@ -78,6 +80,7 @@ def run_js(js_copy: Path, script: str, data: Any = None) -> Any:
 def test_the_files_of_the_page() -> None:
     assert {p.name for p in EPI_JS.iterdir()} == set(JS_FILES)
     assert (APP_DIR / "templates" / "epi.html").is_file()
+    assert (APP_DIR / "templates" / "epi_index.html").is_file()
 
 
 @needs_node
@@ -128,6 +131,9 @@ def test_every_field_the_page_reads_of_a_run_is_in_the_shapes() -> None:
         shapes.ContourOut,
         shapes.TracesOut,
         shapes.RegistrationOut,
+        shapes.EpiIndexOut,
+        shapes.EpiParticipantOut,
+        shapes.EpiIndexSessionOut,
     ):
         fields |= set(model.model_fields)
     from surfcensus.func.model import CorrectionsInfo, FrameInfo, StatementInfo

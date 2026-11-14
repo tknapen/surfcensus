@@ -27,6 +27,7 @@ from pydantic import BaseModel, ValidationError
 
 from surfcensus import schemas as table_schemas
 from surfcensus.app import schemas
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut
 from surfcensus.app.schemas import (
     MAX_EVENT_PAYLOAD_BYTES,
     MAX_EVENTS_PER_CALL,
@@ -121,6 +122,8 @@ def test_the_examples_cover_every_route_shape() -> None:
         "StatsOut",
         "ErrorsOut",
         "HealthOut",
+        "EpiIndexOut",
+        "EpiStreamOut",
     }
 
 
@@ -147,10 +150,21 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         ),
         ("GET", "/api/stats"): Route("GET", "/api/stats", StatsOut, unblinded=True),
         ("GET", "/api/export"): Route("GET", "/api/export", unblinded=True),
+        # the EPI pages of a run directory (docs/epi_interface.md, "The app in a run
+        # directory"), each unblinded
+        ("GET", "/epi"): Route("GET", "/epi", unblinded=True),
+        ("GET", "/api/epi"): Route("GET", "/api/epi", EpiIndexOut, unblinded=True),
+        ("GET", "/epi/{participant_uid}"): Route("GET", "/epi/{participant_uid}", unblinded=True),
+        ("GET", "/api/epi/{participant_uid}"): Route(
+            "GET", "/api/epi/{participant_uid}", EpiStreamOut, unblinded=True
+        ),
+        ("GET", "/epi-media/{participant_uid}/{session_uid}/{path}"): Route(
+            "GET", "/epi-media/{participant_uid}/{session_uid}/{path}", unblinded=True
+        ),
     }
-    assert len(ROUTES) == 15  # no route twice
-    # what is unblinded is the review page and everything under its API, and nothing a
-    # rating page calls
+    assert len(ROUTES) == 20  # no route twice
+    # what is unblinded is the review page and everything under its API, and the EPI pages,
+    # and nothing a rating page calls
     unblinded = {route.path for route in ROUTES if route.unblinded}
     assert unblinded == {
         "/review",
@@ -158,6 +172,11 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         "/api/review/{subject_uid}",
         "/api/stats",
         "/api/export",
+        "/epi",
+        "/api/epi",
+        "/epi/{participant_uid}",
+        "/api/epi/{participant_uid}",
+        "/epi-media/{participant_uid}/{session_uid}/{path}",
     }
     for route in ROUTES:
         if route.request is not None and route.method == "POST":
