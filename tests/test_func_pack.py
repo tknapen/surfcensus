@@ -69,7 +69,6 @@ from surfcensus.func.pack import (
     pack_session,
     quantise,
     series_volumes,
-    session_windows,
     volume_bytes,
     write_contours,
 )
@@ -354,36 +353,26 @@ def test_series_volumes_reads_one_volume_at_a_time(
 # --- what a pack holds ----------------------------------------------------------------------
 
 
-def pooled_windows(runs: list[SyntheticRun]) -> tuple[float, float]:
-    """The session's window and SD window, computed here over the runs as stored."""
-    values, sds = [], []
-    for r in runs:
-        pre = stored(r.files["pre_bold"])
-        mask = mask_of(r)
-        values += [pre[..., t][mask] for t in range(0, pre.shape[3], WINDOW_STEP)]
-        steady = pre[..., [t for t in range(pre.shape[3]) if t not in motion_of(r).non_steady]]
-        sds.append(steady.astype(np.float64).std(axis=3, ddof=1)[mask])
-    return (
-        float(np.percentile(np.concatenate(values), PERCENTILE)),
-        float(np.percentile(np.concatenate(sds), PERCENTILE)),
-    )
-
-
-def test_one_window_for_the_session_from_all_its_runs(packed) -> None:
+def test_each_run_has_its_own_window_from_its_preprocessed_series(packed) -> None:
     session_dir, runs, _ = packed
-    hi, sd_hi = pooled_windows(runs)
     session = read_session(session_dir)
-    assert session is not None and session.window == (0.0, hi)
-    assert session.sd_window is not None and session.sd_window[1] == pytest.approx(sd_hi, 1e-9)
-    for r in runs:
+    assert session is not None
+    for r, listed in zip(runs, session.runs, strict=True):
         info = read_pack(session_dir, run_id(r))
         assert info is not None
-        assert info.window == session.window and info.sd_window == session.sd_window
+        pre = stored(r.files["pre_bold"])
+        mask = mask_of(r)
+        sub = range(0, pre.shape[3], WINDOW_STEP)
+        hi = float(np.percentile(np.stack([pre[..., t][mask] for t in sub]), PERCENTILE))
+        assert info.window == (0.0, hi) == listed.window
+        assert info.sd_window == listed.sd_window
 
 
-def test_a_brighter_run_is_shown_brighter_and_changes_every_pack(
+def test_a_brighter_run_keeps_its_own_window_and_the_common_scale_shows_it_brighter(
     ds: SyntheticFuncDataset, tmp_path: Path
 ) -> None:
+    from surfcensus.func.packread import byte_values, common_scale
+
     _geometry_ready()
     runs, anchor = ses1(ds)
     img = nib.load(str(runs[1].files["pre_bold"]))
@@ -395,23 +384,30 @@ def test_a_brighter_run_is_shown_brighter_and_changes_every_pack(
     plan = plan_of(ds, runs, anchor, None)
     info = pack_session(tmp_path / "a", session_id("sub-01", "1"), plan, inputs, None, EpiConfig())
     session_dir = tmp_path / "a" / info.session
-    assert info.window is not None
     a = read_pack(session_dir, run_id(runs[0]))
     b = read_pack(session_dir, run_id(runs[1]))
-    assert a is not None and b is not None and a.window == b.window == info.window
-    # the same voxel, one run 1.5 times the other: not normalised away by the display
-    va = decode_volume(session_dir, a, "pre", 3).astype(float)
-    vb = decode_volume(session_dir, b, "pre", 3).astype(float)
-    inside = (va > 20) & (vb < 250)
-    assert np.allclose(vb[inside], 1.5 * va[inside], atol=1.0)
-    # without the bright run the window is another, and so is the pack of every other run
-    fewer = plan_of(ds, [runs[0], runs[2], runs[3]], anchor, None)
-    other = pack_session(
-        tmp_path / "b", info.session, fewer, [inputs[0], *inputs[2:]], None, EpiConfig()
-    )
-    assert other.window != info.window
-    c = read_pack(tmp_path / "b" / info.session, run_id(runs[0]))
-    assert c is not None and c.content_digest != a.content_digest
+    assert a is not None and b is not None
+    assert b.window[1] == pytest.approx(1.5 * a.window[1], rel=1e-6)
+    va = decode_volume(session_dir, a, "pre", 3)
+    vb = decode_volume(session_dir, b, "pre", 3)
+    # normalization on: each run under its own window, the two pictures alike
+    assert np.abs(va.astype(int) - vb.astype(int)).max() <= 1
+    # what a stored byte stands for: the signal, within half a step of the window
+    pre_b = stored(bright_path)[..., 3]
+    step = b.window[1] / 255
+    inside = (vb > 0) & (vb < 255)
+    assert np.abs(byte_values(b.window)[vb][inside] - pre_b[inside]).max() <= step / 2 + 1e-3
+    # normalization off: one window, 0 to the largest upper limit, the bright run brighter
+    top = max(x.window[1] for x in info.runs if x.window is not None)
+    assert top == b.window[1]
+    shown_a = common_scale(a.window, top)[va].astype(float)
+    shown_b = common_scale(b.window, top)[vb].astype(float)
+    assert np.array_equal(common_scale(b.window, top), np.arange(256, dtype=np.uint8))
+    keep = (va > 30) & (vb < 250)
+    assert np.allclose(shown_b[keep], 1.5 * shown_a[keep], atol=2.0)
+    # another run does not change the pack of this one
+    alone = pack_run(tmp_path / "alone", inputs[0], EpiConfig())
+    assert alone.content_digest == a.content_digest
 
 
 def test_the_runs_lie_on_one_timeline_in_acquisition_order(packed) -> None:
@@ -424,31 +420,46 @@ def test_the_runs_lie_on_one_timeline_in_acquisition_order(packed) -> None:
     assert [x.tr_s for x in session.runs] == [2.0] * 4
 
 
-def test_slice_offsets_place_slices_of_two_grids_in_one_frame() -> None:
-    from surfcensus.func.pack import slice_offsets
+def test_slice_planes_are_normals_and_distances_from_the_anatomy_origin() -> None:
+    from surfcensus.func.pack import slice_planes
 
     a = Grid((4, 5, 6), to_matrix4(GRID_AFFINE))
-    b_affine = GRID_AFFINE.copy()
-    b_affine[:3, 3] += (8.0, -16.0, 4.0)  # one voxel right, two back, half a voxel up
-    b = Grid((4, 5, 7), to_matrix4(b_affine))
-    axes, here = slice_offsets(a, a)
-    assert axes == {"sagittal": "x", "coronal": "y", "axial": "z"}
-    assert here["sagittal"] == (-12.0, -4.0, 4.0, 12.0)  # 8 mm voxels about the middle
-    _, there = slice_offsets(b, a)
-    assert there["sagittal"] == (-4.0, 4.0, 12.0, 20.0)
-    assert there["coronal"][2] == here["coronal"][0]
-    assert there["axial"][0] == here["axial"][0] + 4.0
-    # an oblique grid: the offset of a slice is where its centre lies along the axis
+    normals, here = slice_planes(a)
+    assert normals == {
+        "sagittal": (1.0, 0.0, 0.0),
+        "coronal": (0.0, 1.0, 0.0),
+        "axial": (0.0, 0.0, 1.0),
+    }
+    for n, plane in enumerate(PLANES):  # the coordinates of the slice planes themselves
+        want = [GRID_AFFINE[n, n] * k + GRID_AFFINE[n, 3] for k in range(a.shape[n])]
+        assert here[plane] == pytest.approx(want, abs=1e-6)
+    # an axis that runs backwards: the normal turns, the distance with it
+    flipped = GRID_AFFINE.copy()
+    flipped[0, 0], flipped[0, 3] = -8.0, 40.0
+    normals, back = slice_planes(Grid((4, 5, 6), to_matrix4(flipped)))
+    assert normals["sagittal"] == (-1.0, 0.0, 0.0)
+    assert back["sagittal"] == pytest.approx([-40.0, -32.0, -24.0, -16.0], abs=1e-6)
+    # an oblique grid: exact, the planes of the slices on screen meet in one point
     tilt = np.eye(4)
     c, s = np.cos(np.radians(20.0)), np.sin(np.radians(20.0))
     tilt[:3, :3] = [[1, 0, 0], [0, c, -s], [0, s, c]]
-    oblique = Grid((4, 5, 6), to_matrix4(tilt @ GRID_AFFINE))
-    axes, values = slice_offsets(oblique, a)
-    assert axes == {"sagittal": "x", "coronal": "y", "axial": "z"}
-    centre = apply(GRID_AFFINE, np.array([[1.5, 2.0, 2.5]]))[0]
-    for k in range(5):
-        point = apply(tilt @ GRID_AFFINE, np.array([[1.5, k, 2.5]]))[0]
-        assert values["coronal"][k] == pytest.approx(point[1] - centre[1], abs=1e-6)
+    affine = tilt @ GRID_AFFINE
+    normals, values = slice_planes(Grid((4, 5, 6), to_matrix4(affine)))
+    voxel = np.array([2.0, 3.0, 1.0])
+    point = apply(affine, voxel[None])[0]
+    for n, plane in enumerate(PLANES):
+        assert np.dot(normals[plane], point) == pytest.approx(
+            values[plane][int(voxel[n])], abs=1e-5
+        )
+    # and the slice of the straight grid nearest to that point
+    straight_normals, straight = slice_planes(a)
+    nearest = int(np.argmin(np.abs(np.asarray(straight["coronal"]) - point[1])))
+    assert abs(straight["coronal"][nearest] - point[1]) <= 4.0
+    # a grid of a run displaced into another frame: P . G, not G
+    shift = np.eye(4)
+    shift[:3, 3] = (3.0, 0.0, 0.0)
+    _, moved = slice_planes(a, to_matrix4(shift))
+    assert moved["sagittal"] == pytest.approx([x + 3.0 for x in here["sagittal"]], abs=1e-6)
 
 
 def test_the_preprocessed_stream_is_the_series_as_written_quantised(packed) -> None:
@@ -558,8 +569,6 @@ def _write_session_json(directory: Path, plan: SessionPlan, info: PackInfo) -> N
         config_hash="x",
         fd_threshold_mm=0.5,
         registration=None,
-        window=None,
-        sd_window=None,
         grids=(
             GridInfo(
                 grid_key=grid.key,
@@ -568,7 +577,7 @@ def _write_session_json(directory: Path, plan: SessionPlan, info: PackInfo) -> N
                 oblique_deg=0.0,
                 edge_letters={},
                 contours=None,
-                slice_axis={},
+                slice_normal={},
                 slice_mm={},
             ),
         ),
@@ -580,8 +589,6 @@ def _write_session_json(directory: Path, plan: SessionPlan, info: PackInfo) -> N
 
 def test_the_stills_are_over_the_steady_state_volumes(packed) -> None:
     session_dir, runs, _ = packed
-    session = read_session(session_dir)
-    assert session is not None and session.sd_window is not None
     for r in runs:
         info = read_pack(session_dir, run_id(r))
         assert info is not None
@@ -594,8 +601,10 @@ def test_the_stills_are_over_the_steady_state_volumes(packed) -> None:
         mean = steady.mean(axis=3)
         assert np.array_equal(decode_still(session_dir, info, "pre", "mean"), my_quantise(mean, hi))
         sd = steady.std(axis=3, ddof=1)
+        sd_hi = float(np.percentile(sd[mask_of(r)], PERCENTILE))
+        assert info.sd_window == (0.0, sd_hi)
         got = decode_still(session_dir, info, "pre", "sd").astype(int)
-        assert np.abs(got - my_quantise(sd, session.sd_window[1]).astype(int)).max() <= 1
+        assert np.abs(got - my_quantise(sd, sd_hi).astype(int)).max() <= 1
         # over every volume the mean is another: the signal changes with the volume
         assert not np.array_equal(my_quantise(pre.mean(axis=3), hi), my_quantise(mean, hi))
         traces = json.loads((session_dir / info.traces.file).read_text())
@@ -1145,13 +1154,8 @@ def test_the_worked_example_decodes_to_the_values_of_the_prototype_pack(
             rigid=RigidPath(own, 6, 0.0, True, FuncRole.XFM_TO_ANAT, FuncRole.REFERENCE),
             tr_s=proto_run["tr_s"],
         )
-        # the prototype has a window per run; D38 has one per session, so each run is packed
-        # here with the prototype's window of it passed in
-        windows = (tuple(proto_run["window"]), tuple(proto_run["sd_window"]))
-        info = pack_run(session_dir, inp, config, *windows)
+        info = pack_run(session_dir, inp, config)
         infos.append(info)
-        # alone, a run is a session of one, whose window is the prototype's of that run
-        assert session_windows([inp]) == windows
         assert info.n_volumes == proto_run["n_volumes"] == 146
         assert list(info.window) == proto_run["window"]
         assert list(info.sd_window) == proto_run["sd_window"]
@@ -1171,5 +1175,5 @@ def test_the_worked_example_decodes_to_the_values_of_the_prototype_pack(
                     (proto / proto_run["streams"][stream][still]["file"]).read_bytes()
                 ), (n, stream, still)
     # and a second pack of the same files has the same digest
-    again = pack_run(tmp_path / "again" / sid, inp, config, *windows)
+    again = pack_run(tmp_path / "again" / sid, inp, config)
     assert again.content_digest == infos[1].content_digest

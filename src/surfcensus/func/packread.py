@@ -204,3 +204,25 @@ def decode_contours(session_dir: Path, grid_key: str, plane: str) -> bytes:
             if grid.grid_key == grid_key and grid.contours is not None:
                 sha = grid.contours[plane].sha256
     return inflate_checked(Path(session_dir) / contour_file(grid_key, plane), sha)
+
+
+def byte_values(window: tuple[float, float]) -> np.ndarray:
+    """What each stored value 0 to 255 of a run with this window stands for, float64: the
+    middle of the values that quantise to it, ``lo + b * (hi - lo) / 255`` (``RULES["value"]``
+    of ``func.model``). 0 also holds everything below ``lo`` and 255 everything above ``hi``."""
+    lo, hi = float(window[0]), float(window[1])
+    return lo + np.arange(256, dtype=np.float64) * ((hi - lo) / 255.0)
+
+
+def common_scale(window: tuple[float, float], top: float) -> np.ndarray:
+    """The table by which the page shows a run under one window ``(0, top)`` for the whole
+    stream, with intensity normalization off (``RULES["common_scale"]``): stored value ``b``
+    of a run with window ``(0, hi)`` is shown as ``floor(b * hi / top + 0.5)``, clipped to
+    0..255, uint8. ``top`` is the largest upper limit of the runs of the stream; a run with
+    that limit keeps its values."""
+    if not window[0] == 0.0:
+        raise ValueError("the windows of a pack start at 0")
+    if not top >= window[1] > 0:
+        raise ValueError("top is the largest upper limit of the stream")
+    scaled = np.floor(np.arange(256, dtype=np.float64) * (float(window[1]) / float(top)) + 0.5)
+    return np.clip(scaled, 0, 255).astype(np.uint8)
