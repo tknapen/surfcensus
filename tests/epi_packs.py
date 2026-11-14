@@ -148,7 +148,9 @@ def _corrections(sdc: bool) -> Corrections:
     report = FuncRole.SUMMARY_REPORT
     return Corrections(
         motion=Statement("applied", None, None),
-        sdc=Statement("applied", "FLB", report) if sdc else Statement("not applied", "None", report),
+        sdc=Statement("applied", "FLB", report)
+        if sdc
+        else Statement("not applied", "None", report),
         sdc_method="FLB (fieldmap-less, SyN-based)" if sdc else None,
         slice_timing=Statement("not applied", "Not applied", report),
         registration=Statement("applied", "bbregister", report),
@@ -157,11 +159,11 @@ def _corrections(sdc: bool) -> Corrections:
     )
 
 
-def _write_series(path: Path, shape: Sequence[int], affine: np.ndarray, n: int, gain: float) -> None:
+def _write_series(
+    path: Path, shape: Sequence[int], affine: np.ndarray, n: int, gain: float
+) -> None:
     points = apply(affine, voxel_centres(shape))
-    volumes = [
-        (gain * series_value(points, t)).reshape(tuple(shape), order="F") for t in range(n)
-    ]
+    volumes = [(gain * series_value(points, t)).reshape(tuple(shape), order="F") for t in range(n)]
     img = nib.Nifti1Image(np.stack(volumes, axis=-1).astype(np.float32), affine)
     img.set_sform(affine, code=1)
     img.set_qform(affine, code=1)
@@ -179,7 +181,9 @@ def _scaled_copy(source: Path, target: Path, gain: float) -> None:
 
 
 def _contours(ds: SyntheticFuncDataset, grid: Grid) -> tuple:
-    surfaces = fc.surfaces_in_display(ds.fs_subjects_dir / "sub-01", to_matrix4(FSNATIVE_TO_T1W), grid)
+    surfaces = fc.surfaces_in_display(
+        ds.fs_subjects_dir / "sub-01", to_matrix4(FSNATIVE_TO_T1W), grid
+    )
     return fc.plane_contours(surfaces, grid)
 
 
@@ -242,7 +246,9 @@ def _input(
         anchor_run=anchor_id,
         anchor_matrix=to_matrix4(anchor.anat_to_scanner),
         raw_affine=RawAffine(
-            to_matrix4(src.raw_affine), "header, unchecked" if unchecked else "header", not unchecked
+            to_matrix4(src.raw_affine),
+            "header, unchecked" if unchecked else "header",
+            not unchecked,
         ),
         motion=_motion(src),
         corrections=_corrections(sdc),
@@ -378,5 +384,3 @@ def stream_order(stream: PackedStream) -> list[tuple[str, str, int, int]]:
             out.append((sid, run.run, at, run.n_volumes))
             at += run.n_volumes
     return out
-
-

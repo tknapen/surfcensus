@@ -51,7 +51,7 @@ export class Views {
 
   makeGroup(key) {
     const element = document.createElement('section');
-    element.className = 'group';
+    element.className = 'epi-group';
     element.dataset.group = key;
     const head = document.createElement('h2');
     const heading = document.createElement('span');
@@ -59,11 +59,11 @@ export class Views {
     badge.className = 'badge';
     head.append(heading, badge);
     const row = document.createElement('div');
-    row.className = 'panels';
+    row.className = 'epi-panels';
     element.append(head, row);
     const panels = SPEC.map((spec, plane) => {
       const box = document.createElement('div');
-      box.className = 'panel';
+      box.className = 'epi-panel';
       box.dataset.plane = String(plane);
       const gray = document.createElement('canvas');
       gray.className = 'gray';
@@ -72,7 +72,7 @@ export class Views {
       box.append(gray, over);
       const letters = EDGES.map((edge) => {
         const letter = document.createElement('span');
-        letter.className = `letter ${edge}`;
+        letter.className = `epi-letter ${edge}`;
         box.append(letter);
         return letter;
       });
@@ -179,9 +179,9 @@ export class Views {
   // The layer over the voxels: contours of the slices on screen and the crosshair of the other
   // two planes. contours: per plane the decoded file of the grid on screen, or null. Drawn again
   // only when the slices, the grid, the switches, the layout or the loaded contours change.
-  overlay(slices, contours, showContours, showCrosshair, active) {
+  overlay(slices, contours, showContours, showCrosshair, active, contourKey = '') {
     const shape = this.grid.shape;
-    const key = [this.grid.grid_key, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active].join('|');
+    const key = [this.grid.grid_key, contourKey, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active].join('|');
     if (key === this.overlayKey) return;
     this.overlayKey = key;
     const dpr = window.devicePixelRatio || 1;

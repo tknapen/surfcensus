@@ -74,7 +74,7 @@ class GridOut(_Shape):
     contours: dict[str, ContourOut] | None
     slice_normal: dict[str, tuple[float, float, float]]
     slice_mm: dict[str, tuple[float, ...]]
-    version: str
+    token: str
     """Asked for with the contour files (``?v=``): changes whenever one of them does."""
 
 
@@ -101,7 +101,7 @@ class EpiPackOut(_Shape):
     streams: dict[str, StreamOut]
     """``raw`` and ``pre``."""
     traces: TracesOut
-    version: str
+    token: str
     """Asked for with the run's files (``?v=``): changes whenever one of them does."""
 
 
@@ -122,6 +122,8 @@ class EpiRunOut(_Shape):
     first: int | None
     window: tuple[float, float] | None
     sd_window: tuple[float, float] | None
+    detail: str | None
+    """One sentence beside the reason, when there is more to say."""
     pack: EpiPackOut | None
     """None for a run that is not packed, or whose pack is not whole on disk."""
 
@@ -142,6 +144,8 @@ class EpiStreamOut(_Shape):
     """``GET /api/epi/stream``: the subject's one stream."""
 
     label: str
+    order: str
+    """How the sessions were put in order (``StreamInfo.order``)."""
     reading: str
     """What the page says under its title (``func.model.READING``)."""
     memory_mib: int = Field(ge=1)

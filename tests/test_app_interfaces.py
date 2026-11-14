@@ -163,7 +163,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "PAGES": None,
         "create_app": ("run_dir", "mode", "rater", "allowed_hosts"),
         "start_server": ("run_dir", "host", "port", "mode", "rater"),
-        "serve": ("run_dir", "host", "port", "mode", "rater", "open_browser", "stop"),
+        "serve": ("run_dir", "host", "port", "mode", "rater", "open_browser", "stop", "stopped"),
     },
     "surfcensus.export.tables": {
         "EXPORT_TABLES": None,
@@ -222,7 +222,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "relocate",
             "force",
         ),
-        "serve_review": ("run", "app", "rater", "open_browser", "stop"),
+        "serve_review": ("run", "app", "rater", "open_browser", "stop", "stopped"),
     },
 }
 

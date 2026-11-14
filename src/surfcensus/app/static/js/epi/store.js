@@ -80,7 +80,7 @@ export class Store {
         await Promise.all(
           STREAMS.flatMap((s) =>
             STILLS.map(async (what) => {
-              out[s][what] = await this.fetchFile(session, run.pack.streams[s][what], run.pack.version, nVoxels);
+              out[s][what] = await this.fetchFile(session, run.pack.streams[s][what], run.pack.token, nVoxels);
             }),
           ),
         );
@@ -176,7 +176,7 @@ export class Store {
         type: 'load',
         id,
         file: entry.file,
-        url: this.url(session, entry.file, run.pack.version),
+        url: this.url(session, entry.file, run.pack.token),
         sha256: entry.sha256,
         refKey,
         nVoxels,

@@ -122,10 +122,16 @@ function stateKey(s) {
   return [s.kind === 'series' ? s.g : `${segOf(s.g)}:${s.kind}`, s.view, s.slices.join(','), s.diffScale, s.normalized].join('|');
 }
 
+// The contours of a grid belong to its session: two sessions on one grid may have the
+// contours of different FreeSurfer subjects, or one of them none.
+function contourKey(k) {
+  return `${segment(k).session}|${segment(k).gridKey}`;
+}
+
 function contoursReady(k) {
   const grid = gridOf(k);
   if (!grid.contours) return true;
-  const c = contoursOf.get(grid.grid_key);
+  const c = contoursOf.get(contourKey(k));
   return Array.isArray(c) && c.every((x) => x !== null);
 }
 
@@ -229,6 +235,11 @@ function render(reason = 'other') {
       page.lastSeek = { g: seek.g, ms: now - seek.at };
       seek = null;
     }
+    if (reason === 'seek') {
+      // a jump ends the markers of where the page was: they belong to another volume
+      closeMarker('fd', now);
+      closeMarker('ns', now);
+    }
     raiseMarkers(now);
   }
   showMarker(now);
@@ -239,10 +250,10 @@ function render(reason = 'other') {
 }
 
 function drawOverlay() {
-  const grid = gridOf(segOf(state.g));
-  const loaded = contoursOf.get(grid.grid_key);
+  const k = segOf(state.g);
+  const loaded = contoursOf.get(contourKey(k));
   const planes = Array.isArray(loaded) ? loaded : [null, null, null];
-  views.overlay(state.slices, planes, state.contours, state.crosshair, state.active);
+  views.overlay(state.slices, planes, state.contours, state.crosshair, state.active, contourKey(k));
 }
 
 function raiseMarkers(now) {
@@ -284,10 +295,10 @@ function showMarker(now) {
   let text = '';
   if (visible && marker.fd) {
     kind = 'fd';
-    text = `FD ${marker.fd.value.toFixed(2)} mm at volume ${localVolume(marker.fd.g).t} of the run`;
+    text = `FD ${marker.fd.value.toFixed(2)} mm at volume ${localVolume(marker.fd.g).t} of its run`;
   } else if (visible && marker.ns) {
     kind = 'ns';
-    text = `non-steady state, volume ${localVolume(marker.ns.g).t} of the run`;
+    text = `non-steady state, volume ${localVolume(marker.ns.g).t} of its run`;
   }
   const signature = kind + text;
   if (signature !== marker.shownKind) {
@@ -382,7 +393,7 @@ function writeRun() {
   $('warning').textContent = warnings.join(' ');
   const missing = session.runs.filter((r) => r.reason !== null);
   $('session-note').textContent = missing.length
-    ? `${session.label}: ${missing.length} run(s) not in the stream: ${missing.map((r) => `${r.name} (${r.reason})`).join('; ')}.`
+    ? `${session.label}: ${missing.length} run(s) not in the stream: ${missing.map((r) => `${r.name} (${r.reason}${r.detail ? `: ${r.detail}` : ''})`).join('; ')}.`
     : `${session.label}: every listed run is in the stream.`;
   writeCorrections();
 }
@@ -713,7 +724,7 @@ function buildRuns() {
         b.disabled = true;
         b.textContent = `${run.name} `;
         away.textContent = run.reason || 'no pack';
-        b.title = 'not in the stream';
+        b.title = run.detail ? `not in the stream: ${run.detail}` : 'not in the stream';
       } else {
         b.dataset.seg = String(k);
         b.textContent = `${run.name} `;
@@ -791,12 +802,13 @@ function buildControls() {
   const limits = [...new Set(stream.sessions.filter((s) => s.registration).map((s) => s.registration.limit_mm))];
   $('help-limit').textContent = limits.join(', ');
   $('help-hold').textContent = String(HOLD_MS);
+  $('help-order').textContent = stream.order;
   $('help-memory').textContent = formatBytes(store.limitBytes);
   $('help-window').textContent = `${stream.rules.window}; ${stream.rules.quantise}. ${stream.rules.common_scale}.`;
 }
 
 function availableHeight() {
-  const used = ['bar', 'reading', 'run-note', 'session-note', 'corrections', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
+  const used = ['bar', 'reading', 'runs', 'run-note', 'session-note', 'corrections', 'legend', 'controls', 'status'].reduce((a, id) => a + $(id).offsetHeight, 0);
   const warn = $('warning').hidden ? 0 : $('warning').offsetHeight;
   const tr = state.traces ? $('traces').offsetHeight : 0;
   if (window.innerWidth < 700) return 0.9 * window.innerHeight;
@@ -815,20 +827,20 @@ async function fetchJson(url) {
 // The contours of every grid of the stream, small, loaded at the start in parallel.
 function loadContours() {
   const jobs = [];
-  for (const session of stream.sessions) {
+  stream.sessions.forEach((session, si) => {
     for (const grid of session.grids) {
-      if (contoursOf.has(grid.grid_key) && contoursOf.get(grid.grid_key) !== null) continue;
+      const key = `${si}|${grid.grid_key}`;
       if (!grid.contours) {
-        if (!contoursOf.has(grid.grid_key)) contoursOf.set(grid.grid_key, null);
+        contoursOf.set(key, null);
         continue;
       }
       const planes = [null, null, null];
-      contoursOf.set(grid.grid_key, planes);
+      contoursOf.set(key, planes);
       PLANES.forEach((name, plane) => {
         const entry = grid.contours[name];
         jobs.push(
           (async () => {
-            const response = await fetch(`${session.media_url}${entry.file}?v=${encodeURIComponent(grid.version)}`);
+            const response = await fetch(`${session.media_url}${entry.file}?v=${encodeURIComponent(grid.token)}`);
             if (!response.ok) throw new Error(`${entry.file}: status ${response.status}`);
             const packed = await response.arrayBuffer();
             page.requests += 1;
@@ -837,12 +849,12 @@ function loadContours() {
             if (digest && digest !== entry.sha256) throw new Error(`${entry.file}: the bytes are not those the session lists`);
             const data = await inflate(packed);
             planes[plane] = decodeContours(data.buffer, stream.contour_unit || CONTOUR_UNIT);
-            if (shown && shown.grid === grid.grid_key) drawOverlay();
+            if (shown && contourKey(shown.seg) === key) drawOverlay();
           })(),
         );
       });
     }
-  }
+  });
   return Promise.all(jobs).then(() => {
     page.timing.contours = performance.now();
   });
@@ -938,11 +950,17 @@ window.__epi = {
   // normalized) and resolve when the panels hold what was asked for.
   set(change) {
     if ('view' in change && VIEWS.includes(change.view)) setView(change.view);
-    if ('kind' in change && KINDS.includes(change.kind)) setKind(change.kind);
     if ('normalized' in change && change.normalized !== state.normalized) setNormalized(change.normalized);
     if ('g' in change) {
       state.g = clamp(change.g, 0, timeline.total - 1);
+      state.kind = 'series';
+      seek = { g: state.g, at: performance.now() };
       enterSegment(segOf(state.g));
+    }
+    if ('kind' in change && KINDS.includes(change.kind)) {
+      state.kind = change.kind;
+      if (change.kind !== 'series') state.playing = false;
+      writeLegend();
     }
     if ('slices' in change) {
       const grid = gridOf(segOf(state.g));
@@ -952,9 +970,8 @@ window.__epi = {
     if ('diffScale' in change) setDiffScale(change.diffScale);
     if ('rate' in change) setRate(change.rate);
     for (const k of ['contours', 'crosshair']) if (k in change) state[k] = change[k];
-    if ('g' in change) setTime(change.g, 'seek');
     if ('playing' in change) setPlaying(change.playing);
-    else render('other');
+    else render('g' in change ? 'seek' : 'other');
     return window.__epi.ready();
   },
   ready() {
@@ -966,30 +983,40 @@ window.__epi = {
   },
   has: (view, g) => streamsOf(view).every((s) => store.volume(s, g) !== null),
   idle: () => store.idle(),
-  // the gray levels a panel holds, as the canvas has them (the red channel), and its size
-  pixels(group, plane) {
-    const canvas = document.querySelector(`#views .group[data-group="${group}"] .panel[data-plane="${plane}"] canvas.gray`);
-    const ctx = canvas.getContext('2d');
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+  // the gray levels a panel holds, as the canvas has them, and its size; read through a copy
+  // made for reading, so that the page's own canvases stay as the page made them
+  pixels(group, plane, layer = 'gray') {
+    const canvas = document.querySelector(`#views .epi-group[data-group="${group}"] .epi-panel[data-plane="${plane}"] canvas.${layer}`);
+    const copy = document.createElement('canvas');
+    copy.width = canvas.width;
+    copy.height = canvas.height;
+    const ctx = copy.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(canvas, 0, 0);
+    const data = ctx.getImageData(0, 0, copy.width, copy.height).data;
+    if (layer !== 'gray') {
+      let drawn = 0;
+      for (let i = 3; i < data.length; i += 4) if (data[i]) drawn += 1;
+      return { w: copy.width, h: copy.height, drawn };
+    }
     const out = [];
     for (let i = 0; i < data.length; i += 4) out.push([data[i], data[i + 1], data[i + 2]]);
-    return { w: canvas.width, h: canvas.height, rgb: out };
+    return { w: copy.width, h: copy.height, rgb: out };
   },
   // where a panel's canvas lies on the page, in CSS px
   rect(group, plane) {
-    const canvas = document.querySelector(`#views .group[data-group="${group}"] .panel[data-plane="${plane}"] canvas.gray`);
+    const canvas = document.querySelector(`#views .epi-group[data-group="${group}"] .epi-panel[data-plane="${plane}"] canvas.gray`);
     const r = canvas.getBoundingClientRect();
     return { x: r.left, y: r.top, w: r.width, h: r.height, cw: canvas.width, ch: canvas.height };
   },
   boxRect(group, plane) {
-    const box = document.querySelector(`#views .group[data-group="${group}"] .panel[data-plane="${plane}"]`);
+    const box = document.querySelector(`#views .epi-group[data-group="${group}"] .epi-panel[data-plane="${plane}"]`);
     const r = box.getBoundingClientRect();
     return { x: r.left, y: r.top, w: r.width, h: r.height };
   },
   contoursDrawn() {
-    const grid = gridOf(segOf(state.g));
-    const c = contoursOf.get(grid.grid_key);
-    return { grid: grid.grid_key, loaded: Array.isArray(c) && c.every((x) => x !== null), key: views.overlayKey };
+    const k = segOf(state.g);
+    const c = contoursOf.get(contourKey(k));
+    return { grid: gridOf(k).grid_key, contours: contourKey(k), loaded: Array.isArray(c) && c.every((x) => x !== null), key: views.overlayKey };
   },
   texts: () => ({
     runNote: $('run-note').textContent,

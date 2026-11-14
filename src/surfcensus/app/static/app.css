@@ -1228,16 +1228,16 @@ textarea:focus-visible {
 }
 
 /* waiting for a volume: the picture stays, its frame says so */
-.epi #views.stale .panel {
+.epi #views.stale .epi-panel {
   outline-color: var(--warn-line);
 }
 
-.epi .group {
+.epi .epi-group {
   border: 2px solid transparent;
   border-radius: 4px;
 }
 
-.epi .group h2 {
+.epi .epi-group h2 {
   margin: 0;
   width: 0;
   min-width: 100%;
@@ -1252,49 +1252,49 @@ textarea:focus-visible {
   gap: 10px;
 }
 
-.epi .group h2 span {
+.epi .epi-group h2 span {
   overflow: hidden;
   text-overflow: ellipsis;
   min-width: 0;
 }
 
-.epi .group h2 span:first-child {
+.epi .epi-group h2 span:first-child {
   flex: 0 0 auto;
   max-width: 100%;
 }
 
-.epi .group .badge {
+.epi .epi-group .badge {
   font-weight: 700;
   flex: 0 1 auto;
 }
 
-.epi .group.marker-fd {
+.epi .epi-group.marker-fd {
   border-color: var(--fd);
 }
 
-.epi .group.marker-fd .badge {
+.epi .epi-group.marker-fd .badge {
   color: var(--fd);
 }
 
-.epi .group.marker-ns {
+.epi .epi-group.marker-ns {
   border-color: var(--ns);
 }
 
-.epi .group.marker-ns .badge {
+.epi .epi-group.marker-ns .badge {
   color: var(--ns);
 }
 
-.epi .panels {
+.epi .epi-panels {
   display: flex;
   gap: 8px;
   align-items: center;
 }
 
-.epi .panels[data-panels="column"] {
+.epi .epi-panels[data-panels="column"] {
   flex-direction: column;
 }
 
-.epi .panel {
+.epi .epi-panel {
   position: relative;
   background: #000;
   outline: 1px solid #000;
@@ -1304,24 +1304,24 @@ textarea:focus-visible {
   overflow: hidden;
 }
 
-.epi .panel.active {
+.epi .epi-panel.active {
   outline: 1px solid var(--accent);
 }
 
 /* the canvases take the size of the grid on screen; views.js places them in the box */
-.epi .panel canvas {
+.epi .epi-panel canvas {
   position: absolute;
 }
 
-.epi .panel .gray {
+.epi .epi-panel .gray {
   image-rendering: pixelated;
 }
 
-.epi .panel .over {
+.epi .epi-panel .over {
   pointer-events: none;
 }
 
-.epi .letter {
+.epi .epi-letter {
   position: absolute;
   font: 600 11px system-ui, sans-serif;
   color: #fff;
@@ -1329,25 +1329,25 @@ textarea:focus-visible {
   pointer-events: none;
 }
 
-.epi .letter.left {
+.epi .epi-letter.left {
   left: 3px;
   top: 50%;
   transform: translateY(-50%);
 }
 
-.epi .letter.right {
+.epi .epi-letter.right {
   right: 3px;
   top: 50%;
   transform: translateY(-50%);
 }
 
-.epi .letter.top {
+.epi .epi-letter.top {
   top: 1px;
   left: 50%;
   transform: translateX(-50%);
 }
 
-.epi .letter.bottom {
+.epi .epi-letter.bottom {
   bottom: 1px;
   left: 50%;
   transform: translateX(-50%);
