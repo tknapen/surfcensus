@@ -366,10 +366,12 @@ def test_the_frontend_files_are_those_of_the_contract() -> None:
     assert (STATIC_DIR / "app.css").is_file()
     assert {path.name for path in TEMPLATES_DIR.iterdir()} == {
         "base.html",
+        "epi.html",
         "rate.html",
         "review.html",
     }
-    # nothing to build and nothing else to ship: scripts, one stylesheet, three pages
+    # nothing to build and nothing else to ship: scripts, one stylesheet, four pages (the
+    # EPI page's modules are in js/epi/ and tested in test_epi_frontend.py)
     others = [
         str(path.relative_to(STATIC_DIR))
         for path in STATIC_DIR.rglob("*")

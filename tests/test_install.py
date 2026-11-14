@@ -173,7 +173,12 @@ def test_the_wheel_holds_the_app_and_the_protocol_and_nothing_else_beside_the_co
         templates = source_files("app", "templates")
         # the pages and their scripts are there, byte for byte
         assert {Path(name).suffix for name in static} == {".js", ".css"} and len(static) >= 12
-        assert {Path(name).name for name in templates} == {"base.html", "rate.html", "review.html"}
+        assert {Path(name).name for name in templates} == {
+            "base.html",
+            "epi.html",
+            "rate.html",
+            "review.html",
+        }
         for name in sorted(static | templates | {"surfcensus/data/protocol.yaml"}):
             assert name in names, f"{name} is not in the wheel"
             assert archive.read(name) == (PACKAGE.parent / name).read_bytes(), name

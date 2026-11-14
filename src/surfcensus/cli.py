@@ -117,6 +117,103 @@ def render_subject(
     typer.echo(f"{target}: {counts} slices, {time.perf_counter() - start:.1f} s")
 
 
+@app.command("epi-session")
+def epi_session_command(
+    path: Path = typer.Argument(
+        ...,
+        help="A folder with fMRIPrep output: a BIDS dataset root, its derivatives/ folder, the "
+        "fMRIPrep folder or its FreeSurfer subjects directory.",
+    ),
+    subject: str = typer.Option(..., "--subject", metavar="LABEL", help="sub-01 or 01."),
+    session: list[str] | None = typer.Option(
+        None,
+        "--session",
+        metavar="LABEL",
+        help="Only this session (1 or ses-1). Repeatable. Without it, every session of the "
+        "subject, as one stream.",
+    ),
+    raw: Path | None = typer.Option(
+        None,
+        "--raw",
+        metavar="DIR",
+        help="The raw BIDS dataset, when it is not the dataset whose derivatives/ holds the "
+        "fMRIPrep output.",
+    ),
+    out: str = typer.Option(..., "--out", metavar="DIR", help="The directory of the packs."),
+    epi_runs: list[str] | None = typer.Option(
+        None,
+        "--epi-runs",
+        metavar="GLOB",
+        help="Only the runs whose BIDS name matches (*task-rest*). Repeatable.",
+    ),
+    serve: bool = typer.Option(False, "--serve", help="Then show the packs on 127.0.0.1."),
+    port: int | None = typer.Option(
+        None, "--port", min=0, max=65535, metavar="N", help="With --serve; 0: any free one."
+    ),
+    no_browser: bool = typer.Option(False, "--no-browser", help="With --serve: open no browser."),
+) -> None:
+    """Pack the raw and preprocessed EPI series of one subject, without a run directory."""
+    # step 1 of docs/epi_interface.md: quality control of the raw data and of the
+    # preprocessing, one subject, view only
+    from surfcensus.func.api import epi_subject
+
+    if not out.strip():  # an unset shell variable; as a path it would be the current directory
+        raise typer.BadParameter("the output path is empty", param_hint="--out")
+    if not serve and (port is not None or no_browser):
+        raise typer.BadParameter("--port and --no-browser go with --serve")
+    target = Path(out)
+    start = time.perf_counter()
+    with _stops_with_exit_2():
+        with _stops_at_signals(
+            "the packs are not complete, and the next call makes them"
+        ) as signals:
+            stream = epi_subject(
+                path,
+                subject,
+                target,
+                sessions=session or None,
+                raw=raw,
+                runs=epi_runs or None,
+                progress=lambda line: typer.echo(line, err=True),
+            )
+            packed, listed = _packed_runs(target, stream.sessions)
+            if packed == 0:
+                typer.echo(
+                    f"No run of {stream.label} can be packed, so there is nothing to show.",
+                    err=True,
+                )
+                raise typer.Exit(1)
+            typer.echo(
+                f"EPI packs: {packed} of {listed} runs of {stream.label} in {target}, "
+                f"{time.perf_counter() - start:.1f} s",
+                err=True,
+            )
+            if not serve:
+                return
+            with _app_stops_with_exit_2():
+                from surfcensus.app.epi import serve_packs
+
+                signals.serving = True  # from here a SIGTERM only stops the page
+                serve_packs(target, port=port, open_browser=not no_browser, stop=signals.stop)
+                signals.served()
+            typer.echo("The EPI page has stopped.", err=True)
+
+
+def _packed_runs(out: Path, sessions: Sequence[str]) -> tuple[int, int]:
+    """The packed runs and all listed runs of the sessions of ``out/stream.json``."""
+    from surfcensus.func import SESSION_JSON
+    from surfcensus.func.model import SessionInfo, read_info
+
+    packed = listed = 0
+    for sid in sessions:
+        info = read_info(out / sid / SESSION_JSON, SessionInfo)
+        if info is None:
+            continue
+        listed += len(info.runs)
+        packed += sum(1 for run in info.runs if run.reason is None)
+    return packed, listed
+
+
 _RECORDED_STAYS = "what was recorded stays, and the next call goes on"
 
 

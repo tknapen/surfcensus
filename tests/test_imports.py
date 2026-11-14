@@ -15,6 +15,7 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from synth_func import write_func_dataset  # pyrefly: ignore[missing-import]
 from synth_tree import write_tree  # pyrefly: ignore[missing-import]
 
 import surfcensus
@@ -89,8 +90,9 @@ APP_DEPENDENCIES = ("fastapi", "uvicorn", "sqlmodel", "jinja2")
 package (decision O20) and are imported by the modules under ``app/`` alone."""
 APP_PACKAGES = (*APP_DEPENDENCIES, "sqlalchemy", "starlette")
 """Those, and the two they bring that the app imports by name."""
-LIGHT_APP_MODULES = ("surfcensus.app", "surfcensus.app.schemas")
-"""The modules under ``app/`` that the rest of the package imports."""
+LIGHT_APP_MODULES = ("surfcensus.app", "surfcensus.app.schemas", "surfcensus.app.epi_schemas")
+"""The modules under ``app/`` that the rest of the package imports. ``app.epi_schemas``, the
+shapes of the EPI page, is pydantic only; ``app.epi``, its pack-only server, is of the app."""
 
 
 def imports_the_app_packages(module: str) -> bool:
@@ -197,6 +199,7 @@ def commands(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[int, l
     study = write_tree(root / "data" / "study", "fmriprep", ("sub-01", "sub-02"))
     subject = study / "sourcedata" / "freesurfer" / "sub-01"
     run, reviewed = root / "run", root / "reviewed"
+    epi = write_func_dataset(root / "func")
     calls: dict[str, tuple[object, ...]] = {
         "--help": ("--help",),
         "--version": ("--version",),
@@ -208,6 +211,7 @@ def commands(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[int, l
         "status": ("status", "--run-dir", run, "--failures"),
         "review --no-serve": ("review", study, "--no-serve", "--run-dir", reviewed, "--jobs", 1),
         "export": ("export", "--run-dir", reviewed),
+        "epi-session": ("epi-session", epi.raw_root, "--subject", "02", "--out", root / "epi"),
         # the two below are the control: they are commands of the app
         "finalize": ("finalize", "--run-dir", reviewed),
         "serve --mode team": ("serve", "--run-dir", reviewed, "--mode", "team", "--no-browser"),
@@ -228,6 +232,7 @@ def commands(tmp_path_factory: pytest.TempPathFactory) -> dict[str, tuple[int, l
         "status",
         "review --no-serve",
         "export",
+        "epi-session",
     ],
 )
 def test_a_command_that_does_not_serve_loads_no_package_of_the_app(
