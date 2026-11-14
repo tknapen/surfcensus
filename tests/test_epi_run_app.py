@@ -632,3 +632,15 @@ def test_a_session_that_stream_json_lists_without_its_session_json_is_waited_for
     assert 'data-poll="5"' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
     assert [s["session_uid"] for s in body["sessions"]] == [epi_run.sessions[FULL][0]]
+
+
+def test_every_element_the_index_script_looks_up_is_in_its_page() -> None:
+    from surfcensus.app.server import STATIC_DIR, TEMPLATES_DIR
+
+    source = (STATIC_DIR / "js" / "epi" / "index.js").read_text(encoding="utf-8")
+    wanted = set(re.findall(r"\$\('([\w-]+)'\)", source))
+    page = (TEMPLATES_DIR / "epi_index.html").read_text(encoding="utf-8")
+    assert wanted and wanted <= set(re.findall(r'\bid="([\w-]+)"', page)), wanted
+    # it writes nothing and asks nothing of another host
+    for word in ("localStorage", "sessionStorage", "method:", "http:", "https:"):
+        assert word not in source, word
