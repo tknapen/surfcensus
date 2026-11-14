@@ -79,6 +79,8 @@ class ReviewPage {
     this.subject = null;
     this.viewer = null;
     this.selected = null;
+    this.hashOpened = false;
+    this.subjectsLinked = false;
   }
 
   async start() {
@@ -151,6 +153,8 @@ class ReviewPage {
     byId("review-body").hidden = false;
     this.table();
     this.scatter();
+    this.subjectsLink();
+    this.openFromHash();
     const first = review.total ? this.offset + 1 : 0;
     const last = this.offset + review.rows.length;
     byId("review-count").textContent = `${review.total} subjects`;
@@ -194,13 +198,49 @@ class ReviewPage {
       const line = html("tr");
       line.dataset.subjectUid = row.subject_uid;
       if (row.subject_uid === this.selected) line.setAttribute("aria-selected", "true");
-      for (const column of review.columns) line.append(html("td", "", cellText(row[column])));
+      for (const column of review.columns) {
+        if (column === "func_sessions") line.append(this.sessionsCell(row));
+        else line.append(html("td", "", cellText(row[column])));
+      }
       line.addEventListener("click", () => this.open(row));
       return line;
     });
     const table = byId("subjects");
     table.tHead.replaceChildren(head);
     table.tBodies[0].replaceChildren(...body);
+  }
+
+  // The functional sessions of a subject (a run with functional data, step 3): a link to the
+  // subject page, whose click does not open the row here.
+  sessionsCell(row) {
+    const cell = html("td");
+    const target = html("a", "", cellText(row.func_sessions));
+    target.href = api.routePath("subjectPage", { key: row.subject_uid });
+    target.title = "the functional runs of this subject";
+    target.addEventListener("click", (event) => event.stopPropagation());
+    cell.append(target);
+    return cell;
+  }
+
+  // In a run with functional data, one link in the header to the subject pages.
+  subjectsLink() {
+    if (this.subjectsLinked || !this.review.columns.includes("func_sessions")) return;
+    this.subjectsLinked = true;
+    const target = html("a", "", "subjects");
+    target.id = "subjects-link";
+    target.href = api.routePath("subjectsPage");
+    byId("rate-link").after(target);
+  }
+
+  // The subject named by the address (`#subject=<uid>`, the link of a subject page), opened
+  // once when the page has loaded.
+  openFromHash() {
+    if (this.hashOpened) return;
+    this.hashOpened = true;
+    const uid = new URLSearchParams(window.location.hash.slice(1)).get("subject");
+    if (!uid) return;
+    const found = this.review.rows.find((row) => row.subject_uid === uid);
+    this.open(found ?? { subject_uid: uid });
   }
 
   // Composite score (x) against the final label (y), one dot per subject of the table.

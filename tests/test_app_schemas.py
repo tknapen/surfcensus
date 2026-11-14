@@ -27,7 +27,7 @@ from pydantic import BaseModel, ValidationError
 
 from surfcensus import schemas as table_schemas
 from surfcensus.app import schemas
-from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut, SubjectPageOut, SubjectsOut
 from surfcensus.app.schemas import (
     MAX_EVENT_PAYLOAD_BYTES,
     MAX_EVENTS_PER_CALL,
@@ -124,6 +124,8 @@ def test_the_examples_cover_every_route_shape() -> None:
         "HealthOut",
         "EpiIndexOut",
         "EpiStreamOut",
+        "SubjectsOut",
+        "SubjectPageOut",
     }
 
 
@@ -161,10 +163,17 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         ("GET", "/epi-media/{participant_uid}/{session_uid}/{path}"): Route(
             "GET", "/epi-media/{participant_uid}/{session_uid}/{path}", unblinded=True
         ),
+        # the subject pages of a run with functional data (step 3), each unblinded
+        ("GET", "/subjects"): Route("GET", "/subjects", unblinded=True),
+        ("GET", "/subject/{key}"): Route("GET", "/subject/{key}", unblinded=True),
+        ("GET", "/api/subjects"): Route("GET", "/api/subjects", SubjectsOut, unblinded=True),
+        ("GET", "/api/subjects/{key}"): Route(
+            "GET", "/api/subjects/{key}", SubjectPageOut, unblinded=True
+        ),
     }
-    assert len(ROUTES) == 20  # no route twice
-    # what is unblinded is the review page and everything under its API, and the EPI pages,
-    # and nothing a rating page calls
+    assert len(ROUTES) == 24  # no route twice
+    # what is unblinded is the review page and everything under its API, the EPI pages and
+    # the subject pages, and nothing a rating page calls
     unblinded = {route.path for route in ROUTES if route.unblinded}
     assert unblinded == {
         "/review",
@@ -177,6 +186,10 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
         "/epi/{participant_uid}",
         "/api/epi/{participant_uid}",
         "/epi-media/{participant_uid}/{session_uid}/{path}",
+        "/subjects",
+        "/subject/{key}",
+        "/api/subjects",
+        "/api/subjects/{key}",
     }
     for route in ROUTES:
         if route.request is not None and route.method == "POST":

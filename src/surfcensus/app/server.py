@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import errno
 import html
+import json
 import os
 import re
 import signal
@@ -70,7 +71,18 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 import surfcensus
 from surfcensus.app import schemas
 from surfcensus.app.db import get_or_create_rater, open_app_db, store_submission
-from surfcensus.app.epi_schemas import EpiIndexOut, EpiIndexSessionOut, EpiParticipantOut
+from surfcensus.app.epi_schemas import (
+    EpiIndexOut,
+    EpiIndexSessionOut,
+    EpiParticipantOut,
+    FuncFrameOut,
+    FuncRunOut,
+    FuncSessionOut,
+    SubjectPageOut,
+    SubjectRowOut,
+    SubjectsOut,
+    SurfaceState,
+)
 from surfcensus.app.events import record_setting, store_events
 from surfcensus.app.finalize import record_single, sync_unratable
 from surfcensus.app.marks import MarkError, VertexIndex, check_snap_radius, resolve_mark
@@ -94,6 +106,7 @@ from surfcensus.calibration import CalibrationSet, load_calibration, validate_ca
 from surfcensus.config import ConfigError, epi_settings, load_config
 from surfcensus.export.tables import frame_csv, marks_frame, ratings_frame, subjects_frame
 from surfcensus.func.batch import RecordedState, recorded_states
+from surfcensus.func.model import CorrectionsInfo
 from surfcensus.log import get_logger
 from surfcensus.privacy import scrub
 from surfcensus.protocol import install_protocol, load_protocol, marks_required
@@ -168,7 +181,15 @@ _NO_ROUTE = "there is no such route"
 _CLOSED = {
     "review": "you still have subjects to rate; the review opens when none is left",
     "epi": "you still have subjects to rate; the EPI movies open when none is left",
+    "subjects": "you still have subjects to rate; the subject pages open when none is left",
 }
+SUBJECTS_URL = "/subjects"
+"""The page of every subject of the run (step 3 of docs/epi_interface.md)."""
+SUBJECT_URL = "/subject"
+"""The page of one row of it: ``/subject/<key>``."""
+SUBJECTS_API = "/api/subjects"
+_KEY = re.compile(r"[0-9a-f]{16}")
+_STREAM_RULES = ("acquisition time", "session label")
 EPI_INDEX_URL = "/epi"
 EPI_API = "/api/epi"
 EPI_MEDIA_URL = "/epi-media"
@@ -720,16 +741,20 @@ class _App:
         if closed:
             raise _Refused(403, "request", _CLOSED[what])
 
-    def epi_gate(self) -> None:
-        """:meth:`gate` for the EPI routes, which a page asks many files of: the queue is
-        looked at only where the rule can close the routes (a blind run, or several raters)."""
+    def epi_gate(self, what: str = "epi") -> None:
+        """:meth:`gate` for the EPI routes, which a page asks many files of, and for the
+        subject pages (``what`` names the screens in the refusal): the queue is looked at
+        only where the rule can close the routes (a blind run, or several raters)."""
         with self.session() as (session, rater):
             n_raters = session.exec(select(func.count()).select_from(Rater)).one()
             if not (self.config.app.blind or n_raters > 1):
                 return
             closed = has_work_left(session, rater, self.plan())
         if closed:
-            raise _Refused(403, "request", _CLOSED["epi"])
+            raise _Refused(403, "request", _CLOSED[what])
+
+    def subjects_gate(self) -> None:
+        self.epi_gate("subjects")
 
     # --- shapes ---------------------------------------------------------------------------------
 
@@ -1297,6 +1322,8 @@ class _App:
             "unratable_reason",
             "n_ratings",
             "n_marks",
+            "func_sessions",
+            "func_packed",
         ]
         if self.public.mode() != "local":
             wanted.remove("subject_label")
@@ -1309,6 +1336,8 @@ class _App:
             raise _invalid(exc) from None
         self.gate()
         frame = subjects_frame(self.run_dir)
+        if self.epi_offered():
+            frame = self.with_func_columns(frame)
         columns = self.review_columns(frame)
         rows = [
             {name: _plain(value) for name, value in zip(columns, values, strict=True)}
@@ -1570,7 +1599,12 @@ class _App:
             return closed
         if participant_uid is None:
             text = self.pages.get_template("epi_index.html").render(
-                static=STATIC_URL, version=self.version, mode=self.mode, api=EPI_API, rate_url="/"
+                static=STATIC_URL,
+                version=self.version,
+                mode=self.mode,
+                api=EPI_API,
+                rate_url="/",
+                subjects_url=SUBJECTS_URL,
             )
             return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
         self.epi_participant(participant_uid)
@@ -1582,6 +1616,7 @@ class _App:
             api=f"{EPI_API}/{participant_uid}",
             index_url=EPI_INDEX_URL,
             rate_url="/",
+            subjects_url=SUBJECTS_URL,
             # the page asks every EPI_POLL_S while packs of the participant wait and every
             # EPI_POLL_IDLE_S when none do; poll_s is the interval of now, and after each answer
             # the page asks the index which of the two applies
@@ -1629,6 +1664,293 @@ class _App:
             media_type="application/octet-stream",
             headers={"Cache-Control": MEDIA_CACHE if current else NO_CACHE},
         )
+
+    # --- the subject pages (step 3 of docs/epi_interface.md) -------------------------------------
+
+    def func_view(self) -> _FuncView:
+        """What the subject pages and the review columns read of one request: the present
+        subjects (``subjects_frame``), the present participants, sessions and runs of the
+        catalog, and the recorded state of every run (``func.batch.recorded_states``)."""
+        frame = subjects_frame(self.run_dir)
+        if "present" in frame.columns:
+            frame = frame[[_true(v) for v in frame["present"]]]
+        participants = {str(r["participant_uid"]): r for r in _records(self.epi_participants())}
+        sessions = [
+            r
+            for r in _records(self.public.func_sessions())
+            if _true(r.get("present")) and str(r["participant_uid"]) in participants
+        ]
+        runs_of: dict[str, list[dict[str, Any]]] = {}
+        for row in _records(self.public.func_runs()):
+            if _true(row.get("present")):
+                runs_of.setdefault(str(row["session_uid"]), []).append(row)
+        state = recorded_states(self.public, epi_settings(self.config).pack_hash())
+        return _FuncView(_records(frame), participants, sessions, runs_of, state)
+
+    def with_func_columns(self, frame: pd.DataFrame) -> pd.DataFrame:
+        """The review table with ``func_sessions`` (the present sessions whose FreeSurfer
+        subject is the row's) and ``func_packed`` (their ``packed`` runs)."""
+        view = self.func_view()
+        n_sessions: dict[str, int] = {}
+        n_packed: dict[str, int] = {}
+        for row in view.sessions:
+            uid = row.get("subject_uid")
+            if not uid:
+                continue
+            n_sessions[str(uid)] = n_sessions.get(str(uid), 0) + 1
+            counts = _epi_counts(view.runs_of.get(str(row["session_uid"]), []), view.state)
+            n_packed[str(uid)] = n_packed.get(str(uid), 0) + counts["n_packed"]
+        frame = frame.copy()
+        uids = [str(uid) for uid in frame["subject_uid"]]
+        frame["func_sessions"] = [n_sessions.get(uid, 0) for uid in uids]
+        frame["func_packed"] = [n_packed.get(uid, 0) for uid in uids]
+        return frame
+
+    def subject_rows(self, view: _FuncView) -> list[tuple[SubjectRowOut, list[dict[str, Any]]]]:
+        """Every row of ``/subjects`` with its sessions: one per present FreeSurfer subject,
+        with the sessions whose FreeSurfer subject it is, then one per participant with the
+        sessions that have none (or whose FreeSurfer subject the run no longer lists), so
+        that every present session is on exactly one row."""
+        local = self.public.mode() == "local"
+        present = {str(r["subject_uid"]) for r in view.subjects}
+        by_subject: dict[str, list[dict[str, Any]]] = {}
+        by_participant: dict[str, list[dict[str, Any]]] = {}
+        for row in view.sessions:
+            uid = row.get("subject_uid")
+            if uid and str(uid) in present:
+                by_subject.setdefault(str(uid), []).append(row)
+            else:
+                by_participant.setdefault(str(row["participant_uid"]), []).append(row)
+
+        def counts(own: list[dict[str, Any]]) -> dict[str, int]:
+            total = {
+                "n_runs": 0,
+                "n_packable": 0,
+                "n_packed": 0,
+                "n_pending": 0,
+                "n_failed": 0,
+                "n_flagged": 0,
+            }
+            for session_row in own:
+                runs = view.runs_of.get(str(session_row["session_uid"]), [])
+                for name, value in _epi_counts(runs, view.state).items():
+                    total[name] += value
+            return total
+
+        rows: list[tuple[SubjectRowOut, list[dict[str, Any]]]] = []
+        subject_rows = []
+        for row in view.subjects:
+            uid = str(row["subject_uid"])
+            own = by_subject.get(uid, [])
+            participant = min((str(s["participant_uid"]) for s in own), default=None)
+            label = row.get("subject_label") if local else None
+            out = SubjectRowOut(
+                key=uid,
+                kind="subject",
+                subject_uid=uid,
+                participant_uid=participant,
+                label=None if label is None else str(label),
+                dataset=str(row.get("dataset") or ""),
+                surface=_surface_state(row),
+                surface_reason=_text(row.get("unratable_reason"))
+                or _text(row.get("render_reason")),
+                n_sessions=len(own),
+                url=f"{SUBJECT_URL}/{uid}",
+                epi_url=None if participant is None else f"{EPI_INDEX_URL}/{participant}",
+                **counts(own),
+            )
+            subject_rows.append((out, own))
+        subject_rows.sort(key=lambda item: (item[0].label or "", item[0].key))
+        participant_rows = []
+        for uid, own in by_participant.items():
+            facts = view.participants[uid]
+            label = facts.get("participant") if local else None
+            out = SubjectRowOut(
+                key=uid,
+                kind="participant",
+                subject_uid=None,
+                participant_uid=uid,
+                label=None if label is None else str(label),
+                dataset=str(facts.get("dataset") or ""),
+                surface="none",
+                surface_reason=None,
+                n_sessions=len(own),
+                url=f"{SUBJECT_URL}/{uid}",
+                epi_url=f"{EPI_INDEX_URL}/{uid}",
+                **counts(own),
+            )
+            participant_rows.append((out, own))
+        participant_rows.sort(key=lambda item: (item[0].label or "", item[0].key))
+        rows += subject_rows + participant_rows
+        return rows
+
+    def subjects_out(self) -> SubjectsOut:
+        rows = [row for row, _ in self.subject_rows(self.func_view())]
+        return SubjectsOut(subjects=tuple(rows), n_pending=sum(row.n_pending for row in rows))
+
+    def subject_page_out(self, key: str) -> SubjectPageOut:
+        """One row of :meth:`subjects_out` with its sessions and their runs; 404 for a key
+        that is no row."""
+        missing = _Refused(404, "key", "there is no such subject")
+        if _KEY.fullmatch(key) is None:
+            raise missing
+        view = self.func_view()
+        # a subject is looked up first, then a participant (two HMACs of other prefixes)
+        found = min(
+            (item for item in self.subject_rows(view) if item[0].key == key),
+            key=lambda item: item[0].kind != "subject",
+            default=None,
+        )
+        if found is None:
+            raise missing
+        row, own = found
+        local = self.public.mode() == "local"
+        shown: dict[str, set[str]] = {}
+        sessions = []
+        for session_row in own:
+            participant = str(session_row["participant_uid"])
+            if participant not in shown:
+                shown[participant] = set(self.packs_of(participant).shown_sessions())
+            facts = view.participants[participant]
+            sessions.append(
+                self.session_out(
+                    session_row,
+                    facts,
+                    view,
+                    str(session_row["session_uid"]) in shown[participant],
+                    local,
+                )
+            )
+        sessions.sort(
+            key=lambda s: (s.participant or "", s.participant_uid, s.stream_order, s.session_uid)
+        )
+        return SubjectPageOut(
+            subject=row,
+            review_url=None if row.subject_uid is None else f"/review#subject={row.subject_uid}",
+            rate_url="/",
+            index_url=SUBJECTS_URL,
+            epi_index_url=EPI_INDEX_URL,
+            sessions=tuple(sessions),
+        )
+
+    def session_out(
+        self,
+        row: Mapping[str, Any],
+        participant: Mapping[str, Any],
+        view: _FuncView,
+        shown: bool,
+        local: bool,
+    ) -> FuncSessionOut:
+        session_uid = str(row["session_uid"])
+        participant_uid = str(row["participant_uid"])
+        runs = sorted(
+            view.runs_of.get(session_uid, []),
+            key=lambda r: (
+                r.get("acquisition_order") is None,
+                r.get("acquisition_order") or 0,
+                str(r["run_uid"]),
+            ),
+        )
+        anchor = _text(row.get("anchor_run_uid")) or next(
+            (str(r["run_uid"]) for r in runs if _true(r.get("anchor"))), None
+        )
+        anchor_row = next((r for r in runs if str(r["run_uid"]) == anchor), None)
+        anchor_state = None if anchor is None else view.state.get(anchor)
+        rule = _text(participant.get("session_order"))
+        out_runs = []
+        for run in runs:
+            uid = str(run["run_uid"])
+            recorded = view.state.get(uid, RecordedState("pending", None, None))
+            out_runs.append(
+                FuncRunOut(
+                    run_uid=uid,
+                    name=_text(run.get("name")) if local else None,
+                    acquisition_order=_int(run.get("acquisition_order")),
+                    session_order=_int(run.get("session_order")),
+                    anchor=uid == anchor,
+                    selected=_true(run.get("selected")),
+                    n_volumes=_int(run.get("n_volumes")),
+                    tr_s=_float(run.get("tr_s")),
+                    echoes=max(1, _int(run.get("echoes")) or 1),
+                    grid_key=_text(run.get("grid_key")),
+                    grid_shape=_json_tuple(run.get("grid_shape"), int),  # type: ignore[arg-type]
+                    voxel_mm=_json_tuple(run.get("voxel_mm"), float),  # type: ignore[arg-type]
+                    oblique_deg=_float(run.get("oblique_deg")),
+                    raw_affine=_text(run.get("raw_affine")),  # type: ignore[arg-type]
+                    reference_image=_flag(run.get("reference_image")),
+                    rigid=_flag(run.get("rigid")),
+                    dof=_int(run.get("dof")),
+                    corrections=_corrections(run.get("corrections")),
+                    frame=_frame_out(run),
+                    state=recorded.state,
+                    reason=recorded.reason,
+                    detail=recorded.detail if local else None,
+                    epi_url=(
+                        f"{EPI_INDEX_URL}/{participant_uid}#run={uid}"
+                        if recorded.state == "packed" and shown
+                        else None
+                    ),
+                )
+            )
+        label = participant.get("participant") if local else None
+        return FuncSessionOut(
+            session_uid=session_uid,
+            participant_uid=participant_uid,
+            participant=None if label is None else str(label),
+            label=_text(row.get("session_label")) or "",
+            stream_order=max(0, _int(row.get("stream_order")) or 0),
+            stream_rule=rule if rule in _STREAM_RULES else "session label",  # type: ignore[arg-type]
+            subject_uid=_text(row.get("subject_uid")),
+            fs_subject=_text(row.get("fs_subject")) if local else None,
+            anchor_run_uid=anchor,
+            anchor_name=None if anchor_row is None or not local else _text(anchor_row.get("name")),
+            anchor_rule=_text(row.get("anchor_rule")),  # type: ignore[arg-type]
+            anchor_note=_text(row.get("anchor_note")),
+            anchor_packed=anchor_state is not None and anchor_state.state == "packed",
+            frame_limit_mm=_float(row.get("frame_limit_mm")),
+            shared_frame_plausible=_flag(row.get("shared_frame_plausible")),
+            anchor_is_outlier=_flag(row.get("anchor_is_outlier")),
+            n_grids=max(0, _int(row.get("n_grids")) or 0),
+            problem=_text(row.get("problem")),
+            shown=shown,
+            runs=tuple(out_runs),
+        )
+
+    def get_subjects(self) -> Response:
+        self.epi_available()
+        self.subjects_gate()
+        return _json(self.subjects_out())
+
+    def get_subject_page(self, key: str) -> Response:
+        self.epi_available()
+        self.subjects_gate()
+        return _json(self.subject_page_out(key))
+
+    def subjects_page(self, key: str | None, to_a_reader: bool) -> Response:
+        """The page of every subject (``key`` None) or of one row. Closed as ``/review`` is;
+        a browser that asks for a closed page gets the reason as a page with a way back."""
+        self.epi_available()
+        closed = self._closed_page("subjects", self.subjects_gate, to_a_reader)
+        if closed is not None:
+            return closed
+        common = {
+            "static": STATIC_URL,
+            "version": self.version,
+            "mode": self.mode,
+            "poll_s": EPI_POLL_S,
+            "rate_url": "/",
+            "review_url": "/review",
+            "epi_index_url": EPI_INDEX_URL,
+            "subjects_url": SUBJECTS_URL,
+        }
+        if key is None:
+            text = self.pages.get_template("subjects.html").render(api=SUBJECTS_API, **common)
+        else:
+            self.subject_page_out(key)  # 404 for a key that is no row
+            text = self.pages.get_template("subject.html").render(
+                api=f"{SUBJECTS_API}/{key}", key=key, **common
+            )
+        return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
 
     # --- every route goes through here ----------------------------------------------------------
 
@@ -1715,6 +2037,97 @@ def _epi_counts(
         "n_failed": failed,
         "n_flagged": sum(_true(r.get("flagged")) for r in runs),
     }
+
+
+@dataclass(frozen=True)
+class _FuncView:
+    """What one request of the subject pages reads (:meth:`_App.func_view`)."""
+
+    subjects: list[dict[str, Any]]
+    participants: dict[str, dict[str, Any]]
+    sessions: list[dict[str, Any]]
+    runs_of: dict[str, list[dict[str, Any]]]
+    state: Mapping[str, RecordedState]
+
+
+def _missing(value: object) -> bool:
+    if value is None or value is pd.NA:
+        return True
+    try:
+        return bool(pd.isna(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+
+
+def _text(value: object) -> str | None:
+    return None if _missing(value) or value == "" else str(value)
+
+
+def _int(value: object) -> int | None:
+    return None if _missing(value) else int(value)  # type: ignore[arg-type]
+
+
+def _float(value: object) -> float | None:
+    return None if _missing(value) else float(value)  # type: ignore[arg-type]
+
+
+def _flag(value: object) -> bool | None:
+    return None if _missing(value) else bool(value)
+
+
+def _json_tuple(value: object, kind: type) -> tuple[Any, ...] | None:
+    """A grid shape or voxel size as the catalog stores it (a JSON list), or None."""
+    text = _text(value)
+    if text is None:
+        return None
+    try:
+        items = json.loads(text)
+        return tuple(kind(item) for item in items) if len(items) == 3 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _corrections(value: object) -> CorrectionsInfo | None:
+    text = _text(value)
+    if text is None:
+        return None
+    try:
+        return CorrectionsInfo.model_validate_json(text)
+    except ValidationError:
+        return None
+
+
+def _frame_out(run: Mapping[str, Any]) -> FuncFrameOut | None:
+    values = [
+        _float(run.get(name))
+        for name in ("frame_mean_mm", "frame_max_mm", "frame_rotation_deg", "frame_translation_mm")
+    ]
+    if any(value is None for value in values):
+        return None
+    mean, largest, rotation, translation = values
+    assert mean is not None and largest is not None
+    assert rotation is not None and translation is not None
+    return FuncFrameOut(
+        mean_mm=mean,
+        max_mm=largest,
+        rotation_deg=rotation,
+        translation_mm=translation,
+        flagged=_flag(run.get("flagged")),
+    )
+
+
+def _surface_state(row: Mapping[str, Any]) -> SurfaceState:
+    """The surface side of a subject row, the first that holds (``epi_schemas.SurfaceState``)."""
+    if _text(row.get("unratable_reason")) is not None:
+        return "unratable"
+    if (_int(row.get("n_ratings")) or 0) > 0:
+        return "rated"
+    status = _text(row.get("render_status"))
+    if status == "failed":
+        return "render failed"
+    if status == "done":
+        return "rendered"
+    return "not rendered"
 
 
 def _review_rating(row: Mapping[str, Any]) -> schemas.ReviewRating:
@@ -1891,6 +2304,24 @@ def create_app(
     @app.get("/api/export")
     def export() -> Response:
         return state.answer(state.get_export, unblinded=True)
+
+    @app.get(SUBJECTS_URL)
+    def subjects_page(request: Request) -> Response:
+        reader = "text/html" in request.headers.get("accept", "")
+        return state.answer(state.subjects_page, None, reader, unblinded=True)
+
+    @app.get(SUBJECT_URL + "/{key}")
+    def subject_page(key: str, request: Request) -> Response:
+        reader = "text/html" in request.headers.get("accept", "")
+        return state.answer(state.subjects_page, key, reader, unblinded=True)
+
+    @app.get(SUBJECTS_API)
+    def subjects_api() -> Response:
+        return state.answer(state.get_subjects, unblinded=True)
+
+    @app.get(SUBJECTS_API + "/{key}")
+    def subject_api(key: str) -> Response:
+        return state.answer(state.get_subject_page, key, unblinded=True)
 
     # the EPI pages of a run directory: unblinded, and routes that do not exist (404) where
     # the run has none

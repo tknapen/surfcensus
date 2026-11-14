@@ -21,7 +21,7 @@ from typing import Any
 from pydantic import BaseModel
 
 from surfcensus.app import schemas
-from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut
+from surfcensus.app.epi_schemas import EpiIndexOut, EpiStreamOut, SubjectPageOut, SubjectsOut
 from surfcensus.protocol import parse_protocol, shipped_protocol_bytes
 
 DATA = Path(__file__).parent / "data"
@@ -55,6 +55,8 @@ EXAMPLE_SHAPES: dict[str, type[BaseModel]] = {
     "health": schemas.HealthOut,
     "epi_index": EpiIndexOut,
     "epi_stream": EpiStreamOut,
+    "subjects": SubjectsOut,
+    "subject_page": SubjectPageOut,
 }
 """Key of ``api_examples.json`` -> the shape its value has."""
 
@@ -81,6 +83,8 @@ EXAMPLE_ROUTES: dict[str, str] = {
     "health": "GET /healthz",
     "epi_index": "GET /api/epi",
     "epi_stream": "GET /api/epi/{participant_uid}",
+    "subjects": "GET /api/subjects",
+    "subject_page": "GET /api/subjects/{key}",
 }
 """Key of ``api_examples.json`` -> the route that receives or answers it, as method and path
 of ``schemas.ROUTES``."""

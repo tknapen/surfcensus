@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}surfcensus: subjects{% endblock %}
+{% block body %}
+<main id="subjects-page" class="subjects-page" data-page="list" data-api="{{ api }}" data-poll="{{ poll_s }}" data-state="loading">
+  <header class="review-head">
+    <nav class="subjects-nav" aria-label="other pages"><a id="rate-link" href="{{ rate_url }}">rating screen</a><a id="review-link" href="{{ review_url }}">review</a><a id="epi-index-link" href="{{ epi_index_url }}">EPI movies</a></nav>
+    <h1>Subjects</h1>
+    <span class="tagline">the surfaces and the functional runs of every subject: quality control of the <b>acquisition</b> and of the <b>processing</b></span>
+  </header>
+  <p id="subjects-packing" class="subjects-packing" role="status" hidden></p>
+  <p id="subjects-message" class="message" role="status" hidden></p>
+  <div class="table-wrap subjects-wrap">
+    <table id="subject-rows" class="subjects">
+      <thead>
+        <tr><th scope="col">subject</th><th scope="col">dataset</th><th scope="col">surfaces</th><th scope="col">sessions</th><th scope="col">runs</th><th scope="col">packed</th><th scope="col">waiting</th><th scope="col">failed</th><th scope="col">flagged</th><th scope="col">EPI stream</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </div>
+  <p class="hint">A row is a FreeSurfer subject with the functional sessions that use it, or a participant whose
+    sessions have no FreeSurfer subject. Its page lists every session and run: the raw series, placed once per
+    session in the anatomy, is there for quality control of the <b>raw data</b>; the series as the pipeline wrote
+    it, for quality control of the <b>preprocessing</b>. <b>packed</b>, <b>waiting</b> and <b>failed</b> are what the
+    catalog records under the present pack settings. A run is <b>flagged</b> when its own registration would put it
+    more than the limit elsewhere than the session's one registration does; that is a statement about the raw data.</p>
+</main>
+{% endblock %}
+{% block scripts %}
+<script type="module" src="{{ static }}/js/subjects.js?v={{ version }}"></script>
+{% endblock %}

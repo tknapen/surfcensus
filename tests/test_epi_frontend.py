@@ -203,6 +203,29 @@ def test_the_timeline_is_every_packed_run_of_every_session_in_order(
 
 
 @needs_node
+def test_the_segment_of_a_run_is_where_the_page_starts_when_its_address_names_it(
+    js_copy: Path, packed: PackedStream, shape: dict[str, Any]
+) -> None:
+    """``#run=<run_uid>`` (the links of the subject pages, step 3): the segment of that run on
+    the timeline, and -1 for a run that is not on it, which the page starts at 0 for."""
+    absent = shape["sessions"][0]["runs"][0]["run_uid"][::-1]
+    wanted = [r["run_uid"] for s in shape["sessions"] for r in s["runs"]] + [absent, "", None]
+    out = run_js(
+        js_copy,
+        "const t = L.buildTimeline(input.shape.sessions);\n"
+        "output(input.wanted.map((uid) => L.segmentOfRun(t, input.shape.sessions, uid)));\n",
+        {"shape": shape, "wanted": wanted},
+    )
+    order = [run for _, run, _, _ in stream_order(packed)]
+    for uid, k in zip(wanted, out, strict=True):
+        if uid in order:
+            assert k == order.index(uid), uid
+        else:
+            assert k == -1, uid
+    assert sorted(k for k in out if k >= 0) == list(range(len(order)))
+
+
+@needs_node
 def test_the_traces_of_the_stream_are_those_of_its_runs(
     js_copy: Path, packed: PackedStream, shape: dict[str, Any]
 ) -> None:

@@ -1853,7 +1853,9 @@ def test_the_unblinded_routes_are_those_of_the_schemas() -> None:
     # the EPI pages, whose rules are tested in test_epi_run_app.py
     epi = {route.path for route in schemas.ROUTES if "epi" in route.path}
     assert len(epi) == 5
-    assert marked == {*UNBLINDED, "/api/review/{subject_uid}", *epi}
+    # the subject pages, whose rules are tested in test_subjects_app.py
+    subjects = {route.path for route in schemas.SUBJECT_ROUTES}
+    assert marked == {*UNBLINDED, "/api/review/{subject_uid}", *epi, *subjects}
 
 
 def test_a_researcher_alone_with_their_own_data_can_look_at_any_time(

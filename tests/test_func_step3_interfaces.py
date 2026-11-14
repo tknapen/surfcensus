@@ -436,9 +436,6 @@ def test_func_status_is_laid_out_for_e3b() -> None:
     for name, parameters in signatures.items():
         function = getattr(status, name)
         assert tuple(inspect.signature(function).parameters) == parameters
-        # the stubs until E3.B writes them; E3.B removes these three lines
-        with pytest.raises(NotImplementedError, match=r"work package E3\.B: func/status\.py"):
-            function(None)
 
 
 BANNED = {"input_signature", "content_digest", "pack_key", "fd", "dvars", "non_steady", "traces"}

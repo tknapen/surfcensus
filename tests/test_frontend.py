@@ -34,7 +34,8 @@ from pydantic import BaseModel
 
 from surfcensus import protocol as protocol_module
 from surfcensus import schemas as table_schemas
-from surfcensus.app import schemas
+from surfcensus.app import epi_schemas, schemas
+from surfcensus.func.model import CorrectionsInfo, StatementInfo
 from surfcensus.protocol import Criterion, Protocol, ScaleLevel
 from surfcensus.render import geometry
 from surfcensus.render.model import (
@@ -59,10 +60,12 @@ JS_FILES = (
     "rate.js",
     "rating.js",
     "review.js",
+    "subjects.js",
     "tour.js",
     "viewer.js",
 )
-"""The modules of docs/dev/contract.md, section 7.9."""
+"""The modules of docs/dev/contract.md, section 7.9, and ``subjects.js``, the subject pages of
+a run with functional data (step 3 of docs/epi_interface.md)."""
 
 USED_ROUTES = {
     ("GET", "/"),
@@ -77,10 +80,15 @@ USED_ROUTES = {
     ("GET", "/api/review/{subject_uid}"),
     ("GET", "/api/export"),
     ("GET", "/epi"),
+    ("GET", "/subjects"),
+    ("GET", "/subject/{key}"),
+    ("GET", "/api/subjects"),
+    ("GET", "/api/subjects/{key}"),
 }
 """What ``api.js`` names (``/epi`` is the page the rating screen links to; the EPI pages call
-their own routes, tested in test_epi_run_app.py). The pages also load ``/static/...`` and
-``/media/...``; they call neither ``/api/stats`` nor ``/healthz``."""
+their own routes, tested in test_epi_run_app.py; the four routes of the subject pages are
+called by ``subjects.js`` and linked from the rating and the review screen). The pages also
+load ``/static/...`` and ``/media/...``; they call neither ``/api/stats`` nor ``/healthz``."""
 
 REVIEW_COLUMNS = frozenset(re.findall(r"``(\w+)``", schemas.ReviewOut.__doc__ or "")) | frozenset(
     table_schemas.SCORES.names
@@ -112,6 +120,15 @@ NAMES: dict[str, type[BaseModel] | tuple[type[BaseModel], ...] | frozenset[str]]
     "problem": schemas.ErrorOut,
     "mark": (schemas.PreviousMark, schemas.ReviewMark),
     "row": REVIEW_COLUMNS,
+    # the subject pages (subjects.js)
+    "listing": epi_schemas.SubjectsOut,
+    "subjectRow": epi_schemas.SubjectRowOut,
+    "subjectPage": epi_schemas.SubjectPageOut,
+    "funcSession": epi_schemas.FuncSessionOut,
+    "funcRun": epi_schemas.FuncRunOut,
+    "funcFrame": epi_schemas.FuncFrameOut,
+    "corrections": CorrectionsInfo,
+    "statement": StatementInfo,
 }
 
 SHAPES: dict[str, type[BaseModel]] = {
@@ -372,8 +389,10 @@ def test_the_frontend_files_are_those_of_the_contract() -> None:
         "epi_index.html",
         "rate.html",
         "review.html",
+        "subject.html",
+        "subjects.html",
     }
-    # nothing to build and nothing else to ship: scripts, one stylesheet, five pages (the
+    # nothing to build and nothing else to ship: scripts, one stylesheet, seven pages (the
     # EPI page's modules are in js/epi/ and tested in test_epi_frontend.py)
     others = [
         str(path.relative_to(STATIC_DIR))
@@ -694,6 +713,126 @@ def test_every_element_a_page_script_looks_up_is_in_its_page(
     assert wanted
     present = set(re.findall(r'\bid="([\w-]+)"', pages[route]))
     assert wanted <= present, wanted - present
+
+
+@pytest.fixture(scope="module")
+def subject_pages() -> dict[str, str]:
+    """The two subject pages (step 3) as the server renders them (``_App.subjects_page``)."""
+    jinja2 = pytest.importorskip("jinja2")
+    from surfcensus.app.server import STATIC_URL
+
+    environment = jinja2.Environment(
+        loader=jinja2.FileSystemLoader(TEMPLATES_DIR),
+        undefined=jinja2.StrictUndefined,
+        autoescape=True,
+    )
+    common = {
+        "static": STATIC_URL,
+        "version": "1.2.3",
+        "mode": "local",
+        "poll_s": 5,
+        "rate_url": "/",
+        "review_url": "/review",
+        "epi_index_url": "/epi",
+        "subjects_url": "/subjects",
+    }
+    return {
+        "list": environment.get_template("subjects.html").render(api="/api/subjects", **common),
+        "one": environment.get_template("subject.html").render(
+            api="/api/subjects/" + "0" * 16, key="0" * 16, **common
+        ),
+    }
+
+
+def test_the_subject_pages_load_their_script_and_link_to_routes_only(
+    subject_pages: dict[str, str],
+) -> None:
+    routes = {path for _, path in js_routes().values()}
+    for text in subject_pages.values():
+        assert '<script type="module" src="/static/js/subjects.js?v=1.2.3"></script>' in text
+        assert len(re.findall(r"<script\b", text)) == 1 and "<style" not in text
+        assert not re.search(r"\son\w+\s*=", text), "an inline event handler"
+        for target in re.findall(r"""(?:src|href)="([^"]*)\"""", text):
+            if target.startswith("/static/") or target == "data:,":
+                continue
+            assert target in routes, target
+        # both uses of the EPI interface are named
+        assert "raw data" in text and "preprocessing" in text
+    assert 'data-key="0000000000000000"' in subject_pages["one"]
+
+
+def test_every_element_the_subjects_script_looks_up_is_in_its_pages(
+    subject_pages: dict[str, str],
+) -> None:
+    source = js_sources()["subjects.js"]
+    wanted = set(re.findall(r'byId\("([\w-]+)"\)', source))
+    ids = {name: set(re.findall(r'\bid="([\w-]+)"', text)) for name, text in subject_pages.items()}
+    assert wanted <= ids["list"] | ids["one"], wanted - (ids["list"] | ids["one"])
+    # what the list draws is on the list, what the page of one subject draws is on that page
+    assert {"subject-rows", "subjects-packing", "subjects-message"} <= ids["list"]
+    assert {"subject-name", "surface", "sessions", "subjects-link", "review-link"} <= ids["one"]
+
+
+def test_the_subjects_script_reads_the_fields_of_the_subject_shapes() -> None:
+    seen: dict[str, set[str]] = {}
+    assert field_problems(blank_js(js_sources()["subjects.js"]), "subjects.js", seen) == []
+    expected = {
+        "SubjectsOut": {"subjects", "n_pending"},
+        "SubjectRowOut": {
+            "key",
+            "kind",
+            "label",
+            "surface",
+            "surface_reason",
+            "n_sessions",
+            "n_runs",
+            "n_packed",
+            "n_pending",
+            "n_failed",
+            "n_flagged",
+            "url",
+            "epi_url",
+            "dataset",
+        },
+        "SubjectPageOut": {
+            "subject",
+            "review_url",
+            "rate_url",
+            "index_url",
+            "epi_index_url",
+            "sessions",
+        },
+        "FuncSessionOut": {
+            "label",
+            "participant",
+            "stream_order",
+            "stream_rule",
+            "anchor_name",
+            "anchor_rule",
+            "anchor_packed",
+            "anchor_is_outlier",
+            "frame_limit_mm",
+            "runs",
+            "shown",
+            "problem",
+        },
+        "FuncRunOut": {
+            "name",
+            "n_volumes",
+            "tr_s",
+            "raw_affine",
+            "corrections",
+            "frame",
+            "state",
+            "reason",
+            "epi_url",
+            "anchor",
+            "acquisition_order",
+        },
+        "CorrectionsInfo": {"motion", "sdc", "sdc_method", "slice_timing", "registration"},
+    }
+    for owner, fields in expected.items():
+        assert fields <= seen.get(owner, set()), f"{owner}: {fields - seen.get(owner, set())}"
 
 
 def test_the_keys_named_on_the_rating_page_are_keys_of_the_keyboard_map(

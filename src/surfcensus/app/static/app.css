@@ -1828,3 +1828,164 @@ body.no-traces .epi #traces {
 .progress .epi-link {
   margin-left: 12px;
 }
+
+/* --- the subject pages of a run (subjects.html, subject.html; step 3) ----------------------- */
+
+/* a page that scrolls as a whole; a wide table scrolls inside its own box */
+.subjects-page {
+  height: 100%;
+  overflow: auto;
+  padding: var(--pad);
+}
+
+.subjects-page .subjects-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px 12px;
+}
+
+.subjects-page .tagline {
+  color: var(--muted);
+}
+
+.subjects-page .tagline b,
+.subjects-page .hint b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+.subjects-page .hint {
+  max-width: 980px;
+  color: var(--muted);
+}
+
+.subjects-page .subjects-wrap {
+  max-height: none;
+  margin: 8px 0;
+}
+
+.subjects-page .subjects tbody tr {
+  cursor: default;
+}
+
+.subjects-page .subjects td.wrap {
+  white-space: normal;
+  min-width: 9em;
+  vertical-align: top;
+}
+
+.subjects-page table.runs td {
+  vertical-align: top;
+}
+
+.subjects-page .subjects td.corrections-cell {
+  min-width: 22em;
+}
+
+.subjects-page .subjects .hint {
+  font-size: 12px;
+}
+
+.subjects-page .subjects .flagged,
+.subjects-packing {
+  color: var(--warn-line);
+}
+
+.subjects-page .state-failed {
+  color: #ff8a80;
+}
+
+.subjects-page .state-cannot-be-packed,
+.subjects-page .state-not-selected,
+.subjects-page .surface-none {
+  color: var(--muted);
+}
+
+.subject-surface p {
+  margin: 4px 0;
+}
+
+.subject-session {
+  margin: 14px 0;
+  padding: 8px var(--pad);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.subject-session h2 {
+  margin: 0 0 6px;
+  font-size: 15px;
+}
+
+.subject-session .session-of {
+  color: var(--muted);
+  font-weight: 400;
+}
+
+.session-facts {
+  display: grid;
+  grid-template-columns: max-content minmax(0, 1fr);
+  gap: 2px 14px;
+  margin: 0 0 8px;
+  font-size: 12.5px;
+}
+
+.session-facts dt {
+  color: var(--muted);
+}
+
+.session-facts dd {
+  margin: 0;
+}
+
+.subject-session .runs-wrap {
+  max-height: none;
+  background: var(--bg);
+}
+
+.subjects-page ul.corrections {
+  margin: 0;
+  padding-left: 1.1em;
+}
+
+.anchor-badge {
+  margin-left: 6px;
+  padding: 0 5px;
+  border: 1px solid var(--accent);
+  border-radius: 4px;
+  color: var(--accent);
+  font-size: 11px;
+}
+
+@media (max-width: 760px) {
+  .session-facts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .session-facts dd {
+    margin-bottom: 4px;
+  }
+}
+
+/* the link of the rating screen to the page of the subject on screen: in the progress line
+   beside the EPI link; in a narrow window the links wrap, each link whole, rather than
+   squeeze the progress text into a narrow column */
+.progress #subject-link {
+  white-space: nowrap;
+}
+
+@media (max-width: 760px) {
+  .progress {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+
+  .progress .links {
+    white-space: normal;
+  }
+
+  .progress .links a {
+    white-space: nowrap;
+  }
+}

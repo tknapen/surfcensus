@@ -22,6 +22,12 @@ export const ROUTES = {
   // the index of the EPI movies, the one link of the rating page to them (session.epi_url);
   // the EPI pages call their own routes (js/epi/)
   epiPage: ["GET", "/epi"],
+  // the subject pages of a run with functional data (step 3): every subject with its
+  // surface state and its functional sessions, and one subject with every session and run
+  subjectsPage: ["GET", "/subjects"],
+  subjectPage: ["GET", "/subject/{key}"],
+  subjects: ["GET", "/api/subjects"],
+  subjectInfo: ["GET", "/api/subjects/{key}"],
 };
 
 const UNSENT_KEY = "surfcensus.unsent";
@@ -99,6 +105,8 @@ export const getBack = () => request("back");
 export const getReview = (query) => request("review", { query });
 export const getSubject = (subjectUid) =>
   request("subject", { params: { subject_uid: subjectUid } });
+export const getSubjects = () => request("subjects");
+export const getSubjectInfo = (key) => request("subjectInfo", { params: { key } });
 
 // The NextOut that is not `rendering`: asks again after `retry_after_s` while nothing is
 // rendered, and when the server does not answer.

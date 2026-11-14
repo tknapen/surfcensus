@@ -47,6 +47,8 @@ from surfcensus.sources.local import (
     stored_subjects_dirs,
 )
 from surfcensus.store import (
+    _FUNC_RUN_COLUMNS,
+    _FUNC_SESSION_COLUMNS,
     PublicCatalog,
     clusters_with_native,
     primary_scores,
@@ -379,7 +381,7 @@ _COUNTED_EVENTS = {
     "mode": "n_mode_switches",
     "back": "n_back",
 }
-_EXPORT_FILE = re.compile(rf"(?:{'|'.join(EXPORT_TABLES)})\.(?:csv|parquet)")
+_EXPORT_FILE = re.compile(rf"(?:{'|'.join((*EXPORT_TABLES, *FUNC_TABLES))})\.(?:csv|parquet)")
 
 _Kind = Literal["str", "int", "float", "bool"]
 _Spec = tuple[tuple[str, _Kind], ...]
@@ -579,6 +581,53 @@ _PARQUET_SCHEMAS: dict[str, pa.Schema] = {
             ),
         ]
     ),
+}
+
+# the column types of the functional tables, from the column types of the public views
+_STORE_KINDS: dict[str, _Kind] = {
+    "str": "str",
+    "bool": "bool",
+    "bool?": "bool",
+    "int": "int",
+    "int?": "int",
+    "float": "float",
+}
+_FUNC_KINDS: dict[str, _Kind] = {
+    **{name: _STORE_KINDS[kind] for name, kind in _FUNC_SESSION_COLUMNS},
+    **{name: _STORE_KINDS[kind] for name, kind in _FUNC_RUN_COLUMNS},
+    "dataset": "str",
+    "participant": "str",
+    "stream_rule": "str",
+    "n_packed": "int",
+    "n_failed": "int",
+    "n_pending": "int",
+    "participant_uid": "str",
+    "pack_state": "str",
+    "pack_reason": "str",
+    "pack_detail": "str",
+    "pack_n_volumes": "int",
+    "pack_bytes": "int",
+    "packed_at": "str",
+}
+_FUNC_SPECS: dict[str, _Spec] = {
+    "func_sessions": tuple((name, _FUNC_KINDS[name]) for name in FUNC_SESSIONS_COLUMNS),
+    "func_runs": tuple((name, _FUNC_KINDS[name]) for name in FUNC_RUNS_COLUMNS),
+}
+_ARROW_OF: dict[_Kind, pa.DataType] = {
+    "str": pa.string(),
+    "bool": pa.bool_(),
+    "int": pa.int64(),
+    "float": pa.float64(),
+}
+_PARQUET_SCHEMAS.update(
+    {
+        name: pa.schema([pa.field(column, _ARROW_OF[kind]) for column, kind in spec])
+        for name, spec in _FUNC_SPECS.items()
+    }
+)
+_FUNC_SORT_KEYS: dict[str, tuple[str, ...]] = {
+    "func_sessions": ("participant_uid", "stream_order", "session_uid"),
+    "func_runs": ("session_uid", "acquisition_order", "run_uid"),
 }
 
 
@@ -1298,6 +1347,130 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
     }
 
 
+def _epi_on(src: _Sources, profile: Profile) -> bool:
+    """Whether this export writes :data:`FUNC_TABLES`: the profile ``analysis`` of a local
+    run whose EPI interface is on and whose catalog has functional data. Never a release or a
+    census export (O28); a catalog of schema 1 has no functional data."""
+    from surfcensus.config import epi_settings
+
+    if profile != "analysis" or not src.local:
+        return False
+    return epi_settings(load_config(src.run_dir)).enabled and src.public.has_func()
+
+
+def _func_frame(name: str, rows: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    spec = _FUNC_SPECS[name]
+    frame = _frame(spec, [tuple(row.get(column) for column, _ in spec) for row in rows])
+    keys = list(_FUNC_SORT_KEYS[name])
+    return frame.sort_values(keys, kind="stable").reset_index(drop=True)
+
+
+def _func_value(value: object) -> object:
+    """A value of a public frame as a plain Python value (None for a missing one)."""
+    if _missing(value):
+        return None
+    return value.item() if hasattr(value, "item") else value
+
+
+def _func_tables(src: _Sources) -> dict[str, pd.DataFrame]:
+    """``func_sessions`` and ``func_runs`` from the public views and the recorded states of
+    the runs under the present pack settings (``func.batch.recorded_states``): what the
+    catalog records, as the subject pages say it, not what ``pack`` would do now (which also
+    asks the disk; ``surfcensus status`` says that). Reads the catalog only: no pack file,
+    no ``traces.json``, no chunk, so no trace and nothing of a pack's identity is exported
+    (O28, decision D20). No acquisition date either (decision D42): the catalog holds none,
+    only the order and the name of the rule."""
+    from surfcensus.config import epi_settings
+    from surfcensus.func.batch import recorded_states
+
+    public = src.public
+    pack_hash = epi_settings(load_config(src.run_dir)).pack_hash()
+    states = recorded_states(public, pack_hash)
+
+    def records(frame: pd.DataFrame) -> list[dict[str, Any]]:
+        return [
+            {column: _func_value(value) for column, value in row.items()}
+            for row in ([] if len(frame) == 0 else frame.to_dict("records"))
+        ]
+
+    participants = {row["participant_uid"]: row for row in records(public.func_participants())}
+    sessions = records(public.func_sessions())
+    owner = {row["session_uid"]: row["participant_uid"] for row in sessions}
+    packs = {
+        row["run_uid"]: row
+        for row in records(public.packs())
+        if row["config_hash"] == pack_hash and row["status"] == "done"
+    }
+    runs = []
+    counts: dict[str, dict[str, int]] = {}
+    for row in records(public.func_runs()):
+        uid = row["run_uid"]
+        state = states.get(uid)
+        pack = packs.get(uid) if state is not None and state.state == "packed" else None
+        session = row["session_uid"]
+        if state is not None:
+            tally = counts.setdefault(session, {})
+            tally[state.state] = tally.get(state.state, 0) + 1
+        runs.append(
+            {
+                **row,
+                "participant_uid": owner.get(session),
+                "pack_state": None if state is None else state.state,
+                "pack_reason": None if state is None else state.reason,
+                "pack_detail": None if state is None else state.detail,
+                "pack_n_volumes": None if pack is None else pack["n_volumes"],
+                "pack_bytes": None if pack is None else pack["bytes"],
+                "packed_at": None if pack is None else pack["packed_at"],
+            }
+        )
+    rows = []
+    for row in sessions:
+        participant = participants.get(row["participant_uid"], {})
+        tally = counts.get(row["session_uid"], {})
+        rows.append(
+            {
+                **row,
+                "dataset": participant.get("dataset"),
+                "participant": participant.get("participant"),
+                "stream_rule": participant.get("session_order"),
+                "n_packed": tally.get("packed", 0),
+                "n_failed": tally.get("failed", 0),
+                "n_pending": tally.get("pending", 0),
+            }
+        )
+    return {
+        "func_sessions": _func_frame("func_sessions", rows),
+        "func_runs": _func_frame("func_runs", runs),
+    }
+
+
+def _epi_manifest(src: _Sources) -> dict[str, Any]:
+    """The manifest key :data:`EPI_MANIFEST_KEY`: the stage hashes of the functional side
+    under the present configuration, and every functional source with its dataset, connector,
+    pipeline version and layout generation, so that each number of the two tables traces to
+    the settings and the pipeline output it came from."""
+    from surfcensus.config import epi_settings
+
+    epi = epi_settings(load_config(src.run_dir))
+    sources = src.public.func_sources()
+    return {
+        "config_hashes": {
+            "pack": epi.pack_hash(),
+            "epi_session": epi.session_hash(),
+            "func_inventory": epi.inventory_hash(),
+        },
+        "sources": [
+            {
+                "dataset": _func_value(row["dataset"]),
+                "connector": _func_value(row["connector"]),
+                "pipeline_version": _func_value(row["pipeline_version"]),
+                "generation": _func_value(row["generation"]),
+            }
+            for row in ([] if len(sources) == 0 else sources.to_dict("records"))
+        ],
+    }
+
+
 def _refuse_in_sources(run_dir: Path, target: Path) -> None:
     """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, a directory
     that a source of a local run reads (``sources.local.refuse_in_sources``): its subjects
@@ -1368,7 +1541,11 @@ def export_run(
 ) -> list[Path]:
     """Write every table of :data:`EXPORT_TABLES` and ``manifest.json`` into ``out_dir``
     (default: ``export/`` or ``release/`` of the run directory), atomically and sorted;
-    returns the paths written, the manifest last.
+    returns the paths written, the manifest last. In the profile ``analysis`` of a local run
+    whose EPI interface is on and that has functional data, also :data:`FUNC_TABLES`, after
+    the ten, and the manifest key :data:`EPI_MANIFEST_KEY`; otherwise neither, so such an
+    export has the files, rows and manifest bytes of before step 3, and a later export
+    without them removes the functional files that the earlier manifest lists.
 
     Works on a run without ratings and on one without ``app.sqlite``. The manifest holds
     the run id, mode, profile, key fingerprint, package version, stage hashes, template id,
@@ -1422,12 +1599,17 @@ def export_run(
         scores = _scores(src)
         tables = _tables(src, profile, scores)
         manifest = _manifest(src, profile, fmt, scores)
+        written = EXPORT_TABLES
+        if _epi_on(src, profile):
+            tables.update(_func_tables(src))
+            manifest[EPI_MANIFEST_KEY] = _epi_manifest(src)
+            written = (*EXPORT_TABLES, *FUNC_TABLES)
     target.mkdir(parents=True, exist_ok=True)
-    names = {name: f"{name}.{fmt}" for name in EXPORT_TABLES}
+    names = {name: f"{name}.{fmt}" for name in written}
     _forget_earlier(target, set(names.values()))
     paths = []
     files = {}
-    for name in EXPORT_TABLES:
+    for name in written:
         path = target / names[name]
         _WRITERS[fmt](path, tables[name], _PARQUET_SCHEMAS.get(name))
         files[path.name] = {"rows": len(tables[name]), "sha256": sha256_file(path)}

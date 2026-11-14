@@ -123,6 +123,8 @@ class RatePage {
     this.turn = 0;
     this.visibleSince = null;
     this.visibleMs = 0;
+    // whether the server offers the EPI pages, and with them the subject pages, now
+    this.epiOffered = false;
   }
 
   async start() {
@@ -357,6 +359,19 @@ class RatePage {
     const link = byId("epi-link");
     if (session.epi_url) link.href = session.epi_url;
     link.hidden = !session.epi_url;
+    this.epiOffered = Boolean(session.epi_url);
+    this.showSubjectLink();
+  }
+
+  // The link to the page of the subject on screen, with its functional runs (step 3): under
+  // the rule of the EPI link, while an assignment is open. It is made from the subject_uid
+  // the assignment carries already (its media URLs carry it too), so the rating routes
+  // answer nothing new; the page says when a subject has no functional runs.
+  showSubjectLink() {
+    const link = byId("subject-link");
+    const shown = Boolean(this.epiOffered && this.assignment);
+    if (shown) link.href = api.routePath("subjectPage", { key: this.assignment.subject_uid });
+    link.hidden = !shown;
   }
 
   leave() {
@@ -371,6 +386,7 @@ class RatePage {
     this.note.value = "";
     this.noteBox.hidden = true;
     this.picker.close();
+    this.showSubjectLink();
     this.refresh();
   }
 
@@ -398,6 +414,7 @@ class RatePage {
     this.visibleMs = assignment.previous ? 0 : takeVisit(assignment.assignment_id);
     this.visibleSince = this.watching() ? performance.now() : null;
     this.setState("rating");
+    this.showSubjectLink();
     const started = performance.now();
     this.viewer.show(assignment, { autoplay: !assignment.previous }).then((result) => {
       if (!result.current) return;

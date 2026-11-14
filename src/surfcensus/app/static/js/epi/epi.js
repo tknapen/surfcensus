@@ -32,6 +32,7 @@ import {
   skipNote,
   pointOf,
   RATES,
+  segmentOfRun,
   signalOf,
   slicesAt,
   SPEC,
@@ -87,6 +88,7 @@ let noteAt = -Infinity;
 let segOnScreen = -1;
 let allGrids = [];
 let errorShown = null; // the error the status line says, until a later load succeeds
+let startNote = null; // that the run the address asked for (#run=) is not in the stream, until another run is shown
 let noticeKind = ''; // what #notice says: '' (nothing), 'waiting' (packs being made), 'stale' or 'grown'
 let helpReturn = null; // the element that had the focus when the help was opened
 const contoursOf = new Map(); // grid key -> [three decoded files] while loading or loaded; null without contours
@@ -107,6 +109,7 @@ const page = {
   requests: 0,
   fetchedBytes: 0,
   grownAt: null, // performance.now() when the page said that the stream grew
+  startRun: null, // the run the address asked for (#run=<run_uid>) and the page started at, or null
 };
 
 // ---- the stream -----------------------------------------------------------------------------
@@ -191,6 +194,7 @@ function enterSegment(k) {
   if (k === segOnScreen) return;
   const before = segOnScreen;
   segOnScreen = k;
+  if (before >= 0) startNote = null;
   const grid = gridOf(k);
   if (before < 0 || gridOf(before).grid_key !== grid.grid_key) {
     state.slices = slicesAt(grid, state.place);
@@ -574,6 +578,7 @@ function measuredRate() {
 
 function writeStatus(vols, k) {
   const parts = [];
+  if (startNote) parts.push(startNote);
   if (pending) parts.push(state.kind === 'series' ? `loading volume ${state.g}` : 'loading');
   if (vols && k !== undefined) {
     const [i, j, kk] = state.slices;
@@ -1239,7 +1244,17 @@ async function start() {
   $('subject').textContent = stream.label;
   $('reading').textContent = stream.reading;
   state.fdLimit = stream.sessions.find((s) => s.fd_threshold_mm)?.fd_threshold_mm || 0.5;
-  const first = gridOf(0);
+  // the run the address names (#run=<run_uid>, a link of a subject page), else the beginning
+  const asked = new URLSearchParams(window.location.hash.slice(1)).get('run');
+  let k0 = segmentOfRun(timeline, stream.sessions, asked);
+  if (k0 < 0) {
+    k0 = 0;
+    if (asked) startNote = 'the run asked for is not in the stream now';
+  } else {
+    page.startRun = asked;
+  }
+  state.g = segment(k0).first;
+  const first = gridOf(k0);
   state.slices = first.shape.map((n) => Math.floor(n / 2));
   state.place = pointOf(first, state.slices);
   views = new Views($('views'), streamPanelSizesMm(allGrids), {
@@ -1266,7 +1281,7 @@ async function start() {
     setTime(g, 'seek');
   });
   buildControls();
-  enterSegment(0);
+  enterSegment(k0);
   views.setGroups(groupsOf(state.view), groupLabels());
   traces.setData(streamData, state.fdLimit);
   document.addEventListener('keydown', onKeyDown);
@@ -1284,7 +1299,7 @@ async function start() {
     }
   });
   loadContours().catch(fail);
-  await store.stills(0);
+  await store.stills(k0);
   render('other');
   requestAnimationFrame(tick);
 }

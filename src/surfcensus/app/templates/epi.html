@@ -63,7 +63,7 @@
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
   <section id="about" aria-label="what the two streams are">
-    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if poll_idle_s is defined and poll_idle_s %} <span id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
+    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if subjects_url is defined %} <a id="subjects-link" href="{{ subjects_url }}">subjects</a>{% endif %}{% if poll_idle_s is defined and poll_idle_s %} <span id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
     <p id="reading"></p>
     <p id="rate-limit">Above 60 volumes per second, faster than most displays refresh, not every volume is put on
       screen (beside the rate it says which share is), and an artefact in a single volume can be missed. At 60 or

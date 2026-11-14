@@ -634,6 +634,21 @@ class Route(NamedTuple):
     (``app.queue.has_work_left``), by the one rule of docs/rater_app.md."""
 
 
+SUBJECT_ROUTES: tuple[Route, ...] = (
+    Route("GET", "/subjects", unblinded=True),
+    Route("GET", "/subject/{key}", unblinded=True),
+    Route("GET", "/api/subjects", SubjectsOut, unblinded=True),
+    Route("GET", "/api/subjects/{key}", SubjectPageOut, unblinded=True),
+)
+"""The routes of the subject pages of a run (step 3 of docs/epi_interface.md, "Step 3: the plan
+(E3.0)"). Appended to :data:`ROUTES` by work package E3.A, which answers them. ``/subjects`` is
+the list of every subject of the run with its surface state and its functional sessions,
+``/subject/<key>`` the page of one row of it (``key`` a ``subject_uid``, or the
+``participant_uid`` of a participant whose sessions have no FreeSurfer subject). They are
+unblinded and answer, like the EPI routes, only in a local run with functional data whose EPI
+interface is on; otherwise as a route that does not exist (404). Their paths hold no ``epi``, so
+that the routes of the EPI pages stay those whose path starts with ``/epi`` or ``/api/epi``."""
+
 ROUTES: tuple[Route, ...] = (
     Route("GET", "/"),
     Route("GET", "/review", unblinded=True),
@@ -655,6 +670,7 @@ ROUTES: tuple[Route, ...] = (
     Route("GET", "/epi/{participant_uid}", unblinded=True),
     Route("GET", "/api/epi/{participant_uid}", EpiStreamOut, unblinded=True),
     Route("GET", "/epi-media/{participant_uid}/{session_uid}/{path}", unblinded=True),
+    *SUBJECT_ROUTES,
 )
 """Every route of the app (local mode). The server serves these and no other, and the
 frontend calls none that is not here: ``/`` and ``/review`` are the pages, ``/static`` the
@@ -667,25 +683,9 @@ participant's stream (decision D38), ``/epi-media/<participant_uid>/<session_uid
 files of its packs, by the patterns and rules of ``app.epi``. They are unblinded, and they
 answer only in a local run with functional data whose EPI interface is on; otherwise they
 answer as a route that does not exist (404), so a run without functional data and a census
-run are answered as before step 2.
+run are answered as before step 2. The four routes of :data:`SUBJECT_ROUTES` (step 3) answer
+under the same rule.
 
 ``POST /api/skip`` answers 404 for an assignment that does not exist, 403 for another
 rater's, and 409 for one that is not open for the rater: one that has a submission, or
 whose render is no longer the subject's (``app.queue.SkipRefused``)."""
-
-SUBJECT_ROUTES: tuple[Route, ...] = (
-    Route("GET", "/subjects", unblinded=True),
-    Route("GET", "/subject/{key}", unblinded=True),
-    Route("GET", "/api/subjects", SubjectsOut, unblinded=True),
-    Route("GET", "/api/subjects/{key}", SubjectPageOut, unblinded=True),
-)
-"""The routes of the subject pages of a run (step 3 of docs/epi_interface.md, "Step 3: the
-plan (E3.0)"). Not yet among :data:`ROUTES`: the server answers them from work package E3.A
-on, which appends them to :data:`ROUTES` in the same change, since :data:`ROUTES` lists what
-the server answers and no other. ``/subjects`` is the list of every subject of the run with
-its surface state and its functional sessions, ``/subject/<key>`` the page of one row of it
-(``key`` a ``subject_uid``, or the ``participant_uid`` of a participant whose sessions have
-no FreeSurfer subject). They are unblinded and answer, like the EPI routes, only in a local
-run with functional data whose EPI interface is on; otherwise as a route that does not
-exist (404). Their paths hold no ``epi``, so that the routes of the EPI pages stay those
-whose path starts with ``/epi`` or ``/api/epi``."""

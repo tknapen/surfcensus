@@ -84,6 +84,15 @@ export function buildTimeline(sessions) {
   return { total: at, segments };
 }
 
+// The segment of the run `runUid` on the timeline (sessions: EpiStreamOut.sessions), or -1
+// when the run is not on it (not packed, not whole on disk, not in the stream now). The EPI
+// page starts there when its address names the run (#run=<run_uid>, the links of the subject
+// pages).
+export function segmentOfRun(timeline, sessions, runUid) {
+  if (!runUid) return -1;
+  return timeline.segments.findIndex((seg) => sessions[seg.session].runs[seg.run].run_uid === runUid);
+}
+
 // The segment that holds volume g of the stream (0 <= g < total).
 export function locate(timeline, g) {
   const s = timeline.segments;
