@@ -481,7 +481,7 @@ def pack_run(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInf
                     squares[stream] += v64 * v64
                 q = quantise(vol, *window)
                 hashers[stream].update(volume_bytes(q))
-                pending[stream].append(volume_bytes(q - ref[stream]))  # uint8: mod 256
+                pending[stream].append(volume_bytes(q))  # uint8: mod 256
                 if len(pending[stream]) == k_chunk or t == n - 1:
                     flush(stream, t + 1 - len(pending[stream]))
         for stream in STREAMS:
