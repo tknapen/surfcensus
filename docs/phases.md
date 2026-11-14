@@ -35,8 +35,8 @@ Input: `datasets`. Output: `subjects`, `files`.
 
 - One prefix-scoped listing per subject directory. Record presence, size and ETag (for a local source, the modification time) for every file role.
 - Fetch Tier A files (stats, build stamp, the three recon-all logs, whole; see `data_sources.md`) and parse provenance.
-- Mark a subject `complete` if every file a render cannot do without is present (T1, white and pial of both hemispheres), and record separately whether it has the stats files (`tier_a`) and the thickness and `sphere.reg` files (`tier_b`). A directory with `mri/` and `surf/` that lacks render files is recorded as incomplete, with the roles it lacks.
-- A subject whose listing is what the catalog already holds is skipped without reading a file. A subject that the listing no longer contains is marked absent; its render and ratings stay.
+- Mark a subject `complete` if every file a render cannot do without is present (T1, white and pial of both hemispheres), and record separately whether it has the stats files (`tier_a`) and the thickness and `sphere.reg` files (`tier_b`). A directory with `mri/` and `surf/` that lacks render files is recorded as incomplete, with the roles it lacks. A file that a git-annex or DataLad clone holds without its content (a link into `.git/annex/objects` without target, or a pointer file) counts as lacking, and the subject's `problem` names such files (`not fetched: ...`, `architecture.md`, Sources); it is no failure, and `review` and `inventory` say how to fetch them.
+- A subject whose listing is what the catalog already holds is skipped without reading a file. Of a subject that is read, the files of at most 32 kB are also read at their head, to tell git-annex pointer files. A subject that the listing no longer contains is marked absent; its render and ratings stay.
 
 Exit check: number of complete subjects by source, FreeSurfer version, and T2/FLAIR-pial use. A second reportable number. Also decides whether the remaining phases fit in time and storage (Tier B 13 to 14 MB per subject, Tier B plus C 36 to 43 MB).
 

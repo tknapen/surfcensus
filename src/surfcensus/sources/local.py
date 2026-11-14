@@ -302,7 +302,8 @@ def fetch_line(
     the subjects whose problem names such files (``patterns.unfetched_files``) count. None
     when none does, for any other run, and when the files lie in no git repository.
     ``given`` is the folder the user named, from which the dataset of the command follows
-    (:func:`fetch_command`)."""
+    (:func:`fetch_command`); without it, the BIDS dataset that holds the subjects
+    (:func:`dataset_holding`), else the stored root."""
     wanted: dict[str, list[str]] = {}
     total, sized = 0, True
     for label, problem in problems.items():
@@ -321,6 +322,9 @@ def fetch_line(
         record, _ = detect_layout(stored[0].root, nested=False, quiet=True)
     except SourceError:
         return None
+    if given is None:
+        # the BIDS dataset that holds the subjects when there is one, as review of it says
+        given = dataset_holding(record) or Path(record.root)
     command = fetch_command(Path(record.root) / record.fs_root, wanted, given)
     if command is None:
         return None

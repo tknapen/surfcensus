@@ -1348,3 +1348,28 @@ def test_inventory_of_a_subject_with_the_whole_logs_of_a_real_one(
 def test_the_roles_read_and_fetched_are_tier_a() -> None:
     assert set(PROVENANCE_ROLES) | set(STATS_ROLES) == set(TIER_A)
     assert not set(PROVENANCE_ROLES) & set(STATS_ROLES)
+
+
+def test_files_without_content_are_named_without_their_size_in_a_census_run(
+    census: Census,
+) -> None:
+    from synth_annex import unfetch  # pyrefly: ignore[missing-import]
+
+    subject = Path(census.local.subjects_dir) / "sub-7T01"
+    unfetch(census.local.subjects_dir, [subject / "mri" / "T1.mgz"])
+    unfetch(census.local.subjects_dir, [subject / "surf" / "lh.white"], "pointer")
+    census.run(census.local)
+    (row,) = [
+        dict(row)
+        for row in census.catalog.query(
+            "SELECT problem, complete, missing_roles FROM subjects WHERE subject_label = ?",
+            ("sub-7T01",),
+        )
+    ]
+    # the sizes of local files stay in no public column of a census run (decision D20)
+    assert row["problem"] == (
+        "not fetched: 2 files are git-annex links and pointer files whose content is not "
+        "here: mri/T1.mgz, surf/lh.white"
+    )
+    assert row["complete"] == 0 and row["missing_roles"].startswith("t1,lh_white")
+    assert census.catalog.failures().empty  # no failure of the inventory

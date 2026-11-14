@@ -35,13 +35,13 @@ from typer.testing import CliRunner, Result
 from surfcensus.cli import app
 from surfcensus.review import default_run_dir, render_counts, review
 from surfcensus.run import Run
-from surfcensus.sources.base import UNFETCHED, FileRole, SourceError, Unfetched
+from surfcensus.sources.base import TIER_B, UNFETCHED, FileRole, SourceError, Unfetched
 from surfcensus.sources.local import (
     LocalSource,
     detect_layout,
     fetch_command,
-    uninstalled_subdataset as registered,
 )
+from surfcensus.sources.local import uninstalled_subdataset as registered
 from surfcensus.sources.patterns import (
     POINTER_MAX_BYTES,
     annex_key_size,
@@ -50,6 +50,7 @@ from surfcensus.sources.patterns import (
     find_unfetched,
     is_unfetched_problem,
     resolve_subject_files,
+    size_words,
     unfetched_files,
     unfetched_problem,
     unfetched_said,
@@ -188,7 +189,10 @@ def test_the_problem_names_the_files_and_reads_back() -> None:
     assert unfetched_files(census) == (["mri/T1.mgz", "surf/lh.pial.T1"], None)
     pointer = Unfetched(FileRole.T1, "mri/T1.mgz", "mri/T1.mgz", None, "pointer")
     one = unfetched_problem([pointer])
-    assert one == f"{UNFETCHED}: 1 file is a git-annex pointer file whose content is not here: mri/T1.mgz"
+    assert (
+        one
+        == f"{UNFETCHED}: 1 file is a git-annex pointer file whose content is not here: mri/T1.mgz"
+    )
     assert unfetched_files(unfetched_problem([items[0], pointer])) == (["mri/T1.mgz"], 5_600_000)
     assert "at least 5.6 MB" in unfetched_problem([items[0], pointer])
     assert unfetched_said(problem) == (
@@ -222,19 +226,20 @@ def test_the_listing_opens_no_file(
     record = records["sub-01"]
     if kind == "link":
         # a link without content is in no FileRef: it is listed by name, as unfetched
-        assert set(record.unfetched) == {FileRole.T1, *RENDER_ROLES_LINKED}
+        assert set(record.unfetched) == {
+            FileRole.T1,
+            FileRole.LH_WHITE,
+            FileRole.RH_WHITE,
+            FileRole.LH_PIAL,
+            FileRole.RH_PIAL,
+        }
         assert not set(record.unfetched) & set(record.files)
-        assert record.unfetched[FileRole.T1].size == (
-            len(Path(os.readlink(subject / "mri" / "T1.mgz")).name) and annex_key_size(
-                Path(os.readlink(subject / "mri" / "T1.mgz")).name
-            )
-        )
+        key = Path(os.readlink(subject / "mri" / "T1.mgz")).name
+        assert record.unfetched[FileRole.T1].size == annex_key_size(key)
+        assert annex_key_size(key) == int(key.split("-s")[1].split("--")[0]) > 0
     else:
         # a pointer file is a regular file: the listing cannot tell, the inventory does
         assert record.unfetched == {} and FileRole.T1 in record.files
-
-
-RENDER_ROLES_LINKED = {FileRole.LH_WHITE, FileRole.RH_WHITE, FileRole.LH_PIAL, FileRole.RH_PIAL}
 
 
 # --- inventory, render, status, export, review ---------------------------------------------------
@@ -278,13 +283,17 @@ def test_one_subject_without_content_is_named_with_its_files_and_the_command(
         assert not row["complete"] and not row["tier_a"]
         assert is_unfetched_problem(row["problem"])
         names = unfetched_files(row["problem"])
-        assert names is not None and set(names[0]) == {
-            p.relative_to(subject).as_posix() for p in files_of(subject)
-        } | {p.path.relative_to(subject).as_posix() for p in made}
-        assert names[1] == sum(len(p.data) for p in made) // 1000 * 1000 or names[1]
+        expected = [role_of(p.path, subject) for p in made]
+        assert names is not None
+        assert names[0] == [
+            p.path.relative_to(subject).as_posix()
+            for p in sorted(made, key=lambda p: list(FileRole).index(role_of(p.path, subject)))
+        ]
+        assert set(expected) == set(FileRole) - {FileRole.TALAIRACH, *TIER_B}
+        total = sum(len(p.data) for p in made)
         # provenance that the logs would give is unknown, not false
-        assert row["fs_version"] is None or row["fs_version"] != row["fs_version"]
-        assert row["t2pial"] is pd_na() and row["recon_flags"] is None
+        assert row["fs_version"] is None and row["recon_flags"] is None
+        assert row["t2pial"] is pd_na() and row["edited"] is pd_na()
         assert render_counts(run) == (2, 1, 0)
         renders = run.public().renders().set_index("subject_uid")
         detail = Catalog(run_dir / CATALOG_FILE, readonly=True)
@@ -303,17 +312,10 @@ def test_one_subject_without_content_is_named_with_its_files_and_the_command(
         "mri/brainmask.mgz, surf/lh.white, surf/rh.white, surf/lh.pial and 8 more; "
     )
     assert line in said
-    paths = " ".join(f"freesurfer/sub-01/{p.path.relative_to(subject).as_posix()}" for p in made)
-    command = f"datalad -C {shlex.quote(str((root / 'derivatives').resolve()))} get"
-    # the dataset of the command is the innermost that holds the files' subject
-    # directory and the folder named, here the superdataset root holds it: the paths are
-    # relative to it
+    # the dataset of the command is the innermost that holds the folder named: the root
     command = f"datalad -C {shlex.quote(str(root.resolve()))} get"
-    paths = " ".join(
-        f"derivatives/freesurfer/sub-01/{p.path.relative_to(subject).as_posix()}"
-        for p in sorted(made, key=lambda p: list(FileRole).index(role_of(p.path, subject)))
-    )
-    assert f"Fetch them (15 kB) with: {command} {paths}\n" in said
+    paths = " ".join(f"derivatives/freesurfer/sub-01/{name}" for name in names[0])
+    assert f"Fetch them ({size_words(total)}) with: {command} {paths}\n" in said
     assert snapshot_links(root) == before
 
     # status and the inventory command say it too, and count no failure
@@ -325,7 +327,7 @@ def test_one_subject_without_content_is_named_with_its_files_and_the_command(
     inventory = cli("inventory", "--run-dir", run_dir)
     assert inventory.exit_code == 0, inventory.output
     assert "lacks files whose content is not fetched (git-annex): 1 (sub-01)" in inventory.output
-    assert f"  Fetch them (15 kB) with: {command} " in inventory.output
+    assert f"  Fetch them ({size_words(total)}) with: {command} {paths}\n" in inventory.output
     # the export has the sentence in the subject's problem
     exported = cli("export", "--run-dir", run_dir)
     assert exported.exit_code == 0, exported.output
@@ -361,3 +363,210 @@ def pd_read(path: Path) -> object:
     import pandas as pd
 
     return pd.read_csv(path, dtype=str, keep_default_na=False).replace("", None)
+
+
+def test_when_every_subject_lacks_content_review_says_so_once_with_one_command(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], no_tools: Path
+) -> None:
+    labels = [f"sub-{n:02d}" for n in range(1, 6)]
+    root = dataset(tmp_path / "ds", labels)
+    derivatives = root / "derivatives"
+    made = []
+    for label in labels:
+        made += unfetch(derivatives, files_of(derivatives / "freesurfer" / label))
+    before = snapshot_links(root)
+    with review(root, run_dir=tmp_path / "run", serve=False, jobs=1) as run:
+        assert render_counts(run) == (0, 5, 0)
+    said = capsys.readouterr().err
+    assert (
+        "5 cannot be rendered: 5 with files whose content is not fetched (git-annex) "
+        "(sub-01, sub-02, sub-03, sub-04, sub-05)."
+    ) in said
+    (fetch_said,) = [line for line in said.splitlines() if line.startswith("Fetch")]
+    total = size_words(sum(len(p.data) for p in made))
+    assert fetch_said.startswith(
+        f"Fetch the files of these 5 subjects ({total}) with: cd {shlex.quote(str(root.resolve()))}"
+        " && datalad get derivatives/freesurfer/sub-0*/mri/T1.mgz "
+    )
+    assert fetch_said.count("sub-0*/") == 13 and "sub-01/" not in fetch_said
+    assert "No subject of this run can be rendered, so there is nothing to rate." in said
+    assert snapshot_links(root) == before
+
+
+def test_the_command_fits_the_repository(tmp_path: Path) -> None:
+    # git-annex without DataLad: git annex get, in the repository that holds the files
+    repo = make_repository(tmp_path / "plain", datalad=False)
+    write_tree(repo, "subjects_dir", ["sub-01", "sub-02"])
+    wanted = {"sub-01": ["mri/T1.mgz", "surf/lh.pial"]}
+    assert fetch_command(repo, wanted) == (
+        f"git -C {shlex.quote(str(repo.resolve()))} annex get sub-01/mri/T1.mgz sub-01/surf/lh.pial"
+    )
+    both = wanted | {"sub-02": ["mri/T1.mgz"]}
+    assert fetch_command(repo, both) == (
+        f"cd {shlex.quote(str(repo.resolve()))} && git annex get sub-0*/mri/T1.mgz "
+        "sub-0*/surf/lh.pial"
+    )
+    # outside every repository there is nothing to say
+    bare = tmp_path / "bare"
+    write_tree(bare, "subjects_dir", ["sub-01"])
+    assert fetch_command(bare, wanted) is None
+    # the dataset named, or the innermost one that holds it; a folder above every dataset
+    # gives the outermost below it
+    root = dataset(tmp_path / "ds", ["sub-01"])
+    subjects = root / "derivatives" / "freesurfer"
+    inner = f"datalad -C {shlex.quote(str((root / 'derivatives').resolve()))} get"
+    outer = f"datalad -C {shlex.quote(str(root.resolve()))} get"
+    assert fetch_command(subjects, wanted, root) == (
+        f"{outer} derivatives/freesurfer/sub-01/mri/T1.mgz "
+        "derivatives/freesurfer/sub-01/surf/lh.pial"
+    )
+    assert fetch_command(subjects, wanted, subjects).startswith(f"{inner} freesurfer/sub-01/")
+    assert fetch_command(subjects, wanted, tmp_path).startswith(f"{outer} derivatives/")
+    assert fetch_command(subjects, wanted).startswith(f"{inner} freesurfer/sub-01/")
+    # a subject that is a link into a store is fetched where it lies, by its own paths
+    store = make_repository(tmp_path / "store")
+    write_tree(store, "subjects_dir", ["sub-09"])
+    study = tmp_path / "study"
+    study.mkdir()
+    (study / "sub-09").symlink_to(store / "sub-09", target_is_directory=True)
+    linked = fetch_command(study, {"sub-09": ["mri/T1.mgz"]})
+    assert linked == f"datalad -C {shlex.quote(str(store.resolve()))} get sub-09/mri/T1.mgz"
+
+
+def test_a_name_with_a_space_is_quoted(tmp_path: Path) -> None:
+    repo = make_repository(tmp_path / "my data")
+    write_tree(repo, "subjects_dir", ["sub-01"])
+    command = fetch_command(repo, {"sub-01": ["mri/T1.mgz"]})
+    assert command is not None and shlex.split(command)[:3] == [
+        "datalad",
+        "-C",
+        str(repo.resolve()),
+    ]
+
+
+def test_a_catalog_made_before_links_were_told_apart_gets_the_reason_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import surfcensus.sources.local as local_module
+
+    root = dataset(tmp_path / "ds", ["sub-01", "sub-02"])
+    derivatives = root / "derivatives"
+    unfetch(derivatives, files_of(derivatives / "freesurfer" / "sub-01", RENDER_FILES))
+    run_dir = tmp_path / "run"
+    with monkeypatch.context() as patch:  # the listing of the version before
+        patch.setattr(local_module, "find_unfetched", lambda *args: {})
+        with Run(run_dir, LocalSource(root)) as run:
+            assert run.inventory().done == 2
+            rows = run.public().subjects().set_index("subject_label")
+            assert rows.loc["sub-01", "problem"] is None
+    with Run(run_dir) as run:
+        report = run.inventory()
+        # the subject with links is read again, the other is skipped as unchanged
+        assert (report.done, report.skipped, report.failed) == (1, 1, 0)
+        rows = run.public().subjects().set_index("subject_label")
+        assert is_unfetched_problem(rows.loc["sub-01", "problem"])
+        assert run.inventory().skipped == 2
+
+
+def test_a_pointer_file_among_the_logs_leaves_the_flags_unknown(tmp_path: Path) -> None:
+    root = dataset(tmp_path / "ds", ["sub-01", "sub-02"])
+    derivatives = root / "derivatives"
+    unfetch(
+        derivatives,
+        [derivatives / "freesurfer" / "sub-01" / "scripts" / "recon-all-lh.log"],
+        "pointer",
+    )
+    with Run(tmp_path / "run", LocalSource(root)) as run:
+        run.inventory()
+        rows = run.public().subjects().set_index("subject_label")
+    one, other = rows.loc["sub-01"], rows.loc["sub-02"]
+    # the other logs say what they say; what the missing one would add is not known
+    assert not other["t2pial"] and other["t2pial"] is not pd_na()
+    assert one["t2pial"] is pd_na() and one["edited"] is pd_na()
+    assert one["fs_version"] == "6.0.1" and one["complete"]
+    found = unfetched_files(one["problem"])
+    assert found is not None and found[0] == ["scripts/recon-all-lh.log"]
+
+
+# --- subdatasets that are not installed ---------------------------------------------------------
+
+
+def test_a_dataset_whose_derivatives_are_not_installed_says_how_to_install_them(
+    tmp_path: Path,
+) -> None:
+    root = write_bids_dataset(tmp_path / "ds")
+    make_repository(root)
+    uninstalled_subdataset(root, "derivatives")
+    assert registered(root / "derivatives") == root
+    install = f"datalad -C {shlex.quote(str(root.resolve()))} get -n derivatives"
+    with pytest.raises(SourceError) as caught:
+        detect_layout(root)
+    assert caught.value.reason == "layout"
+    assert caught.value.detail == (
+        f"no FreeSurfer subject found in {root.resolve()}: derivatives is a subdataset that "
+        f"is not installed (an empty folder); install it, without the file content, with: "
+        f"{install}"
+    )
+    # a path inside it does not exist yet
+    with pytest.raises(SourceError) as inside:
+        detect_layout(root / "derivatives" / "freesurfer")
+    assert inside.value.reason == "not found"
+    assert inside.value.detail.endswith(f"; install it, without the file content, with: {install}")
+    # the command line: one line, exit code 2
+    result = cli("review", root, "--run-dir", tmp_path / "run", "--no-serve")
+    assert result.exit_code == 2 and install in result.output
+    assert not (tmp_path / "run").exists()
+
+
+def test_a_pipeline_folder_that_is_not_installed_is_named(tmp_path: Path) -> None:
+    root = write_bids_dataset(tmp_path / "ds")
+    make_repository(root)
+    derivatives = root / "derivatives"
+    derivatives.mkdir()
+    (derivatives / "README").write_text("derivatives\n")
+    make_repository(derivatives)
+    uninstalled_subdataset(derivatives, "fmriprep")
+    with pytest.raises(SourceError) as caught:
+        detect_layout(root)
+    assert "derivatives/fmriprep is a subdataset that is not installed" in caught.value.detail
+    assert caught.value.detail.endswith(
+        f"datalad -C {shlex.quote(str(derivatives.resolve()))} get -n fmriprep"
+    )
+
+
+def test_an_empty_folder_that_no_repository_registers_is_only_empty(tmp_path: Path) -> None:
+    root = write_bids_dataset(tmp_path / "ds")
+    (root / "derivatives" / "freesurfer").mkdir(parents=True)
+    with pytest.raises(SourceError) as caught:
+        detect_layout(root)
+    assert "derivatives/freesurfer (empty)" in caught.value.detail
+    assert "not installed" not in caught.value.detail
+    assert registered(root / "derivatives" / "freesurfer") is None
+
+
+def test_a_description_that_is_not_fetched_still_marks_the_dataset(tmp_path: Path) -> None:
+    # in a DataLad clone dataset_description.json is often annexed itself (it was in the
+    # clone of 2026-11-14); the run still goes beside the dataset, never into it
+    root = dataset(tmp_path / "ds", ["sub-01"])
+    unfetch(root, [root / "dataset_description.json"])
+    subjects = root / "derivatives" / "freesurfer"
+    assert default_run_dir(subjects) == tmp_path / "surfcensus-run"
+
+
+@pytest.mark.parametrize("kind", ["link", "pointer"])
+def test_a_freesurfer_7_subject_is_fetched_by_the_names_of_its_pial_files(
+    tmp_path: Path, kind: str
+) -> None:
+    root = dataset(tmp_path / "ds", ["sub-01"])
+    surf = root / "derivatives" / "freesurfer" / "sub-01" / "surf"
+    for hemi in ("lh", "rh"):
+        (surf / f"{hemi}.pial").rename(surf / f"{hemi}.pial.T1")
+        (surf / f"{hemi}.pial").symlink_to(f"{hemi}.pial.T1")  # in git, not annexed
+    unfetch(root / "derivatives", [surf / "lh.pial.T1", surf / "rh.pial.T1"], kind)  # type: ignore[arg-type]
+    with Run(tmp_path / "run", LocalSource(root)) as run:
+        run.inventory()
+        (row,) = run.public().subjects().itertuples(index=False)
+    # `datalad get surf/lh.pial` would find the link in git and fetch nothing
+    found = unfetched_files(row.problem)
+    assert found is not None and found[0] == ["surf/lh.pial.T1", "surf/rh.pial.T1"]
+    assert not row.complete

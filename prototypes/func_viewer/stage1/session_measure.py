@@ -39,6 +39,7 @@ from session import (
     parse_name,
     pick_anchor,
     read_itk_ras,
+    run_key,
     session_of,
     session_volume,
     sidecar_time,
@@ -63,12 +64,19 @@ def load_runs(data):
             "raw_mean": means.with_name(stem + "_raw_mean.nii.gz"),
             "preproc_mean": means.with_name(stem + "_preproc_mean.nii.gz"),
         }
+        if not files["raw"].exists():  # run-01 in the raw name where the derivative has run-1
+            key = (session_of(parse_name(stem)), run_key(parse_name(stem)))
+            for candidate in sorted((data / "raw").glob("*_bold.nii.gz")):
+                ent = parse_name(candidate.name[: -len("_bold.nii.gz")])
+                if "echo" not in ent and (session_of(ent), run_key(ent)) == key:
+                    files["raw"] = candidate
+                    break
         runs.append(
             {
                 "stem": stem,
                 "session": session_of(parse_name(stem)),
                 "xfm": xfm,
-                "time": sidecar_time(raw.with_name(stem + "_bold.json")),
+                "time": sidecar_time(Path(str(files["raw"])[: -len(".nii.gz")] + ".json")),
                 **{k: (p if p.exists() else None) for k, p in files.items()},
             }
         )

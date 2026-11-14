@@ -115,14 +115,26 @@ def rendered(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
     return calls
 
 
+class Reads(list[FileRole]):
+    def __init__(self) -> None:
+        super().__init__()
+        self.heads: list[FileRole] = []
+
+
 @pytest.fixture
-def read(monkeypatch: pytest.MonkeyPatch) -> list[FileRole]:
-    """The roles read through ``LocalSource.read_bytes``, from now on."""
-    roles: list[FileRole] = []
+def read(monkeypatch: pytest.MonkeyPatch) -> Reads:
+    """The roles read whole through ``LocalSource.read_bytes``, from now on; the reads of a
+    byte range, the heads by which the inventory tells git-annex pointer files, are in
+    ``heads``."""
+    roles = Reads()
+    heads = roles.heads
     original = LocalSource.read_bytes
 
     def recording(self: LocalSource, subject: object, role: FileRole, **kwargs: object) -> bytes:
-        roles.append(role)
+        if kwargs.get("byte_range") is None:
+            roles.append(role)
+        else:
+            heads.append(role)
         return original(self, subject, role, **kwargs)
 
     monkeypatch.setattr(LocalSource, "read_bytes", recording)
@@ -615,7 +627,7 @@ def test_a_run_is_inventoried_and_rendered(
 
 
 def test_a_second_inventory_reads_no_file_and_a_second_render_renders_nothing(
-    study: Path, new_run: Callable[..., Run], read: list[FileRole], rendered: list[Path]
+    study: Path, new_run: Callable[..., Run], read: Reads, rendered: list[Path]
 ) -> None:
     run = new_run(study)
     run.inventory()
@@ -624,12 +636,13 @@ def test_a_second_inventory_reads_no_file_and_a_second_render_renders_nothing(
         [FileRole.BUILD_STAMP, FileRole.RECON_LOG, FileRole.RECON_LOG_LH, FileRole.RECON_LOG_RH]
     )
     assert len(rendered) == 2
-    del read[:], rendered[:]
+    assert read.heads and all(role not in read for role in read.heads)
+    del read[:], rendered[:], read.heads[:]
 
     first = (run.inventory(), run.render())
     assert (first[0].done, first[0].skipped) == (0, 3)
     assert (first[1].done, first[1].skipped, first[1].failed) == (0, 2, 1)
-    assert read == [] and rendered == []
+    assert read == [] and read.heads == [] and rendered == []
     # the same again, with the same failed count: nothing was retried and nothing forgotten
     second = run.render()
     assert (second.done, second.skipped, second.failed, second.failures) == (
