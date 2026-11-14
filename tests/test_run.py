@@ -1034,8 +1034,8 @@ def test_another_root_is_refused_and_relocate_keeps_every_uid_and_render_key(
         Run(run.run_dir, local(moved))
     assert raised.value.reason == "other root"
     assert raised.value.detail == (
-        f"this run directory belongs to {study.resolve()}; pass --run-dir for a new run, or "
-        "--relocate if the data moved"
+        f"this run directory belongs to {study.resolve()}, which holds no subjects now: pass "
+        "--relocate if they moved to this path, or --run-dir DIR for a new run"
     )
     assert (run.run_dir / CONFIG_FILE).read_bytes() == stored
 
@@ -1059,6 +1059,13 @@ def test_another_root_is_refused_and_relocate_keeps_every_uid_and_render_key(
     for path in copy.rglob("*"):
         if path.is_file():
             touch(path)
+    # while the data are still where the run has them, the copy looks like another dataset
+    # (review of the quick start, F4): --relocate would bind the run to it as well
+    with pytest.raises(ConfigError, match="still where they were") as raised:
+        Run(run.run_dir, local(copy), relocate=True)
+    assert raised.value.reason == "invalid"
+    # the earlier place moved out of the way, the copy takes the run over
+    moved.rename(tmp_path / "archive" / "study-2.old")
     with Run(run.run_dir, local(copy), relocate=True) as again:
         assert again.inventory().done == 3
         assert again.render().done == 2
@@ -1117,6 +1124,12 @@ def test_relocating_keeps_the_subject_set_and_refuses_data_of_another_pipeline(
 
     stored = (run_dir / CONFIG_FILE).read_bytes()
     plain = write_tree(tmp_path / "plain", "subjects_dir", LABELS)
+    # another dataset while the data of the run are still there (review of the quick start)
+    with pytest.raises(ConfigError, match="still where they were"):
+        Run(run_dir, local(plain), relocate=True)
+    assert (run_dir / CONFIG_FILE).read_bytes() == stored
+    # gone from there, the catalog refuses the other pipeline
+    moved.rename(tmp_path / "gone")
     with pytest.raises(ConfigError, match="would get other identifiers") as raised:
         Run(run_dir, local(plain), relocate=True)
     assert raised.value.reason == "invalid"

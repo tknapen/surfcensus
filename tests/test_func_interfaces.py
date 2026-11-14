@@ -211,6 +211,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "SessionRunInfo": None,
         "SessionInfo": None,
         "TracesInfo": None,
+        "StreamInfo": None,
         "PackInfo": None,
         "info_text": ("info",),
         "read_info": ("path", "model"),
@@ -396,6 +397,7 @@ MODELS: dict[str, tuple[str, ...]] = {
     "ContourFile": ("file", "bytes", "sha256", "slices", "lines", "points"),
     "StreamFiles": ("ref", "mean", "sd", "chunks"),
     "TracesInfo": ("fd", "dvars", "non_steady"),
+    "StreamInfo": ("format", "version", "surfcensus_version", "label", "sessions"),
     "StatementInfo": ("state", "words", "source", "note"),
     "CorrectionsInfo": RECORDS["Corrections"],
 }

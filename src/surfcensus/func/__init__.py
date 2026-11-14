@@ -57,6 +57,9 @@ into ``session.json`` and ``pack.json`` and runs are named by id."""
 SESSION_JSON = "session.json"
 PACK_JSON = "pack.json"
 TRACES_JSON = "traces.json"
+STREAM_JSON = "stream.json"
+"""At the root of an ``--out`` directory: the sessions of one subject in the order of the
+subject's one stream (decision D38); ``func.model.StreamInfo``."""
 CONTOURS_DIR = "contours"
 
 STREAMS: tuple[str, str] = ("raw", "pre")

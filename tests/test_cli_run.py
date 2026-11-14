@@ -278,8 +278,8 @@ def test_inventory_refuses_another_root_and_relocates_when_asked(
     refused = cli("inventory", "--run-dir", run_dir, "--source", moved)
     assert refused.exit_code == 2
     assert refused.output == (
-        f"other root: this run directory belongs to {study.resolve()}; pass --run-dir for a "
-        "new run, or --relocate if the data moved\n"
+        f"other root: this run directory belongs to {study.resolve()}, which holds no subjects "
+        "now: pass --relocate if they moved to this path, or --run-dir DIR for a new run\n"
     )
 
     relocated = cli("inventory", "--run-dir", run_dir, "--relocate", "--source", moved)
@@ -703,7 +703,12 @@ def test_inventory_of_a_dataset_root_says_where_the_subjects_were_found(
     # the subjects directory itself is a plain subjects directory, with a root of its own
     refused = cli("inventory", "--run-dir", run_dir, "--source", inner / FS_ROOT)
     assert refused.exit_code == 2
-    assert refused.output.startswith(f"other root: this run directory belongs to {inner}; ")
+    # it holds the same subjects in another layout: no --relocate, which would be refused
+    assert refused.output == (
+        f"other root: this run directory belongs to {inner}, where the subjects of this path "
+        f"lie as well, in a layout that gives them other identifiers: give {inner} as the path "
+        "to go on with that run, or --run-dir DIR for a new run\n"
+    )
 
     # the dataset moved: --relocate with the new dataset root keeps the run and its subjects
     moved = tmp_path / "elsewhere" / "ds"
@@ -854,7 +859,13 @@ def test_a_run_of_the_subjects_directory_follows_to_the_dataset_root_within_one_
     name, one = pseudonym(run_dir), uid(run_dir, "sub-01")
     refused = cli("inventory", "--run-dir", run_dir, "--source", plain)
     assert refused.exit_code == 2
-    assert refused.output.startswith(f"other root: this run directory belongs to {subjects_dir}; ")
+    # the same subjects in the same pipeline, named another way: --relocate is right here
+    assert refused.output == (
+        f"other root: this run directory belongs to {subjects_dir}, where the subjects of this "
+        f"path lie as well, named another way: give {subjects_dir} as the path to go on with "
+        "that run, --relocate to name the subjects as this path from now on (they keep their "
+        "identifiers), or --run-dir DIR for a new run\n"
+    )
     moved = cli("inventory", "--run-dir", run_dir, "--source", plain, "--relocate")
     assert moved.exit_code == 0, moved.output
     assert lines(moved)[0] == (

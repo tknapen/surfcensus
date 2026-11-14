@@ -273,6 +273,22 @@ class SessionInfo(_Frozen):
     rules: dict[str, str] = Field(default_factory=lambda: dict(RULES))
 
 
+class StreamInfo(_Frozen):
+    """``stream.json``, at the root of a directory of packs without a run directory
+    (``surfcensus epi-session --out DIR``): the sessions of one subject in the order of the
+    subject's one continuous stream (decision D38). Written last, after every
+    ``session.json``, so its presence marks a directory whose every session is in place.
+    Never served; the page receives the sessions in this order."""
+
+    format: Literal["epi-pack"] = PACK_FORMAT
+    version: int = PACK_VERSION
+    surfcensus_version: str
+    label: str
+    """``sub-01``."""
+    sessions: tuple[str, ...]
+    """The session ids (the names of the session directories), in stream order."""
+
+
 class TracesInfo(_Frozen):
     """``traces.json``: the motion estimates of a run as the page plots them."""
 
@@ -321,7 +337,7 @@ class PackInfo(_Frozen):
     whatever zlib wrote it."""
 
 
-Info = TypeVar("Info", SessionInfo, PackInfo, TracesInfo)
+Info = TypeVar("Info", SessionInfo, PackInfo, TracesInfo, StreamInfo)
 
 
 def info_text(info: BaseModel) -> str:
