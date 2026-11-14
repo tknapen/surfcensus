@@ -17,6 +17,7 @@ import hashlib
 import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import PurePosixPath
 
 from surfcensus import privacy
 from surfcensus.config import ConfigError, InventoryConfig, RunConfig, stage_hashes
@@ -67,12 +68,16 @@ class _TierA:
     """Roles that the subject has and that could not be read, with the reason."""
     digests: Mapping[FileRole, str]
     """SHA-256 of the files that were read whole. A head has none: it is no file's digest."""
+    pointers: Mapping[FileRole, str] = field(default_factory=dict)
+    """Roles whose file is a git-annex pointer file, with its key: neither a text nor a
+    digest, since what was read is not the file's content."""
 
 
 def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig) -> _TierA:
     texts: dict[FileRole, str] = {}
     unread: list[tuple[FileRole, SourceError]] = []
     digests: dict[FileRole, str] = {}
+    pointers: dict[FileRole, str] = {}
     partial = False
     for role in PROVENANCE_ROLES:
         ref = record.files.get(role)
@@ -87,42 +92,62 @@ def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig)
         except SourceError as exc:
             unread.append((role, exc))
             continue
+        key = annex_pointer(data[:POINTER_PROBE_BYTES], ref.size)
+        if key is not None:
+            pointers[role] = key
+            continue
         texts[role] = decode_text(data)
         if not head:
             digests[role] = hashlib.sha256(data).hexdigest()
         elif role is not FileRole.BUILD_STAMP:  # of the stamp only the first line is used
             partial = True
-    return _TierA(texts, partial, tuple(unread), digests)
+    return _TierA(texts, partial, tuple(unread), digests, pointers)
 
 
-def _without_content(source: Source, record: SubjectRecord) -> SubjectRecord:
-    """``record`` with the git-annex pointer files among its files taken out of ``files``
-    and put with the links of ``unfetched``. The inventory then stores the subject without
-    them, and with a ``problem`` that names them all (``patterns.unfetched_problem``).
+def _without_content(
+    source: Source, record: SubjectRecord, read: Mapping[FileRole, str]
+) -> SubjectRecord:
+    """``record`` with its git-annex pointer files taken out of ``files`` and put with the
+    links of ``unfetched``. ``read``: the pointer files among the build stamp and the logs,
+    which :func:`_read_tier_a` read anyway, with their keys. The inventory stores the
+    subject without them, and with a ``problem`` that names them all
+    (``patterns.unfetched_problem``).
 
-    A pointer file is a regular file of at most ``POINTER_MAX_BYTES``, so only files of at
-    most that size are looked at, and of each the first ``POINTER_PROBE_BYTES``. This is
-    done for a subject that is read anyway, never for one that the skip test passes over: a
-    file that becomes its content changes size, and with it the listing. A file that cannot
-    be read here is left as it is; reading it later says why."""
+    Of the other files, a pointer file is a regular file of at most ``POINTER_MAX_BYTES``,
+    so only files of at most that size are looked at, the first ``POINTER_PROBE_BYTES`` of
+    each, and only from a local source: the objects of a bucket have their content, and a
+    ranged request per small file would cost more there. This is done for a subject that is
+    read anyway, never for one that the skip test
+    passes over: a file that becomes its content changes size, and with it the listing. A
+    file that cannot be read here is left as it is; reading it later says why."""
     kept = dict(record.files)
     unfetched: dict[FileRole, Unfetched] = dict(record.unfetched)
+    # a bucket lists objects with their content; a pointer file is what a local clone holds
+    local = source.kind == "local"
     for role, ref in record.files.items():
-        if ref.size > POINTER_MAX_BYTES:
+        if role in read:
+            key: str | None = read[role]
+        elif role in PROVENANCE_ROLES or ref.size > POINTER_MAX_BYTES or not local:
             continue
-        try:
-            head = source.read_bytes(record, role, byte_range=(0, POINTER_PROBE_BYTES - 1))
-        except SourceError:
+        else:
+            try:
+                head = source.read_bytes(record, role, byte_range=(0, POINTER_PROBE_BYTES - 1))
+            except SourceError:
+                continue
+            key = annex_pointer(head, ref.size)
+        if key is None:
             continue
-        key = annex_pointer(head, ref.size)
-        if key is not None:
-            del kept[role]
-            unfetched[role] = Unfetched(
-                role, ref.location, ref.location, annex_key_size(key), "pointer"
-            )
-    if len(kept) == len(record.files) and not unfetched:
+        del kept[role]
+        # a link to another candidate name (FreeSurfer 7: lh.pial -> lh.pial.T1) is in git
+        # itself; the fetch is of the file it leads to, which the variant names
+        fetch = ref.location
+        if ref.variant is not None and ref.variant != PurePosixPath(fetch).name:
+            fetch = (PurePosixPath(fetch).parent / ref.variant).as_posix()
+        unfetched[role] = Unfetched(role, ref.location, fetch, annex_key_size(key), "pointer")
+    if not unfetched:
         return record
-    return dataclasses.replace(record, files=kept, unfetched=unfetched)
+    ordered = {role: unfetched[role] for role in FileRole if role in unfetched}
+    return dataclasses.replace(record, files=kept, unfetched=ordered)
 
 
 def inventory_subject(source: Source, record: SubjectRecord, config: InventoryConfig) -> Provenance:
@@ -134,8 +159,8 @@ def inventory_subject(source: Source, record: SubjectRecord, config: InventoryCo
     ``provenance.subject_provenance``). A Tier A file that the subject does not have, or
     that the source cannot read (any ``SourceError``), gives None fields, not an error.
     """
-    record = _without_content(source, record)
     read = _read_tier_a(source, record, config)
+    record = _without_content(source, record, read.pointers)
     return subject_provenance(
         read.texts,
         record.files,
@@ -249,7 +274,8 @@ def _inventory_dataset(
                 skipped += 1
                 continue
 
-            record = _without_content(source, record)
+            read = _read_tier_a(source, record, config.inventory)
+            record = _without_content(source, record, read.pointers)
             if record.unfetched:
                 # what the subject lacks, and why, for every place that says so; the size
                 # of local files stays out of a census run (decision D20)
@@ -259,7 +285,6 @@ def _inventory_dataset(
                         record.unfetched.values(), sizes=config.mode == "local"
                     ),
                 )
-            read = _read_tier_a(source, record, config.inventory)
             problems = [(role.value, exc) for role, exc in read.unread]
             unfetched = _fetch_stats(source, record)
             if unfetched is not None:

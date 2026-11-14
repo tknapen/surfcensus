@@ -406,7 +406,7 @@ function setHelp(on) {
   if (on) {
     state.playing = false;
     writeControls();
-    $('help-close').focus();
+    $('help-close').focus({ preventScroll: true }); // the sheet opens at its top
   } else {
     $('help-button').focus();
   }

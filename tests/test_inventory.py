@@ -54,7 +54,7 @@ from surfcensus.sources.base import (
     input_signature,
 )
 from surfcensus.sources.local import LocalSource
-from surfcensus.sources.patterns import ROLE_CANDIDATES
+from surfcensus.sources.patterns import POINTER_MAX_BYTES, POINTER_PROBE_BYTES, ROLE_CANDIDATES
 from surfcensus.store import Catalog, PublicCatalog
 
 DATA = Path(__file__).parent / "data" / "recon_logs"
@@ -123,6 +123,12 @@ class Spy:
         self.listed_before_failing = 0
         self.problems: dict[str, str] = {}
         self.after_listing: Callable[[], None] | None = None
+
+    @property
+    def tier_a_reads(self) -> list[tuple[str, FileRole, tuple[int, int] | None]]:
+        """The reads of the build stamp and the logs; the others are the heads of small
+        files, read to tell git-annex pointer files (see the test of what is read)."""
+        return [read for read in self.reads if read[1] in PROVENANCE_ROLES]
 
     def datasets(self, only: Collection[str] | None = None) -> Iterator[DatasetRecord]:
         self.only.append(only)
@@ -448,16 +454,29 @@ def test_an_interruption_leaves_no_stored_subject_without_its_digests(
         }
 
 
-def test_only_the_stamp_and_the_logs_are_read_and_a_local_source_leases_nothing(
+def test_only_the_stamp_the_logs_and_heads_of_small_files_are_read_and_nothing_is_leased(
     bench: Bench,
 ) -> None:
     spy = Spy(bench.source())
     bench.run(spy)
-    assert sorted(spy.reads) == sorted(
-        (label, role, None) for label in ("sub-01", "sub-02") for role in PROVENANCE_ROLES
-    )
+    whole = [(label, role, None) for label in ("sub-01", "sub-02") for role in PROVENANCE_ROLES]
+    # and the head of every other file small enough to be a git-annex pointer file, which
+    # says that its content is not there (patterns.annex_pointer)
+    source = bench.source()
+    heads = [
+        (record.subject_label, role, (0, POINTER_PROBE_BYTES - 1))
+        for record in source.subjects(source.dataset)
+        for role, ref in record.files.items()
+        if role not in PROVENANCE_ROLES and ref.size <= POINTER_MAX_BYTES
+    ]
+    assert heads  # the light subjects are small
+    assert sorted(spy.reads, key=str) == sorted(whole + heads, key=str)
     assert spy.leases == []
     assert spy.only == [None]
+    # a subject that the skip test passes over is not opened at all
+    spy = Spy(bench.source())
+    bench.run(spy)
+    assert spy.reads == []
 
 
 def test_inventory_subject_parses_what_the_source_reads(bench: Bench) -> None:
@@ -476,7 +495,7 @@ def test_inventory_subject_parses_what_the_source_reads(bench: Bench) -> None:
     # a subject without Tier A files: nothing is read and nothing is known
     spy = Spy(source)
     bare = inventory_subject(spy, records["sub-03"], InventoryConfig())
-    assert spy.reads == []
+    assert spy.tier_a_reads == []
     assert (bare.build_stamp, bare.fs_version, bare.n_invocations, bare.finished) == (None,) * 4
     assert (bare.t2pial, bare.edited, bare.holes) == (None, None, None)
     assert (bare.flags, bare.pial_variant, bare.participant) == ((), "pial", "sub-03")
@@ -508,7 +527,7 @@ def test_a_second_inventory_reads_no_file_and_changes_nothing(
 ) -> None:
     first = Spy(bench.source())
     assert bench.run(first).done == 3
-    assert len(first.reads) == 8 and upserted == list(LABELS)
+    assert len(first.tier_a_reads) == 8 and upserted == list(LABELS)
     before = bench.dump()
 
     second = Spy(bench.source())
@@ -524,7 +543,7 @@ def test_force_reads_every_subject_again(bench: Bench, upserted: list[str]) -> N
     spy = Spy(bench.source())
     report = bench.run(spy, force=True)
     assert (report.done, report.skipped) == (3, 0)
-    assert len(spy.reads) == 8
+    assert len(spy.tier_a_reads) == 8
     assert upserted == [*LABELS, *LABELS]
 
 
@@ -652,7 +671,9 @@ def test_head_mode_reads_the_first_bytes_of_a_long_log_and_short_files_whole(
     )
     spy = Spy(bench.source())
     bench.run(spy, config=config)
-    assert [(role, byte_range) for label, role, byte_range in spy.reads if label == "sub-01"] == [
+    assert [
+        (role, byte_range) for label, role, byte_range in spy.tier_a_reads if label == "sub-01"
+    ] == [
         (FileRole.BUILD_STAMP, None),
         (FileRole.RECON_LOG, (0, 1999)),
         (FileRole.RECON_LOG_LH, None),
@@ -678,7 +699,7 @@ def test_a_log_that_fits_in_the_head_is_not_partial(bench: Bench) -> None:
     (record,) = [r for r in source.subjects(source.dataset) if r.subject_label == "sub-01"]
     spy = Spy(source)
     found = inventory_subject(spy, record, InventoryConfig(logs="head", head_bytes=longest))
-    assert all(byte_range is None for _, _, byte_range in spy.reads)
+    assert all(byte_range is None for _, _, byte_range in spy.tier_a_reads)
     assert found == inventory_subject(source, record, InventoryConfig())
     assert found.finished is True and found.t2pial is False
 
