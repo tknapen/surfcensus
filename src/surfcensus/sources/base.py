@@ -10,7 +10,7 @@ from __future__ import annotations
 import hashlib
 from collections.abc import Collection, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -116,6 +116,32 @@ class FileRef:
     """Remote: ``LastModified`` of the listing, ISO 8601."""
 
 
+UnfetchedKind = Literal["link", "pointer"]
+
+UNFETCHED = "not fetched"
+"""The reason of a subject's ``problem`` when files it lists have no content: the
+placeholders of git-annex (a link into ``.git/annex/objects`` whose target is not there,
+or a pointer file). Unlike ``unreadable`` it is no failure of the inventory: the subject is
+listed with the files it has, and lacks the others."""
+
+
+@dataclass(frozen=True)
+class Unfetched:
+    """A file of a subject whose name is there and whose content is not (git-annex)."""
+
+    role: FileRole
+    location: str
+    """The candidate name of the role, relative to the subject directory (``surf/lh.pial``)."""
+    fetch: str
+    """What a fetch is asked for, relative to the subject directory: the file that the link
+    leads to when that is another candidate name in the subject directory
+    (``surf/lh.pial.T1`` for FreeSurfer 7's ``lh.pial -> lh.pial.T1``), else ``location``."""
+    size: int | None
+    """Bytes, from the ``-s`` field of the git-annex key; None when the key has none."""
+    kind: UnfetchedKind
+    """``link``: a link into the object store; ``pointer``: a pointer file."""
+
+
 @dataclass(frozen=True)
 class DatasetRecord:
     source: SourceKind
@@ -150,7 +176,15 @@ class SubjectRecord:
     """One file per role the subject has, keyed in :class:`FileRole` definition order."""
     problem: str | None = None
     """Why the directory could not be listed, for example ``unreadable: Permission denied``;
-    ``files`` is then empty."""
+    ``files`` is then empty. In a record from the catalog it can also be a ``not fetched: ...``
+    sentence (:data:`UNFETCHED`) that the inventory wrote: the files named there are listed
+    by name and have no content, and ``files`` holds the others."""
+    unfetched: Mapping[FileRole, Unfetched] = field(default_factory=dict, compare=False)
+    """Roles whose first candidate with a name is a git-annex link to content that is not
+    there; such a role is not in ``files``. A source finds these from the listing alone
+    (``readlink``, no file opened); pointer files, which are regular files, are recognised
+    by the inventory (``patterns.annex_pointer``). Not stored as such: the inventory writes
+    them into ``problem``."""
 
 
 class SourceError(Exception):

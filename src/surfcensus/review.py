@@ -46,10 +46,11 @@ from surfcensus.sources.local import (
     LocalSource,
     dataset_holding,
     detect_layout,
+    fetch_line,
     refuse_in_sources,
     where_subjects_lie,
 )
-from surfcensus.sources.patterns import ROLE_CANDIDATES
+from surfcensus.sources.patterns import ROLE_CANDIDATES, is_unfetched_problem, unfetched_said
 from surfcensus.store import queue_order, queue_scores
 
 if TYPE_CHECKING:
@@ -344,31 +345,49 @@ def _say_inventory(run: Run, path: Path | str | None = None) -> None:
     where = where_subjects_lie(run.config, path)
     line = f"Found {_plural(len(present), 'subject')}{f' in {where}' if where else ''}"
     line += f" ({', '.join(described)})."
-    lacking: list[tuple[str, str]] = []
+    lacking: list[tuple[str, str, bool]] = []  # label, what it lacks, whether not fetched
+    unfetched: dict[str, object] = {}
     for row in present.sort_values("subject_label").itertuples(index=False):
+        not_fetched = is_unfetched_problem(row.problem)
+        if not_fetched:
+            unfetched[str(row.subject_label)] = row.problem
         if bool(row.complete):
             continue
-        if isinstance(row.problem, str):
+        if not_fetched:
+            why = str(unfetched_said(row.problem))
+        elif isinstance(row.problem, str):
             why = row.problem
         else:
             has = public.roles(str(row.subject_uid))
             why = ", ".join(
                 f"no {ROLE_CANDIDATES[role][0]}" for role in RENDER_ROLES if role not in has
             )
-        lacking.append((str(row.subject_label), why))
+        lacking.append((str(row.subject_label), why, not_fetched))
     if 0 < len(lacking) <= _BY_SUBJECT:
-        named = ", ".join(f"{label} ({why})" for label, why in lacking)
+        named = ", ".join(f"{label} ({why})" for label, why, _ in lacking)
         line += f" {len(lacking)} cannot be rendered: {named}."
     elif lacking:
         # many: once per thing that is lacking, not once per subject
         by_reason: dict[str, list[str]] = {}
-        for label, why in lacking:
-            by_reason.setdefault(why, []).append(label)
+        for label, why, not_fetched in lacking:
+            # each such subject names its own files; together they are one cause
+            key = "files whose content is not fetched (git-annex)" if not_fetched else why
+            by_reason.setdefault(key, []).append(label)
         grouped = "; ".join(
             f"{len(labels)} with {why} ({_listed(labels)})" for why, labels in by_reason.items()
         )
         line += f" {len(lacking)} cannot be rendered: {grouped}."
     _say(line)
+    fetch = fetch_line(run.config, unfetched, path)
+    if fetch is not None:
+        # once, for all of them: one command, not one per subject
+        named = sum(not_fetched for _, _, not_fetched in lacking)
+        if len(unfetched) > named:  # complete subjects that lack Tier A or B files
+            _say(
+                f"{_plural(len(unfetched), 'subject')} lack files whose content is not "
+                "fetched (git-annex); scores and provenance go without them until it is."
+            )
+        _say(fetch)
 
 
 def _say_scores(run: Run) -> None:

@@ -12,6 +12,7 @@ the input signature over all of a subject's files, with the identity of the inve
 
 from __future__ import annotations
 
+import dataclasses
 import hashlib
 import time
 from collections.abc import Collection, Mapping, Sequence
@@ -29,7 +30,15 @@ from surfcensus.sources.base import (
     Source,
     SourceError,
     SubjectRecord,
+    Unfetched,
     input_signature,
+)
+from surfcensus.sources.patterns import (
+    POINTER_MAX_BYTES,
+    POINTER_PROBE_BYTES,
+    annex_key_size,
+    annex_pointer,
+    unfetched_problem,
 )
 from surfcensus.store import Catalog
 
@@ -86,6 +95,36 @@ def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig)
     return _TierA(texts, partial, tuple(unread), digests)
 
 
+def _without_content(source: Source, record: SubjectRecord) -> SubjectRecord:
+    """``record`` with the git-annex pointer files among its files taken out of ``files``
+    and put with the links of ``unfetched``. The inventory then stores the subject without
+    them, and with a ``problem`` that names them all (``patterns.unfetched_problem``).
+
+    A pointer file is a regular file of at most ``POINTER_MAX_BYTES``, so only files of at
+    most that size are looked at, and of each the first ``POINTER_PROBE_BYTES``. This is
+    done for a subject that is read anyway, never for one that the skip test passes over: a
+    file that becomes its content changes size, and with it the listing. A file that cannot
+    be read here is left as it is; reading it later says why."""
+    kept = dict(record.files)
+    unfetched: dict[FileRole, Unfetched] = dict(record.unfetched)
+    for role, ref in record.files.items():
+        if ref.size > POINTER_MAX_BYTES:
+            continue
+        try:
+            head = source.read_bytes(record, role, byte_range=(0, POINTER_PROBE_BYTES - 1))
+        except SourceError:
+            continue
+        key = annex_pointer(head, ref.size)
+        if key is not None:
+            del kept[role]
+            unfetched[role] = Unfetched(
+                role, ref.location, ref.location, annex_key_size(key), "pointer"
+            )
+    if len(kept) == len(record.files) and not unfetched:
+        return record
+    return dataclasses.replace(record, files=kept, unfetched=unfetched)
+
+
 def inventory_subject(source: Source, record: SubjectRecord, config: InventoryConfig) -> Provenance:
     """Read the build stamp and the logs of one subject through ``source.read_bytes`` and
     parse them.
@@ -95,8 +134,15 @@ def inventory_subject(source: Source, record: SubjectRecord, config: InventoryCo
     ``provenance.subject_provenance``). A Tier A file that the subject does not have, or
     that the source cannot read (any ``SourceError``), gives None fields, not an error.
     """
+    record = _without_content(source, record)
     read = _read_tier_a(source, record, config)
-    return subject_provenance(read.texts, record.files, record.subject_label, partial=read.partial)
+    return subject_provenance(
+        read.texts,
+        record.files,
+        record.subject_label,
+        partial=read.partial,
+        unread=tuple(record.unfetched),
+    )
 
 
 @dataclass
@@ -192,12 +238,27 @@ def _inventory_dataset(
                 # the directory could not be listed: a failed unit until a listing succeeds
                 tally.failures.append((uid, record.problem.partition(": ")[0]))
                 extra.append(f"problem\t{record.problem}")
+            for role, item in record.unfetched.items():
+                # a link without content is in no FileRef; a subject that has one is read
+                # again when it changes, and a catalog made before links were told apart
+                # from absent files gets the reason once
+                extra.append(f"unfetched\t{role.value}\t{item.location}\t{item.fetch}\t{item.size}")
             signature = input_signature(record.files, None, extra)
             known = (uid, signature, record.fs_dir)
             if not force and stored.get(record.subject_label) == known:
                 skipped += 1
                 continue
 
+            record = _without_content(source, record)
+            if record.unfetched:
+                # what the subject lacks, and why, for every place that says so; the size
+                # of local files stays out of a census run (decision D20)
+                record = dataclasses.replace(
+                    record,
+                    problem=unfetched_problem(
+                        record.unfetched.values(), sizes=config.mode == "local"
+                    ),
+                )
             read = _read_tier_a(source, record, config.inventory)
             problems = [(role.value, exc) for role, exc in read.unread]
             unfetched = _fetch_stats(source, record)
@@ -216,7 +277,11 @@ def _inventory_dataset(
                     record.files, None, [*extra, *(f"unread\t{what}" for what, _ in problems)]
                 )
             provenance = subject_provenance(
-                read.texts, record.files, record.subject_label, partial=read.partial
+                read.texts,
+                record.files,
+                record.subject_label,
+                partial=read.partial,
+                unread=tuple(record.unfetched),
             )
             # with the subject, in one transaction: stored without its digests, a subject
             # would be skipped from then on and never get them

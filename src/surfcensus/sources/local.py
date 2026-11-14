@@ -17,6 +17,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import sys
 import types
 from collections.abc import Collection, Iterable, Iterator, Mapping, Sequence
@@ -38,14 +39,19 @@ from surfcensus.sources.base import (
     SourceError,
     SourceKind,
     SubjectRecord,
+    Unfetched,
 )
 from surfcensus.sources.patterns import (
     ROLE_CANDIDATES,
     TEMPLATE_FILES,
+    annex_link,
+    find_unfetched,
     is_file,
     is_subject_candidate,
     is_template_name,
     resolve_subject_files,
+    size_words,
+    unfetched_files,
     variant_name,
 )
 
@@ -127,6 +133,200 @@ def _is_text(name: str) -> bool:
 def _escape(name: str) -> str:
     """The glob that matches ``name`` and nothing else."""
     return re.sub(r"([*?\[])", r"[\1]", name)
+
+
+def _named(path: Path) -> bool:
+    """Whether ``path`` is a file, or a git-annex link whose content is not fetched: in a
+    DataLad clone ``dataset_description.json`` is often annexed, and a file that has a name
+    marks a dataset as much as one that has its content. Raises OSError like ``is_file``."""
+    return is_file(path) or annex_link(path) is not None
+
+
+# --- what is not there in a DataLad dataset: subdatasets that are not installed, and the
+# command that fetches files whose content is not there ----------------------------------------
+
+_SUBMODULE_PATH = re.compile(r"^\s*path\s*=\s*(.+?)\s*$")
+
+
+def _ancestors(path: Path) -> list[Path]:
+    return [path, *path.parents]
+
+
+def _is_repository(folder: Path) -> bool:
+    return os.path.lexists(folder / ".git")
+
+
+def _is_dataset(folder: Path) -> bool:
+    try:
+        return _is_repository(folder) and _is_dir(folder / ".datalad")
+    except OSError:
+        return False
+
+
+def uninstalled_subdataset(folder: Path | str) -> Path | None:
+    """The repository whose ``.gitmodules`` registers ``folder``, when ``folder`` is an
+    empty directory: a subdataset (a git submodule) that is not installed, as a fresh
+    ``datalad clone`` leaves every subdataset. None otherwise, also when it cannot be told.
+    Reads the ``.gitmodules`` of the folder's ancestors, nothing else."""
+    folder = Path(os.path.abspath(folder))
+    try:
+        if _names(folder) != []:
+            return None
+    except OSError:
+        return None
+    for holder in folder.parents:
+        modules = holder / ".gitmodules"
+        try:
+            if not _is_repository(holder) or not is_file(modules):
+                continue
+            text = modules.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        relative = folder.relative_to(holder).as_posix()
+        for line in text.splitlines():
+            found = _SUBMODULE_PATH.match(line)
+            if found and found.group(1).strip("\"'") == relative:
+                return holder
+        return None  # the innermost repository decides
+    return None
+
+
+def install_command(folder: Path | str, holder: Path | str) -> str:
+    """The command that installs the subdataset ``folder`` of the repository ``holder``
+    without fetching any file content: ``datalad -C <holder> get -n <folder>``, or for a
+    repository that is no DataLad dataset ``git -C <holder> submodule update --init``."""
+    holder = Path(holder)
+    relative = shlex.quote(Path(os.path.abspath(folder)).relative_to(holder).as_posix())
+    if _is_dataset(holder):
+        return f"datalad -C {shlex.quote(str(holder))} get -n {relative}"
+    return f"git -C {shlex.quote(str(holder))} submodule update --init {relative}"
+
+
+def _not_installed(folder: Path, shown: str | None = None) -> str | None:
+    """The sentence for a folder that is a subdataset that is not installed, or None;
+    ``shown`` is how the message names the folder (the folder itself by default)."""
+    holder = uninstalled_subdataset(folder)
+    if holder is None:
+        return None
+    return (
+        f"{shown or folder} is a subdataset that is not installed (an empty folder); install "
+        f"it, without the file content, with: {install_command(folder, holder)}"
+    )
+
+
+def _fetch_root(path: Path, given: Path | None) -> tuple[Path, bool] | None:
+    """Where a fetch of ``path`` is run, and whether that is a DataLad dataset: of the
+    DataLad datasets that hold ``path``, the innermost that holds ``given`` (the folder a
+    user named), else the outermost below ``given``, else the innermost; without DataLad
+    the innermost git repository, for ``git annex get``. None outside any repository."""
+    folders = _ancestors(path.parent)
+    repositories = [folder for folder in folders if _is_repository(folder)]
+    if not repositories:
+        return None
+    if not _is_dataset(repositories[0]):
+        return repositories[0], False
+    datasets = [folder for folder in repositories if _is_dataset(folder)]
+    if given is not None:
+        holding = [folder for folder in datasets if given.is_relative_to(folder)]
+        if holding:
+            return holding[0], True
+        below = [folder for folder in datasets if folder.is_relative_to(given)]
+        if below:
+            return below[-1], True
+    return datasets[0], True
+
+
+def fetch_command(
+    subjects_dir: Path | str,
+    wanted: Mapping[str, Sequence[str]],
+    given: Path | str | None = None,
+) -> str | None:
+    """One shell line that fetches the files ``wanted`` names (subject label -> names
+    relative to the subject directory, as ``patterns.unfetched_files`` gives them), or None
+    when they lie in no git repository.
+
+    One subject: ``datalad -C <dataset> get <paths>``, the paths relative to the dataset;
+    ``datalad get`` installs a subdataset on the way when one is needed (DataLad 1.8.0,
+    tried 2026-11-14), so the dataset may be the one the user named. Several subjects: ``cd
+    <dataset> && datalad get <subjects>/<prefix>*/<name> ...``, one shell pattern per name,
+    since the line would otherwise grow with the subjects; the pattern can also match
+    subjects whose files are there, which ``datalad get`` passes over. Without DataLad:
+    ``git -C <repository> annex get <paths>`` in the repository that holds the files.
+    """
+    base = Path(subjects_dir).resolve()
+    asked = None if given is None else Path(given).resolve()
+    labels = sorted(wanted)
+    if not labels:
+        return None
+    try:
+        directories = {label: (base / label).resolve() for label in labels}
+        first = directories[labels[0]] / wanted[labels[0]][0]
+        found = _fetch_root(first, asked)
+    except (OSError, RuntimeError, IndexError):
+        return None
+    if found is None:
+        return None
+    root, datalad = found
+    linked = any(directory.parent != base for directory in directories.values())
+    if len(labels) == 1 or linked or not base.is_relative_to(root):
+        paths = []
+        for label in labels:
+            for name in wanted[label]:
+                file = directories[label] / name
+                if not file.is_relative_to(root):
+                    continue
+                paths.append(shlex.quote(file.relative_to(root).as_posix()))
+        if not paths:
+            return None
+        tool = "datalad -C {root} get" if datalad else "git -C {root} annex get"
+        return f"{tool.format(root=shlex.quote(str(root)))} {' '.join(paths)}"
+    prefix = labels[0]
+    for label in labels[1:]:  # the labels' common start, character by character
+        while not label.startswith(prefix):
+            prefix = prefix[:-1]
+    names = list(dict.fromkeys(name for label in labels for name in wanted[label]))
+    folder = base.relative_to(root).as_posix()
+    head = "" if folder == "." else f"{shlex.quote(folder)}/"
+    patterns = [
+        f"{head}{shlex.quote(prefix) if prefix else ''}*/{shlex.quote(name)}" for name in names
+    ]
+    tool = "datalad get" if datalad else "git annex get"
+    return f"cd {shlex.quote(str(root))} && {tool} {' '.join(patterns)}"
+
+
+def fetch_line(
+    config: RunConfig, problems: Mapping[str, object], given: Path | str | None = None
+) -> str | None:
+    """The line that says how to fetch the files without content of the subjects of a local
+    run with one local source: ``problems`` maps subject labels to their ``problem``, and
+    the subjects whose problem names such files (``patterns.unfetched_files``) count. None
+    when none does, for any other run, and when the files lie in no git repository.
+    ``given`` is the folder the user named, from which the dataset of the command follows
+    (:func:`fetch_command`)."""
+    wanted: dict[str, list[str]] = {}
+    total, sized = 0, True
+    for label, problem in problems.items():
+        found = unfetched_files(problem)
+        if found is None:
+            continue
+        wanted[label] = found[0]
+        if found[1] is None:
+            sized = False
+        else:
+            total += found[1]
+    stored = [s for s in config.sources if s.kind == "local" and s.root is not None]
+    if not wanted or config.mode != "local" or len(stored) != 1 or stored[0].root is None:
+        return None
+    try:
+        record, _ = detect_layout(stored[0].root, nested=False, quiet=True)
+    except SourceError:
+        return None
+    command = fetch_command(Path(record.root) / record.fs_root, wanted, given)
+    if command is None:
+        return None
+    them = "them" if len(wanted) == 1 else f"the files of these {len(wanted)} subjects"
+    amount = f" ({'at least ' if not sized else ''}{size_words(total)})" if total else ""
+    return f"Fetch {them}{amount} with: {command}"
 
 
 def template_files_missing(directory: Path | str) -> tuple[str, ...] | None:
@@ -305,7 +505,7 @@ def dataset_holding(record: DatasetRecord, given: Path | str | None = None) -> P
         if folder.name != DERIVATIVES:
             continue
         try:
-            if is_file(folder.parent / _DESCRIPTION):
+            if _named(folder.parent / _DESCRIPTION):
                 found = folder.parent
         except OSError:
             continue
@@ -435,9 +635,23 @@ def detect_layout(
     return record, implied
 
 
+def _inside_uninstalled(path: Path) -> str:
+    """``; <sentence>`` when the nearest folder of ``path`` that exists is a subdataset that
+    is not installed (:func:`_not_installed`), else empty."""
+    for folder in Path(os.path.abspath(path)).parents:
+        try:
+            if not _is_dir(folder):
+                continue
+        except OSError:
+            return ""
+        sentence = _not_installed(folder)
+        return "" if sentence is None else f"; {sentence}"
+    return ""
+
+
 def _detect(given: Path, notes: _Notes, nested: bool) -> tuple[DatasetRecord, tuple[str, ...]]:
     if not _is_dir(given):
-        raise SourceError("not found", f"{given} is not a directory")
+        raise SourceError("not found", f"{given} is not a directory{_inside_uninstalled(given)}")
     if is_subject_candidate(given):
         notes.append((logging.INFO, f"{given} is one FreeSurfer subject directory"))
         return _record(given.parent, ".", "subjects_dir"), (_escape(given.name),)
@@ -633,7 +847,7 @@ def _looks_like_bids(base: Path) -> bool:
     """Whether ``base`` has the two marks of a BIDS dataset: ``dataset_description.json``
     and a ``sub-*`` folder."""
     try:
-        if not is_file(base / _DESCRIPTION):
+        if not _named(base / _DESCRIPTION):
             return False
         return any(n.startswith("sub-") and _is_dir(base / n) for n in _names(base) or ())
     except OSError:
@@ -645,7 +859,7 @@ def _without_subjects(derivatives: Path, folders: Sequence[str]) -> list[tuple[P
     subject, for the message of a search that found none: ``sourcedata/freesurfer`` and
     ``freesurfer`` in it and in each of ``folders``, and a folder whose own name starts
     with ``freesurfer``; each with whether it is empty. An empty one is what a DataLad
-    subdataset that is not installed looks like."""
+    subdataset that is not installed looks like (:func:`_uninstalled_below` tells)."""
     places = []
     for folder in (derivatives, *(derivatives / name for name in folders)):
         places += [folder / "sourcedata" / "freesurfer", folder / "freesurfer"]
@@ -660,6 +874,16 @@ def _without_subjects(derivatives: Path, folders: Sequence[str]) -> list[tuple[P
         if names is not None:
             found.setdefault(place, not names)
     return list(found.items())
+
+
+def _uninstalled_below(base: Path, derivatives: Path, folders: Sequence[str]) -> list[str]:
+    """The sentences of :func:`_not_installed` for ``derivatives``, its ``folders`` and the
+    folders for FreeSurfer output in them that are subdatasets that are not installed,
+    each folder named relative to ``base``."""
+    places = [derivatives, *(derivatives / name for name in folders)]
+    places += [place for place, empty in _without_subjects(derivatives, folders) if empty]
+    said = [_not_installed(place, _shown(place, base)) for place in dict.fromkeys(places)]
+    return [sentence for sentence in said if sentence is not None]
 
 
 def _nothing_found(base: Path, *, bids: bool) -> str:
@@ -687,6 +911,10 @@ def _nothing_below(base: Path, derivatives: Path, searched: _Searched) -> str:
     where = "the path" if derivatives == base else f"{DERIVATIVES}/"
     listed = ", ".join(searched.folders[:_MAX_NAMES]) or "none"
     more = len(searched.folders) - _MAX_NAMES
+    uninstalled = _uninstalled_below(base, derivatives, searched.folders)
+    if uninstalled:
+        # nothing can be found before the subdataset is there: that is all there is to say
+        return f"no FreeSurfer subject found in {base}: " + "; ".join(uninstalled[:_MAX_NAMES])
     detail = (
         f"no FreeSurfer subject found in {base}. A subject is a directory with mri/ and "
         f"surf/ that is not a template; looked in {where} and its folders ({listed}"
@@ -830,6 +1058,7 @@ class LocalSource:
             directory = subjects_dir / label
             fs_dir = (PurePosixPath(self.dataset.fs_root) / label).as_posix()
             files: dict[FileRole, FileRef] = {}
+            unfetched: dict[FileRole, Unfetched] = {}
             problem = problems.get(label)
             if problem is None:
                 first = seen.setdefault(directory.resolve(), label)
@@ -842,10 +1071,10 @@ class LocalSource:
                     )
                     continue
                 try:
-                    files = _list_files(directory)
+                    files, unfetched = _list_files(directory)
                 except OSError as exc:
                     problem = f"unreadable: {_strerror(exc)}"
-            records.append(SubjectRecord(dataset, label, fs_dir, files, problem))
+            records.append(SubjectRecord(dataset, label, fs_dir, files, problem, unfetched))
         return iter(records)
 
     def _select(self, labels: list[str]) -> list[str]:
@@ -938,10 +1167,12 @@ class LocalSource:
         )
 
 
-def _list_files(directory: Path) -> dict[FileRole, FileRef]:
-    """One :class:`FileRef` per role that ``directory`` has, from ``stat()`` alone. Size and
-    modification time are those of the file a link leads to."""
+def _list_files(directory: Path) -> tuple[dict[FileRole, FileRef], dict[FileRole, Unfetched]]:
+    """One :class:`FileRef` per role that ``directory`` has, from ``stat()`` alone, and the
+    roles whose candidate is a git-annex link without content (``patterns.find_unfetched``,
+    from ``readlink``). Size and modification time are those of the file a link leads to."""
     paths = resolve_subject_files(directory)
+    unfetched = find_unfetched(directory, paths)
     files = {}
     for role in FileRole:
         if role not in paths:
@@ -955,7 +1186,7 @@ def _list_files(directory: Path) -> dict[FileRole, FileRef]:
             etag_or_mtime=str(stat.st_mtime_ns),
             variant=variant_name(role, path) if len(ROLE_CANDIDATES[role]) > 1 else None,
         )
-    return files
+    return files, unfetched
 
 
 def _check_unchanged(ref: FileRef, stat: os.stat_result) -> None:

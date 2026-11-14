@@ -125,10 +125,12 @@ class Source:
 
     @staticmethod
     def _volume(img, t):
+        """Volume t as pipeline/make_videos.py scales it (stored values as float32, times the
+        slope, plus the intercept). Only that volume is read: get_unscaled() would read the whole
+        series at every call, which for a long run is gigabytes."""
         proxy = img.dataobj
-        return proxy.get_unscaled()[..., t].astype(np.float32) * float(proxy.slope) + float(
-            proxy.inter
-        )
+        stored = proxy._get_unscaled((slice(None), slice(None), slice(None), int(t)))
+        return np.asarray(stored).astype(np.float32) * float(proxy.slope) + float(proxy.inter)
 
     def window(self, run):
         """0 to the 99.5th percentile of the preprocessed series in the mask, volumes 0, 10, ..."""

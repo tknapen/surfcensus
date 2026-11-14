@@ -51,6 +51,7 @@ from surfcensus.sources.base import (
     TIER_A_REQUIRED,
     TIER_B,
     TIER_B_REQUIRED,
+    UNFETCHED,
     DatasetRecord,
     FileRef,
     FileRole,
@@ -267,6 +268,9 @@ _SIDECARS = ("-journal", "-wal", "-shm")
 _UID = re.compile(r"[0-9a-f]{16}")
 _PSEUDONYM = re.compile(r"D-[0-9a-f]{1,64}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
+
+# the start of a `subjects.problem` that names files without content, which is no failure
+_UNFETCHED_PREFIX = f"{UNFETCHED}: "
 
 # roles whose absence `subjects.missing_roles` names, in FileRole definition order
 _NAMED_WHEN_MISSING = tuple(
@@ -1276,7 +1280,10 @@ class Catalog:
 
         The failed rows of the ``work`` ledger, the failed renders (phase ``render``) and
         the present subjects that the inventory could not list (phase ``inventory``, the
-        text before the colon of ``problem`` as the reason). Ordered by phase, then unit.
+        text before the colon of ``problem`` as the reason). A ``problem`` that says that
+        files have no content (``not fetched: ...``) is no failure and is not listed; the
+        render of such a subject is, when it lacks a render file. Ordered by phase, then
+        unit.
         """
         rows = self._db.rows(
             "SELECT unit, phase, reason, detail FROM work WHERE status = 'failed' "
@@ -1289,7 +1296,9 @@ class Catalog:
             "  CASE WHEN instr(problem, ': ') > 0 "
             "       THEN substr(problem, instr(problem, ': ') + 2) END "
             "FROM subjects WHERE problem IS NOT NULL AND present = 1 "
-            "ORDER BY 2, 1"
+            "AND substr(problem, 1, ?) != ? "
+            "ORDER BY 2, 1",
+            (len(_UNFETCHED_PREFIX), _UNFETCHED_PREFIX),
         )
         return _frame(_FAILURE_COLUMNS, [row for row in rows if phase in (None, row["phase"])])
 

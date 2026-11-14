@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterable, Mapping
+from collections.abc import Collection, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
@@ -249,6 +249,7 @@ def subject_provenance(
     subject_label: str,
     *,
     partial: bool = False,
+    unread: Collection[FileRole] = (),
 ) -> Provenance:
     """What the build stamp, the logs and the file names say about one subject.
 
@@ -256,6 +257,8 @@ def subject_provenance(
     ``recon_log_rh``, each present only if it could be read; other roles are ignored.
     ``files``: the subject's listing. ``partial``: at least one log is a head (see
     :func:`parse_recon_log`); a caller that read a whole log through a byte range passes False.
+    ``unread``: roles the subject has by name whose content is not there (git-annex
+    placeholders, which are not in ``files``); a log among them leaves the flags unknown.
 
     * Version: from the build stamp file; if that is absent or holds no version, from the
       last stamp line of ``recon_log``. ``build_stamp`` is the stamp the version was read
@@ -305,6 +308,7 @@ def subject_provenance(
         not partial
         and bool(invocations)
         and all(role in texts for role in _LOG_ROLES if role in files)
+        and not any(role in unread for role in _LOG_ROLES)
     )
     pial_variant = _pial_variant(files)
 

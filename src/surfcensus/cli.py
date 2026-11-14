@@ -343,7 +343,8 @@ def _print_inventory(run: Run, source: Path | None = None) -> None:
     ``D-3f9a1c07: FreeSurfer subjects found in derivatives/fmriprep/sourcedata/freesurfer
     (fMRIPrep layout, fMRIPrep 21.0.2)``. Any other run names layout and pipeline as the
     catalog has them; a census run keeps where its subjects lie in the catalog."""
-    from surfcensus.sources.local import LAYOUT_WORDS, where_subjects_lie
+    from surfcensus.sources.local import LAYOUT_WORDS, fetch_line, where_subjects_lie
+    from surfcensus.sources.patterns import is_unfetched_problem
 
     public = run.public()
     datasets = public.datasets()
@@ -378,14 +379,24 @@ def _print_inventory(run: Run, source: Path | None = None) -> None:
         counts = ", ".join(f"{name} ({versions[name]})" for name in sorted(versions))
         typer.echo(f"FreeSurfer: {counts}")
     lacking: dict[str, list[str]] = {}
+    unfetched: dict[str, object] = {}
     for row in present.itertuples(index=False):
-        if isinstance(row.problem, str):
+        if is_unfetched_problem(row.problem):
+            # each names its own files; together they are one cause, and one command
+            what = "lacks files whose content is not fetched (git-annex)"
+            lacking.setdefault(what, []).append(row.subject_uid)
+            if isinstance(row.subject_label, str):
+                unfetched[row.subject_label] = row.problem
+        elif isinstance(row.problem, str):
             lacking.setdefault(row.problem, []).append(row.subject_uid)
         elif not (row.complete and row.tier_a and row.tier_b):
             what = f"lacks {row.missing_roles.replace(',', ', ')}"
             lacking.setdefault(what, []).append(row.subject_uid)
     for what in sorted(lacking):
         typer.echo(f"  {what}: {len(lacking[what])} ({_names(subjects, lacking[what])})")
+    fetch = fetch_line(run.config, unfetched, source)
+    if fetch is not None:
+        typer.echo(f"  {fetch}")
 
 
 @app.command("inventory", cls=_RelocateCommand)
@@ -611,6 +622,7 @@ def status(
     from surfcensus.render.batch import PHASE as RENDER
     from surfcensus.render.batch import render_failures, render_status
     from surfcensus.run import Run
+    from surfcensus.sources.patterns import is_unfetched_problem
     from surfcensus.store import CATALOG_FILE, Catalog
 
     with _stops_with_exit_2(), Run(run_dir) as run:
@@ -621,7 +633,11 @@ def status(
         # a dataset found in another pipeline's layout has a second row, the same pseudonym
         pseudonyms = ", ".join(dict.fromkeys(public.datasets()["pseudonym"])) or "none"
         typer.echo(f"{run.config.mode} run, datasets: {pseudonyms}")
-        unreadable = int(present["problem"].notna().sum())
+        # a subject whose files have no content (git-annex) was listed: no failure
+        unreadable = sum(
+            isinstance(problem, str) and not is_unfetched_problem(problem)
+            for problem in present["problem"]
+        )
         absent = len(subjects) - len(present)
         gone = f" ({absent} no longer in the source)" if absent else ""
         typer.echo(f"inventory: {len(present) - unreadable} done, {unreadable} failed{gone}")
