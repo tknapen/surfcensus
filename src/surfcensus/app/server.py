@@ -1750,12 +1750,17 @@ def serve(
     mode: AppMode = "local",
     rater: str | None = None,
     open_browser: bool = True,
+    stop: threading.Event | None = None,
 ) -> None:
     """:func:`start_server`, print the URL, open the browser, wait for Ctrl-C or SIGTERM in
-    the main thread, stop. Refuses to start (``ConfigError("invalid", ...)``) when renders
-    of the selection are out of date: ``N renders are out of date; run surfcensus render
-    --run-dir DIR``. Says on stderr when selected subjects are not rendered yet, and when
-    the queue is empty because the run has no subject to rate."""
+    the main thread, stop. With ``stop`` the call sets no SIGTERM handler and serves until
+    the event is set (or Ctrl-C): the caller sets it from a handler of its own, which the
+    command line keeps until the process ends, so that a SIGTERM that comes after the
+    server has stopped cannot kill a command that stopped in order. Refuses to start
+    (``ConfigError("invalid", ...)``) when renders of the selection are out of date:
+    ``N renders are out of date; run surfcensus render --run-dir DIR``. Says on stderr when
+    selected subjects are not rendered yet, and when the queue is empty because the run
+    has no subject to rate."""
     run_dir = Path(run_dir)
     config = load_config(run_dir)
     with PublicCatalog.open(run_dir) as public:
@@ -1791,15 +1796,16 @@ def serve(
             flush=True,
         )
     handle = start_server(run_dir, host=host, port=port, mode=mode, rater=rater)
-    stop = threading.Event()
-    in_main = threading.current_thread() is threading.main_thread()
-    earlier = signal.signal(signal.SIGTERM, lambda *_: stop.set()) if in_main else None
+    waits = threading.Event() if stop is None else stop
+    # the caller's event: the caller's handler. Otherwise SIGTERM for the length of the call.
+    in_main = stop is None and threading.current_thread() is threading.main_thread()
+    earlier = signal.signal(signal.SIGTERM, lambda *_: waits.set()) if in_main else None
     try:
         print(f"Rating app: {handle.url} (Ctrl-C to stop)", file=sys.stderr, flush=True)
         if open_browser:
             with suppress(webbrowser.Error):
                 webbrowser.open(handle.url)
-        while handle.running and not stop.wait(0.2):
+        while handle.running and not waits.wait(0.2):
             pass
     except KeyboardInterrupt:
         pass

@@ -775,34 +775,61 @@ def review(
         return run
     # SIGTERM stops the app as Ctrl-C does, from before the app is announced until the
     # closing line is out: a second one (a process manager that signals the whole group)
-    # must not end the command in the middle of stopping.
+    # must not end the call in the middle of stopping. The handler that was there is put
+    # back when the call returns, as a function owes its caller. A process that is about
+    # to end must not do that (see :func:`serve_review`).
     stop = threading.Event()
     in_main = threading.current_thread() is threading.main_thread()
     earlier: Any = signal.signal(signal.SIGTERM, lambda *_: stop.set()) if in_main else None
     try:
-        try:
-            _say(f"Rating app: {app.url} (Ctrl-C to stop)")
-            _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")
-            if open_browser:
-                with suppress(webbrowser.Error):
-                    webbrowser.open(app.url)
-            with suppress(KeyboardInterrupt):
-                while app.handle.running and not stop.wait(0.2):
-                    pass
-        finally:
-            app.stop()
-        try:
-            progress = _progress_of(run.run_dir, rater)
-        except Exception:  # a closing line is not worth a traceback after the work is saved
-            logger.debug("no closing line", exc_info=True)
-            progress = None
-        if progress is not None:
-            rated, left = progress
-            _say(
-                f"{rated} rated, {left} to go. Run the same command to continue. "
-                f"Export: surfcensus export --run-dir {run.run_dir}"
-            )
+        serve_review(run, app, rater=rater, open_browser=open_browser, stop=stop)
     finally:
         if in_main and earlier is not None:
             signal.signal(signal.SIGTERM, earlier)
     return run
+
+
+def serve_review(
+    run: Run,
+    app: ReviewApp,
+    *,
+    rater: str | None = None,
+    open_browser: bool = True,
+    stop: threading.Event | None = None,
+) -> None:
+    """The second half of :func:`review`, for the run and the running app that
+    :func:`open_review` returned: name the address, open the browser, wait, stop the app
+    and say how far the rater got.
+
+    The wait ends at Ctrl-C, when the server ends, and when ``stop`` is set. The call sets
+    no signal handler: whoever wants SIGTERM to stop the app sets ``stop`` from a handler
+    of its own, as :func:`review` does for the length of its call. The command line keeps
+    its handler until the process ends, because a handler that is taken away after the
+    closing line leaves a moment in which a SIGTERM that comes late (a process manager
+    that signals a whole group, a wrapper that passes the signal on) kills a command that
+    had stopped in order. The server is stopped first, then the renderer, which finishes
+    the batch it is on.
+    """
+    stop = threading.Event() if stop is None else stop
+    try:
+        _say(f"Rating app: {app.url} (Ctrl-C to stop)")
+        _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")
+        if open_browser:
+            with suppress(webbrowser.Error):
+                webbrowser.open(app.url)
+        with suppress(KeyboardInterrupt):
+            while app.handle.running and not stop.wait(0.2):
+                pass
+    finally:
+        app.stop()
+    try:
+        progress = _progress_of(run.run_dir, rater)
+    except Exception:  # a closing line is not worth a traceback after the work is saved
+        logger.debug("no closing line", exc_info=True)
+        progress = None
+    if progress is not None:
+        rated, left = progress
+        _say(
+            f"{rated} rated, {left} to go. Run the same command to continue. "
+            f"Export: surfcensus export --run-dir {run.run_dir}"
+        )

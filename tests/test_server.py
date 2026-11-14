@@ -2908,6 +2908,30 @@ def test_serve_prints_the_url_opens_the_browser_and_stops_at_sigterm(
     assert opened == [] and signal.getsignal(signal.SIGTERM) is earlier
 
 
+def test_serve_with_a_stop_event_leaves_sigterm_to_its_caller(
+    app_run: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    earlier = signal.getsignal(signal.SIGTERM)
+    stop = threading.Event()
+    during: list[object] = []
+
+    def stop_when_it_listens() -> None:
+        deadline = time.monotonic() + 30
+        while "Rating app: " not in capsys.readouterr().err and time.monotonic() < deadline:
+            time.sleep(0.01)
+        during.append(signal.getsignal(signal.SIGTERM))
+        stop.set()
+
+    stopper = threading.Thread(target=stop_when_it_listens)
+    stopper.start()
+    with interrupted_if_it_waits_on() as waited_on:
+        serve(app_run, port=0, open_browser=False, stop=stop)  # returns because of the event
+    stopper.join()
+    assert not waited_on
+    # no handler of its own, at any time: the caller's handler sets the event
+    assert during == [earlier] and signal.getsignal(signal.SIGTERM) is earlier
+
+
 def test_serve_stops_at_ctrl_c(app_run: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     ports: list[int] = []
 

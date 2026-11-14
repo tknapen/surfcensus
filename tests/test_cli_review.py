@@ -354,7 +354,16 @@ def test_the_app_of_a_review_stops_at_ctrl_c_and_at_sigterm(
         review_process.send_signal(stop_with)
     # read on from the stream the first lines came from: it has read ahead
     assert review_process.stderr is not None and review_process.stdout is not None
-    err = review_process.stderr.read()
+    err = ""
+    if stop_with == signal.SIGTERM:
+        # and a third comes late, when the closing line is out and the command is about to
+        # end: with the default handler back in place by then, it killed the command
+        while "to go." not in err:
+            line = review_process.stderr.readline()
+            assert line, f"no closing line:\n{err}"
+            err += line
+        review_process.send_signal(stop_with)
+    err += review_process.stderr.read()
     out = review_process.stdout.read()
     assert review_process.wait(timeout=60) == 0, err
     assert out == ""
@@ -366,6 +375,141 @@ def test_the_app_of_a_review_stops_at_ctrl_c_and_at_sigterm(
     assert "Traceback" not in err
     with pytest.raises(httpx.TransportError), httpx.Client(trust_env=False) as client:
         client.get(url + "healthz")
+
+
+# The handler of the commands that serve, without a process: the functions behind the
+# commands are replaced by ones that send this process a SIGTERM where a real one arrives.
+
+
+@pytest.fixture
+def sigterm_restored() -> Iterator[None]:
+    """A command that was stopped by SIGTERM keeps its handler, for a process that is about
+    to end. The test process goes on, and gets back the handler it had."""
+    earlier = signal.getsignal(signal.SIGTERM)
+    yield
+    signal.signal(signal.SIGTERM, earlier)
+
+
+class _NoRun:
+    run_dir = Path("nowhere")
+
+    def __enter__(self) -> _NoRun:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        return None
+
+
+def _sigterm_to_self() -> None:
+    os.kill(os.getpid(), signal.SIGTERM)
+    time.sleep(0.01)  # the handler runs in this thread, at the next instruction
+
+
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_a_sigterm_after_the_app_has_stopped_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+) -> None:
+    from surfcensus import review as reviewing
+
+    earlier = signal.getsignal(signal.SIGTERM)
+    seen: list[object] = []
+
+    def served(run: object, app: object, *, stop: Any, **options: object) -> None:
+        assert not stop.is_set()
+        _sigterm_to_self()  # stops the app in order: no exit from the handler
+        assert stop.is_set()
+        _sigterm_to_self()  # a second one while it stops
+        seen.append(signal.getsignal(signal.SIGTERM))
+
+    monkeypatch.setattr(reviewing, "open_review", lambda *a, **k: (_NoRun(), object()))
+    monkeypatch.setattr(reviewing, "serve_review", served)
+    monkeypatch.setattr(reviewing, "rateable", lambda run: 1)
+    result = cli("review", "nowhere", "--no-browser")
+    assert result.exit_code == 0, result.output
+    # the handler of the command is still there when the command has returned, and takes
+    # a signal that comes now: the default, which was back at this point, ends the process
+    handler = signal.getsignal(signal.SIGTERM)
+    assert seen == [handler] and handler is not earlier and callable(handler)
+    _sigterm_to_self()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_a_sigterm_while_a_review_prepares_ends_it_once(
+    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+) -> None:
+    from surfcensus import review as reviewing
+
+    earlier = signal.getsignal(signal.SIGTERM)
+    undone: list[str] = []
+
+    def preparing(*args: object, **options: object) -> None:
+        try:
+            _sigterm_to_self()
+            raise AssertionError("the first SIGTERM did not end the preparation")
+        finally:
+            _sigterm_to_self()  # a second one while the first is being acted on
+            undone.append("cleaned up")
+
+    monkeypatch.setattr(reviewing, "open_review", preparing)
+    result = cli("review", "nowhere", "--no-browser")
+    assert result.exit_code == 143 and undone == ["cleaned up"]
+    assert signal.getsignal(signal.SIGTERM) is not earlier
+    _sigterm_to_self()
+
+
+def test_a_review_that_serves_nothing_puts_the_sigterm_handler_back(
+    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+) -> None:
+    from surfcensus import review as reviewing
+
+    earlier = signal.getsignal(signal.SIGTERM)
+    during: list[object] = []
+
+    def nothing_served(*args: object, **options: object) -> tuple[_NoRun, None]:
+        during.append(signal.getsignal(signal.SIGTERM))
+        return _NoRun(), None
+
+    monkeypatch.setattr(reviewing, "open_review", nothing_served)
+    monkeypatch.setattr(reviewing, "rateable", lambda run: 1)
+    result = cli("review", "nowhere", "--no-serve")
+    assert result.exit_code == 0, result.output
+    assert during[0] is not earlier and signal.getsignal(signal.SIGTERM) is earlier
+
+    def refused(*args: object, **options: object) -> None:
+        raise ConfigError("invalid", "no")
+
+    monkeypatch.setattr(reviewing, "open_review", refused)
+    assert cli("review", "nowhere", "--no-serve").exit_code == 2
+    assert signal.getsignal(signal.SIGTERM) is earlier
+
+
+@pytest.mark.skipif(os.name == "nt", reason="signals of a POSIX system")
+def test_a_sigterm_after_serve_has_stopped_changes_nothing(
+    monkeypatch: pytest.MonkeyPatch, sigterm_restored: None
+) -> None:
+    import surfcensus.app.server as server
+
+    earlier = signal.getsignal(signal.SIGTERM)
+
+    def served(run_dir: object, *, stop: Any, **options: object) -> None:
+        _sigterm_to_self()
+        assert stop.is_set()
+
+    monkeypatch.setattr(server, "serve", served)
+    result = cli("serve", "--run-dir", "nowhere", "--mode", "local", "--no-browser")
+    assert result.exit_code == 0, result.output
+    assert signal.getsignal(signal.SIGTERM) is not earlier
+    _sigterm_to_self()
+
+    # a serve that is refused has served nothing, and the handler is put back
+    signal.signal(signal.SIGTERM, earlier)
+
+    def refused(run_dir: object, **options: object) -> None:
+        raise ConfigError("invalid", "no")
+
+    monkeypatch.setattr(server, "serve", refused)
+    result = cli("serve", "--run-dir", "nowhere", "--mode", "local", "--no-browser")
+    assert result.exit_code == 2 and signal.getsignal(signal.SIGTERM) is earlier
 
 
 # --- serve ----------------------------------------------------------------------------------------

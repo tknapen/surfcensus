@@ -139,6 +139,55 @@ def _terminated_like_interrupted() -> Iterator[None]:
             signal.signal(signal.SIGTERM, before)
 
 
+class _StopSignals:
+    """SIGTERM for a command that serves the rater app, from its start to the end of the
+    process.
+
+    While the command prepares (``serving`` is false), the first SIGTERM ends it as it
+    ends a phase command: ``SystemExit(143)``, so that a render removes its temporary
+    files. Once the app runs, SIGTERM sets ``stop``, which ends the serving in order: the
+    server, the batch the renderer is on, the closing line, the exit code of the work.
+    Every later SIGTERM changes nothing, whenever it comes.
+    """
+
+    def __init__(self) -> None:
+        self.stop = threading.Event()
+        self.serving = False
+
+    def __call__(self, signum: int, frame: object) -> None:
+        first = not self.stop.is_set()
+        self.stop.set()
+        if first and not self.serving:
+            raise SystemExit(128 + signum)
+
+
+@contextmanager
+def _stop_signals() -> Iterator[_StopSignals]:
+    """Handle SIGTERM with a :class:`_StopSignals` for a command that serves the app.
+
+    After a SIGTERM, and after the app was served to its end, the handler is not taken
+    away again: the process is about to end, and with the default back in place a SIGTERM
+    that comes a moment late (a process manager that signals a whole group, a wrapper
+    that passes the signal on) killed a command that had stopped in order and printed its
+    closing line. A stop that hangs is ended with Ctrl-C or SIGKILL. In every other case
+    (nothing was served, or the command was refused) the earlier handler is put back, so
+    a caller in the same process, such as a test, keeps its own.
+    """
+    signals = _StopSignals()
+    if threading.current_thread() is not threading.main_thread():
+        yield signals  # signal handlers can only be set from the main thread
+        return
+    before = signal.signal(signal.SIGTERM, signals)
+    served = False
+    try:
+        yield signals
+        served = signals.serving
+    finally:
+        # None: a handler that was not set from Python, which cannot be put back
+        if not (served or signals.stop.is_set()) and before is not None:
+            signal.signal(signal.SIGTERM, before)
+
+
 class _RelocateCommand(TyperCommand):
     """``--relocate`` takes an optional value, which typer cannot declare: a ``--relocate``
     that no value follows is given one that stands for "the run's one local source"."""
@@ -749,8 +798,8 @@ def review_command(
     with _app_stops_with_exit_2():
         if not no_serve:
             import surfcensus.app.server  # noqa: F401  (before the work, not after it)
-        with _interrupted_is_exit_130(), _terminated_like_interrupted():
-            run = reviewing.review(
+        with _interrupted_is_exit_130(), _stop_signals() as signals:
+            run, served = reviewing.open_review(
                 path,
                 run_dir=run_dir,
                 subjects=subjects,
@@ -762,12 +811,16 @@ def review_command(
                 fsaverage=fsaverage,
                 video=video,
                 port=port,
-                open_browser=not no_browser,
                 serve=not no_serve,
                 serve_after=serve_after,
                 relocate=relocate,
                 force=force,
             )
+            if served is not None:
+                signals.serving = True  # from here SIGTERM stops the app in order
+                reviewing.serve_review(
+                    run, served, rater=rater, open_browser=not no_browser, stop=signals.stop
+                )
         with run:
             nothing = reviewing.rateable(run) == 0
             if no_serve and not nothing:
@@ -802,14 +855,17 @@ def serve_command(
 
         if mode is None:
             mode = "local" if load_config(run_dir).mode == "local" else "team"
-        serve(
-            run_dir,
-            host=host,
-            port=port,
-            mode="local" if mode == "local" else "team",
-            rater=rater,
-            open_browser=not no_browser,
-        )
+        with _stop_signals() as signals:
+            signals.serving = True  # nothing to undo before the app: SIGTERM only stops it
+            serve(
+                run_dir,
+                host=host,
+                port=port,
+                mode="local" if mode == "local" else "team",
+                rater=rater,
+                open_browser=not no_browser,
+                stop=signals.stop,
+            )
 
 
 @app.command(
