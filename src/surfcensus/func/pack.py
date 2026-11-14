@@ -27,6 +27,7 @@ and is only quantised. Nothing else is done to either.
 from __future__ import annotations
 
 import hashlib
+import math
 import os
 import re
 import secrets
@@ -36,7 +37,7 @@ from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import nibabel as nib
 import numpy as np
@@ -79,6 +80,7 @@ from surfcensus.func.model import (
 )
 from surfcensus.func.packread import inflate_checked, stream_bytes
 from surfcensus.records import (
+    IDENTITY4,
     NO_BRAIN_MASK,
     NO_PREPROCESSED_SERIES,
     NO_RAW_SERIES,
@@ -86,6 +88,7 @@ from surfcensus.records import (
     VOLUME_COUNTS_DIFFER,
     FrameDisplacement,
     Grid,
+    Matrix4,
     PlaneContours,
     RunPackInput,
     SessionPlan,
@@ -385,85 +388,31 @@ def _sd(sums: np.ndarray, squares: np.ndarray, n_steady: int) -> np.ndarray:
     return np.sqrt(np.maximum(squares - sums**2 / n_steady, 0.0) / (n_steady - 1))
 
 
-def _run_statistics(run: RunPackInput) -> tuple[_Checked, np.ndarray, np.ndarray]:
-    """For the session's windows, from one read of every volume of the preprocessed series:
-    the masked values of the volumes 0, 10, 20, ... (float32, volume after volume) and the
-    temporal SD over the steady-state volumes inside the mask (float64). The SD is computed by
-    the same operations, in the same order, as the SD still of :func:`pack_run`, so that the
-    window and the still agree bit for bit."""
-    checked = _check(run)
-    shape = tuple(int(x) for x in run.grid.shape)
-    sub = set(range(0, checked.n, WINDOW_STEP))
-    values = np.empty((len(sub), int(checked.mask.sum())), np.float32)
-    sums = np.zeros(shape, np.float64)
-    squares = np.zeros(shape, np.float64)
-    row = 0
-    for t, vol in enumerate(_pre(run, range(checked.n))):
-        if t in sub:
-            values[row] = vol[checked.mask]
-            row += 1
-        if checked.steady[t]:
-            v64 = vol.astype(np.float64)
-            sums += v64
-            squares += v64 * v64
-    sd = _sd(sums, squares, int(checked.steady.sum()))
-    return checked, values.ravel(), sd[checked.mask]
-
-
-def _windows(
-    stats: Sequence[tuple[np.ndarray, np.ndarray]],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    values = np.concatenate([v for v, _ in stats])
-    # the values of stage 1's np.stack, partitioned in place instead of copied
-    hi = float(np.percentile(values, PERCENTILE, overwrite_input=True))
-    if not hi > 0:
-        raise PackError(PACK_FAILURE, "the preprocessed series has no signal inside the mask")
-    sd_hi = float(np.percentile(np.concatenate([s for _, s in stats]), PERCENTILE))
-    return (0.0, hi), (0.0, sd_hi if sd_hi > 0 else 1.0)
-
-
-def session_windows(
-    runs: Sequence[RunPackInput],
-) -> tuple[tuple[float, float], tuple[float, float]]:
-    """The one 8-bit window of a session and the one window of its SD stills (decision D38):
-    ``(0, the 99.5th percentile)`` of the preprocessed series of all the runs, each inside
-    its brain mask, over the volumes 0, 10, 20, ... of each run, pooled; and of the temporal
-    SD of the preprocessed series over each run's steady-state volumes inside its mask,
-    pooled (1 in place of a percentile of 0). Both are used for both streams of every run, so
-    that a run brighter or darker than the one before is seen as it is. For one run they are
-    stage 1's window and SD window of that run.
-
-    Reads every volume of each preprocessed series once, one at a time, and holds the masked
-    values of the volumes 0, 10, 20, ... and the masked SD of every run (about 0.4 bytes per
-    masked voxel and volume, and 8 bytes per masked voxel and run). Raises
-    :class:`PackError` for the first run that cannot be packed."""
-    if not runs:
-        raise ValueError("a session window needs at least one run")
-    return _windows([_run_statistics(r)[1:] for r in runs])
-
-
-def pack_run(
-    session_dir: Path,
-    run: RunPackInput,
-    config: EpiConfig,
-    window: tuple[float, float] | None = None,
-    sd_window: tuple[float, float] | None = None,
-) -> PackInfo:
+def pack_run(session_dir: Path, run: RunPackInput, config: EpiConfig) -> PackInfo:
     """Write ``<session_dir>/<run.run>/`` (the streams, the stills, ``traces.json`` and
     ``pack.json`` last) and return what ``pack.json`` holds. Raises :class:`PackError` for a
     run that turns out not to be packable (``volume counts differ``, ``no brain mask`` for an
     empty mask or one off the grid).
 
-    ``window`` and ``sd_window`` are the session's (:func:`session_windows`); both None packs
-    the run as a session of its own. A window that changes, because a run of the session was
-    added or removed, changes every pack of the session.
+    The run is stored under its own window, ``(0, the 99.5th percentile of its preprocessed
+    series inside its brain mask over the volumes 0, 10, 20, ...)``, for both streams, and its
+    SD stills under their own (0 to the 99.5th percentile of the temporal SD of the
+    preprocessed series inside the mask): the most of each run in 8 bits. Both are recorded
+    exactly (``PackInfo.window``, ``sd_window``), so that the page can show the stream of a
+    subject under one common scale as well (``func.packread.byte_values``; decision D38).
 
-    The volumes 0, 10, 20, ... of both streams are read once for the reference volume of
-    each stream (the rounded mean of their 8-bit values); then every volume of both streams is
-    read once, the chunks are written as they fill and the steady-state volumes are added to
-    the sums of the stills. What is held: one volume of each stream, the float64 sums and
-    squares (32 bytes per voxel and stream), and the chunk being filled (at most
-    ``chunk_bytes`` per stream).
+    Two passes over the volumes, as in stage 1. The first reads the volumes 0, 10, 20, ... of
+    the preprocessed series twice (once for the window, once for the reference volume of each
+    stream, which is quantised under the window) and those of the raw stream once. The second
+    reads every volume of both streams once, writes the chunks as they fill and adds the
+    steady-state volumes to the sums of the stills. What is held: one volume of each stream,
+    the float64 sums and squares (32 bytes per voxel and stream), the chunk being filled (at
+    most ``chunk_bytes`` per stream), and the masked values of the volumes 0, 10, 20, ... of
+    the preprocessed series for the percentile (0.4 bytes per masked voxel and volume).
+
+    The pack is the tool's display cache: 8-bit values of the existing files on the grid of
+    the preprocessed series, in the run directory or the ``--out`` directory. It writes no
+    image volume, and nothing into or beside the data, and can be deleted and made again.
 
     Everything is written into a hidden directory ``.<run>.<16 hex>.tmp`` in ``session_dir``,
     ``pack.json`` last, and moved to ``<session_dir>/<run>`` under the ``flock`` of
@@ -473,20 +422,25 @@ def pack_run(
     for the digest when they are there, so :func:`pack_session` writes them first.
     """
     session_dir = Path(session_dir)
-    if (window is None) != (sd_window is None):
-        raise ValueError("give both windows of the session, or neither")
-    if window is None or sd_window is None:
-        window, sd_window = session_windows([run])
-    if not window[1] > window[0] or not sd_window[1] > sd_window[0]:
-        raise ValueError(f"not a window: {window}, {sd_window}")
     checked = _check(run)
-    n, steady, non_steady = checked.n, checked.steady, checked.non_steady
+    n, mask, steady, non_steady = checked.n, checked.mask, checked.steady, checked.non_steady
     motion = run.motion
     shape = tuple(int(x) for x in run.grid.shape)
     inputs = _inputs(run.files)
     k_chunk = chunk_volumes(int(np.prod(shape)), config.chunk_bytes)
     portable = config.portable_voxel_map
 
+    # pass A, the volumes 0, 10, 20, ...: the window of the run and the reference volumes
+    sub = list(range(0, n, WINDOW_STEP))
+    values = np.empty((len(sub), int(mask.sum())), np.float32)
+    for row, vol in enumerate(_pre(run, sub)):
+        values[row] = vol[mask]
+    # the values of stage 1's np.stack, partitioned in place instead of copied
+    hi = float(np.percentile(values, PERCENTILE, overwrite_input=True))
+    del values
+    if not hi > 0:
+        raise PackError(PACK_FAILURE, "the preprocessed series has no signal inside the mask")
+    window = (0.0, hi)
     # the volumes 0, 10, 20, ...: the reference volume of each stream
     sub = list(range(0, n, WINDOW_STEP))
     ref_sum = {s: np.zeros(shape, np.float64) for s in STREAMS}
@@ -539,6 +493,8 @@ def pack_run(
         mean = {s: sums[s] / n_steady for s in STREAMS}
         sd = {s: _sd(sums[s], squares[s], n_steady) for s in STREAMS}
         del sums, squares
+        sd_hi = float(np.percentile(sd["pre"][mask], PERCENTILE))
+        sd_window = (0.0, sd_hi if sd_hi > 0 else 1.0)
         stills: dict[str, dict[str, bytes]] = {
             s: {
                 "ref": volume_bytes(ref[s]),
@@ -834,41 +790,42 @@ def _remove_run_dir(session_dir: Path, run: str) -> None:
             shutil.rmtree(path)
 
 
-def slice_offsets(
-    grid: Grid, origin: Grid
-) -> tuple[dict[str, Literal["x", "y", "z"]], dict[str, tuple[float, ...]]]:
-    """Per plane of ``grid``, the world axis nearest the plane's normal and, for each slice,
-    the world coordinate along that axis of the slice's centre minus that of the centre of
-    ``origin`` (the session's first grid), in mm rounded to 1e-6 (``GridInfo.slice_mm``).
+def slice_planes(
+    grid: Grid, display_to_anat: Matrix4 = IDENTITY4
+) -> tuple[dict[str, tuple[float, float, float]], dict[str, tuple[float, ...]]]:
+    """Per plane of ``grid``, the unit normal of its slices in the anatomy's world (RAS,
+    pointing the way the slice index grows) and, for each slice, the signed distance of the
+    slice plane from the origin of the anatomy's world along that normal, in mm
+    (``GridInfo.slice_normal`` and ``GridInfo.slice_mm``), rounded to 1e-6.
 
-    Plane ``n`` cuts voxel axis ``n``; its normal is row ``n`` of the inverse of the 3x3 part
-    of the grid's affine, and the nearest world axis is the one where that row is largest in
-    magnitude (the first of equal ones). The centre of slice ``k`` is the voxel with ``k``
-    along axis ``n`` and the middle of the grid along the other two. For a grid along the
-    world axes the offset is the slice plane's own coordinate; for an oblique grid it is where
-    the slice's centre lies along the axis, which moves by the voxel size times the cosine of
-    the tilt per slice. Computed in Python floats in a fixed order."""
-    a = [[float(x) for x in row] for row in grid.affine]
-    o = [[float(x) for x in row] for row in origin.affine]
-    normals = np.linalg.inv(np.asarray(a)[:3, :3])
-    middle = [(int(x) - 1) / 2 for x in grid.shape]
-    o_middle = [(int(x) - 1) / 2 for x in origin.shape]
-    o_centre = [sum(o[i][j] * o_middle[j] for j in range(3)) + o[i][3] for i in range(3)]
-    axes: dict[str, Literal["x", "y", "z"]] = {}
-    offsets: dict[str, tuple[float, ...]] = {}
-    names: tuple[Literal["x", "y", "z"], ...] = ("x", "y", "z")
+    Plane ``n`` is the plane of voxel coordinate ``n`` equal to ``k``. With ``A = P . G``
+    (display voxel to the anatomy's world) and ``g`` row ``n`` of the 3x3 part of ``A^-1``
+    and ``c`` its translation, the plane is ``g . x = k - c``; the normal is ``g / |g|`` and the
+    distance ``(k - c) / |g|``. The origin is a point of the anatomy, the same for every grid
+    and every session of a subject that share the anatomy's world, so a plane on one grid and a
+    plane on another, of another run or session, are compared by these numbers alone. For a
+    grid along the world axes the normal is an axis and the distance the plane's coordinate
+    (negated for an axis that runs backwards); for an oblique grid the normal is tilted and the
+    numbers stay exact: the three planes of the slices on screen meet in one point ``x`` with
+    ``normal_p . x = distance_p``, and on another grid the slice of plane ``p`` nearest to
+    that place is the one whose distance is nearest ``normal'_p . x``. Computed with
+    ``geometry.compose`` and ``geometry.inverse``, in Python floats."""
+    inv = geometry.inverse(geometry.compose(display_to_anat, grid.affine))
+    normals: dict[str, tuple[float, float, float]] = {}
+    distances: dict[str, tuple[float, ...]] = {}
     for n, plane in enumerate(PLANES):
-        row = [abs(float(x)) for x in normals[n]]
-        i = row.index(max(row))
-        axes[plane] = names[i]
-        values = []
-        for k in range(int(grid.shape[n])):
-            v = list(middle)
-            v[n] = float(k)
-            world = sum(a[i][j] * v[j] for j in range(3)) + a[i][3]
-            values.append(round(world - o_centre[i], 6) + 0.0)
-        offsets[plane] = tuple(values)
-    return axes, offsets
+        g = inv[n][:3]
+        c = inv[n][3]
+        length = math.sqrt(g[0] * g[0] + g[1] * g[1] + g[2] * g[2])
+        normals[plane] = (
+            round(g[0] / length, 6) + 0.0,
+            round(g[1] / length, 6) + 0.0,
+            round(g[2] / length, 6) + 0.0,
+        )
+        distances[plane] = tuple(
+            round((k - c) / length, 6) + 0.0 for k in range(int(grid.shape[n]))
+        )
+    return normals, distances
 
 
 def pack_session(
@@ -884,20 +841,20 @@ def pack_session(
     ``session.json`` last. A run that raises :class:`PackError` is listed in ``session.json``
     with its reason and the others are packed.
 
-    The session is one stream (decision D38): its packed runs one after the other in the
-    order of ``plan.runs`` (acquisition order, the anchor first), each listed with its volumes,
-    its TR and the index of its first volume in the stream. One window for the whole session
-    (:func:`session_windows`) over the runs that can be packed; a run that fails while it is
-    packed is left out of the window, which is then computed again and the runs packed
-    before it are packed again, so that every pack of the session has the window of the runs
-    that are packed. So adding or removing a run of a session changes every pack of it.
-
-    Runs on different grids are packed as groups, one per grid of ``plan.grids``, each with
-    its own contours, and each grid is listed with the offsets of its slices from the centre
-    of the first grid (:func:`slice_offsets`). A run of ``plan.runs`` without a reason that
+    The session is one stretch of the subject's stream (decision D38): its packed runs one
+    after the other in the order of ``plan.runs`` (acquisition order, the anchor first), each
+    listed with its volumes, its TR, the index of its first volume within the session, and its
+    own windows, from which the page makes the common scale of the stream. Runs on different
+    grids are packed as groups, one per grid of ``plan.grids``, each with its own contours,
+    and each grid is listed with its slice planes as normals and distances from the origin of
+    the anatomy (:func:`slice_planes`), so that the page keeps one place in the anatomy across
+    grids and sessions without the affine. A run of ``plan.runs`` without a reason that
     ``runs`` does not hold is listed as ``pack failure``. A run that is not packed loses a
     pack directory that an earlier call left. ``session.json`` is removed before anything is
     written and written again last, so it marks a session whose every pack is in place.
+
+    Like :func:`pack_run`, this writes the tool's display cache only, under ``out_dir``: no
+    image volume, and nothing into or beside the data.
     """
     if not re.fullmatch(ID_PATTERN, session_id):
         raise ValueError(f"not a session id: {session_id!r}")
@@ -916,40 +873,17 @@ def pack_session(
 
     given = {r.run: r for r in runs}
     reasons: dict[str, str] = {}
+    packs: dict[str, PackInfo] = {}
     for item in plan.runs:
         if item.reason is not None:
             reasons[item.run] = item.reason
         elif item.run not in given:
             reasons[item.run] = PACK_FAILURE
-    stats: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-    for item in plan.runs:
-        if item.run not in reasons:
+        else:
             try:
-                stats[item.run] = _run_statistics(given[item.run])[1:]
+                packs[item.run] = pack_run(session_dir, given[item.run], config)
             except PackError as err:
                 reasons[item.run] = err.reason
-    packs: dict[str, PackInfo] = {}
-    windows: tuple[tuple[float, float], tuple[float, float]] | None = None
-    while stats:
-        try:
-            windows = _windows(list(stats.values()))
-        except PackError as err:
-            reasons.update({run: err.reason for run in stats})
-            stats.clear()
-            break
-        failed = False
-        for item in plan.runs:
-            if item.run in stats and item.run not in packs:
-                try:
-                    packs[item.run] = pack_run(session_dir, given[item.run], config, *windows)
-                except PackError as err:
-                    reasons[item.run] = err.reason
-                    del stats[item.run]
-                    failed = True
-                    break
-        if not failed:
-            break
-        packs.clear()  # the window changed: every pack is made again under the new one
     for run in reasons:
         _remove_run_dir(session_dir, run)
 
@@ -972,6 +906,8 @@ def pack_session(
                 n_volumes=None if pack is None else pack.n_volumes,
                 tr_s=None if pack is None else pack.tr_s,
                 first=None if pack is None else first,
+                window=None if pack is None else pack.window,
+                sd_window=None if pack is None else pack.sd_window,
             )
         )
         if pack is not None:
@@ -988,10 +924,11 @@ def pack_session(
             portable_voxel_map=config.portable_voxel_map,
         )
     keys = [k for k in grid_keys if k in plan.grids]
+    to_anat = {g: given[r].display_to_anat for r, g in plan.grid_of.items() if r in given}
     grids = []
     for key in keys:
         grid = plan.grids[key]
-        axes, offsets = slice_offsets(grid, plan.grids[keys[0]])
+        normals, distances = slice_planes(grid, to_anat.get(key, IDENTITY4))
         files = contour_files[key]
         grids.append(
             GridInfo(
@@ -1001,8 +938,8 @@ def pack_session(
                 oblique_deg=geometry.oblique_deg(grid),
                 edge_letters=dict(geometry.edge_letters(grid)),
                 contours=None if files is None else dict(files),
-                slice_axis=axes,
-                slice_mm=offsets,
+                slice_normal=normals,
+                slice_mm=distances,
             )
         )
     label = plan.participant if plan.session is None else f"{plan.participant} ses-{plan.session}"
@@ -1013,8 +950,6 @@ def pack_session(
         config_hash=config.session_hash(),
         fd_threshold_mm=config.fd_threshold_mm,
         registration=registration,
-        window=None if not packs or windows is None else windows[0],
-        sd_window=None if not packs or windows is None else windows[1],
         grids=tuple(grids),
         runs=tuple(listed),
         contours_from=(

@@ -59,6 +59,7 @@ from surfcensus.records import (
     RawRun,
     RigidPath,
     RunEntities,
+    SessionPlan,
     Statement,
     to_matrix4,
 )
@@ -98,7 +99,7 @@ def _written(function: object, *args: object) -> bool:
         function(*args)  # pyrefly: ignore[not-callable]
     except NotImplementedError:
         return False
-    except Exception:  # noqa: BLE001  # written, and refusing this input
+    except Exception:  # written, and refusing this input
         return True
     return True
 
@@ -509,7 +510,9 @@ def expected_order(dataset: SyntheticFuncDataset, participant: str, ses: str | N
     return [r.stem for r in by_name]
 
 
-def plan_for(dataset: SyntheticFuncDataset, connector: object, participant: str, ses: str | None):  # noqa: ANN201
+def plan_for(
+    dataset: SyntheticFuncDataset, connector: object, participant: str, ses: str | None
+) -> tuple[SessionPlan, dict[str, str]]:
     mine = dataset.runs_of(participant, ses)
     deriv = [deriv_run(dataset, r) for r in mine]
     raw = [x for r in mine for x in raw_runs(dataset, r)]
@@ -618,7 +621,7 @@ def test_the_plan_with_the_fmriprep_connector(dataset: SyntheticFuncDataset) -> 
         ids,
         "sub-01",
     )
-    fake, fake_ids = plan_for(dataset, FakeConnector(dataset), "sub-01", "1")
+    fake, _ = plan_for(dataset, FakeConnector(dataset), "sub-01", "1")
     assert [r.name for r in plan.runs] == [r.name for r in fake.runs]
     assert [r.reason for r in plan.runs] == [r.reason for r in fake.runs]
     assert plan.anchor is not None and fake.anchor is not None

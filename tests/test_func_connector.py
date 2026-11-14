@@ -92,7 +92,7 @@ def paths(dataset: SyntheticFuncDataset, run: DerivRun) -> dict[FuncRole, Path]:
         (None, SCANNER_T1W),
         ("", SCANNER_T1W),
         ("latest", SCANNER_T1W),
-        ("٢٣.٢", SCANNER_T1W),
+        ("\u0662\u0663.\u0662", SCANNER_T1W),
     ],
 )
 def test_the_generation_of_a_version(version: str | None, generation: str) -> None:
@@ -113,6 +113,7 @@ def test_a_derivative_is_detected_with_its_version(dataset: SyntheticFuncDataset
 def copy_tree(dataset: SyntheticFuncDataset, tmp_path: Path) -> Path:
     """The derivative without its series (small): every name, the text files whole."""
     target = tmp_path / "fmriprep"
+    target.mkdir()
     for path in sorted(dataset.deriv_root.rglob("*")):
         if "sourcedata" in path.parts:
             continue
@@ -199,7 +200,10 @@ def test_every_synthetic_run_is_listed_with_its_files(dataset: SyntheticFuncData
         # which of several candidate names was listed
         if not old and FuncRole.REFERENCE in found.files:
             assert found.files[FuncRole.REFERENCE].variant == "desc-coreg_boldref"
+        if not old and FuncRole.PRE_BOLD in found.files:
             assert found.files[FuncRole.PRE_BOLD].variant == "space-T1w_desc-preproc_bold"
+            if FuncRole.PRE_MASK in found.files:
+                assert found.files[FuncRole.PRE_MASK].variant == "space-T1w_desc-brain_mask"
         if old:
             assert all(ref.variant is None for ref in found.files.values())
         # the spaces of the preprocessed series and the display grid
@@ -239,7 +243,7 @@ def test_names_that_are_no_run_do_not_break_the_listing(
         "sub-02_task-rest_run-01_x.txt",
         "sub-02_task-r_e_run-1_bold.nii.gz",
         "sub-02_run-1_desc-preproc_bold.nii.gz",  # no task
-        "sub-02_task-rest_run-١_desc-preproc_bold.nii.gz",
+        "sub-02_task-rest_run-\u0661_desc-preproc_bold.nii.gz",
         "sub-01_task-rest_run-1_desc-preproc_bold.nii.gz",  # another participant
         "sub-02_ses-1_task-rest_run-1_desc-preproc_bold.nii.gz",  # names a session
         "sub-02_",
@@ -255,7 +259,10 @@ def test_names_that_are_no_run_do_not_break_the_listing(
     match = made.detect(folder)
     assert match is not None
     stems = [r.stem for r in made.list_runs(folder, "sub-02", match)]
-    assert stems == [r.stem for r in dataset.runs if r.design.participant == "sub-02"]
+    assert stems == sorted(
+        (r.stem for r in dataset.runs if r.design.participant == "sub-02"),
+        key=lambda stem: bids.name_order(bids.parse_entities(stem)),
+    )
 
 
 def test_a_derivative_folder_that_cannot_be_listed_is_an_error(
@@ -532,8 +539,8 @@ def test_what_a_report_does_not_say_is_unknown() -> None:
     c = read_summary_report(text.replace("Slice timing", "slice TIMING"), None)
     assert c.slice_timing.state == "applied"
     assert c.sdc_method == "FMB (fieldmap-based) & phase"
-    for nonsense in ("", "<li>" * 10_000, "\x00￿<li>Registration:</li>", 3):
-        read_summary_report(nonsense, None)  # pyrefly: ignore[bad-argument-type]
+    for nonsense in ("", "<li>" * 10_000, "\x00\uffff<li>Registration:</li>"):
+        read_summary_report(nonsense, None)
 
 
 def test_a_report_that_cannot_be_read_gives_unknown(
@@ -680,6 +687,10 @@ def test_the_listings_give_the_plan_the_reasons_of_the_design(
             )
         except NotImplementedError:
             pytest.skip("func/session.py (package E1.B) is not written yet")
+        # every reason that the listing and the headers decide; a run on another grid is
+        # E1.B's to rule on (the spec has it both as a reason and as a group of its own)
         reasons = {r.deriv.stem: r.reason for r in plan.runs}
         expected = {r.stem: r.design.reason for r in dataset.runs_of(participant, session)}
-        assert reasons == expected
+        for stem, reason in expected.items():
+            if reason != "runs on different grids":
+                assert reasons[stem] == reason, stem

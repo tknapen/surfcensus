@@ -162,7 +162,9 @@ def test_the_kinds_that_are_read() -> None:
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
             "Parameters: 1.0", "Parameters: 1_0"
         ),
-        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace("Parameters: 1.0", "Parameters: \u0661"),
+        text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
+            "Parameters: 1.0", "Parameters: \u0661"
+        ),
         text_of([1e300, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [1e300, 0, 0]),  # overflows
         text_of([1.0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0], [0, 0, 0]).replace(
             "FixedParameters", "Fixed"

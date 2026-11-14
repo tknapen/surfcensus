@@ -52,7 +52,7 @@ def test_the_entities_of_a_name() -> None:
         "ses-1_sub-01_task-rest_bold",  # sub not first
         "sub-_task-rest_bold",  # empty label
         "sub-01_task-rest_run-a_bold",  # run is a number
-        "sub-01_task-rest_run-١_bold",  # an Arabic-Indic one is not an ASCII digit
+        "sub-01_task-rest_run-\u0661_bold",  # an Arabic-Indic one is not an ASCII digit
         "sub-01_task-rest_echo-x_bold",
         "sub-01_task-rést_bold",  # labels are ASCII letters and digits
         "sub-01_task-rest_run-1234567890123456789_bold",  # at most 18 digits
@@ -66,7 +66,7 @@ def test_a_name_that_does_not_parse_is_no_run(name: str) -> None:
 def test_run_numbers_are_compared_as_numbers() -> None:
     assert bids.run_index("01") == bids.run_index("1") == 1
     assert bids.run_index("0010") == 10
-    for wrong in (None, "", "a", "1a", "١", "-1", "1" * 19):
+    for wrong in (None, "", "a", "1a", "\u0661", "-1", "1" * 19):
         assert bids.run_index(wrong) is None
     a = bids.parse_entities("sub-01_ses-1_task-rest_run-01_bold")
     b = bids.parse_entities("sub-01_ses-1_task-rest_run-1_desc-preproc_bold")
@@ -129,7 +129,7 @@ def test_acquisition_times() -> None:
         "10:00:61",
         "2020-01-01",  # a date alone orders nothing
         "10:00",
-        "١:00:00",
+        "\u0661:00:00",
         "1" * 100,
         "2020-13-01T10:00:00",
     ):

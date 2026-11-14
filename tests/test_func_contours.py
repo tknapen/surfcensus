@@ -11,6 +11,7 @@ not zero, so a chain that skips ``T1.mgz`` or turns a transform round is off by 
 from __future__ import annotations
 
 import struct
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -67,7 +68,8 @@ def test_the_surfaces_in_display_voxels_are_the_closed_form(
 
 def test_each_link_of_the_chain_matters(dataset: SyntheticFuncDataset, surfaces: dict) -> None:
     """With each transform of the chain left out or turned round, the vertices lie more than
-    a tenth of a voxel (0.8 mm) from where the chain puts them: the test above would see every such error."""
+    a tenth of a voxel (0.8 mm) from where the chain puts them: the test above would see
+    every such error."""
     subject = dataset.subjects["sub-01"]
     tkr = read_surface(subject.path / "surf" / "lh.pial").vertices
     got = surfaces["lh.pial"][0]
@@ -179,12 +181,12 @@ def test_chain_joins_segments_into_lines() -> None:
     assert contours.chain(np.zeros((0, 2, 2), np.int64)) == []
 
 
-def test_a_missing_surface_is_named(dataset: SyntheticFuncDataset, tmp_path) -> None:  # noqa: ANN001
+def test_a_missing_surface_is_named(dataset: SyntheticFuncDataset, tmp_path: Path) -> None:
     import shutil
 
     copy = tmp_path / "sub-01"
     shutil.copytree(dataset.fs_subjects_dir / "sub-01", copy)
     (copy / "surf" / "rh.pial").unlink()
-    with pytest.raises(FileNotFoundError, match="surf/rh.pial") as error:
+    with pytest.raises(FileNotFoundError, match=r"surf/rh\.pial") as error:
         contours.surfaces_in_display(copy, to_matrix4(FSNATIVE_TO_T1W), GRID)
     assert str(tmp_path) not in str(error.value)
