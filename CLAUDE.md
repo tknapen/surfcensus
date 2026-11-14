@@ -2,6 +2,19 @@
 
 Project memory for Claude Code. Read this first; the detailed specs live in `docs/` and are imported below.
 
+## Governing purpose (Tomas, 2026-11-14)
+
+> "Yes, this is the governing purpose, to present people with a full quality control visualization tool that shows, perhaps even on one page, could be different pages, a surface segmentation quality control interface and a raw and pre-processed EPI movie interface. All of those exist for people to be able to judge visually the quality of acquisition and processing on a full session or multiple sessions of fMRI and MRI data."
+
+So the project is one quality-control visualization tool with two interfaces, and everything else serves it:
+
+- The surface interface: FreeSurfer white and pial surfaces over the T1 around the occipital pole, scored, rendered and rated. Built (milestones 1 to 4 and the quick start).
+- The EPI movie interface: the raw and the preprocessed EPI series of every run of a session as moving pictures on the same slices, with the surfaces as contours (its purpose statement is in the section "The functional viewer" below; decision D36). Built as a prototype outside the package (`prototypes/func_viewer/`); to be brought into the package and its app.
+- The unit a person looks at is a session, or several sessions, of one subject's MRI and fMRI data: the anatomy and its surfaces, and every functional run. What is judged by eye is the quality of the acquisition and of the processing.
+- Whether the two interfaces share one page or have pages of their own is open (his words leave both); the default of the build is one app with a page for each, linked per subject and session (decision D37).
+
+The census of public FreeSurfer derivatives, described below, is one use of the surface interface and the source of the paper's numbers. Where the census and the tool pull apart, the tool comes first.
+
 ## What this project is
 
 `surfcensus` is a pip-installable Python package that scores FreeSurfer reconstructions quantitatively, renders animated three-plane views around the occipital pole, and serves those renderings to human raters through a web app built for thousands of brains.
@@ -13,12 +26,12 @@ It has two uses with one pipeline (see `docs/architecture.md`):
 
 It is the surface-reconstruction arm of a paper on visualizing fMRI preprocessing quality. The paper's thesis is that people must look at their data. This package supplies the evidence for that thesis on the anatomical side: a census of how often FreeSurfer pial and white surfaces in shared public derivatives absorb the superior sagittal sinus, the transverse sinus, or the cerebellar tentorium near the occipital pole, and how often quantitative checks miss it.
 
-The scientific claims the package must support are:
+The scientific claims that the census must support are:
 
 1. Prevalence: the fraction of public FreeSurfer reconstructions with visible non-brain inclusion in occipital cortex, by dataset, field strength, FreeSurfer version, and T2/FLAIR-pial use.
 2. Detectability: how well cortical-thickness outlier scores, computed per vertex in fsaverage space, predict rater judgments, both per subject and per location (raters click-mark errors). In particular, the rate of rater-identified failures among subjects that look normal on the numbers: the blind spot of quantitative QC.
 
-Everything in the package serves one of these two numbers.
+Everything in the census serves one of these two numbers. The package as a whole serves the governing purpose above.
 
 ## The functional viewer: purpose and priority (Tomas, 2026-11-14)
 
