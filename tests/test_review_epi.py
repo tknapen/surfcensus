@@ -34,7 +34,7 @@ pytest.importorskip("fastapi")
 pytest.importorskip("sqlmodel")
 
 from surfcensus import review as reviewing
-from surfcensus.config import CONFIG_FILE, ConfigError, load_config, new_census_config
+from surfcensus.config import CONFIG_FILE, ConfigError, load_config
 from surfcensus.func import batch as fbatch
 from surfcensus.func.packread import read_pack
 from surfcensus.privacy import HashKey
@@ -231,6 +231,7 @@ def test_no_epi_makes_no_pack_and_is_stored_until_given_again(
     run = review(folder.raw_root, run_dir=run_dir, jobs=1, serve=False, epi=True)
     assert viewable(run) == 11 and pack_counts(run) == (11, 0, 0)
     run.close()
+    assert load_config(run_dir).epi.enabled  # pyrefly: ignore[missing-attribute]
 
 
 def test_epi_runs_selects_runs_is_stored_and_a_glob_that_matches_none_is_refused(
@@ -273,9 +274,7 @@ def test_raw_names_a_raw_dataset_that_the_rules_do_not_find(
     assert load_config(run_dir).epi.raw == str(ds.raw_root.resolve())  # pyrefly: ignore
     # a run directory in a participant folder of the raw dataset named is refused
     with pytest.raises(ConfigError, match="only read"):
-        review(
-            ds.deriv_root, run_dir=ds.raw_root / "sub-01" / "run", serve=False, raw=ds.raw_root
-        )
+        review(ds.deriv_root, run_dir=ds.raw_root / "sub-01" / "run", serve=False, raw=ds.raw_root)
     assert not (ds.raw_root / "sub-01" / "run").exists()
 
 
@@ -315,9 +314,12 @@ def test_a_folder_without_functional_data_is_told_and_stores_nothing_new(
     assert not (run_dir / EPI_DIR).exists()
     for table in ("func_sources", "func_participants", "func_sessions", "func_runs", "packs"):
         assert _rows(run_dir, f"SELECT COUNT(*) FROM {table}") == [(0,)]
-    # the same command again writes the same configuration
+    # the same command again writes the same configuration, also with --epi, which is the
+    # default and so writes no section
     before = (run_dir / CONFIG_FILE).read_bytes()
     review(folder.raw_root, run_dir=run_dir, jobs=1, serve=False).close()
+    assert (run_dir / CONFIG_FILE).read_bytes() == before
+    review(folder.raw_root, run_dir=run_dir, jobs=1, serve=False, epi=True).close()
     assert (run_dir / CONFIG_FILE).read_bytes() == before
 
 
@@ -331,10 +333,16 @@ def test_relocate_keeps_every_functional_identifier_and_packs_nothing(
     shutil.move(folder.root, moved)
     with pytest.raises(ConfigError):
         review(moved / "ds", run_dir=run_dir, serve=False)
+    # the move itself takes the functional roots along, before any inventory, so that a
+    # pack of the moved run reads the files at their new place
+    with Run(run_dir, local(moved / "ds"), relocate=True) as run:
+        roots = _rows(run_dir, "SELECT deriv_root, raw_root FROM func_sources")
+        assert roots == [(str(moved / "ds" / "derivatives" / "fmriprep"), str(moved / "ds"))]
+        shutil.rmtree(next((run_dir / EPI_DIR).glob("*/*/*/raw")))  # one pack to make again
+        report = run.pack()
+        assert (report.done, report.skipped, report.failed) == (1, 10, 0)
     run = review(moved / "ds", run_dir=run_dir, jobs=1, serve=False, relocate=True)
     assert sorted(_rows(run_dir, "SELECT run_uid, session_uid FROM func_runs")) == before
-    roots = _rows(run_dir, "SELECT deriv_root, raw_root FROM func_sources")
-    assert roots == [(str(moved / "ds" / "derivatives" / "fmriprep"), str(moved / "ds"))]
     report = run.pack()
     assert (report.done, report.skipped) == (0, 11)
     run.close()
@@ -355,9 +363,7 @@ def test_with_no_surface_to_render_the_app_opens_at_the_first_packed_session(
     packed = {p.parent.name for p in _packed_dirs(tmp_path / "run")}
     assert packed == {order[0]}  # one session: --serve-after counts sessions here
     app.stop()
-    run, app = open_review(
-        folder.raw_root, run_dir=tmp_path / "run", jobs=1, port=0, serve_after=0
-    )
+    run, app = open_review(folder.raw_root, run_dir=tmp_path / "run", jobs=1, port=0, serve_after=0)
     opened.append((run, app))
     assert app is not None and pack_counts(run) == (11, 0, 0) and not app.rendering
 
@@ -411,10 +417,8 @@ def test_a_second_rater_has_the_epi_pages_closed_until_done(
 
 
 def test_a_census_run_does_nothing_functional(folder: SyntheticFuncDataset, tmp_path: Path) -> None:
-    key = HashKey(b"k" * 32)
-    run = Run(
-        tmp_path / "census", local(folder.raw_root), config=new_census_config(key), key=key
-    )
+    key = HashKey(bytes(range(1, 33)), "dataset-key")
+    run = Run(tmp_path / "census", local(folder.raw_root), key=key)
     try:
         run.inventory()
         report = run.func_inventory()
@@ -444,8 +448,37 @@ def test_the_pack_of_a_run_equals_that_of_epi_session_on_the_same_folder(
         for pack_json in (out / sid).glob("*/pack.json"):
             info = read_pack(out / sid, pack_json.parent.name)
             assert info is not None
-            by_run[info.name if hasattr(info, "name") else pack_json.parent.name] = (
-                info.content_digest
-            )
+            by_run[info.run] = info.content_digest
     digests = {d for (d,) in _rows(run_dir, "SELECT content_digest FROM packs")}
     assert set(by_run.values()) <= digests and len(by_run) == 7
+
+
+def test_the_session_order_of_the_store_is_that_of_the_stream() -> None:
+    """``func_participants.session_order`` and step 1's ``StreamInfo.order`` name one rule."""
+    from surfcensus import store
+    from surfcensus.func import api, inventory
+
+    assert store.SESSION_ORDER == inventory.SESSION_ORDER == api.SESSION_ORDER
+
+
+def test_a_session_whose_contours_cannot_be_cut_has_no_contour_files_among_its_inputs(
+    folder: SyntheticFuncDataset, tmp_path: Path
+) -> None:
+    """As ``epi-session`` does: a pack without contours does not depend on the FreeSurfer
+    files (E2.Z, for the open point of E2.B and E2.C)."""
+    (folder.fs_subjects_dir / "sub-01" / "surf" / "lh.white").write_bytes(b"not a surface")
+    run_dir = tmp_path / "run"
+    run = review(folder.raw_root, run_dir=run_dir, jobs=1, serve=False, epi=True)
+    try:
+        assert pack_counts(run)[0] == 11
+    finally:
+        run.close()
+    for session_dir in (run_dir / EPI_DIR).glob("*/*"):
+        if not session_dir.is_dir():
+            continue
+        for pack_json in session_dir.glob("*/pack.json"):
+            info = read_pack(session_dir, pack_json.parent.name)
+            assert info is not None
+            bases = {item.base for item in info.inputs}
+            contours = list(session_dir.glob("contours/*/*.bin"))
+            assert ("freesurfer" in bases) == bool(contours), pack_json

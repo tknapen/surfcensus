@@ -501,7 +501,8 @@ def pack_session_unit(
     ``epi_dir``, ``config`` and ``keep``).
 
     Contours that cannot be cut (a FreeSurfer file that cannot be read) leave the session
-    without contours, with a warning, as ``surfcensus epi-session`` does; the runs are packed.
+    without contours, with a warning, and the files of the contours out of the inputs of its
+    packs, as ``surfcensus epi-session`` does; the runs are packed.
     A run whose inputs could not be read (``work.input_failures``) is listed as ``pack
     failure`` with its detail. An error of writing the display cache is raised as it is, for
     the parent to tell a full disk from a failure of the session."""
@@ -513,10 +514,24 @@ def pack_session_unit(
         raise ValueError(f"the work of session {work.session_uid} was handed in for {session_uid}")
     plan = work.plan
     contours = None
+    inputs = work.inputs
     if work.contours is not None and plan.grids:
         contours, note = cut_contours(work.contours, plan)
         if contours is None:
             _log.warning("session %s is packed %s", session_uid, note)
+            # as ``epi-session`` does: a pack without contours does not depend on the files
+            # of the contours, so they are not among its inputs (E2.Z)
+            inputs = tuple(
+                replace(
+                    item,
+                    session_inputs=tuple(
+                        entry
+                        for entry in item.session_inputs
+                        if entry[1] != "freesurfer" and entry[0] != "xfm_anat_fsnative"
+                    ),
+                )
+                for item in inputs
+            )
     if work.input_failures:
         plan = replace(plan, details={**plan.details, **work.input_failures})
     packable = {r.run for r in plan.runs if r.reason is None}
@@ -524,7 +539,7 @@ def pack_session_unit(
         Path(epi_dir) / work.participant_uid,
         session_uid,
         plan,
-        work.inputs,
+        inputs,
         contours,
         config,
         keep=keep.get(session_uid, frozenset()),

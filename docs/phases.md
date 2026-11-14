@@ -1,6 +1,6 @@
 # Phases of the search
 
-The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`, which also selects every subject; `surfcensus inventory`, `surfcensus metrics` and `surfcensus render` run the phases one at a time.
+The census proceeds through nine phases. Each phase has a defined input, output, and a check that must pass before the next phase runs at full scale. Local users run phases 2, 4, 6 and 7 implicitly through `surfcensus review`, which also selects every subject and, for a folder with functional data, lists the functional runs after phase 2 and packs them behind the app (step 2 of the EPI interface, `epi_interface.md`); `surfcensus inventory`, `surfcensus metrics` and `surfcensus render` run the phases one at a time.
 
 Cheap phases run on everything; expensive phases run on what the cheap phases select. The guiding cost asymmetry is that downloading and computing are cheap compared with rater time, so the pipeline spends compute freely to make every rated minute informative.
 
@@ -41,6 +41,8 @@ Input: `datasets`. Output: `subjects`, `files`.
 Exit check: number of complete subjects by source, FreeSurfer version, and T2/FLAIR-pial use. A second reportable number. Also decides whether the remaining phases fit in time and storage (Tier B 13 to 14 MB per subject, Tier B plus C 36 to 43 MB).
 
 Built (milestone 2) for local sources: `surfcensus inventory --run-dir DIR --source PATH`.
+
+Functional runs (step 2 of the EPI interface, not a phase of the census): in a local run, `inventory` and `review` follow the surface inventory with phase 2f, the functional inventory, which lists the fMRIPrep derivative and the raw BIDS dataset of the folder by rule and records participants, sessions and runs from listings, sidecars, reports, transforms, masks and headers, never a volume; its skip test is per session (`func_sessions.inventory_hash`). `review` then packs the functional sessions behind the app, after the surface renders, and `surfcensus pack` does it on its own (`epi_interface.md`, "Step 2 as built"). A census run does neither.
 
 ## Phase 3: enrichment
 

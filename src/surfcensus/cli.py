@@ -521,7 +521,11 @@ def _print_inventory(run: Run, source: Path | None = None) -> None:
         typer.echo(f"  {fetch}")
 
 
-@app.command("inventory", cls=_RelocateCommand)
+@app.command(
+    "inventory",
+    cls=_RelocateCommand,
+    short_help="List the subjects (phase 2), then the functional runs (phase 2f).",
+)
 def inventory(
     run_dir: Path = _RUN_DIR,
     source: Path | None = typer.Option(
@@ -758,7 +762,7 @@ def render(
     raise typer.Exit(1 if report.failed else 0)
 
 
-@app.command("pack")
+@app.command("pack", short_help="Pack the pending functional sessions of a run into epi/.")
 def pack(
     run_dir: Path = _RUN_DIR,
     jobs: int = typer.Option(1, "--jobs", min=1, metavar="J", help="Worker processes."),

@@ -144,6 +144,14 @@ The path is a BIDS dataset with an fMRIPrep derivative below `derivatives/`, the
 
 This is step 1 of the EPI interface (`docs/epi_interface.md`): one subject, no run directory, view only; nothing is rated. On the two runs of `ds000102` sub-01 (146 volumes each, 3 mm) the page was up 34 s after the command on one machine. Two independent reviews recomputed the packed values from the files and drove the page on real packs; no person has looked at a pack yet.
 
+### Both interfaces from one command
+
+```
+surfcensus review /path/to/bids_dataset
+```
+
+When the folder holds an fMRIPrep derivative with functional runs below `derivatives/` and the raw BIDS series beside it, `review` also lists the functional runs after the FreeSurfer subjects, says how many can be shown and why the others cannot, and, once the rating screen is up and the surfaces are rendered, packs the raw and preprocessed EPI series of every session behind the app. The app then offers the EPI movies at `/epi` (the address is printed as `EPI movies:`): one stream per participant over all runs and sessions, the same as `epi-session` shows. `--raw DIR` names a raw dataset that lies elsewhere, `--epi-runs GLOB` packs only the runs whose name matches, and `--no-epi` leaves the functional side out; all three are kept for later calls. `surfcensus pack --run-dir DIR` makes the packs of a run on its own. The packs are a display cache in the run directory; nothing is written into the data. A folder without functional data is reviewed exactly as before. This is step 2 of the EPI interface (`docs/epi_interface.md`, "Step 2 as built"); the subject pages, and functional data in `status` and `export`, are step 3. It was tested on synthetic folders and on `ds000102` sub-01; no person has looked at the result yet.
+
 ## Planned
 
 - The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.

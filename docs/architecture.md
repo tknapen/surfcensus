@@ -136,7 +136,7 @@ surfcensus/
       api.py               # three_plane(), render_subject()
       batch.py             # phase 6 for a run: pending subjects, the renders table, the check sample
       freeview.py          # optional backend, wraps the original gist approach
-    func/                  # the EPI movie interface, step 1 (docs/epi_interface.md)
+    func/                  # the EPI movie interface, steps 1 and 2 (docs/epi_interface.md)
       bids.py              # BIDS entities, run keys, raw series, sidecar inheritance
       itk.py               # ITK text transforms as RAS matrices
       connectors/          # what is specific to a pipeline; fmriprep.py is the one built
@@ -146,7 +146,10 @@ surfcensus/
       model.py             # session.json, pack.json, traces.json, stream.json
       pack.py              # the display cache: format epi-pack version 2
       packread.py          # a decoder of packs, for tests and checks
-      api.py               # find_folders, epi_subject, epi_session
+      api.py               # epi_subject, epi_session (surfcensus epi-session)
+      discover.py          # step 2: the derivative and the raw dataset of a run, the places that are read
+      inventory.py         # step 2: phase 2f (the functional inventory), the lease of a session, fetch lines
+      batch.py             # step 2: the pack phase of a run (epi/), its skip rule and its rows
     app/
       __init__.py          # the name of app.sqlite and of its tables, for code that reads it without the app's packages
       schemas.py           # the shapes of the API (pydantic only); RenderOut, the render a page receives
@@ -157,7 +160,7 @@ surfcensus/
       events.py            # interaction events
       finalize.py          # final labels and marks; unratable labels for failed renders; freezing a calibration set
       marks.py             # click -> voxel -> tkr/scanner RAS -> native vertex -> fsaverage6 vertex
-      epi.py               # a server for EPI packs alone (surfcensus epi-session --serve)
+      epi.py               # the EPI pages: a server for packs alone (epi-session --serve), and Packs, which the app of a run serves
       epi_schemas.py       # the shapes the EPI page receives
       static/              # vanilla JS + CSS, no build step, ships in the wheel
       templates/
@@ -205,7 +208,9 @@ surfcensus review PATH [--run-dir DIR] [--subjects GLOB]... [--rater NAME] [--bl
                        [--require-marks / --no-require-marks] [--field-strength T] [--jobs J]
                        [--fsaverage DIR] [--video / --no-video] [--port N] [--no-browser]
                        [--no-serve] [--serve-after N] [--relocate] [--force]
-    # inventory + metrics + scoring + render + serve, in one go
+                       [--raw DIR] [--epi / --no-epi] [--epi-runs GLOB]...
+    # inventory + functional inventory + metrics + scoring + render + serve, in one go;
+    # the EPI packs are made behind the app (docs/epi_interface.md, Step 2 as built)
 surfcensus serve    --run-dir DIR [--host H] [--port N] [--mode local|team] [--rater NAME] [--no-browser]
 surfcensus finalize --run-dir DIR
 surfcensus calibration freeze --run-dir DIR [--subject UID]... [--version V]
@@ -228,6 +233,7 @@ surfcensus epi-session PATH --subject LABEL --out DIR [--session LABEL]... [--ra
 - The same command again does the same steps with everything unchanged skipped: on two real subjects it is back at the app in 0.8 s (`rater_app.md`, what was measured). `--relocate` is for data that moved, as for `inventory`, and is refused while the stored root still holds its subjects in another subjects directory.
 - `--no-serve` renders every subject and stops; it needs no package of the app. `review` ends with exit code 1 only when no subject of the run can be rendered, with 2 for what stops a phase command, and with 0 otherwise, also when some subjects failed: those are named and are unratable.
 - `review` is for a local run with one source. A census run is refused; `serve` is the command for it (team mode, milestone 5).
+- Functional data (step 2 of the EPI interface, `epi_interface.md`, "Step 2 as built"). When the folder also holds an fMRIPrep derivative with functional runs and their raw BIDS dataset (found by rule from the surface source, or named with `--raw DIR`), `review` lists them after the surface inventory (phase 2f: listings, sidecars, reports, transforms, masks and headers, never a volume) and prints one block: where, how many runs in how many sessions of how many participants, how many can be packed and why the others cannot, the flagged runs and outlier anchors as statements about the raw data, and the fetch lines of functional files without content. The thread behind the app renders the remaining surfaces first and then packs the functional sessions into `epi/`, a batch of `--jobs` sessions at a time; the app offers the EPI index at `/epi` (address printed as `EPI movies:`), unblinded like `/review`. When no subject can be rendered and a run can be packed, the app opens at the first packed session and `--serve-after` counts sessions. The closing line says how many packs are made. `--raw`, `--no-epi` (and `--epi`) and `--epi-runs` are stored in the section `epi` of `config.yaml`, which is written only once it differs from the defaults, so a folder without functional data, or a call without these options, writes `config.yaml` as before. `review` ends with 1 only when nothing can be rendered and nothing packed.
 - `serve` starts the app on a run that is rendered and renders nothing; `finalize`, `calibration freeze` and `export` are described in `rater_app.md` and `phases.md`. An installation that lacks a package of the app (a stripped or broken one: the packages are dependencies) gets one line that names the package and `pip install surfcensus`, with exit code 2, before any work is done.
 
 Census (and power users), one subcommand per phase:
@@ -237,6 +243,8 @@ surfcensus key init   [--path FILE]          # create the dataset key (census on
 surfcensus discover   --run-dir DIR [--source openneuro-derivatives|openneuro-embedded]
 surfcensus inventory  --run-dir DIR [--source PATH] [--subjects GLOB]... [--field-strength T]
                       [--dataset ID]... [--force] [--relocate [PSEUDONYM]]
+                      [--raw DIR] [--epi / --no-epi] [--epi-runs GLOB]...
+surfcensus pack       --run-dir DIR [--jobs J] [--epi-runs GLOB]... [--force] [--retry-failed]
 surfcensus enrich     --run-dir DIR
 surfcensus metrics    --run-dir DIR [--stage regional|fsaverage|reference|score|native|merge]...
                       [--dataset ID]... [--jobs J] [--fsaverage DIR] [--retemplate]
@@ -253,7 +261,9 @@ surfcensus reference build --run-dir DIR --out reference/
 
 Every phase command is idempotent and resumable. It skips work whose outputs exist with a matching config hash, and accepts `--dataset` filters so Snakemake can parallelize per dataset. Remote concurrency is bounded (`remote.max_concurrency`, default 8) with exponential backoff on 5xx and S3 `SlowDown`.
 
-`inventory`, `render` and `status` (milestone 2) and `metrics` (milestone 3) are built, for local sources:
+`inventory`, `render` and `status` (milestone 2) and `metrics` (milestone 3) are built, for local sources, and `pack` (step 2 of the EPI interface), for local runs:
+
+- `inventory` runs the functional inventory (phase 2f) after the surface one when no `--dataset` is given, prints the functional block of `review` and a `func_inventory:` line, and ends with 1 when either has a failed unit. `pack` packs the pending functional sessions into `epi/`, with the exit codes and the signal handling of `render`; with nothing pending it builds no source, so it works with the data not mounted; a census run is refused (`epi_interface.md`, "Step 2 as built").
 
 - `inventory --source PATH` creates a local run in `DIR` when it holds none, and says which layout it found and where the subjects lie under the path (`D-3f9a1c07: FreeSurfer subjects found in derivatives/fmriprep/sourcedata/freesurfer (fMRIPrep layout, fMRIPrep 21.0.2)`; without `--source`, under the stored root; a census run, and a run with several sources, name layout and pipeline as the catalog has them), how many subjects are complete and have Tier A and Tier B files, their FreeSurfer versions, and which subjects lack what. On a run that exists, `--source` only says which source is meant: it must be the stored root, or come with `--relocate` when the data moved. Another root without `--relocate` is refused (`other root`) with what to give: `--relocate` when the stored root holds no subjects now or holds the same subjects in the same pipeline under another name, the stored root as the path when it holds the same subjects in another layout, and a run directory of its own when it holds subjects of another directory, which is another dataset. `--relocate` is refused while the stored root still holds subjects in another subjects directory than the new path (`invalid: --relocate: the data of this run are still where they were ...`): it would bind the run, its renders and ratings to other data under the same identifiers. A copy that the run should no longer read is moved or renamed first. `--relocate` replaces the stored root and, when the data now lies in another layout of the same pipeline (an fMRIPrep output moved from `sourcedata/freesurfer/` to the older `freesurfer/` beside `fmriprep/`), where the subjects are under it. Nothing else changes, so every `subject_uid`, render and rating stays; with several local sources it takes the pseudonym of the dataset that moved. Data that an inventory finds in the layout of another pipeline (a subjects directory that became an fMRIPrep output) is a new set of subjects with new identifiers: the earlier ones are marked absent, with a note, and keep their renders and ratings (decision D21).
 - `render` renders what is pending and prints counts and one line per failure reason. When nothing is pending it reads no source, so it also works while the data is not mounted. A run with a pinned template still reads that template, from `templates/` in the run directory; when that directory was deleted and no fsaverage directory is found to build it from again, `render` stops with `changed: the template this run was scored with is no longer available`, also when nothing is pending (decision D22; `status` works). `--all` renders every complete subject, `--selected` only the selection (which is every complete subject while nothing is selected). `--check-sample` renders nothing: it draws a seeded sample of the done renders for the by-eye check of phase 6 and writes `logs/render-check-<seed>.txt` and `.html`. A `vertex_map.npz` that is there and cannot be read (a truncated copy, a changed byte) or does not hold the arrays of a vertex map is not noticed by the skip test, which looks at names; the `native` stage at the end of `render` notices it when it next reads the vertex maps, leaves that subject's centroids without a native position and says so in a note with the `subject_uid`, at every call until the file is removed and the render made again.
@@ -318,6 +328,9 @@ run/
                               # written again when it does not read back
   cache/                 # remote downloads only, content-addressed, prunable
   logs/                  # render-check-<seed>.txt and .html; in a census run also the phase logs
+  epi/<participant_uid>/      # the EPI display cache of a participant (step 2): only .json and .bin files
+    stream.json          # the participant's sessions in stream order, packed or not yet
+    <session_uid>/       # session.json, contours/<grid_key>/<plane>.bin, <run_uid>/pack.json raw/ pre/ traces.json
   media/<subject_uid>/
     anim.mp4
     tiles/               # per-panel WebP slice tiles in two layers, see rendering.md
@@ -343,7 +356,7 @@ A second secret, the run secret, is 32 random bytes drawn when the catalog is cr
 
 A new catalog is built under a temporary name in the run directory and gets the name `catalog.sqlite` through a hard link when it holds the schema, the identity of the run and the run secret. So `catalog.sqlite` holds a run or does not exist, whenever the process ends, and no other process opens one that is half made. On a file system without hard links the name is taken with an empty file and the run is made in that file in one transaction. A catalog in which no run was made yet (an empty file, or the tables without a row) is never migrated or removed: opening the run makes the run in it, under SQLite's write lock, with the salt of `config.yaml` or, for a census run, the key. A database that holds anything else is refused as not made by surfcensus and left as it is.
 
-Tables in `catalog.sqlite` (the DDL is migration 1 in `store.py`):
+Tables in `catalog.sqlite` (the DDL is migration 1 in `store.py`; migration 2 adds the tables of the EPI interface, below):
 
 - `meta(key, value)`: run id, mode, key kind and fingerprint, creation time, package version, the id of the template the run is pinned to (`template_id`, from its first use); and the run secret.
 - `datasets(dataset_id, pseudonym, source, identity, accession, root, fs_root, template_location, layout, pipeline, pipeline_version, derivative_ref, snapshot_tag, n_subjects_listed, ..., discovered_at)`, unique on `(source, identity, pipeline)`; for a local source, one row with `root` set to the path.
@@ -354,6 +367,8 @@ Tables in `catalog.sqlite` (the DDL is migration 1 in `store.py`):
 - `work(phase, unit, config_hash, input_signature, status, reason, detail, output, surfcensus_version, finished_at)`: the ledger of every phase but inventory and render; a unit is a `subject_uid`, `dataset:<pseudonym>` or `run`. The metric stages are the phases `regional` and `fsaverage` (one unit per subject) and `reference`, `score` and `native` (the unit `run`).
 - `renders(subject_uid, config_hash, input_signature, tile_hash, render_key, video, status, reason, detail, media_path, n_frames, template_id, rendered_at)`
 - `selection(subject_uid, reason, stratum, inclusion_prob, seed)`. `PublicCatalog.selected_uids()` gives its subjects, or None while no selection is made: the table is empty, or it is that of a local run and holds only the rows of a frozen calibration set (reason `calibration`). `render` then takes every complete present subject, and the rater app and `finalize` of a local run every present one.
+
+Migration 2 (`store._MIGRATION_2`, `SCHEMA_VERSION` 2; step 2 of the EPI interface, decision D40) is additive: `func_sources` (the derivative and the raw dataset of a dataset, with their roots and the derivative's identity, private), `func_participants`, `func_sessions` (the anchor, the frame check, the inventory hash), `func_runs` (one row per run with its reason, grid, corrections and frame numbers), `func_files` (keyed by owner kind and owner) and `packs` (the counterpart of `renders`), with five public views that leave out the roots, identities, file facts, input signatures and content digests; the session unit of the pack phase is a row of `work` (phase `epi_session`). A writer migrates every run it opens; a read-only opener (`serve`, `export`, `finalize`, `calibration freeze`) reads a catalog of schema 1 as a run without functional data. A version of the package from before step 2 refuses a migrated catalog (`newer schema`).
 
 What is private stays in the catalog and is reached only through `store.Catalog`, which `run.py`, `cli.py` and the inventory use: `dataset_id` (assigned in the order of the bucket listing), identity, accession, root, `fs_root`, template location, derivative ref and snapshot tag; `fs_dir`; file locations, sizes, ETags and digests; every input signature; the run secret; and in a census run the subject labels and every failure detail (a local run shows the details of its own renders). Three views (`public_datasets`, `public_subjects`, `public_files`) leave these out, and no frame that `store.PublicCatalog` returns holds any of them. It hands out an input signature only as a value to pass back for the skip test. Everything `PublicCatalog` returns is ordered by pseudonym or `subject_uid`, never by `dataset_id`.
 

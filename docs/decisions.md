@@ -727,6 +727,49 @@ D40 (2026-11-14). The shared names of step 2 of the EPI interface (work package 
 - The main app gains the EPI routes in step 2, not step 3, because step 2's exit check is `review` on a folder with both kinds of data: an index, a page per participant, and the media, all unblinded routes (open in a local run that is not blind and has one rater, closed like `/review` otherwise, absent in a census run). The rating screen gets one link, to the index, that names no subject.
 - In force until Tomas says otherwise: a folder with functional data and no FreeSurfer subject at all is not taken by `review` (`epi-session` takes it); packs are made one session per worker process; when no surface can be rendered the app opens at the first packed session.
 
+D41 (2026-11-14). Choices made while building step 2 of the EPI interface (work packages E2.A to E2.Z; `docs/epi_interface.md`, "Step 2 as built"), beyond the shared names of D40. Where a choice departs from the plan of E2.0, it says so.
+
+The catalog (E2.A).
+
+- Migration 2 is applied as E2.0 wrote it. A read-only opener reads every schema from `store.READONLY_OLDEST` (1) as it is: on schema 1 every functional reader answers empty and every functional writer raises `ConfigError("invalid", ...)`, and not a byte of the file changes. Reason: `serve`, `export`, `finalize` and `calibration freeze` keep working on a run that no phase command of this version has opened. A migration that is not additive must raise `READONLY_OLDEST`. The package at `b16ba41` refuses a migrated catalog with `newer schema`.
+- A run that leaves its session loses its `func_files` rows; it is deleted at once when it has no `packs` row, else kept with `present = 0` until `forget_packs`. Reason: the pack phase removes its directory first and its row after (outputs first, rows last).
+- The store records pack details as given; the pack phase scrubs them, as the render phase does.
+
+Discovery and the functional inventory (E2.B).
+
+- One implementation of the rules: `func.api` imports the folder rules and the planning from `func/discover.py` and `func/inventory.py`. The modules load no numpy, nibabel or scipy at import.
+- A session in which `--epi-runs` selects nothing is listed with every run `not selected`; step 1 drops such a session. Reason: the plan says that runs stay listed, and the anchor is decided over all runs.
+- The facts of a run (volumes, TR, raw affine, rigidity, corrections) are read for every run but those not fetched, each on its own; a packable run whose fact fails stays packable with the error as its detail, and the lease records it as a pack failure.
+- The lease (`session_work`) lists the participant again and compares the session hash with the stored one (`SourceError("changed")` otherwise), so nothing is packed from files other than those inventoried.
+- Fetch lines: one per run with placeholders, then one command per repository that holds them (a raw dataset and a derivative are often two DataLad datasets).
+
+The pack phase (E2.C).
+
+- A failure of a whole session (its lease or its worker) is recorded on each run it tried, but for runs whose packs are current, and on the session's ledger row, which then decides: the session is not tried again while its signature is the same. Reason: with per-run rows alone a lease failure caused by one touched file left the other runs failed for good (a test caught it).
+- A stale run of a live session goes only with its session's new `session.json`; a session with a stale run is made pending. Directories are removed by the names the catalog gives, never from a listing of `epi/`.
+- `batches.run_batches` passes a lease value that is not a mapping as it is, so a lease can yield a `SessionWork`; render and metrics behave as before.
+
+The app in a run (E2.D).
+
+- Routes that are not offered (a census run, the interface off, no functional data) answer exactly as a route that does not exist (404). The gate of a blind run or of several raters looks at the queue only when it can close the routes, because a page asks for many chunks.
+- The EPI page asks its API every 5 s while packs of the participant wait, says when the stream grew and plays on. The links to the index and back sit under the page, not in its bar, which they wrapped at 1400 px.
+
+The integration (E2.Z).
+
+- `Run.context()` of a local run binds `func_lease` (`session_work` over `Catalog.func_lease_facts`, with the EPI settings of the configuration the context was made with) and `pack_key` (the run secret bound); a census run gets no lease. `Run.func_inventory` gives an empty report without building a source for a census run and with `--no-epi`. `Run.pack` refuses a census run, decides what is pending before it looks at any source, and when something is pending looks for the FreeSurfer sources and the derivative of each functional source first, so a missing disk stops the call with `not found` (exit code 2) and is recorded against no session. Reason: as for `render` (D29).
+- `--relocate` moves the functional source with the dataset (`Catalog.relocate_func`, roots found again by rule at the new place); identifiers stay, because the derivative's identity is kept (D21) and the roots enter no signature. Checked on a synthetic folder moved as a whole: no inventory and no pack done again.
+- The order of `review` is that of the plan: the surface inventory, the functional inventory, the metrics, the first surface render, the app; behind the app one thread renders the rest and then packs, stopped between batches by the same request. Reason: D33, a rater waits on the surfaces; the functional inventory reads only listings and small files. When no surface can be rendered and a run can be packed, the app opens at the first packed session (`--serve-after` counts sessions, 0 all of them); `--serve-after 0` with surfaces waits for every render and leaves the packs behind the app.
+- `review --no-serve` packs everything as well. `review` ends with 1 only when nothing can be rendered and nothing packed.
+- The EPI options are tri-state and stored like `--video`: `--epi/--no-epi` (the plan named only `--no-epi`; a stored `--no-epi` had no way back otherwise), `--epi-runs`, `--raw`. The section `epi` of `config.yaml` is written only when it then differs from the defaults (`run.epi_with`), so a call without these options, and `--epi` on a run that never had the section, leave `config.yaml` byte for byte as it was. A glob that matches no derivative stem is refused before it is stored, and for a new run before the run is made. `pack --epi-runs` stores the globs and runs the functional inventory first, since what is selected is decided there.
+- The places that are read on the functional side are the participant folders of the derivative and of the raw dataset (`sub-*`, and what such a link leads to), not their roots. E2.B had refused a run directory anywhere inside the two roots; that refused what D35 holds (a run inside a dataset asked for with `--run-dir`, or made there by an earlier version and still used). The rule is now parallel to the FreeSurfer source, where the subjects directory is refused and a place beside it inside an fMRIPrep output is not. A raw dataset named with `--raw` that lies inside the run directory is refused, and so is a run directory in its participant folders, before a run is made. `epi-session --out` keeps the wider refusal: a new output with no earlier behaviour to keep.
+- When the contours of a session cannot be cut, the worker leaves the FreeSurfer files and the fsnative transform out of the inputs of its packs, as `epi-session` does (an edit to `func/batch.py`). Reason: a pack does not depend on files it did not use, and one session gives the same pack through both paths.
+- What `review` prints about functional data is one block after the surface lines, built from the public catalog and, for where the folders lie, from the run's private roots on the terminal of whoever has the data (`Run.func_folders`): the block of `epi-session` adapted to several participants, the registration statements of `epi-session`, the fetch lines after the surface fetch line; then an `EPI packs:` line with an estimate (`func.batch.pack_estimate`), `EPI movies: <url>epi` beside the address of the app, `All EPI packs are made: ...` when the thread is done, and an `EPI packs:` closing line. A folder without functional data gets none of it (one line at info level).
+- `max_gb` of `EpiConfig` exists and no command acts on it yet.
+- E2.D's fixture (`tests/epi_run_fixture.py`) stays for its tests, which need fixed states that the real phases do not make on a schedule; the real phases are tested through the same routes and in a browser in new tests.
+- Edits to files of other packages: `func/discover.py` and `sources/local.py` (the narrower rule above, with E2.B's tests of it in `tests/test_func_discover.py` rewritten for it), `func/batch.py` (the contour inputs).
+
+Checked: see `docs/epi_interface.md`, "Step 2 as built" (Measured, and What was not checked). Tests: `tests/test_review_epi.py`, `tests/test_cli_pack.py`, `tests/test_review_epi_browser.py` (marker `browser`) and `tests/test_network_review_epi.py` (marker `network`), and broken copies of the integration, each caught but where said there. Not checked: a person looking at any of it; a real DataLad dataset with functional data; any machine but one Linux machine.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.

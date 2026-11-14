@@ -213,6 +213,105 @@ Shared files that more than one package needs and none edits but its owner: `rec
 - "Phases and order": the skip test of 2f is `func_sessions.inventory_hash`, not `func_runs.inventory_hash`; runs are taken in acquisition order (step 1: the anchor is not moved).
 - "Configuration": `epi.raw` is added; the section is written only when an option was given.
 
+## Step 2 as built (2026-11-14)
+
+Step 2 is built: the functional inventory, the pack phase and the EPI pages of a run, bound into `Run`, `surfcensus review`, `surfcensus inventory` and a new `surfcensus pack`, so that one command on one folder prepares both interfaces of the tool (D37). The work packages were E2.A (the catalog), E2.B (discovery and the functional inventory), E2.C (the pack phase), E2.D (the pages of a run in the app) and E2.Z (the integration and this record). The choices that the plan above did not make are decision D41. Where this section and the plan or the older sections disagree, this section holds, because it describes what exists.
+
+### What a user runs
+
+```
+surfcensus review PATH [--raw DIR] [--epi / --no-epi] [--epi-runs GLOB]... (and every option of before)
+surfcensus inventory --run-dir DIR [--source PATH] [--raw DIR] [--epi / --no-epi] [--epi-runs GLOB]... (and the rest)
+surfcensus pack --run-dir DIR [--jobs J] [--epi-runs GLOB]... [--force] [--retry-failed]
+```
+
+- `review PATH` does, in this order: the surface inventory and its lines; the functional inventory (phase 2f, `Run.func_inventory`) and its block of lines; the metrics; the first surface render; the app. Behind the app one thread renders the remaining surfaces and then packs the pending functional sessions (`Run.pack`), a batch of `--jobs` sessions at a time; the stop request of the app ends either between two batches. So the time to the rating screen grows only by the functional inventory, which reads listings and small files (measured below).
+- When no surface subject can be rendered and a run can be packed, the app opens when the first `--serve-after` sessions are packed (1 by default, 0 for all), in the order of the pack phase; the rest is packed behind it. `--no-serve` renders and packs everything and stops.
+- Exit codes of `review`: 1 only when no surface subject can be rendered and no functional run is packed or can be packed; 2 for what stops a phase command; 0 otherwise.
+- `--raw DIR`, `--no-epi` and `--epi-runs GLOB` are stored in `config.yaml` (`RunConfig.epi`) and hold until given again, like `--subjects` and `--video`. The section `epi` is written only when it then differs from the defaults (`run.epi_with`), so a call that gives no EPI option, and a run of a folder without functional data, write the bytes of `config.yaml` they wrote before step 2. `--epi` turns the interface on again after `--no-epi`; the plan named only `--no-epi`. A glob of `--epi-runs` that matches the derivative stem of no run is refused before it is stored, also before a new run is made (`refuse_unmatched_epi_runs`, exit code 2); a `--raw` that is not a directory is refused (`not found`).
+- `inventory` runs the functional inventory after the surface one when no `--dataset` is given, prints the same functional block as `review`, then `func_inventory: N done, N skipped, N failed`; its exit code is 1 when either inventory has a failed unit.
+- `pack` packs what is pending and prints `pack: N done, N skipped, N failed`, one line per failure reason with the runs by name, and the `EPI packs:` line. Exit codes of the phase commands: 0, 1 when a pack row is failed, 2 for usage, configuration and the machine (a full disk under `epi/`), 130 and 143 for Ctrl-C and SIGTERM, which it takes as `render` does. When nothing is pending it builds no source, so it works with the data not mounted; when something is pending and the FreeSurfer subjects or the derivative are gone it stops with `not found` (2) before anything is recorded. `--epi-runs` on `pack` stores the globs and runs the functional inventory again first, since what is selected is decided there. A census run is refused (2).
+- `status` and `export` do not show functional data yet (step 3); `status` works on a run with functional tables (tested).
+
+### What it prints
+
+On the synthetic folder of the tests (`synth_func.write_review_folder`, one machine), `review ds --no-browser --port 0` printed, after the surface lines and with the path of the run directory left out:
+
+```
+Functional: 19 runs in 3 sessions of 2 participants in derivatives/fmriprep (fMRIPrep 21.0.2), raw series in . (BIDS); 11 can be packed (T1w space), 8 cannot: sub-02 task-me_run-1 (multi-echo), sub-02 task-min_run-1 (no preprocessed series), sub-02 task-native_run-1 (native space only), sub-02 task-rest_run-1 (no raw series), sub-02 task-rest_run-2 (no brain mask), sub-02 task-rest_run-3 (no transform to the anatomy) and 2 more.
+  sub-02: the anchor task-me_run-1 is not packed (multi-echo); the raw stream of every packed run is drawn through its stored registration.
+  sub-01 ses-1: flagged (raw data): ses-1_task-rest_run-3, drawn through the registration of the anchor ses-1_task-rest_run-2, lies up to 12.0 mm (mean 12.0 mm) from where its own stored registration puts it, beyond the limit of 10 mm.
+  ...
+  sub-01 ses-2: the anchor ses-2_task-rest_run-1 is the outlier (raw data): every other run is flagged against it and they agree with each other, so the anchor, or its stored registration, is the odd one.
+Scores: ...
+Rendered: 1 of 2 subjects, 1 to render while the app runs.
+EPI packs: 0 of 11 runs made; 11 are made while the app runs, after the renders (about 1 s in one process, an estimate: 0.114 s per volume of both streams on 109,368 voxels, scaled by voxels).
+Rating app: http://127.0.0.1:44911/ (Ctrl-C to stop)
+EPI movies: http://127.0.0.1:44911/epi
+  3.2 s from the start of the command to the app.
+All renders are made: 2 of 2 subjects can be rated.
+All EPI packs are made: 11 of 11 runs can be viewed.
+```
+
+and after SIGTERM, below the line of the rater's progress, `EPI packs: 11 of 11 runs made.` (or `...; N are made at the next call.` when packs were left). The places are named relative to the path that was given; `inventory` without `--source` names them relative to the stored root. The fetch lines of functional files without content (`func.inventory.func_fetch_lines`) come at the end of the block, after the surface fetch line. The registration lines are statements about the raw data, worded as `epi-session` words them. A folder without functional data gets none of these lines, and a run with `--no-epi` stored and functional data one line that says the interface is off. What the worked example printed is under "Measured".
+
+### The rule of the places that are read (changed by the integrator)
+
+E2.B refused a run directory or an export anywhere inside the functional derivative or the raw dataset. That broke what D35 holds: a run that an earlier version made inside a dataset is still found and used, and `--run-dir` may name a place inside a dataset. The places that are read are now the participant folders of the two roots (`<derivative>/sub-*` and `<raw>/sub-*`, and what such a link leads to), not the roots themselves, in parallel with the FreeSurfer source, where the subjects directory is refused and a place beside it inside an fMRIPrep output is not (`func.discover.participant_places`, used by `read_places`, `places_of_subjects_dir` and `stored_read_places`). A run directory inside `sub-01/` of the raw dataset or of the derivative is refused; `--run-dir DATASET/surfcensus-run` works with functional data present (tested). The participant folders of a raw dataset named with `--raw` are refused at the creation of a run as well, before anything is written. `epi-session` keeps refusing an `--out` anywhere inside the three folders (`refuse_out`): a new explicit output with no earlier behaviour to keep.
+
+### Loose ends of the packages, decided
+
+- When the contours of a session cannot be cut (a FreeSurfer file that cannot be read), the worker of the pack phase now leaves the FreeSurfer files and the fsnative transform out of the inputs of its packs, as `epi-session` does; before, a pack without contours listed the files of the contours among its inputs (E2.B's and E2.C's open point; `func/batch.py`, tested).
+- `func_participants.session_order` is written from `store.SESSION_ORDER`, a second constant of the value of `func.inventory.SESSION_ORDER`; a test asserts that the two (and that of `func.api`) are equal rather than making the store import the inventory module.
+- A stored run that lists no file: E2.A treats a run without files as one that left its session. The inventory stores only runs that the connector listed from a derivative file, so every stored run has at least that file; a run whose files are git-annex placeholders keeps its rows in `func_files` (checked on the fixture with links: 5 rows for the not-fetched run). Nothing changed.
+- E2.D's fixture (`tests/epi_run_fixture.py`) is kept for its tests: it gives fixed states that the real phases do not produce on a schedule (a participant with one session packed, one failed pack and the rest pending, `stream.json` ahead of the disk). The real phases are tested through the same routes in `tests/test_review_epi.py` (the index and every participant's stream after `review`) and in a browser in `tests/test_review_epi_browser.py`.
+
+### Measured
+
+One shared Linux machine with 4 processors, Python 3.13, files on a local disk, other work running on the machine at times; the worked example (`ds000102` sub-01, 2 runs of 146 volumes on 49 x 62 x 36 voxels) laid out as a BIDS root of links into the pytest cache, with its derivative below `derivatives/fmriprep`, its FreeSurfer subject and the real `fsaverage` in `sourcedata/freesurfer`, and a copy without the two `func/` folders (raw and derivative):
+
+- `surfcensus review ROOT --no-browser`, new run directory, to the line that names the app: 16.3 s from outside both without and with the functional data (the command's own clock: 15.0 s and 14.7 s). The functional inventory of the session took 0.34 s the first time in a process (imports included), 0.03 s planned again, 0.006 s skipped, measured apart through `Run.func_inventory`. So the time to the rating screen is that of the surfaces (D33).
+- With the functional data, every pack was made 47.6 s after the start of the command (about 32 s after the app opened, one process behind the app; the printed estimate said about 33 s).
+- The same command again: 3.0 s and 2.5 s to the app from outside (1.4 s and 1.2 s by the command's clock), nothing rendered or packed.
+- `review(..., serve=False, jobs=2)` on the same root (the network test): one subject rendered, two runs packed, and every decoded volume of both streams of both runs, and the content digests, equal to those of `func.api.epi_subject` (the command `epi-session`) on the same folder; a second call packs nothing. The sources were unchanged (a snapshot of the links and their targets).
+- A folder without functional data: on a synthetic folder, the stderr and stdout of `review --no-serve` equal, byte for byte with the paths taken out, those of the package at `b16ba41` (before step 2), and `config.yaml` differs only in the values drawn at random (salt, its fingerprint, the queue seed).
+
+What the command printed with the functional data (the path of the dataset replaced by `ROOT`):
+
+```
+Run directory: ROOT/../surfcensus-run (new)
+Found 1 subject in derivatives/fmriprep/sourcedata/freesurfer (fMRIPrep layout, FreeSurfer 6.0.1).
+Functional: 2 runs in 1 session of 1 participant in derivatives/fmriprep (fMRIPrep 21.0.2), raw series in . (BIDS); 2 can be packed (T1w space).
+Scores: 1 subject; 1 ranked on ceiling fraction and occipital-to-control ratio, without a reference (decision D16).
+Rendered: 1 of 1 subject.
+EPI packs: 0 of 2 runs made; 2 are made while the app runs (about 33 s in one process, an estimate: 0.114 s per volume of both streams on 109,368 voxels, scaled by voxels).
+Rating app: http://127.0.0.1:40153/ (Ctrl-C to stop)
+EPI movies: http://127.0.0.1:40153/epi
+  14.7 s from the start of the command to the app.
+All EPI packs are made: 2 of 2 runs can be viewed.
+0 rated, 1 to go. Run the same command to continue. Export: surfcensus export --run-dir ROOT/../surfcensus-run
+EPI packs: 2 of 2 runs made.
+```
+
+The last two lines came after SIGTERM.
+
+### What was not checked
+
+- No person has looked at a pack made by a run, at the index or at the link from the rating screen; every reading of a screenshot was an agent's.
+- Only the anatomy-space layout of fMRIPrep below 23.2 was packed through a run (synthetic folders and the worked example). The second generation, native-space series, multi-echo data and sessionwise FreeSurfer subjects went through phase 2f on synthetic data only, or not at all.
+- No real DataLad dataset with functional data; the placeholders are those of the fixture.
+- `--relocate` was tried on a synthetic folder moved as a whole (every identifier kept, nothing packed again); not a raw dataset that moved apart from its derivative.
+- A full or read-only disk during packs behind the app was not staged through `review` (E2.C staged it through the phase).
+- One machine, Linux, Python 3.13, Chromium 153; times were taken while other work ran on the machine.
+
+### What is now wrong in the sections below
+
+- "The one command": the app gains the EPI index and the participant pages; the subject pages are step 3. The option to turn the interface back on is `--epi`.
+- "What it prints": the block is as above; the subjects page is not built, so the second address is that of the EPI index, `EPI movies: <url>epi`.
+- "Commands, exit codes, status, export": `status` and `export` print and write no functional data yet; `review` and `pack` exit as said above.
+- "The rules", first point: the places that are read are the participant folders of the two roots, not the roots (above).
+- "Configuration" in "The pipeline": `max_gb` exists as a setting and is not acted on by any command yet.
+
 ## Scope
 
 In scope: local folders that hold a raw BIDS dataset, an fMRIPrep derivative of it and the FreeSurfer subjects of that derivative; one app with a page per interface and per subject; the phases that list functional runs and pack them; their tables, tests and build order; the connector interface of O29 with one implementation, fMRIPrep.
