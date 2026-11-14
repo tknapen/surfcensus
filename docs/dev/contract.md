@@ -1703,8 +1703,10 @@ def start_server(run_dir: Path, *, host: str = "127.0.0.1", port: int = 8765,
                  mode: Literal["local", "team"] = "local", rater: str | None = None) -> ServerHandle
     # uvicorn.Server in a thread, stopped through should_exit; returns once the port accepts connections
 def serve(run_dir: Path, *, host: str = "127.0.0.1", port: int = 8765, mode: Literal["local", "team"] = "local",
-          rater: str | None = None, open_browser: bool = True) -> None
-    # start_server, print the URL, open the browser, wait for Ctrl-C or SIGTERM in the main thread, stop
+          rater: str | None = None, open_browser: bool = True, stop: threading.Event | None = None) -> None
+    # start_server, print the URL, open the browser, wait for Ctrl-C or SIGTERM in the main thread, stop.
+    # With `stop` it sets no SIGTERM handler and serves until the event is set: the command line sets it
+    # from a handler that it keeps until the process ends (decisions, after the first CI run of milestone 4)
 ```
 
 `app/schemas.py` holds the request and response shapes below as pydantic models (`MarkIn`, `ResolvedMark`, `SessionOut`, `AssignmentOut`, `NextOut`, `RatingIn`, `RatingOut`, `EventsIn`, `ReviewOut`, `SubjectOut`, `StatsOut`, `ErrorsOut`); the frontend and the server are both written against it. It imports `protocol.py` for the `Protocol` model and `render/model.py`, and nothing from the rest of `app/`.
@@ -2733,7 +2735,7 @@ What step 4.0 delivered (2026-11-13), for the packages that follow. Where this d
   - `app/finalize.py` (4.F): the consensus marks are the union of the raters' marks without those of a criterion whose consensus value is none, and the final marks of one rating leave out the marks of a criterion it rates none in the same way.
   - `app/server.py`, `app/events.py` (4.G): `events.record_setting`, `ServerHandle.running`; fifteen routes; a closed `/review` answers a request for a page with a page.
   - Frontend tests (4.C, 4.H): `test_frontend.py` (the script: routes, fields, hosts, pages; the modules without a page under Node), `test_frontend_browser.py` (browser, against `frontend_mock.py`); `js/tour.js`.
-  - `review.py`, `cli.py` (4.Z): beside `review`, `open_review(...) -> (Run, ReviewApp | None)`, `ReviewApp`, `default_run_dir(path)`, `rateable(run)`, `render_counts(run)`. `batches.run_batches`, `render.batch.run_render` and `Run.render` take `stop`; `Run.render` takes `native`. Tests: `test_review.py`, `test_cli_review.py`, `test_browser.py` (browser), `test_network_review.py` (network).
+  - `review.py`, `cli.py` (4.Z): beside `review`, `open_review(...) -> (Run, ReviewApp | None)`, `serve_review(run, app, *, rater, open_browser, stop)` (the second half of `review`: the address, the wait for Ctrl-C or the `stop` event, the stop of the app, the closing line; it sets no signal handler), `ReviewApp`, `default_run_dir(path)`, `rateable(run)`, `render_counts(run)`. `batches.run_batches`, `render.batch.run_render` and `Run.render` take `stop`; `Run.render` takes `native`. Tests: `test_review.py`, `test_cli_review.py`, `test_browser.py` (browser), `test_network_review.py` (network).
 - A trap in `small_run`: its three subjects have the same T1 and surfaces, so they have one `render_key`. Code that keys anything by `render_key` alone, and a test that tells subjects apart by it, is wrong there. The subjects of `tests/demo_run.py` have three keys.
 
 ### Milestone 5
