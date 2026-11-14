@@ -628,6 +628,12 @@ What follows, in the reading of the building session; each point is a default of
 
 Not decided here: the name of the package, which no longer describes it (O1).
 
+D38 (2026-11-14, Tomas). The EPI movie of a session is one continuous stream over all its acquisitions. His words:
+
+> "For the functional interface it's important that the epi videos span all acquisitions in one continuous video stream - no skips between runs other than the ones imposed by the image content itself."
+
+Read as: all runs of a session play one after the other in acquisition order on one timeline, without a stop, a pause or a blank between them, and the display adds nothing at a run boundary. So the slices stay at the same place in the anatomy across runs on different grids, the intensity window is one per session and not one per run, and view, layers and rate carry over; what changes at a boundary is what the data hold (the head's position under the session's one registration, the field of view, the contrast), which is what the raw stream is there to show (D36). The run that is on screen is named beside the pictures and marked on the timeline. It is specified in `docs/epi_interface.md` ("One continuous stream"), and it changes two things that stage 1 and the first draft of the specification had: a run selector that started another film, and a window per run. Open: whether the stream runs on from one session of a subject into the next (default: no, each session is one stream).
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.

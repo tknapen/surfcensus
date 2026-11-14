@@ -21,6 +21,20 @@ What follows for this design, and is not to be weakened by any choice below:
 - The interface is a viewer (D37, O27). A judgement protocol is proposed below, marked as such, and is not built without his word.
 - Nothing of a public dataset's functional data is shown outside the local machine (O28).
 
+## One continuous stream (Tomas, 2026-11-14)
+
+> "For the functional interface it's important that the epi videos span all acquisitions in one continuous video stream - no skips between runs other than the ones imposed by the image content itself."
+
+This was said after the rest of this specification was written, and it overrides the page and the pack wherever they treat a run as a film of its own (decision D38). What follows from it, in the reading of the building session:
+
+- One timeline per session. The movie of a session is all its packed runs, one after the other in acquisition order, as one stream of volumes: playing does not stop, pause, blank or wait for a key at the end of a run, the time slider spans the session, and a loop is a loop over the session. Choosing a run is a jump on that timeline, not another film.
+- Nothing but the images changes at a run boundary. The slices stay at the same place in the anatomy: when the next run lies on another grid, each plane goes to the slice of the new grid that is nearest, in millimetres, to the one that was shown. The intensity window is one per session and stream rule, not one per run, so that a run that is brighter or darker than the one before it is seen as it is and no step in brightness is made by the display. The view, the zoom, the layers and the playback rate stay as they are. What the page says about the run (its name, whether it is the anchor, its displacement under the session's registration, the corrections the pipeline applied) changes with the run, beside the pictures and without interrupting them, and the boundary is a mark on the timeline and in the traces.
+- What does change is the content: the head lies elsewhere in the next run, the field of view or the voxel size differs, the contrast differs. Those jumps are the data, and under the session's one registration they are exactly what the raw stream is there to show (D36).
+- Loading follows the stream: the chunks of the next run are fetched before the last volume of the present one is shown, so that the boundary is not a wait. Where the machine cannot keep up, the clock waits and no volume is skipped, as within a run.
+- Several sessions of a subject: each session is one stream. Whether the stream should run on from one session into the next is open (a question for Tomas below); the default is that it does not, since a new session has a new registration and its own page.
+
+Where the sections below speak of a run selector, of a window per run or of playback of a run, read them with this section.
+
 ## Scope
 
 In scope: local folders that hold a raw BIDS dataset, an fMRIPrep derivative of it and the FreeSurfer subjects of that derivative; one app with a page per interface and per subject; the phases that list functional runs and pack them; their tables, tests and build order; the connector interface of O29 with one implementation, fMRIPrep.

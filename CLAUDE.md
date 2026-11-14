@@ -45,6 +45,7 @@ What follows from it (the reading of the building session; decision D36 in `docs
 - The preprocessed stream is the series as the pipeline wrote it. The page says which steps the pipeline applied to the run, so that a difference between the streams can be read as the effect of those steps.
 - A difference between the streams, and the raw stream's misfit to the contours, is what the viewer exists to show. It is never treated as a confound to remove, to mark as a fault or to select against.
 - Both uses are served explicitly and named in the page and the docs: quality control of the raw data (motion, artefacts in single volumes, distortion and dropout as acquired, movement between runs) and quality control of the preprocessing (what was corrected, what remains, how the preprocessed series conforms to the white and pial surfaces).
+- The movie of a session is one continuous stream over all its runs, in acquisition order (his words of 2026-11-14, decision D38: "no skips between runs other than the ones imposed by the image content itself"): no stop or blank at a run boundary, the same slices in the anatomy, one intensity window per session, so that the only jumps are those of the data.
 - "A full priority" is read as: work on the viewer comes before milestone 5 of the census, until Tomas says otherwise.
 
 The hand-over, with what is built and measured, is `prototypes/func_viewer/README.md`. The rules of that folder hold: no media or data file and no dataset accession but `ds000102` in the repository, results by neutral id, read-only anonymous access.
