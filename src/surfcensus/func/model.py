@@ -44,13 +44,24 @@ RULES: dict[str, str] = {
     ),
     "ref": "rounded mean of the 8-bit volumes 0, 10, 20, ...",
     "window": (
-        "per run, both streams: 0 to the 99.5th percentile of the preprocessed series inside"
-        " the run's brain mask, over the volumes 0, 10, 20, ..."
+        "per session, both streams of every run: 0 to the 99.5th percentile of the"
+        " preprocessed series of all packed runs of the session, each inside its brain mask,"
+        " over the volumes 0, 10, 20, ... of each run, pooled"
     ),
     "quantise": "value = clip(floor((v - lo) * 255 / (hi - lo) + 0.5), 0, 255), float32",
     "sd_window": (
-        "per run, both streams: 0 to the 99.5th percentile of the temporal SD of the"
-        " preprocessed series inside the run's brain mask"
+        "per session, both streams of every run: 0 to the 99.5th percentile of the temporal"
+        " SD of the preprocessed series of all packed runs, each inside its brain mask, pooled"
+    ),
+    "stream": (
+        "the movie of a session is its packed runs one after the other in acquisition order,"
+        " one stream; runs[].first is the index of a run's first volume in it"
+    ),
+    "slices": (
+        "grids[].slice_mm[plane][k] is the world coordinate, along the axis"
+        " grids[].slice_axis[plane], of the centre of slice k of that plane, in mm relative to"
+        " the centre of the first grid; the slice of another grid nearest to it is the one"
+        " whose value is nearest"
     ),
     "stills": (
         "temporal mean and SD (n - 1) over the volumes that the confounds table does not mark"
@@ -170,6 +181,18 @@ class GridInfo(_Frozen):
     draws the plane (``geometry.edge_letters``)."""
     contours: dict[str, ContourFile] | None
     """Plane -> its file; None when the session has no FreeSurfer subject."""
+    slice_axis: dict[str, Literal["x", "y", "z"]]
+    """Plane -> the world axis (RAS) nearest the plane's normal: the axis along which
+    :attr:`slice_mm` is measured."""
+    slice_mm: dict[str, tuple[float, ...]]
+    """Plane -> for each slice ``k`` of the plane, the world coordinate along
+    :attr:`slice_axis` of the slice's centre (the voxel ``k`` of the slice axis with the other
+    two at the middle of the grid), minus that of the centre of the session's first grid, in
+    mm, rounded to 1e-6. Offsets, not coordinates of the public file: the page keeps the
+    slices at one place in the anatomy across runs on different grids by taking, on the next
+    grid, the slice whose offset along the same axis is nearest. For a grid that is oblique to
+    the anatomy this compares slice centres along the world axis, so a tilted slice is placed
+    by where its centre lies, not by its whole plane."""
 
 
 class RegistrationInfo(_Frozen):
@@ -196,6 +219,12 @@ class SessionRunInfo(_Frozen):
     frame: FrameInfo | None
     reason: str | None
     """A ``records.PACK_REASONS`` value when the run cannot be packed, else None."""
+    n_volumes: int | None = None
+    """The volumes of its pack; None for a run that is not packed."""
+    tr_s: float | None = None
+    first: int | None = None
+    """The index of its first volume in the session's one stream (decision D38): the packed
+    runs one after the other in the order of :attr:`SessionInfo.runs`; None when not packed."""
 
 
 class SessionInfo(_Frozen):
@@ -213,8 +242,15 @@ class SessionInfo(_Frozen):
     fd_threshold_mm: float
     registration: RegistrationInfo | None
     """None when no run of the session can be packed."""
+    window: tuple[float, float] | None
+    """The one 8-bit window of the session, for both streams of every run (decision D38);
+    None when no run is packed."""
+    sd_window: tuple[float, float] | None
+    """The one window of the SD stills of the session."""
     grids: tuple[GridInfo, ...]
     runs: tuple[SessionRunInfo, ...]
+    """In the order of the session's stream: acquisition order, the anchor first, then the
+    runs that are not packed."""
     contours_from: str | None
     """Which FreeSurfer subject the contours were cut from, by its name in the subjects
     directory; None without contours."""
@@ -248,6 +284,8 @@ class PackInfo(_Frozen):
     n_volumes: int = Field(ge=1)
     tr_s: float | None
     window: tuple[float, float]
+    """The session's window (:attr:`SessionInfo.window`), which this pack was quantised with:
+    a run added to or removed from the session changes it, and so every pack of the session."""
     sd_window: tuple[float, float]
     chunk_volumes: int = Field(ge=1)
     stills_volumes: int = Field(ge=1)

@@ -123,9 +123,14 @@ def acquisition_order(runs: Sequence[AnchorCandidate], anchor: Anchor) -> tuple[
     """The run ids in acquisition order with the anchor first: by time under the time rule,
     else by name order; ties by name order.
 
-    Under the time rule a run whose time cannot be read (which :func:`pick_anchor` would not
-    have allowed) goes after the timed ones, in name order. Raises ``ValueError`` when the
-    anchor is not among the runs."""
+    This is the order of the session's one continuous stream (D38), so it is the acquisition
+    order exactly as the anchor rule defines it, and nothing is moved: the anchor is first
+    because the rule that chose it is the rule that orders the runs (the earliest time, or the
+    first name), not because it is put there. Under the time rule every run has a readable
+    time (else the rule would not apply); a run without one goes after the timed ones, in
+    name order. Raises ``ValueError`` when the anchor is not among the runs, or when the
+    anchor given is not the first of the order its rule gives (an anchor of another rule or of
+    other runs)."""
     if anchor.run not in {r.run for r in runs}:
         raise ValueError("the anchor is not among the runs")
     by_name = _by_name(runs)
@@ -139,8 +144,10 @@ def acquisition_order(runs: Sequence[AnchorCandidate], anchor: Anchor) -> tuple[
         ordered = sorted(by_name, key=when)
     else:
         ordered = by_name
-    rest = [r.run for r in ordered if r.run != anchor.run]
-    return (anchor.run, *rest)
+    order = tuple(r.run for r in ordered)
+    if order[0] != anchor.run:
+        raise ValueError("the anchor is not the first run in the order of its rule")
+    return order
 
 
 # --- the raw affine -----------------------------------------------------------------------
@@ -174,7 +181,7 @@ def raw_affine_choice(raw_bold: Path, reference: Path | None) -> RawAffine:
     if _agree(ref_affine, header):
         return RawAffine(to_matrix4(header), AFFINE_HEADER, reference_image=True)
     get_qform = getattr(img.header, "get_qform", None)
-    qform = get_qform(coded=True) if get_qform is not None else None
+    qform = get_qform(coded=True)[0] if get_qform is not None else None  # None for code 0
     if qform is not None and _agree(ref_affine, qform):
         return RawAffine(to_matrix4(qform), AFFINE_QFORM, reference_image=True)
     return RawAffine(to_matrix4(ref_affine), AFFINE_REFERENCE, reference_image=True)
@@ -389,6 +396,8 @@ def plan_session(
       grid (equal shape, affines within ``geometry.GRID_TOLERANCE``) is a group of its own,
       named in ``grids`` and ``grid_of`` by the key of its first run in acquisition order. No
       run gets ``runs on different grids``.
+    * ``runs`` holds the packable runs first, in :func:`acquisition_order`, which is the order
+      of the session's one continuous stream (D38), then the others in name order.
     * The session's own files come from ``connector.session_files``, with the match that
       ``connector.detect`` gives for ``deriv_root`` (empty when it gives none).
     * An unreadable file raises (``OSError``, nibabel's errors, ``ConnectorError``): the plan

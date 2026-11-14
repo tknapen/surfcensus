@@ -46,6 +46,9 @@ _KEY_ENTITIES = ("ses", "task", "acq", "ce", "rec", "dir")
 _MAGNITUDE = (None, "mag")
 """``part`` labels of a series that is a run: none, or the magnitude of complex data. The
 phase, real and imaginary parts are not runs of their own (stage 1's listing did the same)."""
+_RAW_KEYS = (*ENTITIES, "part", "chunk")
+"""The entities a raw BOLD series' name may have (BIDS); a name with any other, such as a
+derivative's ``space-`` or ``desc-``, is no raw series."""
 _SIDECAR_MAX_BYTES = 4 * 1024 * 1024
 """A larger file named like a sidecar is not read: it is not one."""
 
@@ -261,7 +264,7 @@ def func_dirs(root: Path, participant: str) -> list[tuple[str | None, Path]]:
     """The ``func/`` folders of a participant: ``(None, root/sub-X/func)`` and
     ``(label, root/sub-X/ses-<label>/func)`` for every session folder, sessions sorted. Only
     folders that exist. Raises ``OSError`` as :func:`list_dir`."""
-    if not _valid_participant(participant):
+    if not valid_participant(participant):
         return []
     subject = Path(root) / participant
     _, dirs = list_dir(subject, Path(root))
@@ -276,7 +279,8 @@ def func_dirs(root: Path, participant: str) -> list[tuple[str | None, Path]]:
     return out
 
 
-def _valid_participant(participant: object) -> bool:
+def valid_participant(participant: object) -> bool:
+    """Whether ``participant`` is ``sub-<label>`` with a label of ASCII letters and digits."""
     return (
         isinstance(participant, str)
         and participant.startswith("sub-")
@@ -307,7 +311,7 @@ def is_raw_dataset(folder: Path) -> bool:
     root = Path(folder)
     _, dirs = list_dir(root, root)
     for participant in dirs:
-        if not _valid_participant(participant):
+        if not valid_participant(participant):
             continue
         try:
             places = func_dirs(root, participant)
@@ -336,6 +340,9 @@ def _raw_entities(name: str, participant: str) -> tuple[RunEntities, str] | None
         return None
     if f"sub-{entities.sub}" != participant or entities.task is None:
         return None
+    parts = stem.split("_")
+    if any(part.partition("-")[0] not in _RAW_KEYS or "-" not in part for part in parts):
+        return None  # a derivative's name (space-, desc-) or no BIDS name
     if _entity_dict(stem).get("part") not in _MAGNITUDE:
         return None
     return entities, stem
@@ -398,7 +405,7 @@ def list_raw_runs(raw_root: Path, participant: str) -> list[RawRun]:
     are not merged, so a time in a higher level than the nearest sidecar is not seen. Raises
     ``OSError`` as :func:`list_dir`."""
     root = Path(raw_root)
-    if not _valid_participant(participant):
+    if not valid_participant(participant):
         return []
     places = func_dirs(root, participant)
     if not places:
