@@ -12,9 +12,9 @@ No image, video or table of the study is in the repository, and no dataset is na
 
 ## Decisions
 
-### Decision 7, which governs the others: what the two streams are for
+### Decision 7, which governs decisions 1 to 6: what the two streams are for
 
-Tomas Knapen, 2026-11-14, after the review of stage 1:
+Tomas Knapen, 2026-11-14, after the review of stage 1 (D36 in `docs/decisions.md`):
 
 "Well, let's be clear, the reason that we're showing both the raw and the fully pre-processed EPI time series as this video is exactly because we want to visualize the effects of pre-processing on the sort of movies, the time courses of the EPI volumes. And so it would be quite insane to perform all manner of processing on the raw data, because the whole idea is to show the difference between that and the pre-processed, and to also show how the pre-processed data now conform to, for example, the FreeSurfer surfaces, etc., etc., right? So it's meant to serve as a quality control type tool for both the raw data and the pre-processing pipeline at the same time. And so the raw and pre-processed visualizations should serve those purposes explicitly. I want you to record this and make it a full priority."
 
@@ -25,6 +25,14 @@ What follows from it. The first two points restate his words; the rest is the re
 - So the pack records, and the page states near the views as information, what the pipeline did to each run: head-motion correction; distortion correction and its method, or none; slice-timing correction or none (from fMRIPrep's summary report of the run). A viewer can then read a difference between the streams as the effect of those steps. Where distortion correction was applied, the raw stream shows the distortion as acquired against the contours, and the preprocessed stream shows how well the correction brought the series onto the surfaces: that is the viewer doing its job.
 - The two uses are named on the page and here, view by view. Quality control of the raw data: head motion, artefacts confined to single volumes, distortion and dropout as acquired, and movement between runs under the one registration (a flagged run is a statement about the raw data, not a fault of the pack). Quality control of the preprocessing: what was corrected, what remains after correction, and how the preprocessed series conforms to the white and pial contours.
 - The failure criterion of stage 1 (step 5) is about these two uses, and the selection of cases should cover the effects the viewer is meant to show, not motion alone ("What remains of stage 1" and "Next steps").
+
+### Decision 8: the governing purpose of the project
+
+Tomas Knapen, 2026-11-14, recorded as D37 in `docs/decisions.md` (decision 7 above is D36 there):
+
+"Yes, this is the governing purpose, to present people with a full quality control visualization tool that shows, perhaps even on one page, could be different pages, a surface segmentation quality control interface and a raw and pre-processed EPI movie interface. All of those exist for people to be able to judge visually the quality of acquisition and processing on a full session or multiple sessions of fMRI and MRI data."
+
+For this folder it means what "Next steps" says: the EPI movie interface moves into the package and its app, beside the surface interface, and is specified in `docs/`; this folder is the record of stage 1 and the reference for the pack format and the page.
 
 ### Decisions 1 to 6
 
@@ -631,9 +639,9 @@ Left out of the study's scratch scripts, because the scripts above supersede the
 
 ## Next steps
 
-The stages of the report, adapted to the decisions. Each stage is kept apart from the surface path, so that the surface census is untouched if the next stage is never built.
+Rewritten on 2026-11-14 after decision 8 (Tomas Knapen's statement of the governing purpose, D37 in `docs/decisions.md`). The earlier plan kept the functional part apart from the package: a subpackage that nothing imports (stage 2, after milestone 4) and a catalog and run directory of its own (stage 3, after milestone 5). That plan is superseded. The EPI movie interface becomes part of the surfcensus package and of its app, beside the surface interface, with the session as the unit a person looks at. The next step is to bring the pack and the page into the package behind `surfcensus review`, for a local folder that holds raw BIDS data, its fMRIPrep derivative and the FreeSurfer subjects. That work is specified in the package's documents (`docs/`), not here. This folder stays as the place where stage 1 was built and measured, and as the reference for the pack format (`stage1/pack_run.py`), the page (`stage1/player/`) and the checks (`stage1/check_geometry.py`, `stage1/check_player.py`).
 
-### Stage 1: in this folder, nothing in the package
+### Stage 1, as it was planned
 
 Steps 1 to 4 are built and were run on 2026-11-13 and 2026-11-14 ("Stage 1, as built" above); step 5 is proposed there and not run; step 6 is optional and not built. The steps as they were planned:
 
@@ -644,22 +652,11 @@ Steps 1 to 4 are built and were run on 2026-11-13 and 2026-11-14 ("Stage 1, as b
 5. State the failure criterion before anyone watches: if the moving picture shows nothing that the mean, the temporal-SD map and the difference stills of the same runs do not show, for judging the raw data or for judging the preprocessing (decision 7), the paper says so. A way to make that testable is to have each viewer first write down what the stills show for a run and then what the moving picture adds, run by run; the exact procedure is for Tomas to fix (open question 1; a proposal is under "What remains of stage 1").
 6. Optional, from the critiques: a shift-detection test, in which viewers judge runs with known added shifts of 0 to 5 mm, before coregistration is offered as something eyes can check.
 
-Two proposals for Tomas that follow from decision 7 (2026-11-14; proposals of the session that applied it, not decided):
+A proposal for Tomas that follows from decision 7 (2026-11-14; a proposal of the session that applied it, not decided): the cases should cover the effects the viewer is meant to show, not motion alone: runs with high and with low motion (head-motion correction), runs with distortion correction by each method fMRIPrep used (fieldmap-less SyN, phase-difference fieldmap, and others such as fieldmaps from reversed phase encoding where a derivative has them) and runs without it, and runs whose preprocessed series fits the surfaces well and badly. The listing of step 1 has the per-run summary reports (`figures/<stem>_desc-summary_bold.html`), so the distortion-correction method of every qualifying run can be read before anything is chosen, as motion was; the rule would be written down before any image is looked at, as the motion rule was.
 
-- The cases should cover the effects the viewer is meant to show, not motion alone: runs with high and with low motion (head-motion correction), runs with distortion correction by each method fMRIPrep used (fieldmap-less SyN, phase-difference fieldmap, and others such as fieldmaps from reversed phase encoding where a derivative has them) and runs without it, and runs whose preprocessed series fits the surfaces well and badly. The listing of step 1 has the per-run summary reports (`figures/<stem>_desc-summary_bold.html`), so the distortion-correction method of every qualifying run can be read before anything is chosen, as motion was; the rule would be written down before any image is looked at, as the motion rule was.
-- The next thing to build: one command that takes a local raw BIDS folder and its fMRIPrep derivative for one subject and session and opens the page, so that anyone can use the viewer on their own data. The pieces exist (`pack_inputs.find_session` reads such a layout once the files are in `deriv/` and `raw/`; `pack_run.py`; `serve.py`); what is missing is reading the two folders where they lie, in BIDS layout, without copying.
+### Ratings, only after a small rated pilot
 
-### Stage 2: after milestone 4
-
-A single-subject command on a local fMRIPrep folder, in a subpackage that imports the package's core and that nothing imports. It writes its own page model and player. Entry conditions from the critiques: the resampling is shown to be deterministic under the locked environment, and the text scrubbing and the source scan of decision D20 cover the new code and BIDS names (a task label can name a dataset).
-
-### Stage 3: after milestone 5
-
-Run-level inventory and a view-only tab. The functional part gets its own catalog file, run directory layout and source protocol, built with the same machinery, so that the surface catalog is never migrated. Leasing has to be per run: one subject can exceed the whole cache (9.0 GB of T1w-space series and 22.4 GB of raw series for one first subject in the sample).
-
-### Stage 4: only after a small rated pilot
-
-Ratings and a blind-spot number, measured against the strongest numbers available for each criterion and with a rating screen that shows no metric. By decision 1 this is not planned; it is named so that nothing built earlier rules it out.
+Ratings and a blind-spot number, measured against the strongest numbers available for each criterion and with a rating screen that shows no metric. By decision 1 this was not planned for the functional part; whether the EPI interface records judgements at all is open in the package's documents (O27 in `docs/decisions.md`).
 
 ## Rules that bind this work
 
@@ -701,5 +698,4 @@ From stage 1:
 From the review of stage 1 and decision 7 (2026-11-14):
 
 16. Should the cases be chosen to cover the effects the viewer is meant to show (head-motion correction at high and low motion, distortion correction by each method and none, good and bad fits to the surfaces) instead of by motion alone, by a rule written down before any image is looked at ("Next steps")? The present eight have distortion correction in five (four fieldmap-less, one fieldmap-based) and none in three, by chance of the motion ranking.
-17. Is the next thing to build one command that takes a local raw BIDS folder and its fMRIPrep derivative for one subject and session and opens the page ("Next steps")?
-18. `check_geometry.py` fails a pack by limits that the session that wrote it chose (more than 0.1% of mask voxels off by more than 1 gray level; a gain in correlation of more than 0.05 for the header's other affine or for the pack's stills, of more than 0.03 for a shift of up to 3 mm). Are these acceptable as the test that the raw stream is in place?
+17. `check_geometry.py` fails a pack by limits that the session that wrote it chose (more than 0.1% of mask voxels off by more than 1 gray level; a gain in correlation of more than 0.05 for the header's other affine or for the pack's stills, of more than 0.03 for a shift of up to 3 mm). Are these acceptable as the test that the raw stream is in place?

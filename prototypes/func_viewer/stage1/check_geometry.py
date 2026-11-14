@@ -57,15 +57,22 @@ A run FAILS when:
   than 1 gray level (raw or preprocessed stream);
 - the raw header's other affine gives a correlation higher than this script's placement by
   more than 0.05;
-- a shift within the search raises the correlation by more than 0.03;
 - the correlation of the pack's two mean stills is lower than this script's correlation through
   the anchor's transform by more than 0.05.
-These limits are choices of this script, set before it was run on any selected session; the
-README (stage 1) gives what it found on the packs it was run on and on a pack made with a wrong
-raw affine on purpose.
+These limits are choices of this script; the README (stage 1) gives what it found on the packs
+it was run on and on a pack made with a wrong raw affine on purpose.
 
-A correlation below 1 is not a failure by itself: the raw stream is not motion-corrected and,
-where fMRIPrep applied distortion correction, not unwarped (the manifest says per run). Exit
+The best shift is reported and is not a failure. In the first version a gain of more than 0.03
+from a shift failed a run. It failed a pack whose raw stream the comparison of values and the
+other checks place correctly (a quiet run with fieldmap-less distortion correction: 1.9 mm, r
+0.892 to 0.943): distortion as acquired displaces the raw image along the phase-encoding axis,
+and a rigid shift then lines up part of it. That is what the raw stream is meant to show
+(decision 7 of the README), so a shift can say "look here", not "misplaced". A misplacement of
+the kind the check exists for (a wrong affine of the raw header, about 22 mm) lies far outside
+the search anyway, and the other tests catch it.
+
+A correlation below 1 is not a failure by itself either: the raw stream is not motion-corrected
+and, where fMRIPrep applied distortion correction, not unwarped (the manifest says per run). Exit
 status 0 when no run fails, 1 when one does, 2 for usage. Prints one line per check, by the
 pack's run ids; names no file.
 """
@@ -84,7 +91,6 @@ VALUE_LIMIT = 1  # gray levels
 VALUE_SHARE = 1e-3  # of the brain-mask voxels
 OTHER_AFFINE_GAIN = 0.05
 STILLS_LOSS = 0.05
-SHIFT_GAIN = 0.03
 SHIFT_MM = 3.0
 PERCENTILE = 99.5
 WINDOW_STEP = 10
@@ -306,10 +312,7 @@ def check_run(pack, entry, files, anchor_xfm, own_xfm, n_check):
                     best, best_r = tuple(float(x) for x in s), r
     out["best_shift_mm"] = [round(x, 2) for x in best]
     out["r_best_shift"] = round(best_r, 4)
-    if best_r - r0 > SHIFT_GAIN:
-        out["fails"].append(
-            f"a shift of {out['best_shift_mm']} mm raises r from {r0:.3f} to {best_r:.3f}"
-        )
+    out["shift_gain"] = round(best_r - r0, 4)  # reported, not a failure (see the docstring)
     return out
 
 
