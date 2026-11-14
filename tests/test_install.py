@@ -271,8 +271,11 @@ def test_one_install_brings_the_packages_of_the_app(
 
 def test_the_installed_command_lists_its_commands(installed: Installed, scratch: Path) -> None:
     out = checked([installed.command, "--help"], cwd=scratch, timeout=COMMAND_S)
+    # whatever the terminal: on CI (GITHUB_ACTIONS) Rich writes escape codes around every
+    # word of a help page, and it always draws a frame around the list of commands
+    words = re.sub(r"[\u2500-\u257f]", " ", re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", out))
     for command in ("review", "serve", "finalize", "export", "inventory", "metrics", "render"):
-        assert re.search(rf"^\W*{command}\b", out, re.M), out
+        assert re.search(rf"^\s*{command}\b", words, re.M), out
     version = tomllib.loads((REPOSITORY / "pyproject.toml").read_text())["project"]["version"]
     assert checked([installed.command, "--version"], cwd=scratch, timeout=COMMAND_S).split() == [
         version
