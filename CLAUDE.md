@@ -66,6 +66,8 @@ Build the local path first: it is the smallest thing that is useful on its own, 
 
 Phase 0 of the census (pilot, `docs/phases.md`) can start as soon as milestone 4 works.
 
+Before milestone 5 (decisions D36 and D37): the EPI movie interface is brought into the package in the three steps of `docs/epi_interface.md` (one session without a run directory, view only; then the run directory and `review`; then the subject pages, status and export). That spec was written on 2026-11-14 and nothing of it is built; its defaults wait for Tomas's answers (its section "Decisions for Tomas").
+
 ## Verified facts the design rests on (checked 2026-11-01)
 
 - The OpenNeuroDerivatives S3 bucket (`s3://openneuro-derivatives`, HTTPS `https://openneuro-derivatives.s3.amazonaws.com`) is listable anonymously. Top-level prefixes: `fitlins/`, `fmriprep/`, `mriqc/`, `xcpd/`. Under `fmriprep/` there were 308 dataset prefixes of the form `dsXXXXXX-fmriprep/`.
@@ -221,6 +223,7 @@ surfcensus export --release | --reveal   # what a census publishes; the pseudony
 @docs/metrics.md
 @docs/rendering.md
 @docs/rater_app.md
+@docs/epi_interface.md
 @docs/rating_protocol.md
 @docs/analysis_plan.md
 @docs/decisions.md
