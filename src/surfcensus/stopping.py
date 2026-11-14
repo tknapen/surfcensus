@@ -25,7 +25,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from typing import Any, Protocol
+from typing import Any, Protocol, runtime_checkable
 
 POLL_SECONDS = 0.05
 """How often :meth:`StopFlag.wait` looks at the flag."""
@@ -36,6 +36,7 @@ INTERRUPTED = 128 + int(signal.SIGINT)
 """The exit code of a command that Ctrl-C ended (130)."""
 
 
+@runtime_checkable
 class StopRequest(Protocol):
     """What a call that serves until it is told to stop reads: a :class:`StopFlag`, or a
     ``threading.Event`` of a caller, which has the same two methods."""

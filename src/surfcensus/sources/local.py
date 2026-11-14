@@ -32,6 +32,7 @@ from surfcensus.inventory.provenance import parse_dataset_description
 from surfcensus.log import get_logger
 from surfcensus.sources.base import (
     HEMIS,
+    RENDER_ROLES,
     DatasetRecord,
     FileRef,
     FileRole,
@@ -42,9 +43,13 @@ from surfcensus.sources.base import (
     Unfetched,
 )
 from surfcensus.sources.patterns import (
+    POINTER_MAX_BYTES,
+    POINTER_PROBE_BYTES,
     ROLE_CANDIDATES,
     TEMPLATE_FILES,
+    annex_key_size,
     annex_link,
+    annex_pointer,
     find_unfetched,
     is_file,
     is_subject_candidate,
@@ -52,6 +57,7 @@ from surfcensus.sources.patterns import (
     resolve_subject_files,
     size_words,
     unfetched_files,
+    unfetched_problem,
     variant_name,
 )
 
@@ -345,6 +351,50 @@ def fetch_line(
     return f"Fetch {them}{amount} with: {command}"
 
 
+_RENDERED_ROLES = (*RENDER_ROLES, FileRole.BRAINMASK)
+"""The roles a render reads from a subject directory, without the template's spheres."""
+
+
+def unfetched_render_files(subject_dir: Path | str) -> list[str] | None:
+    """Two lines for a render of one subject directory that failed for files without
+    content (git-annex links or pointer files among the T1, the brainmask and the white
+    and pial surfaces): the ``not fetched`` sentence of the inventory, and the command that
+    fetches them (:func:`fetch_command`) when they lie in a git repository. None when no
+    such file is there. Reads links and the first bytes of small files only, as the
+    inventory does (decision D35); for ``render-subject``, which has no inventory."""
+    directory = Path(subject_dir)
+    try:
+        present = resolve_subject_files(directory)
+        found = {
+            role: item
+            for role, item in find_unfetched(directory, present).items()
+            if role in _RENDERED_ROLES
+        }
+        for role, path in present.items():
+            if role not in _RENDERED_ROLES or role in found:
+                continue
+            size = path.stat().st_size
+            if size > POINTER_MAX_BYTES:
+                continue
+            # at most POINTER_MAX_BYTES: read whole, which the module's one open() is not for
+            key = annex_pointer(path.read_bytes()[:POINTER_PROBE_BYTES], size)
+            if key is None:
+                continue
+            location = path.relative_to(directory).as_posix()
+            found[role] = Unfetched(role, location, location, annex_key_size(key), "pointer")
+    except (OSError, ValueError, RuntimeError):
+        return None
+    if not found:
+        return None
+    problem = unfetched_problem(found.values())
+    lines = [problem]
+    names = list(dict.fromkeys(item.fetch for item in found.values()))
+    command = fetch_command(directory.parent, {directory.name: names}, directory)
+    if command is not None:
+        lines.append(f"Fetch them with: {command}")
+    return lines
+
+
 def template_files_missing(directory: Path | str) -> tuple[str, ...] | None:
     """The files of ``patterns.TEMPLATE_FILES`` that ``directory`` lacks, for both
     hemispheres; ``()`` for a directory that can serve as the template, None when there is
@@ -475,6 +525,21 @@ def stored_subjects_dirs(config: RunConfig) -> list[Path]:
         except SourceError:
             places.append(Path(stored.root))
     return places
+
+
+def subjects_held(root: Path | str) -> tuple[Path, str] | None:
+    """The subjects directory (links resolved) and the pipeline of the subjects that the
+    stored root of a run holds now, read as the run reads it (no search below a dataset
+    root); None when the root holds no subjects (moved, not mounted, emptied).
+
+    Tells data that moved from another dataset, or the same subjects named another way:
+    ``--relocate`` is the answer to the first only (decision D35, review of the quick
+    start)."""
+    try:
+        record, _ = detect_layout(root, nested=False, quiet=True)
+        return (Path(record.root) / record.fs_root).resolve(), record.pipeline
+    except (SourceError, OSError):
+        return None
 
 
 def found_in(record: DatasetRecord, given: Path | str | None = None) -> str | None:
@@ -702,6 +767,8 @@ def _detect(given: Path, notes: _Notes, nested: bool) -> tuple[DatasetRecord, tu
                     "searched for FreeSurfer subjects",
                 )
             )
+    if seen and searched.undecodable:
+        notes.append((logging.WARNING, _undecodable_said(derivatives, base, searched)))
     if not seen:
         raise SourceError("layout", _nothing_below(base, derivatives, searched))
     (used, said), *others = seen.values()
@@ -778,12 +845,53 @@ class _Searched:
     """The folders of ``derivatives/`` that were searched, by name."""
     unread: dict[Path, str] = dataclasses.field(default_factory=dict)
     """Places that could not be examined, each with the system's reason."""
+    listed: bool = True
+    """Whether the folders of ``derivatives/`` could be listed."""
+    undecodable: list[str] = dataclasses.field(default_factory=list)
+    """Folders of ``derivatives/`` that were not searched because their names are not
+    valid UTF-8, as they are shown (:func:`_display`)."""
 
     def failed(self, folder: Path, exc: OSError) -> None:
-        """Note that ``folder`` could not be searched: under the place the error names,
-        when it names one, since that may be a folder inside it."""
-        place = Path(exc.filename) if isinstance(exc.filename, str) else folder
-        self.unread.setdefault(place, _strerror(exc))
+        """Note that ``folder`` could not be searched, under the place that really could
+        not be read (:func:`_unread_place`): the error may name a path inside a folder
+        that cannot be listed or searched, which need not exist."""
+        place, why = _unread_place(folder, exc)
+        self.unread.setdefault(place, why)
+
+
+def _unread_place(folder: Path, exc: OSError) -> tuple[Path, str]:
+    """The directory on the way from ``folder`` to the path that ``exc`` names that could
+    not be listed or searched, with the system's reason; ``folder`` when the error names
+    no path below it. ``derivatives/sourcedata/freesurfer (Permission denied)`` for a
+    ``derivatives/`` that may not be read is ``derivatives (Permission denied)``."""
+    why = _strerror(exc)
+    if not isinstance(exc.filename, str):
+        return folder, why
+    named = Path(exc.filename)
+    try:
+        below = named.relative_to(folder)
+    except ValueError:
+        return named, why
+    chain = [folder]
+    for part in below.parts:
+        chain.append(chain[-1] / part)
+    for at, place in enumerate(chain[:-1]):
+        try:
+            os.listdir(place)
+        except OSError as listed:
+            return place, _strerror(listed)
+        try:
+            chain[at + 1].stat()
+        except PermissionError as searched:
+            return place, _strerror(searched)  # it can be listed and not searched
+        except OSError:
+            return named, why
+    return named, why
+
+
+def _display(name: str) -> str:
+    """A file name for a message, with bytes that are not UTF-8 written as ``\\xe9``."""
+    return os.fsencode(name).decode("utf-8", "backslashreplace")
 
 
 _ORDER = {".": 0, "sourcedata/freesurfer": 1, "freesurfer": 2}
@@ -838,17 +946,19 @@ def _below(
         names = _names(derivatives) or []
     except OSError as exc:
         searched.failed(derivatives, exc)
+        searched.listed = False
         names = []
     folders = []
     for name in names:
         folder = derivatives / name
         try:
-            if (
-                not _is_dir(folder)
-                or not _is_text(name)
-                or is_template_name(name)
-                or is_subject_candidate(folder)
-            ):
+            if not _is_dir(folder) or is_template_name(name):
+                continue
+            if not _is_text(name):
+                # a run stores the root as text: such a folder cannot be a source's root
+                searched.undecodable.append(_display(name))
+                continue
+            if is_subject_candidate(folder):
                 continue
             searched.folders.append(name)
             folders.extend(probe(folder.resolve(), (folder, folder.resolve())))
@@ -911,7 +1021,7 @@ def _nothing_found(base: Path, *, bids: bool) -> str:
             f"{DERIVATIVES}/ (there is no such folder), sourcedata/freesurfer/, freesurfer/ "
             "and the dataset's own folders; if they are elsewhere, give that folder as the path"
         )
-    unreadable = _unexaminable(base)
+    unreadable = [f"{_shown(place, base)} ({why})" for place, why in _unexaminable(base).items()]
     return (
         f"no FreeSurfer subject found at {base}. A subject is a directory with mri/ and "
         "surf/ that is not a template; looked at the path itself, the folders in "
@@ -921,21 +1031,44 @@ def _nothing_found(base: Path, *, bids: bool) -> str:
     )
 
 
+def _undecodable_said(derivatives: Path, base: Path, searched: _Searched) -> str:
+    shown = _shown(derivatives, base)
+    places = ", ".join(f"{shown}/{name}" for name in searched.undecodable[:_MAX_NAMES])
+    if len(searched.undecodable) == 1:
+        return (
+            f"{places} is skipped: its name is not valid UTF-8, and a source's root is "
+            "stored and hashed as text; rename the folder to search it"
+        )
+    return (
+        f"{places} are skipped: their names are not valid UTF-8, and a source's root is "
+        "stored and hashed as text; rename the folders to search them"
+    )
+
+
 def _nothing_below(base: Path, derivatives: Path, searched: _Searched) -> str:
     """The detail of ``layout`` for a dataset root, or a ``derivatives/`` folder, in which
     the search of rule 6 found no subject."""
     where = "the path" if derivatives == base else f"{DERIVATIVES}/"
-    listed = ", ".join(searched.folders[:_MAX_NAMES]) or "none"
+    listed = ", ".join(searched.folders[:_MAX_NAMES]) or (
+        "none that could be searched" if searched.undecodable else "none"
+    )
     more = len(searched.folders) - _MAX_NAMES
     uninstalled = _uninstalled_below(base, derivatives, searched.folders)
     if uninstalled:
         # nothing can be found before the subdataset is there: that is all there is to say
         return f"no FreeSurfer subject found in {base}: " + "; ".join(uninstalled[:_MAX_NAMES])
+    unread = dict(searched.unread)
+    for place, why in _unexaminable(base).items():
+        unread.setdefault(place, why)
+    if searched.listed:
+        folders = f" and its folders ({listed}{f' and {more} more' if more > 0 else ''})"
+    else:
+        # the folder itself is the place that could not be read: said here, not again below
+        folders = f", which could not be listed ({unread.pop(derivatives, 'not readable')})"
     detail = (
         f"no FreeSurfer subject found in {base}. A subject is a directory with mri/ and "
-        f"surf/ that is not a template; looked in {where} and its folders ({listed}"
-        f"{f' and {more} more' if more > 0 else ''}), in each for subject directories, "
-        "sourcedata/freesurfer/ and freesurfer/"
+        f"surf/ that is not a template; looked in {where}{folders}, in each for subject "
+        "directories, sourcedata/freesurfer/ and freesurfer/"
     )
     if derivatives != base:
         detail += ", and at the path's own sourcedata/freesurfer/, freesurfer/ and folders"
@@ -945,21 +1078,31 @@ def _nothing_below(base: Path, derivatives: Path, searched: _Searched) -> str:
     ]
     if bare:
         detail += f". Without a subject: {', '.join(bare[:_MAX_NAMES])}"
-    unread = [f"{_shown(place, base)} ({why})" for place, why in searched.unread.items()]
-    unread += _unexaminable(base)
-    if unread:
-        detail += f". Could not be examined: {', '.join(unread[:_MAX_NAMES])}"
+    said = [f"{_shown(place, base)} ({why})" for place, why in unread.items()]
+    if said:
+        detail += f". Could not be examined: {', '.join(said[:_MAX_NAMES])}"
+    if searched.undecodable:
+        detail += f". {_undecodable_said(derivatives, base, searched)}"
     return detail
 
 
-def _unexaminable(directory: Path) -> list[str]:
-    names = []
-    for name in _names(directory) or ():
+def _unexaminable(directory: Path) -> dict[Path, str]:
+    """The folders of ``directory`` that could not be examined, with the system's reason;
+    each under the place that really could not be read (:func:`_unread_place`)."""
+    found: dict[Path, str] = {}
+    try:
+        names = _names(directory) or ()
+    except OSError:
+        return found
+    for name in names:
         try:
             is_subject_candidate(directory / name)
-        except OSError:
-            names.append(name)
-    return names[:_MAX_NAMES]
+        except OSError as exc:
+            place, why = _unread_place(directory / name, exc)
+            found.setdefault(place, why)
+        if len(found) >= _MAX_NAMES:
+            break
+    return found
 
 
 class LocalSource:

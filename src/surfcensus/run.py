@@ -51,6 +51,44 @@ if TYPE_CHECKING:
     from surfcensus.templates import Template, TemplateNotFound
 
 
+def other_root_hint(
+    old: str,
+    held: Sequence[tuple[Path, str] | None],
+    here: Path | None,
+    pipeline: str | None,
+    new_run: str,
+) -> str:
+    """What to say after the root ``old`` of a run that a path of another root was given
+    for. ``held`` is what each stored root holds now (``sources.local.subjects_held``),
+    ``here`` and ``pipeline`` the subjects directory and pipeline of the path, ``new_run``
+    the option that makes a new run. ``--relocate`` is suggested only where it is right:
+    data that left the stored root, or the same subjects in the same pipeline under
+    another name. A stored root that still holds subjects of another directory is another
+    dataset (decision D35, review of the quick start)."""
+    if any(place is None for place in held):
+        return (
+            "which holds no subjects now: pass --relocate if they moved to this path, or "
+            f"{new_run} for a new run"
+        )
+    if any(place == (here, pipeline) for place in held):
+        return (
+            "where the subjects of this path lie as well, named another way: give "
+            f"{old} as the path to go on with that run, --relocate to name the subjects "
+            f"as this path from now on (they keep their identifiers), or {new_run} for a "
+            "new run"
+        )
+    if any(place is not None and place[0] == here for place in held):
+        return (
+            "where the subjects of this path lie as well, in a layout that gives them "
+            f"other identifiers: give {old} as the path to go on with that run, or "
+            f"{new_run} for a new run"
+        )
+    return (
+        "which still holds its subjects, so this path is another dataset: give it a run "
+        f"directory of its own with {new_run}"
+    )
+
+
 @dataclass(frozen=True)
 class _StoredLocal:
     """A local source as the run holds it."""
@@ -297,7 +335,7 @@ class Run:
         match = next((s for s in locals_ if s.root == described.root), None)
         moved = match is None
         if match is None:
-            match = self._relocation_target(locals_, relocate)
+            match = self._relocation_target(locals_, relocate, source)
         current = self.config.sources[match.index]
         # on a move the root alone changes; the subject set and field strength stay as stored
         subjects = current.subjects if moved else described.subjects
@@ -354,32 +392,60 @@ class Run:
                         )
 
     def _relocation_target(
-        self, locals_: Sequence[_StoredLocal], relocate: bool | str
+        self, locals_: Sequence[_StoredLocal], relocate: bool | str, source: Source
     ) -> _StoredLocal:
+        """The stored source that ``source``, a local source at another root, stands for.
+
+        Without ``relocate`` this refuses (``other root``) and says what to give: when a
+        stored root still holds its subjects, ``source`` is another dataset or the same
+        subjects named another way, and ``--relocate`` is suggested only for the second
+        within one pipeline. With ``relocate`` a stored root that still holds subjects of
+        another subjects directory is refused (``invalid``): two datasets would be merged
+        under one set of identifiers (decision D35, review of the quick start)."""
+        from surfcensus.sources.local import subjects_held
+
         if not locals_:
             raise ConfigError("invalid", "this run has no local source")
-        if not relocate:
+        local = self.config.mode == "local"
+
+        def named(stored: _StoredLocal) -> str:
             # a census run keeps its roots out of sight: name its datasets by pseudonym
-            local = self.config.mode == "local"
-            old = ", ".join(s.root if local else s.pseudonym for s in locals_)
-            raise ConfigError(
-                "other root",
-                f"this run directory belongs to {old}; pass --run-dir for a new run, or "
-                "--relocate if the data moved",
-            )
+            return stored.root if local else stored.pseudonym
+
+        given = getattr(source, "subjects_dir", None)
+        here = Path(given).resolve() if isinstance(given, Path) else None
+        dataset = getattr(source, "dataset", None)
+        pipeline = getattr(dataset, "pipeline", None)
+        held = {stored.index: subjects_held(stored.root) for stored in locals_}
+        if not relocate:
+            old = ", ".join(named(stored) for stored in locals_)
+            hint = other_root_hint(old, list(held.values()), here, pipeline, "--run-dir DIR")
+            raise ConfigError("other root", f"this run directory belongs to {old}, {hint}")
         if isinstance(relocate, str):
-            named = [s for s in locals_ if s.pseudonym == relocate]
-            if not named:
+            chosen = [s for s in locals_ if s.pseudonym == relocate]
+            if not chosen:
                 raise ConfigError("invalid", f"this run has no local dataset {relocate}")
-            return named[0]
-        if len(locals_) > 1:
+            target = chosen[0]
+        elif len(locals_) > 1:
             names = ", ".join(sorted(s.pseudonym for s in locals_))
             raise ConfigError(
                 "invalid",
                 f"this run has {len(locals_)} local sources ({names}); say which one moved: "
                 "--relocate D-xxxxxxxx",
             )
-        return locals_[0]
+        else:
+            target = locals_[0]
+        place = held[target.index]
+        if place is not None and place[0] != here:
+            raise ConfigError(
+                "invalid",
+                f"--relocate: the data of this run are still where they were "
+                f"({named(target)}), so this path looks like another dataset, not the same "
+                "data moved; give it a run directory of its own with --run-dir DIR. If that "
+                "place holds a copy that this run should no longer read, move or rename the "
+                "copy first, then --relocate takes the run to this path",
+            )
+        return target
 
     def _template_places(self) -> list[tuple[str, Path]]:
         """The fsaverage directories outside the subjects directories that this call may

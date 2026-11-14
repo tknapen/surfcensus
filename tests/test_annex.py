@@ -632,3 +632,31 @@ def test_the_default_run_directory_is_beside_a_datalad_dataset_never_inside_it(
     with review(subjects, serve=False, jobs=1) as run:
         assert run.run_dir == beside
     assert snapshot_links(clone) == before
+
+
+@pytest.mark.parametrize("kind", ["link", "pointer"])
+def test_render_subject_names_files_without_content_and_how_to_fetch_them(
+    tmp_path: Path, kind: str, no_tools: Path
+) -> None:
+    """Review of the quick start (F7): ``render-subject`` has no inventory, and said
+    ``missing surface: no file for t1`` for a link without content and ``unreadable input``
+    for a pointer file. It says what ``review`` says: the files, and the fetch."""
+    root = dataset(tmp_path / "ds", ["sub-01"])
+    derivatives = root / "derivatives"
+    subject = derivatives / "freesurfer" / "sub-01"
+    made = unfetch(derivatives, files_of(subject, ["mri/T1.mgz", "surf/lh.pial"]), kind)  # type: ignore[arg-type]
+    before = snapshot_links(root)
+    result = cli("render-subject", subject, "--out", tmp_path / "out", "--no-video")
+    assert result.exit_code == 1
+    size = sum(len(p.data) for p in made)
+    what = "git-annex links" if kind == "link" else "git-annex pointer files"
+    assert result.stderr.splitlines() == [
+        f"render failed: not fetched: 2 files are {what} whose content is not here: "
+        f"mri/T1.mgz, surf/lh.pial; {size_words(size)}",
+        f"Fetch them with: datalad -C {derivatives} get "
+        "freesurfer/sub-01/mri/T1.mgz freesurfer/sub-01/surf/lh.pial",
+    ]
+    assert snapshot_links(root) == before and not no_tools.exists()
+    # with the content there, the subject renders
+    fetch(made)
+    assert cli("render-subject", subject, "--out", tmp_path / "out", "--no-video").exit_code == 0

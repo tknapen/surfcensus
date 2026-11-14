@@ -39,8 +39,8 @@ from surfcensus.config import (
     write_config,
 )
 from surfcensus.log import get_logger
-from surfcensus.run import Run
-from surfcensus.sources.base import RENDER_ROLES, SourceError
+from surfcensus.run import Run, other_root_hint
+from surfcensus.sources.base import RENDER_ROLES, DatasetRecord, SourceError
 from surfcensus.sources.local import (
     LAYOUT_WORDS,
     LocalSource,
@@ -49,6 +49,7 @@ from surfcensus.sources.local import (
     detect_layout,
     fetch_line,
     refuse_in_sources,
+    subjects_held,
     where_subjects_lie,
 )
 from surfcensus.sources.patterns import ROLE_CANDIDATES, is_unfetched_problem, unfetched_said
@@ -114,43 +115,29 @@ def default_run_dir(path: Path | str) -> Path:
     and when the current directory lies inside the dataset the call is refused
     (``ConfigError("invalid", ...)``), since only ``run_dir`` can then say where.
 
+    A run of this root comes first, wherever of these places it is, and so does one in
+    ``<name>-surfcensus-run`` beside the default (``<name>`` the dataset, or the folder
+    named), the directory that :func:`refuse_foreign_default` tells a user to give when
+    the default place holds the run of another dataset. When ``surfcensus-run`` holds the
+    run of another root and no run of this one is found, it is returned all the same, and
+    :func:`refuse_foreign_default` says what to give instead.
+
     Raises ``SourceError`` as :func:`surfcensus.sources.local.detect_layout` does.
     """
     record, implied = detect_layout(path, quiet=True)
-    subjects_dir = Path(record.root) / record.fs_root
-    if implied:
-        # one subject directory, which may be a link: the run goes beside the directory that
-        # lists it, which is the root the run stores, not beside what the link leads to
-        beside = subjects_dir.parent
-    else:
-        beside, inside = Path(path).resolve().parent, subjects_dir.resolve()
-        if beside == inside or inside in beside.parents:
-            beside = inside.parent
-    dataset = dataset_holding(record, path)
-    datalad = datalad_dataset_holding(beside)
-    if datalad is not None:
-        # beside the path lies inside a DataLad dataset (a clone of an fMRIPrep output, say):
-        # the run goes beside the outermost one, as beside a BIDS dataset
-        datalad = datalad.resolve()
-        if dataset is None or datalad == dataset or datalad in dataset.parents:
-            dataset = datalad
-    if dataset is None:
-        candidate = beside / DEFAULT_RUN_DIR
-        if (candidate / "config.yaml").is_file() or os.access(beside, os.W_OK | os.X_OK):
-            return candidate
+    places = _run_places(Path(path), record, implied)
+    for place in places.earlier:
+        if _holds_run_of(place, record.root):
+            return place
+    if (places.default / "config.yaml").is_file():
+        return places.default  # a run of another root: refuse_foreign_default speaks
+    if places.dataset is None:
+        if os.access(places.default.parent, os.W_OK | os.X_OK):
+            return places.default
         return Path.cwd() / DEFAULT_RUN_DIR
-
-    candidate = dataset.parent / DEFAULT_RUN_DIR
-    if (candidate / "config.yaml").is_file():
-        return candidate
-    # where the rule above put the run of this folder before datasets were known: beside
-    # the path, beside the root, or (the older fMRIPrep layout named by its fmriprep
-    # folder) in the root
-    for earlier in dict.fromkeys((beside, Path(record.root).parent, Path(record.root))):
-        if _holds_run_of(earlier / DEFAULT_RUN_DIR, record.root):
-            return earlier / DEFAULT_RUN_DIR
-    if os.access(dataset.parent, os.W_OK | os.X_OK):
-        return candidate
+    if os.access(places.default.parent, os.W_OK | os.X_OK):
+        return places.default
+    dataset = places.dataset
     here = Path.cwd()
     if here.resolve() == dataset or dataset in here.resolve().parents:
         raise ConfigError(
@@ -160,6 +147,99 @@ def default_run_dir(path: Path | str) -> Path:
             "of a run unless asked; say where the run goes with --run-dir DIR",
         )
     return here / DEFAULT_RUN_DIR
+
+
+@dataclass(frozen=True)
+class _RunPlaces:
+    """Where :func:`default_run_dir` looks for the run of a path."""
+
+    default: Path
+    """``surfcensus-run`` beside the path, or beside the dataset that holds it."""
+    own: Path
+    """``<name>-surfcensus-run`` beside the default, for a second dataset of one folder."""
+    earlier: tuple[Path, ...]
+    """Where a run of this root is looked for, in order: the default, the places where
+    earlier versions put it, and ``own``."""
+    dataset: Path | None
+    """The BIDS or DataLad dataset that the run goes beside, if any."""
+
+
+def _run_places(path: Path, record: DatasetRecord, implied: Sequence[str]) -> _RunPlaces:
+    subjects_dir = Path(record.root) / record.fs_root
+    if implied:
+        # one subject directory, which may be a link: the run goes beside the directory that
+        # lists it, which is the root the run stores, not beside what the link leads to
+        beside = subjects_dir.parent
+        name = subjects_dir.name
+    else:
+        beside, inside = path.resolve().parent, subjects_dir.resolve()
+        name = path.resolve().name
+        if beside == inside or inside in beside.parents:
+            beside, name = inside.parent, inside.name
+    dataset = dataset_holding(record, path) or _fmriprep_output_holding(subjects_dir, beside)
+    datalad = datalad_dataset_holding(beside)
+    if datalad is not None:
+        # beside the path lies inside a DataLad dataset (a clone of an fMRIPrep output, say):
+        # the run goes beside the outermost one, as beside a BIDS dataset
+        datalad = datalad.resolve()
+        if dataset is None or datalad == dataset or datalad in dataset.parents:
+            dataset = datalad
+    if dataset is None:
+        default = beside / DEFAULT_RUN_DIR
+        own = beside / f"{name}-{DEFAULT_RUN_DIR}"
+        return _RunPlaces(default, own, (default, own), None)
+    default = dataset.parent / DEFAULT_RUN_DIR
+    own = dataset.parent / f"{dataset.name}-{DEFAULT_RUN_DIR}"
+    # where the rule above put the run of this folder before datasets were known: beside
+    # the path, beside the root, or (the older fMRIPrep layout named by its fmriprep
+    # folder) in the root
+    inside_runs = (beside, Path(record.root).parent, Path(record.root))
+    earlier = (default, *(place / DEFAULT_RUN_DIR for place in inside_runs), own)
+    return _RunPlaces(default, own, tuple(dict.fromkeys(earlier)), dataset)
+
+
+def _fmriprep_output_holding(subjects_dir: Path, beside: Path) -> Path | None:
+    """The fMRIPrep output that holds the subjects as ``sourcedata/freesurfer`` and has a
+    ``dataset_description.json`` (a BIDS-derivative dataset, as fMRIPrep writes and
+    OpenNeuroDerivatives publishes it), when the place beside the path lies inside it:
+    ``review ds/sourcedata/freesurfer`` puts the run beside ``ds``, as for a BIDS dataset,
+    also when ``ds`` was downloaded without DataLad. None otherwise."""
+    try:
+        inner = subjects_dir.resolve()
+        output = inner.parent.parent
+        if inner.parent.name != "sourcedata" or not (output / "dataset_description.json").is_file():
+            return None
+        place = beside.resolve()
+    except OSError:
+        return None
+    return output if place == output or output in place.parents else None
+
+
+def refuse_foreign_default(path: Path | str, run_dir: Path) -> None:
+    """Raise ``ConfigError("other root", ...)`` when ``run_dir``, the default of
+    :func:`default_run_dir` for ``path``, holds a local run of another root, with what to
+    give instead: the stored root to go on with that run, ``--relocate`` when the stored
+    root holds the same subjects in the same pipeline, and otherwise a ``--run-dir`` of
+    this dataset's own (``<name>-surfcensus-run``, which :func:`default_run_dir` finds
+    afterwards). Nothing happens when ``run_dir`` holds no run or a run of this root, or
+    a census run, which ``review`` refuses for its own reason. The name of the default
+    directory is open question O23."""
+    if not (run_dir / "config.yaml").is_file():
+        return
+    try:
+        stored = load_config(run_dir)
+    except (ConfigError, OSError):
+        return  # the run refuses itself, with its own reason
+    roots = [s.root for s in stored.sources if s.kind == "local" and s.root is not None]
+    record, implied = detect_layout(path, quiet=True)
+    if stored.mode != "local" or not roots or record.root in roots:
+        return
+    places = _run_places(Path(path), record, implied)
+    held = [subjects_held(root) for root in roots]
+    here = (Path(record.root) / record.fs_root).resolve()
+    old = ", ".join(roots)
+    hint = other_root_hint(old, held, here, record.pipeline, f"--run-dir {places.own}")
+    raise ConfigError("other root", f"{run_dir} holds the run of {old}, {hint}")
 
 
 def _holds_run_of(run_dir: Path, root: str) -> bool:
@@ -647,7 +727,12 @@ def open_review(
         )
     path = Path(path)
     jobs = default_jobs() if jobs is None else jobs
-    run_dir = default_run_dir(path) if run_dir is None else Path(run_dir)
+    if run_dir is None:
+        run_dir = default_run_dir(path)
+        if not relocate:
+            refuse_foreign_default(path, run_dir)  # before a run is opened there
+    else:
+        run_dir = Path(run_dir)
     if fsaverage is not None:
         _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
     run, new = _open_run(

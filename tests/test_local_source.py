@@ -361,7 +361,8 @@ def test_a_directory_whose_folders_cannot_be_examined_says_so(
     with pytest.raises(SourceError) as caught:
         LocalSource(tree)
     assert caught.value.reason == "layout"
-    assert caught.value.detail.endswith("Could not be examined: sub-01")
+    # the folder, with the system's reason, as every other place that could not be read
+    assert caught.value.detail.endswith("Could not be examined: sub-01 (Permission denied)")
 
 
 def test_a_subjects_directory_without_search_permission(tmp_path: Path) -> None:
@@ -788,6 +789,94 @@ def test_a_folder_below_derivatives_that_cannot_be_examined(
         "unreadable",
         f"{derivatives}: Permission denied",
     )
+
+
+def _refuse_directory(monkeypatch: pytest.MonkeyPatch, refused: Path) -> None:
+    """``refused`` behaves as a directory of mode 000 does for a user without
+    CAP_DAC_OVERRIDE: it cannot be listed, and nothing inside it can be looked at (its
+    name can). As root, modes stop nothing, so the calls are replaced."""
+    listdir, stat = os.listdir, Path.stat
+
+    def no_listing(path: str | os.PathLike[str]) -> list[str]:
+        if Path(path) == refused:
+            raise PermissionError(13, "Permission denied", str(path))
+        return listdir(path)
+
+    def no_search(self: Path, *args: object, **kwargs: object) -> object:
+        if refused in self.parents:
+            raise PermissionError(13, "Permission denied", str(self))
+        return stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(os, "listdir", no_listing)
+    monkeypatch.setattr(Path, "stat", no_search)
+
+
+def test_a_folder_that_cannot_be_read_is_named_once_as_itself(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of the quick start (F6): the error of a place inside a folder that may not be
+    read names that place, which need not exist. The message names the folder, once."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset.resolve() / "derivatives"
+    derivatives.mkdir()
+    _refuse_directory(monkeypatch, derivatives)
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.reason == "layout"
+    assert caught.value.detail == (
+        f"no FreeSurfer subject found in {dataset.resolve()}. A subject is a directory with "
+        "mri/ and surf/ that is not a template; looked in derivatives/, which could not be "
+        "listed (Permission denied), in each for subject directories, sourcedata/freesurfer/ "
+        "and freesurfer/, and at the path's own sourcedata/freesurfer/, freesurfer/ and "
+        "folders"
+    )
+    monkeypatch.undo()
+    # a folder below derivatives/ that cannot be read, beside one that holds subjects
+    write_tree(derivatives / "fmriprep", "fmriprep", ["sub-02"])
+    (derivatives / "aaa" / "sourcedata").mkdir(parents=True)
+    _refuse_directory(monkeypatch, derivatives / "aaa")
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        assert LocalSource(dataset).dataset.root == str(derivatives / "fmriprep")
+    assert _warnings(caplog) == [
+        "derivatives/aaa could not be examined (Permission denied) and was not searched "
+        "for FreeSurfer subjects"
+    ]
+    monkeypatch.undo()
+    # a subjects directory with a folder that cannot be read: named by itself, with why
+    plain = tmp_path / "plain"
+    (plain / "zz").mkdir(parents=True)
+    _refuse_directory(monkeypatch, plain / "zz")
+    with pytest.raises(SourceError) as caught:
+        LocalSource(plain)
+    assert caught.value.detail.endswith(". Could not be examined: zz (Permission denied)")
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="names of bytes that are not UTF-8")
+def test_a_folder_below_derivatives_with_a_name_that_is_not_text_is_said_to_be_skipped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review of the quick start (F6): such a folder cannot be a source's root, which is
+    stored as text. It is passed over with a warning, and named when nothing is found."""
+    dataset = write_bids_dataset(tmp_path / "ds")
+    derivatives = dataset.resolve() / "derivatives"
+    latin = Path(os.fsdecode(bytes(derivatives) + b"/fs\xe9"))
+    write_tree(latin, "subjects_dir", ["sub-01"])
+    with pytest.raises(SourceError) as caught:
+        LocalSource(dataset)
+    assert caught.value.detail.endswith(
+        "looked in derivatives/ and its folders (none that could be searched), in each for "
+        "subject directories, sourcedata/freesurfer/ and freesurfer/, and at the path's own "
+        "sourcedata/freesurfer/, freesurfer/ and folders. derivatives/fs\\xe9 is skipped: its "
+        "name is not valid UTF-8, and a source's root is stored and hashed as text; rename "
+        "the folder to search it"
+    )
+    write_tree(derivatives / "fmriprep", "fmriprep", ["sub-02"])
+    with caplog.at_level(logging.WARNING, logger="surfcensus"):
+        assert LocalSource(dataset).dataset.root == str(derivatives / "fmriprep")
+    assert _warnings(caplog) == [
+        "derivatives/fs\\xe9 is skipped: its name is not valid UTF-8, and a source's root is "
+        "stored and hashed as text; rename the folder to search it"
+    ]
 
 
 def test_a_stored_root_is_not_searched_below_its_derivatives(

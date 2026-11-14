@@ -102,7 +102,16 @@ def render_subject(
         raise typer.BadParameter(_template_problem(exc), param_hint="--fsaverage") from exc
     except (RenderError, OSError) as exc:
         # OSError: the output cannot be written (not a directory, read-only, disk full)
-        typer.echo(f"render failed: {' '.join(str(exc).split())}", err=True)
+        said = [f"render failed: {' '.join(str(exc).split())}"]
+        if isinstance(exc, RenderError):
+            from surfcensus.sources.local import unfetched_render_files
+
+            # a clone whose files have no content: the cause, and the fetch, as review says
+            unfetched = unfetched_render_files(subject_dir)
+            if unfetched is not None:
+                said = [f"render failed: {unfetched[0]}", *unfetched[1:]]
+        for line in said:
+            typer.echo(line, err=True)
         raise typer.Exit(1) from exc
     counts = ", ".join(f"{len(info.panels[name].slices)} {name}" for name in PANEL_ORDER)
     typer.echo(f"{target}: {counts} slices, {time.perf_counter() - start:.1f} s")
