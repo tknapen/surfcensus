@@ -1068,11 +1068,12 @@ class _Db:
     thread pool); one write transaction is open at a time.
     """
 
-    def __init__(self, path: Path, *, readonly: bool) -> None:
+    def __init__(self, path: Path, *, readonly: bool, migrate: bool = True) -> None:
         if not path.is_file():
             raise ConfigError("missing", f"{path.parent} has no {path.name}")
         self.path = path
         self.readonly = readonly
+        self.migrate = migrate and not readonly
         self.mode: Mode = "local"  # until the file says
         self.version = 0  # the schema the file has, once it is opened
         self._lock = threading.RLock()
@@ -1121,7 +1122,7 @@ class _Db:
             # transaction that makes the run, so no migration is applied to such a file
             raise ConfigError("invalid", f"{name} holds no run: it was not made by surfcensus")
         if version < SCHEMA_VERSION:
-            if self.readonly:
+            if not self.migrate:
                 if version < READONLY_OLDEST:
                     raise ConfigError(
                         "invalid",
@@ -1129,7 +1130,9 @@ class _Db:
                         "command once",
                     )
                 # read as it is: what the later migrations add is absent, and nothing is
-                # written, so the file keeps every byte
+                # migrated (a read-only opening writes nothing at all, so the file keeps
+                # every byte; a writer that does not migrate writes rows of the tables the
+                # file has)
             else:
                 _migrate(self._conn)
                 version = SCHEMA_VERSION
@@ -1217,8 +1220,15 @@ class Catalog:
     ``cli.py`` and (milestone 5) ``calibration_transfer.py``.
     """
 
-    def __init__(self, path: Path | str, *, readonly: bool = False) -> None:
+    def __init__(self, path: Path | str, *, readonly: bool = False, migrate: bool = True) -> None:
         """Open an existing catalog and apply pending migrations.
+
+        ``migrate=False`` opens it for writing without migrating: an older catalog is then
+        read as it is, as a read-only opening reads it (every functional reader answers
+        empty and every functional writer raises), for ``surfcensus status`` and
+        ``calibration freeze``, which must not make a run unreadable for an earlier version
+        (review of step 2 of the EPI interface). Opening for writing still lets SQLite roll
+        back the journal of a writer that was killed.
 
         Raises :class:`ConfigError`: ``missing`` when there is no file, ``newer schema``
         for one written by a later version, ``invalid`` for a file that is no catalog, and
@@ -1226,7 +1236,7 @@ class Catalog:
         which no run was made yet raises :class:`UnfinishedCatalog` and is left as it is;
         :meth:`create` with ``exist_ok`` finishes it.
         """
-        self._db = _Db(Path(path), readonly=readonly)
+        self._db = _Db(Path(path), readonly=readonly, migrate=migrate)
 
     @classmethod
     def create(
@@ -2135,11 +2145,15 @@ class PublicCatalog:
         self._owns_connection = owns_connection
 
     @classmethod
-    def open(cls, run_dir: Path | str, *, readonly: bool = True) -> PublicCatalog:
-        """Needs no key. Read-only by default: no migration is applied, and a catalog older
-        than this version raises ``ConfigError("invalid", ...)``, a newer one
-        ``ConfigError("newer schema", ...)``. The writing methods need ``readonly=False``."""
-        return cls(_Db(Path(run_dir) / CATALOG_FILE, readonly=readonly), owns_connection=True)
+    def open(
+        cls, run_dir: Path | str, *, readonly: bool = True, migrate: bool = True
+    ) -> PublicCatalog:
+        """Needs no key. Read-only by default: no migration is applied, a catalog from
+        :data:`READONLY_OLDEST` on is read as it is, an older one raises
+        ``ConfigError("invalid", ...)``, a newer one ``ConfigError("newer schema", ...)``. The
+        writing methods need ``readonly=False``, which migrates unless ``migrate=False``."""
+        db = _Db(Path(run_dir) / CATALOG_FILE, readonly=readonly, migrate=migrate)
+        return cls(db, owns_connection=True)
 
     def close(self) -> None:
         if self._owns_connection:

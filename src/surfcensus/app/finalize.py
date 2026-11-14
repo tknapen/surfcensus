@@ -738,7 +738,8 @@ def freeze_calibration(
             f"{CALIBRATION_FILE} exists in {run_dir} and is not overwritten; remove it to "
             "freeze the calibration set again",
         )
-    with PublicCatalog.open(run_dir, readonly=False) as public:
+    # writes selection rows, and migrates nothing: an earlier version can still open the run
+    with PublicCatalog.open(run_dir, readonly=False, migrate=False) as public:
         mode = app_db_mode(run_dir)
         if mode is None:
             raise ConfigError(

@@ -12,6 +12,7 @@ fMRIPrep derivative below ``derivatives/`` and the FreeSurfer subjects ``sub-01`
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import sqlite3
 import threading
@@ -482,3 +483,87 @@ def test_a_session_whose_contours_cannot_be_cut_has_no_contour_files_among_its_i
             bases = {item.base for item in info.inputs}
             contours = list(session_dir.glob("contours/*/*.bin"))
             assert ("freesurfer" in bases) == bool(contours), pack_json
+
+
+# --- what the commands say (review of step 2, A-F5 and A-F6) -------------------------------------
+
+
+def test_a_session_without_contours_is_named_by_its_labels(
+    folder: SyntheticFuncDataset, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    (folder.fs_subjects_dir / "sub-01" / "surf" / "lh.white").write_bytes(b"not a surface")
+    with caplog.at_level("WARNING", logger="surfcensus"):
+        review(folder.raw_root, run_dir=tmp_path / "run", jobs=1, serve=False).close()
+    said = [r.getMessage() for r in caplog.records if "without contours" in r.getMessage()]
+    assert said and all(line.startswith("sub-01 ses-") for line in said), said
+    assert not any("Error:" in line for line in said), said
+
+
+def _no_surfaces(tmp_path: Path) -> SyntheticFuncDataset:
+    folder = write_review_folder(tmp_path / "data")
+    for subject in folder.subjects:
+        for surface in (folder.fs_subjects_dir / subject / "surf").glob("?h.pial*"):
+            surface.unlink()
+    return folder
+
+
+def test_with_nothing_to_rate_the_browser_opens_the_epi_movies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from surfcensus.stopping import StopFlag
+
+    folder = _no_surfaces(tmp_path)
+    opened_urls: list[str] = []
+    monkeypatch.setattr(reviewing.webbrowser, "open", lambda url: opened_urls.append(url))
+    monkeypatch.setattr(reviewing, "_render_rest", lambda *args, **kwargs: None)
+    run, app = open_review(folder.raw_root, run_dir=tmp_path / "run", jobs=1, port=0)
+    assert app is not None and app.epi_url is not None
+    stop = StopFlag()
+    stop.set()
+    reviewing.serve_review(run, app, open_browser=True, stop=stop)
+    run.close()
+    assert opened_urls == [app.epi_url]
+    said = capsys.readouterr().err
+    assert f"Rating app: {app.url}" in said
+    assert "No subject can be rated; the browser opens the EPI movies." in said
+
+    # serve on the same run: the EPI address is printed, and the browser goes there too
+    from surfcensus.app import server
+
+    monkeypatch.setattr(server.webbrowser, "open", lambda url: opened_urls.append(url))
+    stop = StopFlag()
+    stop.set()
+    server.serve(tmp_path / "run", port=0, open_browser=True, stop=stop)
+    said = capsys.readouterr().err
+    (address,) = [line for line in said.splitlines() if line.startswith("EPI movies: ")]
+    assert opened_urls[-1] == address.removeprefix("EPI movies: ")
+
+
+def test_review_no_serve_with_nothing_to_rate_does_not_say_that_movies_are_shown(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    folder = _no_surfaces(tmp_path)
+    review(folder.raw_root, run_dir=tmp_path / "run", jobs=1, serve=False).close()
+    said = capsys.readouterr().err
+    assert "are shown" not in said
+    assert "Its functional runs are packed for the EPI movies." in said
+
+
+def test_serve_names_the_epi_movies_when_they_are_offered(
+    folder: SyntheticFuncDataset, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    from surfcensus.app import server
+    from surfcensus.stopping import StopFlag
+
+    review(folder.raw_root, run_dir=tmp_path / "run", jobs=1, serve=False).close()
+    capsys.readouterr()
+    stop = StopFlag()
+    stop.set()
+    server.serve(tmp_path / "run", port=0, open_browser=False, stop=stop)
+    said = capsys.readouterr().err
+    assert re.search(r"EPI movies: http://127\.0\.0\.1:\d+/epi", said)
+    assert "the browser opens the EPI movies" not in said  # there are subjects to rate
+    review(folder.raw_root, run_dir=tmp_path / "off", jobs=1, serve=False, epi=False).close()
+    capsys.readouterr()
+    server.serve(tmp_path / "off", port=0, open_browser=False, stop=stop)
+    assert "EPI movies:" not in capsys.readouterr().err

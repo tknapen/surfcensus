@@ -186,6 +186,25 @@ def acquisition_seconds(value: object) -> tuple[str, float] | None:
         return None
 
 
+def sidecar_problem(path: Path) -> str | None:
+    """Why a JSON sidecar gives no ``AcquisitionTime`` although it is there: ``cannot be
+    read``, ``is larger than 4 MiB`` or ``is not a JSON object``; None when it reads as one
+    (with or without the field). So a sidecar that cannot be parsed is told from one without
+    a time (review of step 2 of the EPI interface)."""
+    try:
+        with open(path, "rb") as handle:
+            data = handle.read(_SIDECAR_MAX_BYTES + 1)
+    except (OSError, ValueError):
+        return "cannot be read"
+    if len(data) > _SIDECAR_MAX_BYTES:
+        return "is larger than 4 MiB"
+    try:
+        value = json.loads(data.decode("utf-8-sig"))
+    except (ValueError, RecursionError):
+        return "is not a JSON object"
+    return None if isinstance(value, dict) else "is not a JSON object"
+
+
 def sidecar_time(path: Path) -> str | None:
     """``AcquisitionTime`` of a JSON sidecar as written, None when the file cannot be read or
     the field is absent or not a string. A file larger than 4 MiB is not read."""

@@ -618,14 +618,23 @@ def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
 
     places = []
     for folder in run.func_folders():
-        deriv = _shown_place(Path(str(folder["deriv_root"])), base)
+        deriv_root = Path(str(folder["deriv_root"]))
+        raw_root = None if folder["raw_root"] is None else Path(str(folder["raw_root"]))
+        # both folders named the same way: relative to the path when both lie in it, else
+        # both as they are (review of step 2)
+        common = base
+        if base is not None and any(
+            place is not None and not place.is_relative_to(base) for place in (deriv_root, raw_root)
+        ):
+            common = None
+        deriv = _shown_place(deriv_root, common)
         version = folder["pipeline_version"]
         pipeline = "fMRIPrep" if folder["connector"] == "fmriprep" else str(folder["connector"])
         pipeline += f" {version}" if isinstance(version, str) else ""
-        if folder["raw_root"] is None:
+        if raw_root is None:
             raw = "no raw dataset found (give it with --raw DIR)"
         else:
-            raw = f"raw series in {_shown_place(Path(str(folder['raw_root'])), base)} (BIDS)"
+            raw = f"raw series in {_shown_place(raw_root, common)} (BIDS)"
         places.append(f"{deriv} ({pipeline}), {raw}")
     selected = [row for row in runs if _true(row["selected"])]
     packable = [row for row in selected if _true(row["packable"])]
@@ -714,6 +723,12 @@ def viewable(run: Run) -> int:
     return done + pending
 
 
+def retry_hint(run: Run) -> str:
+    """What tries failed packs again: a failed run is not tried again while its files stay
+    as they are (the skip rule of D21)."""
+    return f"tried again with: surfcensus pack --run-dir {run.run_dir} --retry-failed"
+
+
 def pack_line(run: Run, *, behind: bool, after_renders: bool = False) -> str | None:
     """``EPI packs: 0 of 11 made; they are made while the app runs, after the renders (about
     20 s in one process, an estimate ...).``; None for a run without packable runs."""
@@ -726,7 +741,7 @@ def pack_line(run: Run, *, behind: bool, after_renders: bool = False) -> str | N
         return None
     line = f"EPI packs: {done} of {_plural(total, 'run')} made"
     if failed:
-        line += f", {failed} failed"
+        line += f", {failed} failed ({retry_hint(run)})"
     if pending:
         if behind:
             line += f"; {pending} are made while the app runs"
@@ -899,6 +914,12 @@ class ReviewApp:
         """Why the renderer behind the app gave up, if it did."""
         return self._problem[0] if self._problem else None
 
+    def in_progress(self) -> str | None:
+        """What the worker behind the app is at (``EPI packs`` or ``renders``), or None."""
+        if not self.rendering:
+            return None
+        return "EPI packs" if self._packing else "renders"
+
     def wait_rendered(self, timeout: float | None = None) -> bool:
         """Wait for the renderer behind the app; false if it is still at work after
         ``timeout`` seconds."""
@@ -977,6 +998,7 @@ def _pack_rest(run: Run, jobs: int, app: ReviewApp) -> None:
     _say(f"All EPI packs are made: {done} of {_plural(done + failed, 'run')} can be viewed.")
     if failed:
         _say_pack_failures(run, report)
+        _say(f"  The failed runs are {retry_hint(run)}")
 
 
 def _check(rater: str | None, jobs: int | None, serve_after: int | None, port: int) -> None:
@@ -1097,8 +1119,10 @@ def open_review(
             if _fetch_said(run, path):
                 # the fetch line above is the remedy: say what comes after it
                 line += " Fetch the files as said above, then run the same command again."
-            if shown:
+            if shown and serve:
                 line += " The EPI movies of its functional runs are shown."
+            elif shown:
+                line += " Its functional runs are packed for the EPI movies."
             _say(line)
             if shown == 0:
                 return run, None
@@ -1307,9 +1331,15 @@ def serve_review(
         if app.epi_url is not None:
             _say(f"EPI movies: {app.epi_url}")
         _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")
+        # no subject to rate and EPI movies to view: the browser goes to the movies (review
+        # of step 2)
+        opened = app.url
+        if app.epi_url is not None and rateable(run) == 0 and viewable(run) > 0:
+            opened = app.epi_url
+            _say("No subject can be rated; the browser opens the EPI movies.")
         if open_browser:
             with suppress(webbrowser.Error):
-                webbrowser.open(app.url)
+                webbrowser.open(opened)
         with suppress(KeyboardInterrupt):
             while app.handle.running and not stop.wait(0.2):
                 pass
@@ -1336,7 +1366,7 @@ def serve_review(
         else:
             line = f"EPI packs: {done} of {_plural(done + failed + pending, 'run')} made"
             if failed:
-                line += f", {failed} failed"
+                line += f", {failed} failed ({retry_hint(run)})"
             if pending:
                 line += f"; {pending} are made at the next call"
             _say(line + ".")

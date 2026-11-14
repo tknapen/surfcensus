@@ -20,7 +20,7 @@
     <button type="button" id="help-button"><kbd>?</kbd> help</button>
   </header>
 
-  <main id="views" data-api="{{ api }}" data-poll="{{ poll_s }}"></main>
+  <main id="views" data-api="{{ api }}" data-poll="{{ poll_s }}"{% if poll_idle_s is defined and poll_idle_s %} data-poll-waiting="{{ poll_waiting_s }}" data-poll-idle="{{ poll_idle_s }}" data-waiting="{{ 'true' if waiting else 'false' }}" data-index-api="{{ index_api }}" data-participant="{{ participant_uid }}"{% endif %}></main>
 
   <section id="timeline" aria-label="the stream of every run, session after session">
     <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
@@ -33,7 +33,7 @@
   </section>
 
   <section id="run-strip" aria-label="the run on screen">
-    <p class="line"><b id="run-name"></b> <span id="run-where"></span> <span id="badges"></span>
+    <p class="line epi-run-line"><b id="run-name"></b> <span id="run-where"></span> <span id="badges"></span>
       <button type="button" id="run-more" aria-expanded="false" aria-controls="run-details">details</button></p>
     <p class="line" id="corrections"></p>
     <div id="run-details" hidden role="region" aria-label="what is said about the run on screen">
@@ -62,7 +62,7 @@
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
   <section id="about" aria-label="what the two streams are">
-    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if poll_s %} <span id="packing" class="epi-packing">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
+    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">all participants</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">rating screen</a>{% endif %}{% if poll_idle_s is defined and poll_idle_s %} <span id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
     <p id="reading"></p>
   </section>
 

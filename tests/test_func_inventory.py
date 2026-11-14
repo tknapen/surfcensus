@@ -390,10 +390,37 @@ def test_a_derivative_that_cannot_be_packed_lists_its_reasons(tmp_path: Path) ->
         assert set(bench.rows("SELECT n_packable FROM func_sessions")) == {(0,)}
 
 
-def test_a_session_that_cannot_be_planned_is_a_failed_unit(tmp_path: Path) -> None:
+def test_a_damaged_mask_fails_its_run_and_not_its_session(tmp_path: Path) -> None:
+    # review of step 2, D-F4: a file of one run that cannot be read fails that run alone
     ds = write_review_folder(tmp_path / "data")
     run = next(r for r in ds.runs if r.design.participant == "sub-02" and r.packable)
     run.files["pre_mask"].write_bytes(b"not a NIfTI file")
+    for bench in _bench(tmp_path, ds):
+        report = bench.func()
+        assert (report.done, report.failed) == (3, 0)
+        (row,) = bench.rows(
+            "SELECT reason, detail, packable FROM func_runs WHERE name LIKE ?",
+            f"%{run.design.task}_run-{run.design.run}",
+        )
+        assert row[0] == "pack failure" and row[2] == 0
+        assert run.files["pre_mask"].name in str(row[1]) and str(tmp_path) not in str(row[1])
+        assert bench.rows("SELECT COUNT(*) FROM func_runs WHERE packable = 1") == [(10,)]
+
+
+def test_a_session_that_cannot_be_planned_is_a_failed_unit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from surfcensus.func import session as session_
+
+    ds = write_review_folder(tmp_path / "data")
+    original = session_.plan_session
+
+    def unplannable(participant: str, *args: object, **kwargs: object) -> object:
+        if participant == "sub-02":
+            raise OSError(f"[Errno 5] Input/output error: '{ds.deriv_root}/sub-02/x'")
+        return original(participant, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(session_, "plan_session", unplannable)
     for bench in _bench(tmp_path, ds):
         report = bench.func()
         assert (report.done, report.failed) == (3, 1)

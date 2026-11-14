@@ -274,7 +274,7 @@ def _plan(
     retry_failed: bool,
 ) -> _Planned:
     from surfcensus.config import ConfigError
-    from surfcensus.func.packread import pack_on_disk
+    from surfcensus.func.packread import pack_on_disk, session_on_disk
 
     epi = _epi(ctx)
     pack_hash, session_hash = epi.pack_hash(), epi.session_hash()
@@ -339,7 +339,8 @@ def _plan(
             else:
                 settled = False
         current |= kept
-        done = outcome is True and (session_dir / SESSION_JSON).is_file()
+        # session.json and every contour file it lists, by name (review of step 2)
+        done = outcome is True and session_on_disk(session_dir)
         # a packs row of a run that is no longer a packable run of this session: the session
         # is written again, so that its new session.json no longer lists the run before the
         # run's directory goes (pack_session removes it after that)
@@ -518,7 +519,10 @@ def pack_session_unit(
     if work.contours is not None and plan.grids:
         contours, note = cut_contours(work.contours, plan)
         if contours is None:
-            _log.warning("session %s is packed %s", session_uid, note)
+            # named by its labels: the EPI phases run in a local run only (review of step 2)
+            from surfcensus.func.inventory import session_text
+
+            _log.warning("%s is packed %s", session_text(plan.participant, plan.session), note)
             # as ``epi-session`` does: a pack without contours does not depend on the files
             # of the contours, so they are not among its inputs (E2.Z)
             inputs = tuple(
@@ -819,6 +823,7 @@ def run_pack(
     force: bool = False,
     retry_failed: bool = False,
     stop: Callable[[], bool] | None = None,
+    waiting: Callable[[], None] | None = None,
 ) -> PhaseReport:
     """Pack the pending sessions (:func:`pack_plan`) in batches of ``jobs`` sessions, each in a
     worker process when ``jobs`` is above 1 (``batches.run_batches`` with ``ctx.func_lease``
@@ -977,6 +982,7 @@ def run_pack(
             jobs=jobs,
             progress=PACK_PHASE,
             stop=stop,
+            waiting=waiting,
         )
 
     # every participant's stream.json, also of those no batch touched (contents that are

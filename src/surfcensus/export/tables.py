@@ -1206,16 +1206,22 @@ def _manifest(src: _Sources, profile: Profile, fmt: Format, scores: pd.DataFrame
 def _refuse_in_sources(run_dir: Path, target: Path) -> None:
     """Raise ``ConfigError("invalid", ...)`` when ``target`` is, or lies inside, a directory
     that a source of a local run reads (``sources.local.refuse_in_sources``): its subjects
-    directory, what a subject or a template in it links to, and the fsaverage directory of
-    a FreeSurfer install. Sources are only read. The roots are those of ``config.yaml``;
-    where a root holds no subjects now (the data is not mounted), ``target`` is compared
-    with the root itself. A census run keeps its roots in the private catalog, out of reach
-    of this module; the command checks it through ``Run.refuse_output_in_sources``."""
+    directory, what a subject or a template in it links to, the participant folders of the
+    functional derivative and of the raw dataset (``func.discover.stored_read_places``), and
+    the fsaverage directory of a FreeSurfer install. Sources are only read. The roots are
+    those of ``config.yaml``; where a root holds no subjects now (the data is not mounted),
+    ``target`` is compared with the root itself. A census run keeps its roots in the private
+    catalog, out of reach of this module; the command checks it through
+    ``Run.refuse_output_in_sources``."""
+    from surfcensus.func.discover import stored_read_places
+
+    config = load_config(run_dir)
     refuse_in_sources(
         target,
-        stored_subjects_dirs(load_config(run_dir)),
+        stored_subjects_dirs(config),
         what="output",
-        also=freesurfer_template_places(),
+        # with the participant folders of a raw dataset named with --raw (review of step 2)
+        also=[*freesurfer_template_places(), *stored_read_places(config)],
     )
 
 

@@ -319,7 +319,13 @@ def participant_places(roots: tuple[tuple[str, Path | None], ...]) -> list[tuple
             except OSError:
                 continue
             if entry.is_symlink():
-                places.append((f"the directory that {name} in {what} links to,", entry))
+                # named by its target, as ``sources.local.source_places`` names a linked
+                # subject; a path written through the link resolves into it
+                try:
+                    target = entry.resolve()
+                except (OSError, RuntimeError):
+                    continue
+                places.append((f"the directory that {name} in {what} links to,", target))
             else:
                 places.append((f"{name} of {what}", entry))
     return places

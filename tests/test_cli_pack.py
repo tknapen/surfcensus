@@ -65,9 +65,11 @@ def test_inventory_lists_the_functional_runs_after_the_subjects(
     assert lines[first - 1].startswith("inventory: ")  # after the surface report
     # without --source, where the folders lie is said relative to the stored root, the
     # derivative that holds the subjects
+    # the derivative and the raw dataset are named the same way: here both as they are,
+    # since the raw dataset does not lie in the stored root (review of step 2, A-F5)
     assert (
-        "19 runs in 3 sessions of 2 participants in . (fMRIPrep 21.0.2), raw series in "
-        f"{folder.raw_root} (BIDS)"
+        f"19 runs in 3 sessions of 2 participants in {folder.deriv_root} (fMRIPrep 21.0.2), "
+        f"raw series in {folder.raw_root} (BIDS)"
     ) in lines[first]
     assert re.fullmatch(rf"func_inventory: 0 done, 3 skipped, 0 failed, {SECONDS}", lines[-1])
 
@@ -81,6 +83,24 @@ def test_pack_packs_what_is_pending_and_then_nothing(inventoried: Path) -> None:
     assert result.exit_code == 0
     assert re.match(rf"pack: 0 done, 11 skipped, 0 failed, {SECONDS}", result.output)
     assert {status for _, status in _packs(inventoried)} == {"done"}
+
+
+def test_pack_ends_with_1_on_a_failed_pack_and_names_retry_failed(inventoried: Path) -> None:
+    # review of step 2, D-F3 and D-F6: a failed pack row is exit code 1, at every call until
+    # it is tried again, and the line that counts it says how to try it again
+    data = inventoried.parent / "data"
+    series = sorted(data.rglob("fmriprep/sub-01/ses-2/func/*space-T1w_desc-preproc_bold.nii*"))
+    assert series
+    blob = series[0].read_bytes()
+    series[0].write_bytes(blob[: len(blob) // 2])  # the header reads, the volumes do not
+    assert cli("inventory", "--run-dir", inventoried).exit_code == 0
+    for _ in range(2):
+        result = cli("pack", "--run-dir", inventoried)
+        assert result.exit_code == 1, result.output
+        assert "1 failed" in result.output
+        assert f"surfcensus pack --run-dir {inventoried} --retry-failed" in result.output
+    result = cli("pack", "--run-dir", inventoried, "--retry-failed")
+    assert result.exit_code == 1, result.output
 
 
 def test_pack_with_the_data_unmounted_works_when_nothing_is_pending_and_stops_otherwise(
@@ -141,6 +161,23 @@ def test_inventory_stores_the_epi_options_and_refuses_a_glob_before_a_run_exists
     assert result.exit_code == 0 and "Functional: 19 runs" in result.output
     result = cli("inventory", "--run-dir", run_dir, "--no-epi")
     assert "the EPI interface is off for this run (--no-epi, stored)" in result.output
+
+
+def test_options_that_bring_the_epi_settings_back_to_the_defaults_remove_the_section(
+    inventoried: Path,
+) -> None:
+    # review of step 2, A-F2: config.yaml goes back to the bytes it had
+    before = (inventoried / CONFIG_FILE).read_bytes()
+    assert b"epi:" not in before
+    assert cli("inventory", "--run-dir", inventoried, "--no-epi").exit_code == 0
+    assert b"epi:" in (inventoried / CONFIG_FILE).read_bytes()
+    assert cli("inventory", "--run-dir", inventoried, "--epi").exit_code == 0
+    assert (inventoried / CONFIG_FILE).read_bytes() == before
+    assert cli("inventory", "--run-dir", inventoried, "--epi-runs", "*_run-1").exit_code == 0
+    assert load_config(inventoried).epi.runs == ("*_run-1",)  # pyrefly: ignore
+    # '*' selects every run, which is what no glob means: the globs are cleared
+    assert cli("inventory", "--run-dir", inventoried, "--epi-runs", "*").exit_code == 0
+    assert (inventoried / CONFIG_FILE).read_bytes() == before
 
 
 def test_status_works_on_a_run_with_functional_tables(inventoried: Path) -> None:
@@ -246,3 +283,96 @@ def test_review_stops_in_order_while_packs_are_made_and_the_next_call_goes_on(
     assert "EPI packs: 11 of 11 runs made." in result.output
     with contextlib.suppress(ProcessLookupError):
         slow_review.kill()
+
+
+def test_an_export_in_a_participant_folder_of_a_raw_dataset_given_with_raw_is_refused(
+    tmp_path: Path,
+) -> None:
+    # review of step 2, A-F1: the participant folders of a raw dataset named with --raw are
+    # read, so no export goes there, also not the default export/ of a run moved there
+    from synth import snapshot_tree  # pyrefly: ignore[missing-import]
+    from synth_func import write_func_dataset  # pyrefly: ignore[missing-import]
+
+    from surfcensus.config import ConfigError
+    from surfcensus.export.tables import export_run
+
+    ds = write_func_dataset(tmp_path / "data", raw_inside=False)
+    run_dir = tmp_path / "run"
+    result = cli("inventory", "--run-dir", run_dir, "--source", ds.deriv_root, "--raw", ds.raw_root)
+    assert result.exit_code == 0, result.output
+    before = snapshot_tree(ds.raw_root)
+    out = ds.raw_root / "sub-02" / "e"
+    result = cli("export", "--run-dir", run_dir, "--out", out)
+    assert result.exit_code == 2, result.output
+    assert "only read" in result.output
+    with pytest.raises(ConfigError, match="only read"):
+        export_run(run_dir, out)
+    with Run(run_dir) as run, pytest.raises(ConfigError, match="only read"):
+        run.refuse_output_in_sources(out)
+    assert snapshot_tree(ds.raw_root) == before
+    moved = ds.raw_root / "sub-02" / "moved"
+    shutil.copytree(run_dir, moved)
+    with_moved = snapshot_tree(ds.raw_root)
+    for command in (("export",), ("finalize",), ("calibration", "freeze")):
+        result = cli(*command, "--run-dir", moved)
+        assert result.exit_code == 2, (command, result.output)
+        assert "only read" in result.output
+    assert snapshot_tree(ds.raw_root) == with_moved
+
+
+def _as_schema_1(catalog: Path) -> None:
+    """Take migration 2 out of a catalog: it is additive, so what is left is a catalog of
+    schema 1 as a version before step 2 wrote it."""
+    with sqlite3.connect(catalog) as db:
+        objects = db.execute(
+            "SELECT type, name FROM sqlite_master WHERE type IN ('view', 'table') AND "
+            "(name LIKE 'func\\_%' ESCAPE '\\' OR name LIKE 'public\\_func\\_%' ESCAPE '\\' "
+            "OR name IN ('packs', 'public_packs')) ORDER BY type = 'table'"
+        ).fetchall()
+        assert len(objects) == 11
+        for kind, name in objects:
+            db.execute(f'DROP {kind.upper()} "{name}"')
+        db.execute("DELETE FROM work WHERE phase = 'epi_session'")
+        db.execute("PRAGMA user_version = 1")
+
+
+def test_status_and_calibration_freeze_do_not_migrate_a_catalog_of_schema_1(
+    inventoried: Path,
+) -> None:
+    # review of step 2, D-F2: an earlier version still opens the run afterwards
+    catalog = inventoried / "catalog.sqlite"
+    _as_schema_1(catalog)
+    before = catalog.read_bytes()
+    result = cli("status", "--run-dir", inventoried)
+    assert result.exit_code == 0, result.output
+    result = cli("status", "--run-dir", inventoried, "--failures")
+    assert result.exit_code == 0, result.output
+    result = cli("calibration", "freeze", "--run-dir", inventoried)
+    assert result.exit_code == 2, result.output  # nothing is rated: refused
+    with sqlite3.connect(catalog) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert catalog.read_bytes() == before
+    assert cli("pack", "--run-dir", inventoried).exit_code == 0  # a writer migrates
+    with sqlite3.connect(catalog) as db:
+        assert db.execute("PRAGMA user_version").fetchone()[0] == 2
+
+
+def test_pack_says_what_is_there_to_pack(tmp_path: Path, inventoried: Path) -> None:
+    # review of step 2, A-F5 (c) and (d)
+    result = cli("pack", "--run-dir", tmp_path / "nothing")
+    assert result.exit_code == 2
+    assert "holds no run; make one with surfcensus review PATH" in result.output
+    assert "give a source" not in result.output
+    assert cli("inventory", "--run-dir", inventoried, "--no-epi").exit_code == 0
+    result = cli("pack", "--run-dir", inventoried)
+    assert result.exit_code == 0, result.output
+    assert "EPI packs: none; the EPI interface is off for this run" in result.output
+    from synth import write_synthetic_subject  # pyrefly: ignore[missing-import]
+
+    subjects = tmp_path / "subjects"
+    write_synthetic_subject(subjects, name="sub-01", shape=(64, 64, 64), subdivisions=2)
+    plain = tmp_path / "plain"
+    assert cli("inventory", "--run-dir", plain, "--source", subjects).exit_code == 0
+    result = cli("pack", "--run-dir", plain)
+    assert result.exit_code == 0, result.output
+    assert "EPI packs: none; this run has no functional run that can be packed." in result.output

@@ -300,6 +300,7 @@ def run_batches(
     jobs: int,
     progress: str | None = None,
     stop: Callable[[], bool] | None = None,
+    waiting: Callable[[], None] | None = None,
 ) -> None:
     """Per batch of ``units`` (pending ``subject_uid``s, in order; for the pack phase
     ``session_uid``s): lease every subject, run ``work`` on each with what its lease yields
@@ -333,6 +334,10 @@ def run_batches(
     ``stop`` is asked before each batch is leased: once it answers true, no further batch is
     started and the call returns. The batches before it are committed, so this is how a
     caller in another thread ends the work between two batches without losing any.
+
+    ``waiting`` is called once when a ``KeyboardInterrupt`` arrives while work runs in worker
+    processes, before that work is waited for, so that a command can say at once what it
+    waits for (a session of the pack phase can take minutes).
     """
     if batch_subjects < 1:
         raise ValueError(f"batch_subjects must be at least 1, not {batch_subjects}")
@@ -372,7 +377,9 @@ def run_batches(
                 else:
                     try:
                         outcomes.update(_in_pool(workers, work, leased, tick))
-                    except BaseException:
+                    except BaseException as exc:
+                        if waiting is not None and isinstance(exc, KeyboardInterrupt):
+                            waiting()
                         # before the leases go: a worker may still be reading their files
                         workers.stop()
                         raise

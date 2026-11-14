@@ -84,6 +84,28 @@ def pack_on_disk(session_dir: Path, run: str) -> bool:
     return True
 
 
+def session_on_disk(session_dir: Path) -> bool:
+    """Whether ``session.json`` of this version is there with a file under every contour name
+    it lists, by one listing per grid folder (names only, as :func:`pack_on_disk`). The packs
+    of the runs are judged by :func:`pack_on_disk`."""
+    session_dir = Path(session_dir)
+    info = read_session(session_dir)
+    if info is None:
+        return False
+    present: dict[str, set[str]] = {}
+    for grid in info.grids:
+        for entry in (grid.contours or {}).values():
+            folder, _, name = entry.file.rpartition("/")
+            if folder not in present:
+                try:
+                    present[folder] = set(os.listdir(session_dir / folder))
+                except OSError:
+                    return False
+            if name not in present[folder]:
+                return False
+    return True
+
+
 @lru_cache(maxsize=4)
 def _inflated(path: str, sha256: str | None, mtime_ns: int, size: int) -> bytes:
     blob = Path(path).read_bytes()

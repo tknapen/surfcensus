@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 import os
+import zlib
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -28,6 +29,7 @@ from pathlib import Path
 import nibabel as nib
 import numpy as np
 from jaxtyping import Bool, Float
+from nibabel.filebasedimages import ImageFileError
 
 from surfcensus.func import bids
 from surfcensus.func.connectors.base import Connector, ConnectorError
@@ -439,8 +441,14 @@ def plan_session(
       anchor's transform, whether the anchor is packed or not.
     * The session's own files come from ``connector.session_files``, with the match that
       ``connector.detect`` gives for ``deriv_root`` (empty when it gives none).
-    * An unreadable file raises (``OSError``, nibabel's errors, ``ConnectorError``), but for a
-      stored transform: the plan of a session is otherwise all or nothing.
+    * A stored transform, the header of a series, a brain mask or a confounds table that
+      cannot be read fails its own run (``pack failure``, the file named in ``details``,
+      without a path), and the other runs are planned; the anchor needs its stored transform
+      only, so a run whose series is damaged can be the anchor without being packed (review
+      of step 2 of the EPI interface). Any other unreadable file raises (``OSError``,
+      nibabel's errors, ``ConnectorError``).
+    * A raw sidecar that is there and cannot be parsed gives its run no acquisition time, so
+      the runs are put in name order; ``anchor_note`` names the sidecar.
     """
     raw_by_key: dict[str, list[RawRun]] = {}
     for raw in sorted(raw_runs, key=lambda r: (r.order, r.stem)):
@@ -481,18 +489,29 @@ def plan_session(
         else:
             reason = next((why for role, why in _MISSING_REASONS if role in missing), None)
         grid: Grid | None = None
-        if reason is None:
-            grid = grid_of(paths[FuncRole.PRE_BOLD])
-            if not same_grid(grid, grid_of(paths[FuncRole.PRE_MASK])):
-                reason = NO_BRAIN_MASK
-        if reason is None:
-            counts = {
-                _n_volumes(paths[FuncRole.RAW_BOLD]),
-                _n_volumes(paths[FuncRole.PRE_BOLD]),
-                _n_rows(paths[FuncRole.CONFOUNDS]),
-            }
-            if len(counts) != 1:
-                reason = VOLUME_COUNTS_DIFFER
+        reading: Path | None = None
+        try:
+            if reason is None:
+                reading = paths[FuncRole.PRE_BOLD]
+                grid = grid_of(reading)
+                reading = paths[FuncRole.PRE_MASK]
+                if not same_grid(grid, grid_of(reading)):
+                    reason = NO_BRAIN_MASK
+            if reason is None:
+                counts = set()
+                for role in (FuncRole.RAW_BOLD, FuncRole.PRE_BOLD):
+                    reading = paths[role]
+                    counts.add(_n_volumes(reading))
+                reading = paths[FuncRole.CONFOUNDS]
+                counts.add(_n_rows(reading))
+                if len(counts) != 1:
+                    reason = VOLUME_COUNTS_DIFFER
+        except _HEADER_ERRORS as err:
+            # a damaged header fails its own run; the others are planned (review of step 2)
+            assert reading is not None
+            reason, grid = PACK_FAILURE, None
+            words = _error_words(err, deriv_root, raw_root)
+            details[run_id(run)] = f"{reading.name} cannot be read: {words}"
         item = SessionRun(
             run=run_id(run),
             name=_name(run),
@@ -553,28 +572,53 @@ def plan_session(
             why = f"{why} ({time_of[first]})"
         anchor = Anchor(run=first, rule=rule, why=why)
         skipped = session_runs[: session_runs.index(first)]
+        notes = []
+        if rule != RULE_TIME:
+            # a sidecar that is there and cannot be parsed is not "no time": say which one
+            # put the order to the names (review of step 2)
+            bad = sorted(
+                {
+                    f"{path.name} {problem}"
+                    for path in (all_paths[r].get(FuncRole.RAW_SIDECAR) for r in by_id)
+                    if path is not None and (problem := bids.sidecar_problem(path)) is not None
+                }
+            )
+            if bad:
+                notes.append(
+                    f"the raw sidecar {', '.join(bad)}, so the runs are ordered by name and "
+                    "not by acquisition time"
+                )
         if skipped:
             names = ", ".join(by_id[r].name for r in skipped)
             words = "has" if len(skipped) == 1 else "have"
-            anchor_note = (
+            notes.append(
                 f"the first {_plural_runs(len(skipped))} by the rule ({names}) {words} no "
                 f"readable stored transform to the anatomy, so the anchor is the next run, "
                 f"{by_id[first].name}"
             )
+        anchor_note = "; ".join(notes) or None
     if packable and anchor is not None:
         order = tuple(r for r in session_runs if r in packable)
         transforms: dict[str, Matrix4] = {anchor.run: rigid_of[anchor.run].matrix}
         masks: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-        for run_uid in order:
+        for run_uid in list(order):
             item, paths, grid = packable[run_uid]
+            try:
+                masks[run_uid] = _mask(paths[FuncRole.PRE_MASK])
+            except _HEADER_ERRORS as err:
+                packable.pop(run_uid)
+                by_id[run_uid] = replace(item, reason=PACK_FAILURE)
+                words = _error_words(err, deriv_root, raw_root)
+                details[run_uid] = f"{paths[FuncRole.PRE_MASK].name} cannot be read: {words}"
+                continue
             transforms[run_uid] = rigid_of[run_uid].matrix
-            masks[run_uid] = _mask(paths[FuncRole.PRE_MASK])
             key = next((k for k, g in grids.items() if same_grid(g, grid)), None)
             if key is None:
                 key = grid.key
                 grids[key] = grid
             grid_of_run[run_uid] = key
-        frame = check_frame(transforms, anchor.run, masks, frame_limit_mm)
+        order = tuple(r for r in order if r in packable)
+        frame = check_frame(transforms, anchor.run, masks, frame_limit_mm) if order else None
 
     position = {run_uid: n for n, run_uid in enumerate(order)}
     runs = tuple(
@@ -614,6 +658,9 @@ def _plural_runs(n: int) -> str:
 
 
 _TRANSFORM_ERRORS = (OSError, ValueError, EOFError, ConnectorError)
+_HEADER_ERRORS = (OSError, ValueError, EOFError, zlib.error, ImageFileError)
+"""What reading the header of a series, a mask or a confounds table raises for a file that
+is damaged; the run then fails on its own (``pack failure`` with the file named)."""
 
 
 def _error_words(err: BaseException, *roots: Path | None) -> str:

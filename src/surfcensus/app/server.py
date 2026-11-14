@@ -174,6 +174,10 @@ EPI_MEDIA_URL = "/epi-media"
 EPI_POLL_S = 5
 """How often, in seconds, the EPI pages of a participant whose packs are still being made
 ask the server again (the stream grows behind the app)."""
+EPI_POLL_IDLE_S = 30
+"""How often, in seconds, the EPI page of a participant with no pack to be made asks the
+server again: packs can still be made later (``surfcensus pack`` in another process, a later
+``review``), and a page left open notices them."""
 EPI_MEMORY_MIB = 512
 """The decoded-chunk limit the EPI page of a run holds for a whole stream (that of
 ``surfcensus epi-session --serve``)."""
@@ -1574,6 +1578,7 @@ class _App:
             )
             return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
         self.epi_participant(participant_uid)
+        waiting = self.epi_waiting(participant_uid)
         text = self.pages.get_template("epi.html").render(
             static=STATIC_URL,
             version=self.version,
@@ -1581,7 +1586,15 @@ class _App:
             api=f"{EPI_API}/{participant_uid}",
             index_url=EPI_INDEX_URL,
             rate_url="/",
-            poll_s=EPI_POLL_S if self.epi_waiting(participant_uid) else 0,
+            # the page asks every EPI_POLL_S while packs of the participant wait and every
+            # EPI_POLL_IDLE_S when none do; poll_s is the interval of now, and after each answer
+            # the page asks the index which of the two applies
+            waiting=waiting,
+            poll_s=EPI_POLL_S if waiting else EPI_POLL_IDLE_S,
+            poll_waiting_s=EPI_POLL_S,
+            poll_idle_s=EPI_POLL_IDLE_S,
+            index_api=EPI_API,
+            participant_uid=participant_uid,
         )
         return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
 
@@ -2070,6 +2083,11 @@ def serve(
     config = load_config(run_dir)
     with PublicCatalog.open(run_dir) as public:
         census = public.mode() == "census"
+        # the EPI pages, offered as the app offers them (``epi_offered``), and whether a pack
+        # can be viewed there
+        epi = not census and epi_settings(config).enabled and public.has_func()
+        packs = public.packs() if epi else None
+        viewable = packs is not None and bool((packs["status"] == "done").any())
         plan = build_plan(
             public,
             queue_scores(run_dir),
@@ -2107,9 +2125,16 @@ def serve(
     earlier = signal.signal(signal.SIGTERM, lambda *_: waits.set()) if in_main else None
     try:
         print(f"Rating app: {handle.url} (Ctrl-C to stop)", file=sys.stderr, flush=True)
+        epi_url = f"{handle.url.rstrip('/')}{EPI_INDEX_URL}" if epi else None
+        if epi_url is not None:
+            print(f"EPI movies: {epi_url}", file=sys.stderr, flush=True)
+        # nothing to rate and EPI movies to view: the browser goes to the movies
+        opened = epi_url if epi_url is not None and viewable and not plan.render_keys else None
+        if opened is not None:
+            print("No subject can be rated; the browser opens the EPI movies.", file=sys.stderr)
         if open_browser:
             with suppress(webbrowser.Error):
-                webbrowser.open(handle.url)
+                webbrowser.open(opened or handle.url)
         while handle.running and not waits.wait(0.2):
             pass
     except KeyboardInterrupt:

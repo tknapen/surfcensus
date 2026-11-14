@@ -97,6 +97,7 @@ const page = {
   errors: [],
   requests: 0,
   fetchedBytes: 0,
+  grownAt: null, // performance.now() when the page said that the stream grew
 };
 
 // ---- the stream -----------------------------------------------------------------------------
@@ -348,11 +349,13 @@ function writeControls() {
   $('play-text').textContent = state.playing ? 'pause' : 'play';
   $('rate').value = String(state.rate);
   const tr = run.tr_s ? `, ${(t * run.tr_s).toFixed(1)} s` : '';
-  $('readout-run').textContent = run.name;
-  $('readout-volume').textContent =
+  setText('readout-run', run.name);
+  setText(
+    'readout-volume',
     state.kind === 'series'
       ? `volume ${t} of 0 to ${run.n_volumes - 1} of the run${tr} · ${state.g} of 0 to ${timeline.total - 1} of the stream`
-      : `still over ${run.pack.stills_volumes} of ${run.n_volumes} volumes of the run`;
+      : `still over ${run.pack.stills_volumes} of ${run.n_volumes} volumes of the run`,
+  );
   const grid = gridOf(k);
   for (const label of $('slices').children) {
     const input = label.querySelector('input');
@@ -367,6 +370,14 @@ function writeControls() {
   $('traces-on').checked = state.traces;
   $('diff-scale').value = String(state.diffScale);
   document.body.classList.toggle('no-traces', !state.traces);
+}
+
+// A text in a slot of fixed size (the read-out, the strip): cut with an ellipsis when it is
+// longer than its slot, so the whole text is also its tooltip.
+function setText(id, text, title = text) {
+  const el = $(id);
+  if (el.textContent !== text) el.textContent = text;
+  if (el.title !== title) el.title = title;
 }
 
 function badge(text, title, kind = '') {
@@ -404,9 +415,8 @@ function writeRun() {
     where = session.label;
   }
   $('run-note').textContent = note;
-  $('run-name').textContent = run.name;
-  $('run-where').textContent = where;
-  $('run-where').title = note;
+  setText('run-name', run.name);
+  setText('run-where', where, note);
   const badges = [];
   const warnings = [];
   if (f && f.flagged) {
@@ -441,6 +451,7 @@ function writeRun() {
   $('session-note').textContent = reg && reg.note ? `${sessionNote} ${reg.note}` : sessionNote;
   if (missing.length) badges.push(badge(`${missing.length} of ${session.label} not in the stream`, sessionNote));
   $('badges').replaceChildren(...badges);
+  $('badges').title = badges.map((b) => b.textContent).join(' · ');
   writeCorrections();
 }
 
@@ -651,10 +662,47 @@ function compareStreams(old, now) {
   return grew ? 'grown' : 'same';
 }
 
+// How often the page asks (data-poll: the interval of now, in seconds; 0 from the pack-only
+// server, whose --out is written whole). In a run directory it asks every data-poll-waiting
+// seconds while packs of the participant wait and every data-poll-idle seconds when none do,
+// so that a page left open also notices packs made later (`surfcensus pack` in another
+// process, a later `review`); after each answer the index of the run says which applies.
+const poll = { seconds: 0, waiting: false, asks: 0, last: null };
+
+async function stillWaiting(main) {
+  const index = main.dataset.indexApi;
+  if (!index) return poll.waiting;
+  try {
+    const response = await fetch(index, { headers: { Accept: 'application/json' } });
+    if (!response.ok) return poll.waiting;
+    const body = await response.json();
+    const me = body.participants.find((p) => p.participant_uid === main.dataset.participant);
+    // a run without its pack, or a session with packable runs that the stream does not hold
+    // yet (the pack phase is writing it), as the server judges it for the page
+    return Boolean(me && (me.n_pending > 0 || me.sessions.some((x) => !x.shown && x.n_packable > 0)));
+  } catch {
+    return poll.waiting;
+  }
+}
+
+function setWaiting(main, waiting) {
+  poll.waiting = waiting;
+  const fast = Number(main.dataset.pollWaiting || 0);
+  const slow = Number(main.dataset.pollIdle || 0);
+  if (fast > 0 && slow > 0) poll.seconds = waiting ? fast : slow;
+  const packing = document.getElementById('packing');
+  if (packing) packing.dataset.waiting = String(waiting);
+}
+
 function watchGrowth(api, seconds) {
+  const main = document.querySelector('main[data-api]');
+  poll.seconds = seconds;
+  poll.waiting = main.dataset.waiting === 'true';
   if (!(seconds > 0)) return;
   const ask = async () => {
     if (noticeKind === 'stale' || noticeKind === 'grown') return;
+    poll.asks += 1;
+    poll.last = performance.now();
     try {
       const response = await fetch(api, { headers: { Accept: 'application/json' } });
       if (response.ok) {
@@ -664,6 +712,7 @@ function watchGrowth(api, seconds) {
           return;
         }
         if (verdict === 'grown') {
+          page.grownAt = performance.now();
           showNotice('grown', GROWN);
           return;
         }
@@ -671,13 +720,14 @@ function watchGrowth(api, seconds) {
           checkStream();
           return;
         }
+        setWaiting(main, await stillWaiting(main));
       }
     } catch {
       // the server is not there now: ask again later
     }
-    setTimeout(ask, seconds * 1000);
+    setTimeout(ask, poll.seconds * 1000);
   };
-  setTimeout(ask, seconds * 1000);
+  setTimeout(ask, poll.seconds * 1000);
 }
 
 function showNotice(kind, text) {
@@ -1266,6 +1316,9 @@ window.__epi = {
   },
   get place() {
     return state.place.slice();
+  },
+  get poll() {
+    return { ...poll };
   },
   texts: () => ({
     runNote: $('run-note').textContent,

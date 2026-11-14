@@ -774,9 +774,17 @@ def pack(
 ) -> None:
     """Pack the pending functional sessions of a run into epi/: the raw and the
     preprocessed EPI series as moving pictures (step 2 of the EPI interface)."""
+    from surfcensus.config import CONFIG_FILE, ConfigError
     from surfcensus.run import Run
 
     with _stops_with_exit_2():
+        if not (run_dir / CONFIG_FILE).is_file():
+            # pack takes no source: a run is made by inventory or review (review of step 2)
+            raise ConfigError(
+                "missing",
+                f"{run_dir} holds no run; make one with surfcensus review PATH or surfcensus "
+                "inventory --source PATH",
+            )
         with Run(run_dir) as run:
             if epi_runs is not None and run.set_epi(runs=epi_runs):
                 # a changed selection is a matter of the inventory: what is not selected is
@@ -784,9 +792,19 @@ def pack(
                 with _stops_at_signals():
                     run.func_inventory()
             with _stops_at_signals():
-                report = run.pack(jobs=jobs, force=force, retry_failed=retry_failed)
+                report = run.pack(
+                    jobs=jobs, force=force, retry_failed=retry_failed, waiting=_waiting_for_packs
+                )
             _print_pack_report(run, report)
     raise typer.Exit(1 if report.failed else 0)
+
+
+def _waiting_for_packs() -> None:
+    typer.echo(
+        "Waiting for the EPI sessions that worker processes are packing to end; "
+        "what was recorded stays, and the next call goes on.",
+        err=True,
+    )
 
 
 def _print_pack_report(run: Run, report: PhaseReport) -> None:
@@ -808,9 +826,15 @@ def _print_pack_report(run: Run, report: PhaseReport) -> None:
         typer.echo(f"  {reason}: {len(listed)} ({', '.join(listed[:_MAX_NAMES])}{more})")
     for note in report.notes:
         typer.echo(f"  {note}")
+    from surfcensus.config import epi_settings
+
     line = pack_line(run, behind=False)
     if line is not None:
         typer.echo(line)
+    elif not epi_settings(run.config).enabled:
+        typer.echo("EPI packs: none; the EPI interface is off for this run (--no-epi, stored).")
+    else:
+        typer.echo("EPI packs: none; this run has no functional run that can be packed.")
 
 
 def _run_names(run: Run) -> dict[str, str]:
@@ -850,7 +874,9 @@ def status(
     from surfcensus.sources.patterns import is_unfetched_problem
     from surfcensus.store import CATALOG_FILE, Catalog
 
-    with _stops_with_exit_2(), Run(run_dir) as run:
+    # opened for writing (a catalog whose writer was killed is put right, D29) and not
+    # migrated: status only reads, and an earlier version can still open the run
+    with _stops_with_exit_2(), Run(run_dir, migrate=False) as run:
         context = run.context()
         public = run.public()
         subjects = public.subjects()
@@ -1045,7 +1071,17 @@ def review_command(
     with _app_stops_with_exit_2():
         if not no_serve:
             import surfcensus.app.server  # noqa: F401  (before the work, not after it)
-        with _stops_at_signals() as signals:
+        behind: list[reviewing.ReviewApp] = []
+
+        def recorded() -> str:
+            # a second Ctrl-C while the work behind the app finishes its batch: the process
+            # ends when that batch has ended, which for a session of packs can take minutes
+            doing = behind[0].in_progress() if behind else None
+            if doing is None:
+                return _RECORDED_STAYS
+            return f"{_RECORDED_STAYS}; the {doing} in progress end first"
+
+        with _stops_at_signals(recorded) as signals:
             run, served = reviewing.open_review(
                 path,
                 run_dir=run_dir,
@@ -1067,6 +1103,7 @@ def review_command(
                 raw=raw,
             )
             if served is not None:
+                behind.append(served)
                 signals.serving = True  # from here SIGTERM stops the app in order
                 reviewing.serve_review(
                     run,

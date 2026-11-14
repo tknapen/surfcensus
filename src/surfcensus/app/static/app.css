@@ -1446,16 +1446,44 @@ textarea:focus-visible {
 
 .epi #readout {
   flex: 1 1 100%;
+  display: flex;
+  gap: 8px;
   margin: 0;
   height: 18px;
+  line-height: 18px;
   white-space: nowrap;
   overflow: hidden;
-  text-overflow: ellipsis;
   font-variant-numeric: tabular-nums;
 }
 
+/* slots of fixed size: a text that changes length at a run boundary, or at play and pause,
+   moves nothing beside it (D38); it is cut with an ellipsis, the whole text in its tooltip */
+.epi #readout-run,
+.epi #readout-volume,
+.epi .epi-run-line > *:not(#run-more) {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.epi #readout-run {
+  flex: 0 0 min(16em, 50%);
+}
+
 .epi #readout-volume {
+  flex: 1 1 0;
   color: var(--muted);
+}
+
+.epi #play {
+  white-space: nowrap;
+}
+
+.epi #play-text {
+  display: inline-block;
+  width: 3.4em;
+  text-align: left;
 }
 
 /* what is said about the run on screen: two lines of fixed height; the whole text in the
@@ -1475,8 +1503,23 @@ textarea:focus-visible {
   text-overflow: ellipsis;
 }
 
+.epi #run-strip .epi-run-line {
+  display: flex;
+  gap: 8px;
+  text-overflow: clip;
+}
+
+.epi #run-name {
+  flex: 0 0 min(14em, 50%);
+}
+
 .epi #run-where {
+  flex: 1 1 0;
   color: var(--muted);
+}
+
+.epi #badges {
+  flex: 0 0 min(22em, 28%);
 }
 
 .epi #badges .badge {
@@ -1585,6 +1628,27 @@ textarea:focus-visible {
   overflow: hidden;
   color: var(--muted);
   font-size: 12px;
+}
+
+.epi #legend {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+/* a slot of fixed size: two lines at most, whatever the run on screen says */
+.epi #legend-text {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 34px;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.epi #legend-bar {
+  flex: 0 0 auto;
 }
 
 .epi #legend[data-normalized="true"] #legend-text {
@@ -1697,6 +1761,11 @@ body.no-traces .epi #traces {
 
 .epi .epi-packing {
   color: var(--warn-line);
+}
+
+/* hidden, its place kept, while no pack of the participant waits */
+.epi .epi-packing[data-waiting="false"] {
+  visibility: hidden;
 }
 
 /* --- the index of the EPI movies of a run (epi_index.html) ---------------------------------- */

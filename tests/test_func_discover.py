@@ -191,10 +191,15 @@ def test_a_participant_link_of_the_raw_dataset_is_a_place(
     refuse_in_sources(other / "inside", [folder.fs_subjects_dir], what="output")
     source = discover.func_source_of(_record(folder.raw_root))
     assert source is not None
+    # named by its target, as a linked subject is (review of step 2, A-F1)
     assert (
         "the directory that sub-09 in the raw dataset links to,",
-        folder.raw_root / "sub-09",
+        elsewhere.resolve(),
     ) in discover.read_places(source)
+    for written in (elsewhere / "inside", folder.raw_root / "sub-09" / "inside"):
+        with pytest.raises(ConfigError) as err:
+            refuse_in_sources(written, [folder.fs_subjects_dir], what="output")
+        assert str(elsewhere.resolve()) in err.value.detail
 
 
 def test_the_commands_that_read_config_yaml_refuse_the_raw_dataset_given(

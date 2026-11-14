@@ -385,12 +385,16 @@ def fs_subject_of(subjects: Path | None, participant: str, label: str | None) ->
 # --- the plan of one session ----------------------------------------------------------------
 
 
-def _no_path(err: BaseException, *roots: Path | None) -> str:
+def _no_path(err: BaseException, *roots: Path | None, named: bool = True) -> str:
+    """The text of ``err`` without the paths of ``roots``, after the name of its class
+    unless ``named`` is false (a line for a person, which a class name does not help)."""
     text = str(getattr(err, "detail", None) or getattr(err, "strerror", None) or err)
     for root in roots:
         if root is not None:
             text = text.replace(f"{root}{os.sep}", "").replace(str(root), ".")
-    return f"{type(err).__name__}: {text}" if not isinstance(err, ConnectorError) else text
+    if not named or isinstance(err, ConnectorError):
+        return text
+    return f"{type(err).__name__}: {text}"
 
 
 def _failed_plan(
@@ -557,7 +561,8 @@ def contour_job(
         q = connector.anat_to_fsnative({FuncRole.XFM_ANAT_FSNATIVE: xfm_path})
         files = patterns.resolve_subject_files(fs_dir)
     except _read_errors() as err:
-        return None, f"without contours: {_no_path(err, fs_dir, folders.deriv_root)}", []
+        words = _no_path(err, fs_dir, folders.deriv_root, named=False)
+        return None, f"without contours: {words}", []
     inputs: list[SessionInput] = [(FuncRole.XFM_ANAT_FSNATIVE.value, "deriv", xfm_path)]
     inputs += [(role.value, "freesurfer", files[role]) for role in FS_FILES if role in files]
     job = ContourJob(fs_dir=fs_dir, fs_subject=plan.fs_subject, anat_to_fsnative=q)
@@ -579,7 +584,7 @@ def cut_contours(
             surfaces = contours_.surfaces_in_display(job.fs_dir, job.anat_to_fsnative, grid)
             out[key] = contours_.plane_contours(surfaces, grid)
     except _read_errors() as err:
-        return None, f"without contours: {_no_path(err, job.fs_dir, *roots)}"
+        return None, f"without contours: {_no_path(err, job.fs_dir, *roots, named=False)}"
     return out, f"contours from {job.fs_subject}"
 
 

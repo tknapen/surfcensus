@@ -165,7 +165,7 @@ def test_from_the_rating_screen_to_a_stream_and_back_with_the_draft_kept(
     assert page.inner_text("#subject") == LABELS[FULL]
     sessions = page.evaluate("window.__epi.stream.sessions.map(s => s.media_url)")
     assert sessions == [f"/epi-media/{FULL}/{s}/" for s in epi_run.sessions[FULL]]
-    assert page.is_visible("#index-link") and not page.locator("#packing").count()
+    assert page.is_visible("#index-link") and not page.is_visible("#packing")
     no_horizontal_scroll(tab)
     tab.shot(f"stream_{width}")
 
@@ -287,3 +287,106 @@ def test_a_closed_epi_page_is_a_page_with_a_way_back(
         tab.close()
     finally:
         handle.stop()
+
+
+PLACES = (
+    "Array.from(document.querySelectorAll('#views .epi-panel, #timeline, #run-strip'))"
+    ".map((e) => { const b = e.getBoundingClientRect();"
+    " return [b.x, b.y, b.width, b.height]; })"
+)
+"""The boxes of the panels, the timeline and the strip, in CSS px."""
+
+
+@pytest.mark.parametrize("participant", [FULL, HALF])
+def test_a_run_packed_later_into_the_session_on_screen_is_noticed_and_plays_on(
+    browser: Any,
+    server: Any,
+    epi_run: EpiRun,
+    participant: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Finding F4 of the review of step 2. ``FULL`` has no pack to be made when its page
+    opens, so the page asks at the slow interval (before, it never asked again); ``HALF``
+    waits for its second session and asks at the fast one. In both, a run of the session on
+    screen is packed while the page plays: the page says that the stream grew, not that the
+    packs were made again, plays on without a jump, and after the reload it offers, the
+    timeline holds the run in its place."""
+    from surfcensus.app import server as app_server
+
+    monkeypatch.setattr(app_server, "EPI_POLL_S", 1)
+    monkeypatch.setattr(app_server, "EPI_POLL_IDLE_S", 2)
+    session = epi_run.shown[participant][-1]
+    runs = epi_run.packed[session]
+    held = runs[1]  # a run in the middle of the session: packed "later"
+    where = epi_run.run_dir / EPI_DIR / participant / session
+    (where / held).rename(where / f".later-{held}")
+    tab = Tab(browser, server.url, width=1400)
+    page = tab.page
+    page.goto(f"{server.url}epi/{participant}")
+    page.wait_for_function("() => window.__epi && window.__epi.shown", timeout=20000)
+    page.wait_for_function("() => window.__epi.allLoaded()", timeout=30000)
+    main = page.locator("main#views")
+    assert main.get_attribute("data-poll") == ("1" if participant == HALF else "2")
+    assert page.is_visible("#packing") is (participant == HALF)
+    before = page.evaluate("window.__epi.timeline")
+    uids = [r["run_uid"] for s in page.evaluate("window.__epi.stream.sessions") for r in s["runs"]]
+    assert held in uids  # listed, without its pack
+    first = next(
+        seg["first"]
+        for seg in before["segments"]
+        if seg["session"] == len(epi_run.shown[participant]) - 1
+    )
+    page.evaluate("(c) => window.__epi.set(c)", {"g": first, "rate": 12, "view": "side"})
+    boxes = page.evaluate(PLACES)
+    page.evaluate("window.__epi.page.log.length = 0")
+    page.evaluate("(c) => window.__epi.set(c)", {"playing": True})
+    page.wait_for_function("() => window.__epi.page.log.length >= 3", timeout=10000)
+    asked = page.evaluate("window.__epi.poll.asks")
+    # the pack phase of another process puts the run's pack in place
+    at = page.evaluate("performance.now()")
+    (where / f".later-{held}").rename(where / held)
+    page.wait_for_function("() => window.__epi.texts().notice !== ''", timeout=20000)
+    notice = page.evaluate("window.__epi.texts().notice")
+    assert "More of this stream has been packed" in notice and "plays on" in notice
+    assert "made again" not in notice
+    took = (page.evaluate("window.__epi.page.grownAt") - at) / 1000
+    assert took <= (1 if participant == HALF else 2) + 5, took
+    assert page.evaluate("window.__epi.poll.asks") > asked
+    # it plays on, every volume in order, nothing moved; it does not reload by itself
+    count = page.evaluate("window.__epi.page.log.length")
+    page.wait_for_function("(n) => window.__epi.page.log.length >= n + 6", arg=count, timeout=20000)
+    page.evaluate("(c) => window.__epi.set(c)", {"playing": False})
+    gs = [e["g"] for e in page.evaluate("window.__epi.page.log") if e["reason"] == "play"]
+    assert gs == [(first + 1 + k) % before["total"] for k in range(len(gs))], gs
+    assert page.evaluate("window.__epi.timeline") == before
+    assert page.evaluate(PLACES) == boxes
+    tab.shot(f"grown_in_session_{LABELS[participant]}")
+    page.click("#notice-reload")
+    page.wait_for_function(
+        "(t) => window.__epi && window.__epi.timeline && window.__epi.timeline.total > t",
+        arg=before["total"],
+        timeout=20000,
+    )
+    page.wait_for_function("() => window.__epi.shown", timeout=20000)
+    after = page.evaluate("window.__epi.timeline")
+    sessions = page.evaluate("window.__epi.stream.sessions")
+    # the run is in its place in acquisition order, and the timeline adds up
+    added = [
+        seg
+        for seg in after["segments"]
+        if sessions[seg["session"]]["runs"][seg["run"]]["run_uid"] == held
+    ]
+    assert len(added) == 1 and len(after["segments"]) == len(before["segments"]) + 1
+    upto = 0
+    for seg in after["segments"]:
+        assert seg["first"] == upto
+        upto += seg["n"]
+    assert upto == after["total"] == before["total"] + added[0]["n"]
+    order = [
+        sessions[s["session"]]["runs"][s["run"]]["acquisition_order"]
+        for s in after["segments"]
+        if s["session"] == added[0]["session"]
+    ]
+    assert order == sorted(order)
+    assert page.evaluate("window.__epi.texts().notice") == ""
+    tab.close()

@@ -364,10 +364,15 @@ def test_the_page_of_a_participant_plays_its_stream_from_the_run(
     client: TestClient, epi_run: EpiRun
 ) -> None:
     page = ok(client.get(f"/epi/{FULL}", headers=PAGE)).text
-    assert f'data-api="/api/epi/{FULL}"' in page and 'data-poll="0"' in page
+    assert f'data-api="/api/epi/{FULL}"' in page
+    # nothing waits: the page asks at the slow interval, so that a page left open still
+    # notices packs made later (finding F4 of the review of step 2)
+    assert 'data-poll="30"' in page and 'data-waiting="false"' in page
+    assert 'data-poll-waiting="5" data-poll-idle="30"' in page
+    assert f'data-index-api="/api/epi" data-participant="{FULL}"' in page
     assert '<a id="index-link" href="/epi">all participants</a>' in page
     assert '<a id="rate-link" href="/">rating screen</a>' in page
-    assert 'id="packing"' not in page
+    assert '<span id="packing" class="epi-packing" data-waiting="false">' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
     # the answer of step 1's server on the same directory, with only the media URLs changed
     alone = Packs(epi_run.run_dir / EPI_DIR / FULL).shape().model_dump(mode="json")
@@ -385,7 +390,8 @@ def test_a_half_packed_participant_shows_what_is_packed_and_asks_again(
     assert [s["session_uid"] for s in body["sessions"]] == list(epi_run.shown[HALF])
     assert len(epi_run.sessions[HALF]) == 2 and len(epi_run.shown[HALF]) == 1
     page = ok(client.get(f"/epi/{HALF}", headers=PAGE)).text
-    assert 'data-poll="5"' in page and 'id="packing"' in page
+    assert 'data-poll="5"' in page and 'data-waiting="true"' in page
+    assert '<span id="packing" class="epi-packing" data-waiting="true">' in page
     # the second session is packed behind the app: the next answer holds it
     second = epi_run.sessions[HALF][1]
     source = epi_run.run_dir / EPI_DIR / FULL / epi_run.sessions[FULL][1]
@@ -626,12 +632,44 @@ def test_a_session_that_stream_json_lists_without_its_session_json_is_waited_for
     # every pack of FULL is recorded as done; the pack phase is writing its second session
     # again, which stream.json lists and whose session.json is not there yet
     page = ok(client.get(f"/epi/{FULL}", headers=PAGE)).text
-    assert 'data-poll="0"' in page
+    assert 'data-poll="30"' in page
     (epi_run.run_dir / EPI_DIR / FULL / epi_run.sessions[FULL][1] / SESSION_JSON).unlink()
     page = ok(client.get(f"/epi/{FULL}", headers=PAGE)).text
     assert 'data-poll="5"' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
     assert [s["session_uid"] for s in body["sessions"]] == [epi_run.sessions[FULL][0]]
+
+
+def test_the_page_asks_again_fast_while_packs_wait_and_slowly_when_none_do(
+    client: TestClient, epi_run: EpiRun, packed: PackedStream
+) -> None:
+    """Finding F4 of the review of step 2: a page opened when nothing waited never asked
+    again (data-poll 0). Now it is told both intervals and the interval of now, and the index
+    it reads after each answer says which applies; the pack-only server of step 1, whose
+    --out is written whole, still does not ask."""
+    from surfcensus.app import server
+    from surfcensus.app.epi import create_epi_app
+
+    assert (server.EPI_POLL_S, server.EPI_POLL_IDLE_S) == (5, 30)
+    for participant, waiting in ((FULL, False), (HALF, True)):
+        page = ok(client.get(f"/epi/{participant}", headers=PAGE)).text
+        now = server.EPI_POLL_S if waiting else server.EPI_POLL_IDLE_S
+        assert (
+            f'data-poll="{now}" data-poll-waiting="5" data-poll-idle="30" '
+            f'data-waiting="{str(waiting).lower()}" data-index-api="/api/epi" '
+            f'data-participant="{participant}"'
+        ) in page
+        # what the page reads to choose: the index entry of the participant
+        index = ok(client.get("/api/epi"), shapes.EpiIndexOut)
+        me = next(p for p in index["participants"] if p["participant_uid"] == participant)
+        says = me["n_pending"] > 0 or any(
+            not s["shown"] and s["n_packable"] for s in me["sessions"]
+        )
+        assert says is waiting
+    alone = TestClient(create_epi_app(packed.out), base_url="http://127.0.0.1")
+    page = ok(alone.get("/", headers=PAGE)).text
+    assert 'data-poll="0"' in page and "data-poll-idle" not in page
+    assert 'id="packing"' not in page
 
 
 def test_every_element_the_index_script_looks_up_is_in_its_page() -> None:

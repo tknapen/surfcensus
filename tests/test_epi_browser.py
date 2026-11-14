@@ -520,8 +520,35 @@ def rects(page: Page) -> dict[str, list[list[float]]]:
     )
 
 
-@pytest.mark.parametrize("size", [(1400, 900), (1920, 1080), (400, 900)])
-@pytest.mark.parametrize("view", ["raw", "side"])
+HELD = ("bar", "run-strip", "timeline", "controls")
+"""The parts of the page whose every element with an id keeps its box (finding F7 of the
+review of step 2): not a list of elements, so that one added later is measured too."""
+
+
+def held_rects(page: Page) -> dict[str, list[float]]:
+    """The box of every element with an id inside the bar, the strip, the timeline and the
+    controls, and of those four, in CSS px, by id."""
+    return page.js(
+        "(() => { const out = {}; for (const id of arg) { const root = document.getElementById(id);"
+        " if (!root) continue; for (const e of [root, ...root.querySelectorAll('[id]')]) {"
+        " const b = e.getBoundingClientRect(); out[e.id] = [b.x, b.y, b.width, b.height]; } }"
+        " return out; })()",
+        list(HELD),
+    )
+
+
+def moved(r0: dict[str, list[float]], r1: dict[str, list[float]]) -> dict[str, list[float]]:
+    """The elements whose box differs, with the largest change of x, y, width and height."""
+    assert r0.keys() == r1.keys()
+    return {
+        k: [round(b - a, 2) for a, b in zip(r0[k], r1[k], strict=True)]
+        for k in r0
+        if r0[k] != r1[k]
+    }
+
+
+@pytest.mark.parametrize("size", [(1400, 900), (1920, 1080), (400, 800)])
+@pytest.mark.parametrize("view", ["raw", "side", "diff"])
 def test_nothing_moves_at_any_boundary_of_the_stream(
     browser: Any, server: Any, packed: PackedStream, size: tuple[int, int], view: str
 ) -> None:
@@ -533,17 +560,23 @@ def test_nothing_moves_at_any_boundary_of_the_stream(
     total = sum(s["n"] for s in segs)
     opened = Page(browser, server.url, *size)
     try:
-        opened.set({"view": view})
-        for k, seg in enumerate([*segs[1:], segs[0]]):
+        # normalization on as well: the legend says the window of the run on screen
+        for k, (seg, normalized) in enumerate(
+            (s, n) for n in (False, True) for s in [*segs[1:], segs[0]]
+        ):
+            opened.set({"view": view, "normalized": normalized})
             after = seg["first"]
             before = (after - 1) % total
             prev = segment_of(segs, before)
             opened.set({"g": before})
             r0 = rects(opened)
+            held0 = held_rects(opened)
             opened.set({"g": after})
             r1 = rects(opened)
+            held1 = held_rects(opened)
             assert r0["boxes"] == r1["boxes"], (k, after)
             assert r0["blocks"] == r1["blocks"], (k, after)
+            assert moved(held0, held1) == {}, (k, after)
             if prev["grid"].grid_key == seg["grid"].grid_key:
                 assert r0["canvases"] == r1["canvases"], (k, after)
             else:
@@ -553,14 +586,27 @@ def test_nothing_moves_at_any_boundary_of_the_stream(
                     assert abs((x0 + w0 / 2) - (x1 + w1 / 2)) <= 1
                     assert abs((y0 + h0 / 2) - (y1 + h1 / 2)) <= 1
         # and while playing through a run boundary, the flagged run and the session boundary
-        opened.set({"g": 40})
+        opened.set({"g": 40, "normalized": False})
         r0 = rects(opened)
+        held0 = held_rects(opened)
         log = play(opened, 40, 60, 80)
         assert {e["g"] for e in log} >= {48, 72, 96, 119, 120}
         opened.set({"g": 125})
         assert rects(opened)["boxes"] == r0["boxes"]
         assert rects(opened)["canvases"] == r0["canvases"]
         assert rects(opened)["blocks"] == r0["blocks"]
+        assert moved(held0, held_rects(opened)) == {}
+        # play and pause: the button keeps its width for both labels, and nothing beside it
+        # moves (the rate, the track of the timeline)
+        opened.set({"g": 40, "rate": 2})
+        held0 = held_rects(opened)
+        opened.set({"playing": True})
+        opened.page.wait_for_function(
+            "() => document.getElementById('play-text').textContent === 'pause'"
+        )
+        held1 = held_rects(opened)
+        opened.set({"playing": False})
+        assert moved(held0, held1) == {}
     finally:
         opened.clean()
 

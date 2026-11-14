@@ -415,6 +415,57 @@ def test_a_participant_that_leaves_loses_its_directory_and_its_rows(bench: Bench
 # --- failures ---------------------------------------------------------------------------------
 
 
+def test_a_session_that_lost_its_contours_is_pending_and_keeps_its_packs(bench: Bench) -> None:
+    # review of step 2, D-F1: a contour file that session.json lists and that is gone
+    bench.pack()
+    session = bench.session_of("sub-01", "1")
+    session_dir = bench.session_dir(session)
+    runs = bench.packable(session)
+    packs = {run: (session_dir / run / "pack.json").read_bytes() for run in runs}
+    contours = sorted((session_dir / "contours").rglob("*.bin"))
+    assert contours
+    want = {p: p.read_bytes() for p in contours}
+    contours[0].unlink()
+    assert not packread.session_on_disk(session_dir)
+    assert fb.pack_pending(bench.ctx()) == [session]
+    report = bench.pack()
+    assert (report.done, report.skipped) == (0, N_PACKABLE)  # no run packed again
+    assert {p: p.read_bytes() for p in contours} == want
+    assert {run: (session_dir / run / "pack.json").read_bytes() for run in runs} == packs
+
+    shutil.rmtree(session_dir / "contours")
+    assert fb.pack_pending(bench.ctx()) == [session]
+    bench.pack()
+    assert {p: p.read_bytes() for p in contours} == want
+    assert fb.pack_pending(bench.ctx()) == []
+
+
+def test_a_changed_pack_setting_repacks_every_run(bench: Bench) -> None:
+    # review of step 2, D-F3: the pack's config hash is part of the skip rule
+    bench.pack()
+    bench.config = bench.config.model_copy(
+        update={"epi": epi_settings(bench.config).model_copy(update={"chunk_bytes": 65536})}
+    )
+    assert len(fb.pack_pending(bench.ctx())) == 3
+    report = bench.pack()
+    assert (report.done, report.skipped) == (N_PACKABLE, 0)
+    assert {r["config_hash"] for r in bench.rows().values()} == {
+        epi_settings(bench.config).pack_hash()
+    }
+
+
+def test_a_lost_stream_json_of_a_participant_that_is_not_packed_comes_back(bench: Bench) -> None:
+    # review of step 2, D-F3: the final writing of every participant's stream.json
+    bench.pack()
+    participant = bench.participants()[0]["participant_uid"]
+    path = bench.run_dir / "epi" / participant / STREAM_JSON
+    want = path.read_bytes()
+    path.unlink()
+    report = bench.pack()
+    assert report.done == 0
+    assert path.read_bytes() == want
+
+
 def test_a_failed_pack_is_recorded_and_not_tried_again_without_retry_failed(
     bench: Bench, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -779,3 +830,80 @@ def test_a_stale_run_of_a_session_not_packed_yet_waits_for_it(bench: Bench) -> N
     assert gone in bench.rows()
     bench.pack()
     assert not (bench.session_dir(session) / gone).exists() and gone not in bench.rows()
+
+
+# --- damaged files of one run (review of step 2, D-F4 and D-F5) ---------------------------------
+
+
+def _epi_session_runs(bench: Bench, tmp_path: Path) -> dict[str, tuple[str | None, str | None]]:
+    """name -> (reason, detail) of the runs of sub-01 ses-1 as ``epi-session`` plans them."""
+    from surfcensus.func.api import epi_subject
+
+    out = tmp_path / "es"
+    stream = epi_subject(bench.ds, "sub-01", out, sessions=["1"])
+    (sid,) = stream.sessions
+    info = packread.read_session(out / sid)
+    assert info is not None
+    return {r.name: (r.reason, r.detail) for r in info.runs}
+
+
+@pytest.mark.parametrize("which", ["other", "anchor"])
+def test_a_damaged_series_header_fails_its_own_run_only(
+    bench: Bench, tmp_path: Path, which: str
+) -> None:
+    session = bench.session_of("sub-01", "1")
+    anchor = bench.anchor_of(session)
+    packable = bench.packable(session)
+    victim = anchor if which == "anchor" else next(r for r in packable if r != anchor)
+    series = bench.files(victim, "raw_bold")
+    series.write_bytes(series.read_bytes()[:50])
+    report = bench.inventory()
+    assert report.failed == 0
+    runs = {r["run_uid"]: r for r in bench.runs() if r["session_uid"] == session}
+    assert runs[victim]["reason"] == PACK_FAILURE and not runs[victim]["packable"]
+    detail = runs[victim]["detail"]
+    assert f"{series.name} cannot be read" in detail and str(bench.root) not in detail
+    assert set(bench.packable(session)) == set(packable) - {victim}
+    assert bench.anchor_of(session) == anchor  # the anchor needs its transform, not its series
+    assert not isinstance(bench.sessions()[session]["problem"], str)
+    report = bench.pack()
+    assert report.failed == 0 and report.done == N_PACKABLE - 1
+    # epi-session plans the session the same way
+    planned = _epi_session_runs(bench, tmp_path)
+    name = runs[victim]["name"]
+    assert planned[name][0] == PACK_FAILURE and f"{series.name} cannot be read" in str(
+        planned[name][1]
+    )
+    assert sum(reason is None for reason, _ in planned.values()) == len(packable) - 1
+
+
+def test_a_raw_sidecar_that_cannot_be_parsed_is_named_in_the_anchor_note(
+    bench: Bench, tmp_path: Path
+) -> None:
+    session = bench.session_of("sub-01", "1")
+    before = bench.sessions()[session]
+    assert before["anchor_rule"] == "acquisition_time"
+    victim = next(r for r in bench.packable(session) if r != bench.anchor_of(session))
+    sidecar = bench.files(victim, "raw_sidecar")
+    sidecar.write_text("{bad")
+    bench.inventory()
+    after = bench.sessions()[session]
+    assert after["anchor_rule"] == "name_order"
+    note = after["anchor_note"]
+    assert isinstance(note, str)
+    assert f"the raw sidecar {sidecar.name} is not a JSON object" in note
+    assert "ordered by name and not by acquisition time" in note
+    assert str(bench.root) not in note
+    # said among the registration lines of inventory and review
+    from surfcensus.review import functional_lines
+
+    lines = functional_lines(bench.run)
+    assert any(sidecar.name in line for line in lines)
+    # and by epi-session, which plans with the same code
+    from surfcensus.func.api import epi_subject
+
+    out = tmp_path / "es"
+    stream = epi_subject(bench.ds, "sub-01", out, sessions=["1"])
+    info = packread.read_session(out / stream.sessions[0])
+    assert info is not None and info.registration is not None
+    assert info.registration.note is not None and sidecar.name in info.registration.note

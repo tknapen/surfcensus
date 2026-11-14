@@ -102,7 +102,9 @@ def epi_with(
     ``--video``. The section ``epi`` is written into ``config.yaml`` only when it then differs
     from the defaults it stands for, so a call that gives no option, or one that gives
     ``--epi`` to a run that never had the section, leaves the bytes of ``config.yaml`` as
-    they were (``config.dump_config``). ``raw`` is stored absolute, links resolved. Raises
+    they were (``config.dump_config``), and options that bring the settings back to the
+    defaults remove the section. ``runs`` of ``("*",)`` stores no glob (every run). A stored
+    ``raw`` cannot be cleared, only replaced. ``raw`` is stored absolute, links resolved. Raises
     ``ConfigError("invalid", ...)`` for a raw dataset that is not a directory and for a
     census run with the interface on (``RunConfig`` refuses it)."""
     from surfcensus.config import EpiConfig, epi_settings
@@ -114,7 +116,8 @@ def epi_with(
     if enabled is not None:
         update["enabled"] = enabled
     if runs is not None:
-        update["runs"] = tuple(dict.fromkeys(runs))
+        # ``--epi-runs '*'`` selects every run, which is what no glob means: it clears them
+        update["runs"] = () if set(runs) == {"*"} else tuple(dict.fromkeys(runs))
     if raw is not None:
         place = Path(raw)
         if not place.is_dir():
@@ -126,6 +129,11 @@ def epi_with(
         raise ConfigError("invalid", " ".join(str(exc).split())) from exc
     if changed == current:
         return config
+    defaults = EpiConfig() if config.mode == "local" else EpiConfig(enabled=False)
+    if changed == defaults:
+        # back to the defaults (``--no-epi`` then ``--epi``): no section, so config.yaml has
+        # the bytes it had before an EPI option was given (review of step 2)
+        return with_changes(config, epi=None)
     return with_changes(config, epi=changed.model_dump())
 
 
@@ -210,6 +218,8 @@ class Run:
     of it, and every ``subject_uid`` stays as it was. With several local sources
     ``relocate`` is the pseudonym of the dataset that moved. A ``config`` given on opening
     replaces the stored one; it must be of the same run (same mode and identity).
+    ``migrate=False`` opens an existing catalog without migrating it (``store.Catalog``), for
+    ``surfcensus status``; a phase that needs what a migration adds then raises.
 
     A run directory inside a directory that a local source reads is refused
     (``ConfigError("invalid", ...)``), before anything is written: its subjects directory,
@@ -229,9 +239,11 @@ class Run:
         key: HashKey | None = None,
         relocate: bool | str = False,
         transport: httpx.BaseTransport | None = None,
+        migrate: bool = True,
     ) -> None:
         self.run_dir = Path(run_dir)
         self._key = key
+        self._migrate = migrate
         self._transport = transport
         self._built: dict[int, Source] = {}
         self._template: Template | None = None
@@ -361,7 +373,7 @@ class Run:
         path = self.run_dir / CATALOG_FILE
         identity = self.config.identity
         try:
-            catalog = Catalog(path)
+            catalog = Catalog(path, migrate=self._migrate)
         except ConfigError as exc:
             if exc.reason != "missing" and not isinstance(exc, UnfinishedCatalog):
                 raise
@@ -609,11 +621,13 @@ class Run:
     def refuse_output_in_sources(self, out: Path | str) -> None:
         """Raise ``ConfigError("invalid", ...)`` when ``out`` is, or lies inside, a directory
         that a local source of the run reads: its subjects directory, the directory that a
-        subject or a template in it links to (``sources.local.source_places``), or the
-        fsaverage directory of this call or of a FreeSurfer install. ``out`` is compared as
-        it is written and with links resolved: sources are only read. Where the source
-        cannot be built now (the data is not mounted), ``out`` is compared with its stored
-        root."""
+        subject or a template in it links to (``sources.local.source_places``), the
+        participant folders of its functional derivative and raw dataset
+        (``func.discover.stored_read_places``), or the fsaverage directory of this call or of
+        a FreeSurfer install. ``out`` is compared as it is written and with links resolved:
+        sources are only read. Where the source cannot be built now (the data is not
+        mounted), ``out`` is compared with its stored root."""
+        from surfcensus.func.discover import stored_read_places
         from surfcensus.sources.local import refuse_in_sources
 
         places = []
@@ -623,7 +637,8 @@ class Run:
             except SourceError:
                 place = None
             places.append(place if isinstance(place, Path) else Path(stored.root))
-        refuse_in_sources(out, places, what="output", also=self._template_places())
+        also = [*self._template_places(), *stored_read_places(self.config)]
+        refuse_in_sources(out, places, what="output", also=also)
 
     # sources
 
@@ -971,6 +986,7 @@ class Run:
         force: bool = False,
         retry_failed: bool = False,
         stop: Callable[[], bool] | None = None,
+        waiting: Callable[[], None] | None = None,
     ) -> PhaseReport:
         """Pack the pending functional sessions into ``epi/`` (``func.batch.run_pack``), with
         the run's lease of a session bound into the context (:meth:`context`).
@@ -982,7 +998,9 @@ class Run:
         functional source are looked for first, and a folder that is gone raises
         ``SourceError("not found", ...)`` before anything is recorded: a missing disk is not
         a property of its sessions. A census run is refused (``ConfigError("invalid", ...)``):
-        the EPI phases do not run there. ``stop`` is that of :meth:`render`."""
+        the EPI phases do not run there. ``stop`` is that of :meth:`render`; ``waiting`` is
+        called when Ctrl-C arrives while sessions are packed in worker processes, which are
+        waited for (``batches.run_batches``)."""
         from surfcensus.config import epi_settings
         from surfcensus.func.batch import pack_pending, run_pack
 
@@ -1007,6 +1025,7 @@ class Run:
             force=force,
             retry_failed=retry_failed,
             stop=stop,
+            waiting=waiting,
         )
 
     def _func_roots(self) -> list[str]:

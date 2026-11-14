@@ -642,9 +642,21 @@ def test_ctrl_c_waits_for_running_work_before_the_leases_are_released(tmp_path: 
     leases = Leases(tmp_path)
     commits = Commits()
 
-    with pytest.raises(KeyboardInterrupt):
-        run_batches(units, leases, interrupt_parent, commits, batch_subjects=4, jobs=2)
+    waited: list[list[str]] = []
 
+    with pytest.raises(KeyboardInterrupt):
+        run_batches(
+            units,
+            leases,
+            interrupt_parent,
+            commits,
+            batch_subjects=4,
+            jobs=2,
+            # said at once, before the running work is waited for (review of step 2, A-F3)
+            waiting=lambda: waited.append(list(leases.released())),
+        )
+
+    assert waited == [[]]
     assert commits.batches == []
     assert leases.leased() == ["a", "signal", "b", "c"]
     assert sorted(leases.released()) == ["a", "b", "c", "signal"]
