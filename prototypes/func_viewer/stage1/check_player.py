@@ -296,7 +296,33 @@ def open_page(browser, url, width=1400, height=900, scale=1):
     return context, page, seen
 
 
-def part_load(check, browser, url):
+def pack_sizes(manifest):
+    """Bytes of the pack by part: per stream the chunks and the stills, the contours, in all."""
+    out = {"raw": 0, "pre": 0, "stills": 0, "contours": 0}
+    for run in manifest["runs"]:
+        for stream in ("raw", "pre"):
+            entry = run["streams"][stream]
+            out[stream] += sum(c["bytes"] for c in entry["chunks"])
+            out["stills"] += sum(entry[k]["bytes"] for k in ("ref", "mean", "sd"))
+    if manifest["contours"]:
+        out["contours"] = sum(p["bytes"] for p in manifest["contours"]["planes"].values())
+    shape = manifest["grid"]["shape"]
+    volumes = sum(run["n_volumes"] for run in manifest["runs"])
+    out["volumes"] = volumes
+    out["decoded_series"] = 2 * volumes * shape[0] * shape[1] * shape[2]
+    out["all"] = out["raw"] + out["pre"] + out["stills"] + out["contours"]
+    return out
+
+
+def part_load(check, browser, url, manifest):
+    sizes = pack_sizes(manifest)
+    check.note(
+        f"pack: {sizes['volumes']} volumes per stream; raw {sizes['raw'] / 1e6:.2f} MB,"
+        f" preprocessed {sizes['pre'] / 1e6:.2f} MB, stills and reference volumes"
+        f" {sizes['stills'] / 1e6:.2f} MB,"
+        f" contours {sizes['contours'] / 1e6:.2f} MB, {sizes['all'] / 1e6:.2f} MB in all (the"
+        f" manifest's sizes); both series decoded: {sizes['decoded_series'] / 1e6:.0f} MB"
+    )
     rows = []
     for _ in range(3):
         t0 = time.perf_counter()
@@ -360,7 +386,7 @@ def part_load(check, browser, url):
             f"resident memory of the renderer process: {statistics.median(rss):.0f} MB"
             f" ({min(rss):.0f} to {max(rss):.0f})"
         )
-    check.results["load"] = rows
+    check.results["load"] = {"pack": sizes, "opens": rows}
 
 
 def part_exact(check, page, source, manifest, rng, n_volumes):
@@ -517,7 +543,10 @@ def play(page, change, seconds):
         }"""
     )
     page.evaluate("window.__player.set({ playing: false })")
-    out["peak_decoded"] = peak
+    stats = page.evaluate("window.__player.stats()")
+    out["peak_decoded"] = max(peak, stats["peakDecoded"])
+    out["limit"] = stats["limitBytes"]
+    out["evictions"] = stats["evictions"]
     return out
 
 
@@ -546,6 +575,8 @@ def part_fps(check, page, manifest, seconds):
             "stalls": got["stalls"],
             "resyncs": got["resyncs"],
             "peak_decoded_bytes": got["peak_decoded"],
+            "limit_bytes": got["limit"],
+            "evictions": got["evictions"],
         }
         rows.append(row)
         check.note(
@@ -558,6 +589,13 @@ def part_fps(check, page, manifest, seconds):
     check.expect(
         all(r["repeated"] == 0 and r["dropped"] == 0 for r in rows),
         "fps: no volume was painted twice in a row and none was skipped, at any rate and view",
+    )
+    limit = rows[-1]["limit_bytes"]
+    check.expect(
+        all(r["peak_decoded_bytes"] <= limit for r in rows),
+        f"fps: the decoded chunks never exceeded the limit of {limit / 1e6:.0f} MB (largest"
+        f" {max(r['peak_decoded_bytes'] for r in rows) / 1e6:.0f} MB, as the page counts it"
+        f" whenever a chunk is kept; {rows[-1]['evictions']} chunks dropped by then)",
     )
     check.results["fps"] = rows
 
@@ -851,7 +889,7 @@ def main():
             check.results["browser"] = {"version": browser.version, "found_by": how}
             check.note(f"Chromium {browser.version} ({how}), Python Playwright; page at {url}")
             if "load" in parts:
-                part_load(check, browser, url)
+                part_load(check, browser, url, manifest)
             if {"exact", "stills", "fps", "scrub", "markers"} & set(parts):
                 context, page, seen = open_page(browser, url)
                 source = (

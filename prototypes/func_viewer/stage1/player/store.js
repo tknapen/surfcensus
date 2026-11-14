@@ -30,7 +30,7 @@ export class Store {
     this.desiredKey = '';
     this.onchunk = () => {};
     this.onerror = () => {};
-    this.counts = { requests: 0, fetchedBytes: 0, evictions: 0, chunkLoads: 0, chunkMs: 0, errors: 0 };
+    this.counts = { requests: 0, fetchedBytes: 0, evictions: 0, chunkLoads: 0, chunkMs: 0, errors: 0, peakDecoded: 0 };
     this.jobs = 0;
     const n = nWorkers || Math.min(4, Math.max(2, (navigator.hardwareConcurrency || 2) - 1));
     this.workers = [];
@@ -146,14 +146,16 @@ export class Store {
         continue;
       }
       const entry = this.manifest.runs[Number(run)].streams[stream].chunks[Number(chunk)];
-      this.evict(entry.count * this.nVoxels);
+      const bytes = entry.count * this.nVoxels;
+      // room for this chunk and for every chunk that is still on its way
+      this.evict(bytes + this.workers.reduce((a, w) => a + (w.busy ? w.busy.bytes : 0), 0));
       const refKey = `${run}|${stream}`;
       if (!slot.refs.has(refKey)) {
         slot.worker.postMessage({ type: 'ref', key: refKey, data: stills[stream].ref });
         slot.refs.add(refKey);
       }
       const id = ++this.jobs;
-      slot.busy = { id, key };
+      slot.busy = { id, key, bytes };
       this.inflight.set(key, id);
       slot.worker.postMessage({
         type: 'load',
@@ -182,8 +184,11 @@ export class Store {
     this.counts.chunkLoads += 1;
     this.counts.chunkMs += message.ms;
     const values = new Uint8Array(message.buffer);
-    if (this.desiredSet.has(job.key) || this.decodedChunkBytes() + values.byteLength <= this.limitBytes) {
+    const wanted = this.desiredSet.has(job.key);
+    if (wanted) this.evict(values.byteLength); // the cursor may have moved since it was asked for
+    if (wanted || this.decodedChunkBytes() + values.byteLength <= this.limitBytes) {
       this.chunks.set(job.key, values);
+      this.counts.peakDecoded = Math.max(this.counts.peakDecoded, this.decodedChunkBytes());
       const [run, stream, chunk] = job.key.split('|');
       this.onchunk(Number(run), stream, Number(chunk));
     }

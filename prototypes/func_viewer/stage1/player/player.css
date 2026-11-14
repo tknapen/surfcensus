@@ -148,9 +148,16 @@ input:focus-visible {
   min-width: 0;
 }
 
+/* in a narrow group the name of the stream stays whole and the marker text gives way: the
+   coloured frame still says that a marker is up */
+.group h2 span:first-child {
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+
 .group .badge {
   font-weight: 700;
-  flex: none;
+  flex: 0 1 auto;
 }
 
 .group.marker-fd {

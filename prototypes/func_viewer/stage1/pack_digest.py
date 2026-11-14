@@ -61,6 +61,8 @@ def main():
     status = 0
     sets = []
     for pack in sys.argv[1:]:
+        if not (Path(pack) / "manifest.json").is_file():
+            sys.exit(f"{pack} holds no manifest.json: not a pack of pack_run.py")
         files = pack_files(pack)
         sets.append(files)
         size = sum((Path(pack) / name).stat().st_size for name in files)
