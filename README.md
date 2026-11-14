@@ -132,6 +132,18 @@ info = sc.render.three_plane("/path/to/SUBJECTS_DIR/sub-01", "media/sub-01")
 
 The renderer's frames have not yet been compared by eye with Freeview. Details are in `docs/rendering.md`.
 
+### The EPI movies of one subject
+
+```
+surfcensus epi-session /path/to/bids_dataset --subject 01 --out epi-sub-01 --serve
+```
+
+This packs the raw and the preprocessed EPI series of every functional run of the subject, all sessions in one stream, into `epi-sub-01` and shows them on a page on `127.0.0.1`: the same slices of the anatomy with the FreeSurfer white and pial surfaces as contours. It serves two uses at once: quality control of the raw data (motion, artefacts in single volumes, distortion and dropout as acquired, movement between runs) and quality control of the preprocessing (what fMRIPrep corrected, what remains, how the preprocessed series fits the surfaces). The raw stream is the raw BIDS series placed once per session by the stored transform of the session's first run and nothing else; the preprocessed stream is the series as fMRIPrep wrote it.
+
+The path is a BIDS dataset with an fMRIPrep derivative below `derivatives/`, the derivative itself, or its FreeSurfer subjects directory; `--raw DIR` names the raw dataset when it lies elsewhere. `--session LABEL` packs only that session, `--epi-runs GLOB` only the runs whose name matches. The packs are a display cache: nothing is written into the data, no NIfTI file is written anywhere, and an `--out` inside one of the folders that are read is refused. Runs that cannot be shown (no raw series, multi-echo, only a standard-space or native-space series, files of a DataLad clone that are not fetched) are listed with their reason. Only fMRIPrep derivatives with `space-T1w` output are packed.
+
+This is step 1 of the EPI interface (`docs/epi_interface.md`): one subject, no run directory, view only; nothing is rated. On the two runs of `ds000102` sub-01 (146 volumes each, 3 mm) the page was up 34 s after the command on one machine. No person has looked at a pack yet.
+
 ## Planned
 
 - The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.

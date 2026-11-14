@@ -67,7 +67,7 @@ Build the local path first: it is the smallest thing that is useful on its own, 
 
 Phase 0 of the census (pilot, `docs/phases.md`) can start as soon as milestone 4 works.
 
-Before milestone 5 (decisions D36 and D37): the EPI movie interface is brought into the package in the three steps of `docs/epi_interface.md` (one session without a run directory, view only; then the run directory and `review`; then the subject pages, status and export). That spec was written on 2026-11-14 and nothing of it is built; its defaults wait for Tomas's answers (its section "Decisions for Tomas").
+Before milestone 5 (decisions D36 and D37): the EPI movie interface is brought into the package in the three steps of `docs/epi_interface.md` (one session without a run directory, view only; then the run directory and `review`; then the subject pages, status and export). Step 1 is built (2026-11-14, decision D39): `surfcensus epi-session PATH --subject LABEL --out DIR [--serve]` packs the functional sessions of one subject of a local folder (fMRIPrep derivatives with `space-T1w` series, the raw BIDS series, the FreeSurfer subject) into a display cache and plays them in the browser as one continuous stream over all runs and sessions (D38), raw beside preprocessed with the white and pial contours, with a normalization toggle. On the worked example (`ds000102` sub-01) its decoded streams equal the prototype's pack and the page's address is printed 34 s after the command; the page itself was driven in Chromium on synthetic packs only, and no person has looked at it. Its independent review, and steps 2 and 3, are not done. The defaults of the spec wait for Tomas's answers (its section "Decisions for Tomas").
 
 ## Verified facts the design rests on (checked 2026-11-01)
 
@@ -194,6 +194,8 @@ just test-browser     # pytest -m browser: the pages in a real browser (SURFCENS
 just test-install     # pytest -m install: the wheel in a fresh environment, review up to a rating; needs uv and the package index
 just lint             # ruff check + ruff format --check + pyrefly
 surfcensus render-subject SUBJECT_DIR --out DIR   # one subject, no run directory
+surfcensus epi-session PATH --subject LABEL --out DIR [--session LABEL]... [--raw DIR] [--serve]
+                                                     # the EPI movies of one subject: packs, and the page (step 1, no run directory)
 surfcensus inventory --run-dir DIR [--source PATH]   # phase 2; --source creates a local run
 surfcensus metrics --run-dir DIR [--jobs J] [--fsaverage DIR]   # phase 4
 surfcensus render --run-dir DIR [--jobs J]           # phase 6

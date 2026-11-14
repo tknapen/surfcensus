@@ -136,6 +136,17 @@ surfcensus/
       api.py               # three_plane(), render_subject()
       batch.py             # phase 6 for a run: pending subjects, the renders table, the check sample
       freeview.py          # optional backend, wraps the original gist approach
+    func/                  # the EPI movie interface, step 1 (docs/epi_interface.md)
+      bids.py              # BIDS entities, run keys, raw series, sidecar inheritance
+      itk.py               # ITK text transforms as RAS matrices
+      connectors/          # what is specific to a pipeline; fmriprep.py is the one built
+      session.py           # anchor, raw affine, frame check, grids of a session
+      geometry.py          # display grid, voxel map, the raw stream's one resampling
+      contours.py          # white and pial contours in display voxels
+      model.py             # session.json, pack.json, traces.json, stream.json
+      pack.py              # the display cache: format epi-pack version 2
+      packread.py          # a decoder of packs, for tests and checks
+      api.py               # find_folders, epi_subject, epi_session
     app/
       __init__.py          # the name of app.sqlite and of its tables, for code that reads it without the app's packages
       schemas.py           # the shapes of the API (pydantic only); RenderOut, the render a page receives
@@ -146,6 +157,8 @@ surfcensus/
       events.py            # interaction events
       finalize.py          # final labels and marks; unratable labels for failed renders; freezing a calibration set
       marks.py             # click -> voxel -> tkr/scanner RAS -> native vertex -> fsaverage6 vertex
+      epi.py               # a server for EPI packs alone (surfcensus epi-session --serve)
+      epi_schemas.py       # the shapes the EPI page receives
       static/              # vanilla JS + CSS, no build step, ships in the wheel
       templates/
     export/
@@ -199,6 +212,9 @@ surfcensus calibration freeze --run-dir DIR [--subject UID]... [--version V]
 surfcensus export --run-dir DIR [--out DIR] [--format csv|parquet] [--release]
 surfcensus render-subject SUBJECT_DIR --out DIR [--fsaverage DIR | --no-template]
     # one subject, no run directory; the CLI form of sc.render.three_plane
+surfcensus epi-session PATH --subject LABEL --out DIR [--session LABEL]... [--raw DIR]
+                       [--epi-runs GLOB]... [--serve] [--port N] [--no-browser]
+    # the EPI movies of one subject, no run directory (docs/epi_interface.md, Step 1 as built)
 ```
 
 `review` defaults the run directory to `PATH/../surfcensus-run` when a run is there already or that place can be written to, else `./surfcensus-run`; for one subject directory as `PATH`, to `surfcensus-run` beside the subjects directory, since a run may not lie inside it; that is the directory that lists the subject, also when the subject directory is a link, so the run never lands beside what the link leads to. Subjects that lie below the `derivatives/` folder of a BIDS dataset: the run goes beside the dataset, `DATASET/../surfcensus-run`, never into it, whether `PATH` is the dataset or a folder inside it, because a dataset (which may be a DataLad dataset) gets no files unless a run directory in it is asked for with `--run-dir`. The dataset is the outermost directory with a `dataset_description.json` that has the subjects below its `derivatives/`, or `PATH` itself when the subjects were found below its `derivatives/`. A run of the same folder that an earlier version made inside the dataset, beside the folder that was named, is still found and used. The same holds when the place beside `PATH` lies inside a DataLad dataset (a directory with `.git` and `.datalad`; `sources.local.datalad_dataset_holding`), such as a clone of an fMRIPrep output that holds no `derivatives/` folder: the run goes beside the outermost such dataset, which would otherwise get untracked files. A git-annex repository without `.datalad` is not told apart. An fMRIPrep output that holds its subjects as `sourcedata/freesurfer/` and has a `dataset_description.json` (a BIDS-derivative dataset, as fMRIPrep writes it and OpenNeuroDerivatives publishes it, also when it was downloaded without DataLad) counts as such a dataset when the place beside `PATH` lies inside it: `review ds/sourcedata/freesurfer` puts the run beside `ds`. A plain git repository (no `.datalad`) is not told apart, so a run of a folder inside one lands in its work tree. When the place beside the dataset cannot be written to, the run goes to `./surfcensus-run`; when the current directory lies inside the dataset, `review` stops with one line that asks for `--run-dir`. A run of the same root comes first, wherever of these places it is: beside the dataset, where an earlier version put it inside the dataset, or in `<name>-surfcensus-run` beside the dataset (`<name>` the dataset, or the folder named when there is none), which is where a second dataset of one folder is told to put its run. Several datasets of one parent folder share the default `surfcensus-run` (open question O23): when it holds the run of another root and no run of this one is found, `review` stops before it opens a run, with exit code 2 and one line, `other root: <dir> holds the run of <root>, ...`, that says what to give. When that root still holds its subjects in another directory it is another dataset, and the line names `--run-dir <parent>/<name>-surfcensus-run`; when it holds the same subjects named another way it names that root as the path to go on with that run, and `--relocate` only within one pipeline; when it holds no subjects now it names `--relocate`. It orders the rating queue by composite score descending unless `--blind` is given, renders in that order, and starts the app on `127.0.0.1` with a single local rater as soon as the first subject of the queue is rendered; the others are rendered while the app runs, and the app says so when a rater is faster than the renderer (decision D33). `--serve-after N` waits for N renders, and `--serve-after 0` for all of them.

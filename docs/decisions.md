@@ -657,6 +657,52 @@ Read as: all runs of a session play one after the other in acquisition order on 
 
 His answer, the same day: "Yes also sessions as a continuous stream. It would be great to be able to toggle the intensity normalization on and off. And the voxel grid for each session is a single rigid body step so I realize that the voxel grid would move between sessions, which is fine if we don't want to actually create new intermediary files, just visualize the existing files" So: the sessions of a subject follow each other in the same stream; each session keeps its own rigid registration, the voxel grid on screen changes at a session boundary, and nothing is resampled to a grid common to runs or sessions; the tool visualizes the files that exist and writes no new image files into or beside the data (it keeps a display cache of its own in the run directory, the packs, which he confirmed: "Yeah the display cache is perfect, just no new nifti files"); and the page can switch intensity normalization on (each run under its own window) and off (one window for the whole stream), which replaces the single window per session of the first reading above. The pack stores each run under its own window and the page derives the common scale, so the toggle needs no second copy of the data.
 
+D39 (2026-11-14). Choices made while building step 1 of the EPI interface (`docs/epi_interface.md`, "Step 1 as built"): the shared types, the connector, the session and geometry code, the pack, the page with its server, and `surfcensus epi-session`. Where a choice departs from the specification, it says so.
+
+Shared types (first step, as D30 did for milestone 3).
+
+- Every module of step 1 was laid out with its types, constants, error classes and signatures before any was written; `tests/test_func_interfaces.py` pins names, parameters and fields. The records of runs, sessions and displays are frozen dataclasses of Python values in `records.py` (a 4x4 matrix is four rows of Python floats, so records compare and pickle as data and the portable voxel map starts from Python floats); the contents of `session.json`, `pack.json`, `traces.json` and `stream.json` are pydantic models in `func/model.py`, so that the pack and the page are written against one definition.
+- The connector protocol has `session_files(...)` beside the methods of the specification, and `list_runs` takes the `ConnectorMatch`, because the generation decides the file names. A listed run carries its key (run index as a number, no subject, no echo) and its order.
+- `EpiConfig` exists on its own; `RunConfig.epi` comes with the run directory (step 2), so that no `config.yaml` gains a key that an earlier version refuses.
+- The fixture `tests/synth_func.py` writes a raw BIDS dataset, an fMRIPrep derivative in either generation of names and the FreeSurfer subjects, with a signal that is linear in anatomical position, so every stored value and the spline sample of the raw stream away from the edge of the raw field of view are known in closed form. Two things it does that real data do not: the series are float32, and the closed form holds only 4 voxels inside the raw field of view.
+
+The connector.
+
+- A name names a run only when its labels are ASCII letters and digits and its run and echo labels ASCII digits (D19: `\d` takes other digits). Derivative names are no raw series; of a `.nii.gz` and a `.nii` with one stem the first is listed; the phase, real and imaginary parts are no runs.
+- A sidecar is inherited from `func/`, the session folder, the subject folder and the root, the nearest level first; levels are not merged, so an `AcquisitionTime` that only a higher level holds is not seen when a nearer sidecar exists.
+- The ITK reader takes one affine transform of 12 parameters and 3 fixed parameters and does its arithmetic in Python floats; it agrees with nitransforms 24.1.1 on numbers that float32 holds (nitransforms reads the lines as float32).
+- The summary report is read by label, tags removed: `Applied` is applied, `Not applied` and `Skipped (...)` not applied, `n/a` unknown; a distortion line `None` is not applied and any other words are the method; without a readable report every statement is unknown, except that a listed distortion figure makes distortion correction applied with an unknown method. Checked against the report templates in the sources of six fMRIPrep versions (20.2.3 to 25.2.3), not against a real report file.
+- A registration counts as rigid when its shear and scale are within 1e-3 and its determinant is positive.
+- A directory or file that cannot be examined is an error that names the place relative to the root, never "absent" (D19).
+
+Session, geometry and pack.
+
+- The order of a session's stream is acquisition order (D38) and no run is moved for the anchor; the anchor is the first run acquired by the rule of the specification.
+- Runs on different grids are each packed on their own grid, with contours cut per grid. The specification listed `runs on different grids` as a reason and, in the same paragraph, said each grid is packed; D38 ("just visualize the existing files") settles it.
+- A pack stores each run under its own window and records it; the common scale of "normalization off" is derived by the page (D38). A session-wide stored window was built first and taken out again.
+- Slice planes are given per grid as unit normals and signed distances from the origin of the anatomy's world, rounded to 1e-6, so that the page can hold one place in the anatomy across grids and sessions without the affine being served.
+- The series are read one volume at a time through the array proxy. The pack is written into a hidden temporary directory, `pack.json` last, and renamed under a lock on the session directory; an interrupted pack leaves the earlier one or none. `session.json` is removed first and written last; `stream.json` likewise for a subject.
+- `content_digest` is the SHA-256 over the digest of the defining JSON (pack.json without ids, version, file names, compressed sizes and digests), the decoded volumes of each stream, the decoded stills, `traces.json` and the inflated contour files. Two packs of one input have one digest in two processes; the compressed bytes are the same on one machine and are not promised elsewhere.
+- Errors of reading an input make the run `pack failure` with a detail without a path; errors of writing the output propagate, for step 2's rule that the machine's faults stop a phase.
+
+The page and its server.
+
+- The shapes stay in `app/epi_schemas.py` and the server in `app/epi.py`, so that the rater app's routes and shapes are untouched in step 1; the server imports the guard, the security headers and the listening code of `app/server.py`. A test compares the fields of the shapes with those of the models, with explicit sets of what is left out and what is added.
+- The cache token of a run or a grid is 16 hex characters of a SHA-256 over the digests of its served files. A prefix of `content_digest` was refused: it covers the sizes and digests of the source files, and an unkeyed hash of those may not leave (D20).
+- Contours are keyed by session and grid: two sessions can share a grid key and not the anatomy's surfaces. The first version keyed by grid and drew one session's contours over another; a test found it.
+- The clock waits for the contours of a grid as it waits for chunks, so no frame is drawn without them. Panel boxes keep one size for the whole stream, the largest over its grids, so the scale in pixels per millimetre does not change at a boundary.
+- The class names of the page are prefixed `epi-`: the rater app's `.panels` and `.panel` rules broke its layout.
+- The memory limit is a parameter of the server; the page reads no local storage and no URL parameter. This departs from the specification, which had it settable per browser.
+
+The command.
+
+- Sessions are ordered by label, numbers compared as numbers, a dataset without sessions first; recorded in `stream.json` (`order`). Acquisition times of the sessions could decide it instead and are not read.
+- Ids: a random key per call, never written; a second call into the same output reuses the ids of its `stream.json` by session label and run name, so the page's addresses stay. Reason: a key file in an output directory would protect nothing in step 1, and step 2 keys ids with the run's own key.
+- Folders are found from what the surface source finds, else from the folder itself, else from the first folder of `derivatives/` that the connector recognises; the raw dataset from `--raw`, the dataset root above `derivatives/`, then `sourcedata/raw` in the derivative.
+- Exit codes as the phase commands: 0; 1 when no run of the subject can be packed (`stream.json` is still written); 2 for usage and configuration; 130 and 143 for the signals, through the shared code of the quick-start review.
+
+Checked: the default suite after the last package, 3,885 passed and 13 skipped (one machine, Python 3.13); 19 browser tests of the page in Chromium 153; the EPI network tests on the worked example (decoded streams equal to the prototype's pack, frame numbers 0.829 and 1.087 mm). Broken copies of the code were run against the tests of each package (20 for the connector, 7 for the pack, 13 for the page and server, 14 for the command and its function); two broken copies of the page were not caught (the mean still shown through the SD table, where the fixture's two tables are equal, and one rounding variant that gave no other result in two million tries). Not checked: see "Step 1 as built". The independent review of step 1 is still to come.
+
 ## Open
 
 O1. Package name. `surfcensus` is a placeholder. Decide with the paper team.
