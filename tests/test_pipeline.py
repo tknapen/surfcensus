@@ -42,6 +42,7 @@ from surfcensus.config import (
 )
 from surfcensus.fsio.annot import read_annotation
 from surfcensus.fsio.morph import read_morph
+from surfcensus.fsio.registration import build_sphere_map
 from surfcensus.fsio.surfaces import read_surface
 from surfcensus.metrics.clusters import find_clusters
 from surfcensus.metrics.fsaverage import (
@@ -1393,8 +1394,10 @@ def planted_run(
 
     ``sub-000``: four vertices of superiorfrontal (control) at 5.0 mm; in lateraloccipital
     three at 4.95 mm, two at 0 and one at 5.5 mm. ``sub-001`` (which has the medial patch):
-    three vertices of ``lh.sphere.reg`` moved onto three others, so that faces fold and some
-    targets lie in no face. ``sub-002``: the faces of ``lh.sphere.reg`` wound inward."""
+    three vertices of ``lh.sphere.reg`` moved onto three others, so that faces fold and the
+    face of some targets is far from their nearest vertices (the wider search of the
+    mapping finds it), and one face taken out, so that some targets lie in no face at all.
+    ``sub-002``: the faces of ``lh.sphere.reg`` wound inward."""
     tmp_path = tmp_path_factory.mktemp("planted_run")
     cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
     first, second, third = (subject.path for subject in cohort.subjects)
@@ -1415,7 +1418,8 @@ def planted_run(
     vertices, faces = fs.read_geometry(str(folded))
     vertices = vertices.copy()
     vertices[[0, 50, 100]] = vertices[[300, 400, 500]]
-    fs.write_geometry(str(folded), vertices, faces)
+    hole = int(np.flatnonzero((faces == 200).any(axis=1))[0])
+    fs.write_geometry(str(folded), vertices, np.delete(faces, hole, axis=0))
 
     inward = third / "surf" / "lh.sphere.reg"
     vertices, faces = fs.read_geometry(str(inward))
@@ -1510,6 +1514,45 @@ def test_the_mapping_counts_are_those_of_resample_hemi_on_the_same_files(
             n_fallback[subject.path.name, hemi] = hemi_map.n_fallback
             # a value of its own in every hemisphere: a constant in the table does not pass
             assert hemi_map.n_missing_cortex > 0
-    # the folded sphere is the only one with targets that lie in no face
+    # the folded sphere with the hole is the only one with targets that lie in no face
     assert n_fallback.pop(("sub-001", "lh")) > 0
     assert set(n_fallback.values()) == {0}
+
+
+def test_the_wider_search_resolves_the_folds_and_not_the_hole(planted_run: PlantedRun) -> None:
+    """``sub-001`` lh: the first search alone leaves the targets of the folded faces and of
+    the hole; the wider search resolves those of the folds, and those of the hole fall
+    back, as the table says."""
+    subject = planted_run.cohort.subjects[1].path
+    sphere = read_surface(subject / "surf" / "lh.sphere.reg")
+    target = planted_run.template.hemis["lh"].sphere
+    metrics = planted_run.config.metrics
+    wide = build_sphere_map(sphere, target, k=metrics.knn, k_wide=metrics.knn_wide)
+    narrow = build_sphere_map(sphere, target, k=metrics.knn, k_wide=metrics.knn)
+    # measured: 41 left by the first search, the 10 of the folds resolved, the 31 of the hole not
+    assert (int(narrow.fallback.sum()), wide.n_widened, int(wide.fallback.sum())) == (41, 10, 31)
+    assert int(narrow.fallback.sum()) == int(wide.fallback.sum()) + wide.n_widened
+    assert not (wide.fallback & ~narrow.fallback).any()
+    row = planted_run.summary.loc[(planted_run.uids["sub-001"], "lh")]
+    assert row["n_fallback"] == int(wide.fallback.sum())
+
+
+def test_maps_of_the_earlier_schema_are_made_again(
+    tmp_path: Path, synth_template: SyntheticTemplate, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A run whose maps were made at schema 1 of the ``fsaverage`` stage (before the wider
+    search) makes every map again at the next call; a call after that skips them."""
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    run_dir = tmp_path / "run"
+    with monkeypatch.context() as patch:
+        patch.setitem(STAGE_SCHEMAS, "fsaverage", 1)
+        with Run(run_dir, local(cohort.root), config=config) as run:
+            run.inventory()
+            assert counts(run.metrics()) == (3 + 3 + 2, 0, 0)
+            before = ledger(run, "fsaverage")
+    with Run(run_dir) as run:
+        assert counts(run.metrics(stages=("fsaverage",))) == (3, 0, 0)
+        after = ledger(run, "fsaverage")
+        assert set(after) == set(before) and all(after[u] != before[u] for u in after)
+        assert counts(run.metrics(stages=("fsaverage",))) == (0, 3, 0)

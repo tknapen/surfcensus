@@ -252,12 +252,14 @@ def test_the_config_reaches_the_sphere_map_and_the_weights(
 ) -> None:
     half = tpl4.hemis["lh"]
     thickness, sphere, annot = tier_b(plain, "lh")
-    seen: list[int] = []
+    seen: list[tuple[int, int]] = []
     build = fa.build_sphere_map
 
-    def recording(source: Surface, target: np.ndarray, *, k: int = 8) -> registration.SphereMap:
-        seen.append(k)
-        return build(source, target, k=k)
+    def recording(
+        source: Surface, target: np.ndarray, *, k: int = 8, k_wide: int = 256
+    ) -> registration.SphereMap:
+        seen.append((k, k_wide))
+        return build(source, target, k=k, k_wide=k_wide)
 
     monkeypatch.setattr(fa, "build_sphere_map", recording)
     missing = {
@@ -266,11 +268,11 @@ def test_the_config_reaches_the_sphere_map_and_the_weights(
             sphere,
             half,
             annot=annot,
-            config=MetricsConfig(mesh="fsaverage4", knn=5, min_valid_weight=weight),
+            config=MetricsConfig(mesh="fsaverage4", knn=5, knn_wide=40, min_valid_weight=weight),
         )[0].n_missing_cortex
         for weight in (0.0, 0.5, 1.0)
     }
-    assert seen == [5, 5, 5]
+    assert seen == [(5, 40), (5, 40), (5, 40)]
     # the template cortex next to the medial wall lies in faces with a corner on the wall
     assert 0 <= missing[0.0] < missing[0.5] < missing[1.0]
 
@@ -1160,16 +1162,16 @@ REAL_TIER_B = tuple(
     for hemi in HEMIS
     for name in ("surf/{h}.thickness", "surf/{h}.sphere.reg", "label/{h}.aparc.annot")
 )
-REAL_MAP = {  # ds000102 sub-01 on fsaverage6, measured 2026-11-13
+REAL_MAP = {  # ds000102 sub-01 on fsaverage6, measured 2026-11-13; fallbacks 2026-11-15
     "lh": {
-        "n_fallback": 3,
+        "n_fallback": 0,  # 3 with the first search alone, resolved by the wider one
         "n_value": 37_420,
         "n_cortex": 37_487,
         "mean": 2.4251,
         "median": 2.4609,
     },
     "rh": {
-        "n_fallback": 2,
+        "n_fallback": 0,  # 2 with the first search alone
         "n_value": 37_455,
         "n_cortex": 37_482,
         "mean": 2.4211,

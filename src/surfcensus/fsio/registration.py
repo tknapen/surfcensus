@@ -55,6 +55,9 @@ class SphereMap:
     """The target vertex nearest each source vertex."""
     flipped: bool
     """The source faces were wound inward and were reversed before the search."""
+    n_widened: int = 0
+    """Target vertices that the search over the first ``k`` neighbours left without a face
+    and the wider search resolved (:func:`build_sphere_map`)."""
 
 
 def _dot(x: np.ndarray, y: np.ndarray) -> np.ndarray:
@@ -144,21 +147,35 @@ def _faces_by_vertex(faces: np.ndarray, n_vertices: int) -> tuple[np.ndarray, np
     return start, order // 3
 
 
-def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: int = 8) -> SphereMap:
+WIDE_K = 256
+"""Default cap of the wider search of :func:`build_sphere_map`: on 34 real subjects no target
+was left without a face at 256 neighbours (docs/metrics.md, The mapping)."""
+
+
+def build_sphere_map(
+    source: Surface, target: Float[np.ndarray, "t 3"], *, k: int = 8, k_wide: int = WIDE_K
+) -> SphereMap:
     """Map every vertex of the ``target`` sphere into the faces of the ``source`` sphere.
 
     Both are put on the unit sphere. For each target point the faces around its ``k``
     nearest source vertices are searched, nearest vertex first and faces in ascending
-    index, for the first one that contains it; a point that none contains falls back to its
-    nearest source vertex. A face wound inward never matches; when more than half of the
-    source faces are, every face is reversed once and ``flipped`` is set. No input raises
-    but a degenerate sphere (:func:`unit_sphere`). The result does not depend on thread
-    count or platform.
+    index, for the first one that contains it. The points that none contains are searched
+    again with twice as many neighbours, and again, doubling up to ``k_wide`` (the last
+    step takes exactly ``k_wide``), by the same rule; a point that is still in no face falls
+    back to its nearest source vertex. A step does not test again the faces of vertices
+    that the step before it tested, which failed; so a point resolved in the step with
+    ``m`` neighbours gets the face that the first search with ``k = m`` would give it, and a
+    point that the first search resolves keeps exactly the face and weights it had. With
+    ``k_wide <= k`` there is no wider search. A face wound inward never matches; when more
+    than half of the source faces are, every face is reversed once and ``flipped`` is set.
+    No input raises but a degenerate sphere (:func:`unit_sphere`). The result does not
+    depend on thread count or platform.
 
     A fallback says that none of the faces searched contains the point, not that no face
-    does: on a sheared or folded sphere the face of a point need not touch any of its ``k``
-    nearest vertices. A larger ``k`` resolves more points and gives those already resolved
-    the same face. What that costs on real subjects is in docs/metrics.md (The mapping).
+    does: on a sheared or folded sphere the face of a point need not touch any of its
+    nearest vertices. ``nearest_source`` and ``nearest_target`` do not depend on ``k`` or
+    ``k_wide``. What the search costs and finds on real subjects is in docs/metrics.md
+    (The mapping).
 
     A target point that is a source vertex (within :data:`COINCIDENT`) takes that vertex
     alone, with the row of a fallback, ``(v, v, v)`` and ``(1, 0, 0)``, and ``fallback``
@@ -211,36 +228,55 @@ def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: in
     fallback = ~resolved
 
     start, face_at = _faces_by_vertex(faces, n_source)
-    unresolved = np.flatnonzero(~resolved)
-    for j in range(k):
-        if not unresolved.size:
-            break
-        point = unresolved
-        vertex = neighbour[point, j]
-        degree = start[vertex + 1] - start[vertex]
-        slot = 0
-        while point.size:
-            more = degree > slot
-            point, vertex, degree = point[more], vertex[more], degree[more]
-            if not point.size:
+
+    def search(points: np.ndarray, candidate: np.ndarray) -> None:
+        """Search the faces around ``candidate[i, :]`` (-1: none) for target ``points[i]``,
+        column by column and faces in ascending index, and record the first that holds it."""
+        for j in range(candidate.shape[1]):
+            if not points.size:
                 break
-            face = face_at[start[vertex] + slot]
-            p = tgt[point]
-            c0, c1, c2 = _dot(p, bxc[face]), _dot(p, cxa[face]), _dot(p, axb[face])
-            total = c0 + c1 + c2
-            floor = -CONTAIN_TOLERANCE * total
-            inside = outward[face] & (total > 0) & (c0 >= floor) & (c1 >= floor) & (c2 >= floor)
-            if inside.any():
-                found = point[inside]
-                w = np.stack([c0[inside], c1[inside], c2[inside]], axis=1)
-                np.maximum(w, 0.0, out=w)
-                weights[found] = w / (w[:, 0] + w[:, 1] + w[:, 2])[:, None]
-                corners[found] = faces[face[inside]]
-                fallback[found] = False
-                keep = ~inside
-                point, vertex, degree = point[keep], vertex[keep], degree[keep]
-            slot += 1
-        unresolved = unresolved[fallback[unresolved]]
+            point, vertex = points, candidate[:, j]
+            degree = np.where(vertex >= 0, start[vertex + 1] - start[vertex], 0)
+            slot = 0
+            while point.size:
+                more = degree > slot
+                point, vertex, degree = point[more], vertex[more], degree[more]
+                if not point.size:
+                    break
+                face = face_at[start[vertex] + slot]
+                p = tgt[point]
+                c0, c1, c2 = _dot(p, bxc[face]), _dot(p, cxa[face]), _dot(p, axb[face])
+                total = c0 + c1 + c2
+                floor = -CONTAIN_TOLERANCE * total
+                inside = outward[face] & (total > 0) & (c0 >= floor) & (c1 >= floor) & (c2 >= floor)
+                if inside.any():
+                    found = point[inside]
+                    w = np.stack([c0[inside], c1[inside], c2[inside]], axis=1)
+                    np.maximum(w, 0.0, out=w)
+                    weights[found] = w / (w[:, 0] + w[:, 1] + w[:, 2])[:, None]
+                    corners[found] = faces[face[inside]]
+                    fallback[found] = False
+                    keep = ~inside
+                    point, vertex, degree = point[keep], vertex[keep], degree[keep]
+                slot += 1
+            left = fallback[points]
+            points, candidate = points[left], candidate[left]
+
+    unresolved = np.flatnonzero(~resolved)
+    search(unresolved, neighbour[unresolved])
+
+    # the wider search: the points left, with twice as many neighbours at each step
+    n_widened = 0
+    left = np.flatnonzero(fallback)
+    tested, step_k, cap = neighbour[left], k, min(k_wide, n_source)
+    while left.size and step_k < cap:
+        step_k = min(2 * step_k, cap)
+        wide = _neighbours(tree, src, tgt[left], step_k)[0]
+        candidate = np.where(_in_rows(wide, tested, n_source), -1, wide)
+        search(left, candidate)
+        found = ~fallback[left]
+        n_widened += int(found.sum())
+        left, tested = left[~found], wide[~found]
 
     return SphereMap(
         n_source=n_source,
@@ -251,7 +287,19 @@ def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: in
         nearest_source=nearest_source.astype(np.int32),
         nearest_target=nearest_target.astype(np.int32),
         flipped=flipped,
+        n_widened=n_widened,
     )
+
+
+def _in_rows(values: np.ndarray, rows: np.ndarray, n: int) -> np.ndarray:
+    """``values[i, j] in rows[i]``, row by row, for indices below ``n``."""
+    if not rows.size:
+        return np.zeros(values.shape, dtype=bool)
+    offset = np.arange(len(values), dtype=np.int64)[:, None] * n
+    known = np.sort((rows + offset).ravel())
+    query = (values + offset).ravel()
+    at = np.minimum(np.searchsorted(known, query), len(known) - 1)
+    return (known[at] == query).reshape(values.shape)
 
 
 def resample(

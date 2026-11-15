@@ -600,10 +600,11 @@ def test_a_sphere_without_faces_maps_by_nearest_vertex_alone() -> None:
 
 def test_more_neighbours_only_ever_resolve_more_points() -> None:
     """A strong warp shears the faces, so the face of a point is often not at its nearest
-    vertices. What few neighbours resolve, more neighbours resolve to the same face."""
+    vertices. What few neighbours resolve, more neighbours resolve to the same face. The
+    first search alone (``k_wide = k``)."""
     source = warped_sphere(4, warp=1.5)
     target = random_directions(np.random.default_rng(12), 20_000)
-    maps = [build_sphere_map(source, target, k=k) for k in (1, 8, 32)]
+    maps = [build_sphere_map(source, target, k=k, k_wide=k) for k in (1, 8, 32)]
     counts = [int(smap.fallback.sum()) for smap in maps]  # measured 3919, 377, 0
     assert counts[0] > 3000 > 1000 > counts[1] > 100
     assert counts[2] == 0
@@ -629,6 +630,117 @@ def test_more_neighbours_only_ever_resolve_more_points() -> None:
     # measured: median 0.043 and at most 0.097 by vertex, 0.0036 and 0.0093 in the face
     assert face_error.max() < 0.012 < 0.03 < np.median(vertex_error) < vertex_error.max() < 0.12
     assert np.median(face_error) < 0.005
+
+
+def sheared() -> tuple[Surface, np.ndarray]:
+    """The sphere and targets of the test above: 377 of 20,000 targets have no face among
+    the faces around their 8 nearest vertices."""
+    return warped_sphere(4, warp=1.5), random_directions(np.random.default_rng(12), 20_000)
+
+
+def map_bytes(smap: SphereMap) -> bytes:
+    return b"".join(np.ascontiguousarray(getattr(smap, name)).tobytes() for name in MAP_ARRAYS)
+
+
+def test_the_wider_search_resolves_what_the_first_search_leaves() -> None:
+    """With the default cap every target of the sheared sphere gets a face; the targets
+    the first search resolved keep their rows, byte for byte; each target the wider search
+    resolved lies in the face it was given."""
+    source, target = sheared()
+    narrow = build_sphere_map(source, target, k=8, k_wide=8)
+    wide = build_sphere_map(source, target, k=8)
+    assert int(narrow.fallback.sum()) == 377 and narrow.n_widened == 0
+    assert not wide.fallback.any() and wide.n_widened == 377
+    first = ~narrow.fallback
+    for name in ("corners", "weights"):
+        np.testing.assert_array_equal(getattr(wide, name)[first], getattr(narrow, name)[first])
+    np.testing.assert_array_equal(wide.nearest_source, narrow.nearest_source)
+    np.testing.assert_array_equal(wide.nearest_target, narrow.nearest_target)
+    lost = narrow.fallback
+    source_unit = unit_sphere(source.vertices)
+    np.testing.assert_allclose(
+        interpolated_points(wide, source_unit)[lost], target[lost], rtol=0, atol=1e-12
+    )
+    np.testing.assert_allclose(
+        wide.weights[lost],
+        solved_weights(source_unit, wide.corners[lost], target[lost]),
+        rtol=0,
+        atol=1e-9,
+    )
+    (inside,) = containing_faces(source_unit, source.faces, target[lost], CONTAIN_TOLERANCE)
+    face_of = {tuple(face): index for index, face in enumerate(source.faces.tolist())}
+    assert all(
+        face_of[tuple(wide.corners[vertex].tolist())] in faces
+        for vertex, faces in zip(np.flatnonzero(lost), inside, strict=True)
+    )
+
+
+@pytest.mark.parametrize("cap", [9, 16, 24, 32])
+def test_a_wider_search_gives_the_map_of_the_first_search_with_its_cap(cap: int) -> None:
+    """Doubling from 8 to ``cap`` resolves exactly what a first search over ``cap``
+    neighbours resolves, with the same faces and weights: the faces the steps leave out
+    are those that a step before failed on."""
+    source, target = sheared()
+    stepped = build_sphere_map(source, target, k=8, k_wide=cap)
+    plain = build_sphere_map(source, target, k=cap, k_wide=cap)
+    assert_same_map(stepped, plain)
+    narrow = build_sphere_map(source, target, k=8, k_wide=8)
+    assert stepped.n_widened == int(narrow.fallback.sum()) - int(stepped.fallback.sum())
+    assert (cap <= 16) == bool(stepped.fallback.any())  # measured: 32 resolves every one
+
+
+def test_a_cap_at_k_is_the_first_search_alone() -> None:
+    """``k_wide`` equal to ``k``, or below it, is the map of before the wider search."""
+    source, target = sheared()
+    narrow = build_sphere_map(source, target, k=8, k_wide=8)
+    assert_same_map(narrow, build_sphere_map(source, target, k=8, k_wide=1))
+    # the map of the first search alone, as before the wider search was built: the counts
+    # of test_more_neighbours_only_ever_resolve_more_points
+    assert int(narrow.fallback.sum()) == 377
+    fallen = narrow.fallback
+    np.testing.assert_array_equal(
+        narrow.corners[fallen], np.repeat(narrow.nearest_source[fallen, None], 3, axis=1)
+    )
+
+
+def test_what_no_face_holds_still_falls_back() -> None:
+    """A sphere with a hole: the targets in the hole are in no face at all, so the wider
+    search leaves them to their nearest vertex."""
+    directions, faces = icosphere(3)
+    north = directions[faces].mean(axis=1)[:, 2] > 0.8
+    target = random_directions(np.random.default_rng(31), 3000)
+    smap = build_sphere_map(surface(directions, faces[~north]), target)
+    (inside,) = containing_faces(directions, faces[~north], target, CONTAIN_TOLERANCE)
+    outside = np.array([len(found) == 0 for found in inside])
+    assert outside.sum() > 50
+    np.testing.assert_array_equal(smap.fallback, outside)
+
+
+def test_the_wider_search_is_the_same_in_another_process(tmp_path: Path) -> None:
+    import hashlib
+    import subprocess
+    import sys
+
+    source, target = sheared()
+    np.savez(tmp_path / "in.npz", vertices=source.vertices, faces=source.faces, target=target)
+    code = (
+        "import hashlib, sys, numpy as np\n"
+        "from surfcensus.fsio.registration import build_sphere_map\n"
+        "from surfcensus.fsio.surfaces import Surface\n"
+        "d = np.load(sys.argv[1])\n"
+        "m = build_sphere_map(Surface(d['vertices'], d['faces']), d['target'])\n"
+        f"names = {MAP_ARRAYS!r}\n"
+        "data = b''.join(np.ascontiguousarray(getattr(m, n)).tobytes() for n in names)\n"
+        "print(hashlib.sha256(data).hexdigest(), m.n_widened)\n"
+    )
+    out = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "in.npz")],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    here = build_sphere_map(source, target)
+    assert out == [hashlib.sha256(map_bytes(here)).hexdigest(), str(here.n_widened)]
 
 
 def test_k_larger_than_the_sphere() -> None:
@@ -948,6 +1060,8 @@ def test_sphere_file_with_reversed_faces_gives_the_same_map(
 
 FSAVERAGE_CACHE = "ds000102-fsaverage"  # where conftest.real_template keeps the files
 REAL_FALLBACKS = {"lh": 3, "rh": 2}  # of 40,962 fsaverage6 targets, measured 2026-11-13
+"""Targets that the search over 8 neighbours leaves without a face; the wider search up to
+256 resolves every one of them (measured 2026-11-15)."""
 N_FSAVERAGE6 = 40_962
 
 
@@ -959,11 +1073,17 @@ def check_real_hemisphere(subject: Path, fsaverage: Path, hemi: str, n_sample: i
     started = time.perf_counter()
     smap = build_sphere_map(sphere, target)
     seconds = time.perf_counter() - started
+    narrow = build_sphere_map(sphere, target, k_wide=8)  # the first search alone
 
     source_unit, target_unit = unit_sphere(sphere.vertices), unit_sphere(target)
     faces = sphere.faces
     assert smap.flipped is False  # the right sphere is wound outward like the left one
-    assert int(smap.fallback.sum()) == REAL_FALLBACKS[hemi]
+    assert int(narrow.fallback.sum()) == REAL_FALLBACKS[hemi]
+    assert not smap.fallback.any()
+    assert smap.n_widened == REAL_FALLBACKS[hemi] and narrow.n_widened == 0
+    first = ~narrow.fallback
+    np.testing.assert_array_equal(smap.corners[first], narrow.corners[first])
+    np.testing.assert_array_equal(smap.weights[first], narrow.weights[first])
     assert (smap.weights >= 0).all()
     np.testing.assert_allclose(smap.weights.sum(axis=1), 1.0, rtol=0, atol=4e-16)
     resolved = ~smap.fallback
@@ -974,7 +1094,7 @@ def check_real_hemisphere(subject: Path, fsaverage: Path, hemi: str, n_sample: i
     # a random sample of targets, and every fallback, against all faces of the sphere
     rng = np.random.default_rng(20261113 + HEMIS.index(hemi))
     sample = np.union1d(
-        rng.choice(N_FSAVERAGE6, size=n_sample, replace=False), np.flatnonzero(smap.fallback)
+        rng.choice(N_FSAVERAGE6, size=n_sample, replace=False), np.flatnonzero(narrow.fallback)
     )
     points = target_unit[sample]
     loose, strict = containing_faces(
@@ -991,13 +1111,12 @@ def check_real_hemisphere(subject: Path, fsaverage: Path, hemi: str, n_sample: i
         uncovered += len(candidates) == 0
         if gap[row] > 1e-12:
             assert smap.nearest_source[target_vertex] == nearest[row]
-        if smap.fallback[target_vertex]:
-            # the search was right to give up: no face that contains the point touches one
-            # of its eight nearest vertices
-            assert corners == (nearest[row],) * 3
+        if narrow.fallback[target_vertex]:
+            # the first search was right to give up: no face that contains the point
+            # touches one of its eight nearest vertices; the wider search found one
+            assert tuple(narrow.corners[target_vertex].tolist()) == (nearest[row],) * 3
             eight = np.argsort(-(points[row] @ source_unit.T), kind="stable")[:8]
             assert not np.isin(faces[candidates], eight).any()
-            continue
         assert face_of[corners] in candidates
     on_faces = sample[~smap.fallback[sample]]
     np.testing.assert_allclose(

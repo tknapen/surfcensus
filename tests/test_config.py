@@ -438,6 +438,22 @@ def test_stage_hash_changes_with_name_schema_payload_and_upstream() -> None:
     assert len({base, *others}) == len(others) + 1
 
 
+def test_the_wider_search_is_on_by_default_and_never_below_knn(tmp_path: Path) -> None:
+    metrics = MetricsConfig()
+    assert (metrics.knn, metrics.knn_wide) == (8, 256)
+    assert MetricsConfig(knn=8, knn_wide=8).knn_wide == 8  # equal: the first search alone
+    with pytest.raises(ValueError, match=r"knn_wide \(4\) must be at least knn \(8\)"):
+        MetricsConfig(knn_wide=4)
+    with pytest.raises(ConfigError, match="knn_wide"):
+        local_config(tmp_path, metrics={"knn": 32, "knn_wide": 16})
+
+
+def test_the_fsaverage_stage_is_at_schema_2() -> None:
+    """Raised with the wider search of the sphere map (decision D46), so that every map of a
+    run made before it is made again."""
+    assert cfg.STAGE_SCHEMAS["fsaverage"] == 2
+
+
 def test_every_metrics_field_belongs_to_one_stage_or_is_named_as_unhashed() -> None:
     hashed = set(FSAVERAGE_STAGE_FIELDS) | set(REFERENCE_STAGE_FIELDS)
     assert not set(FSAVERAGE_STAGE_FIELDS) & set(REFERENCE_STAGE_FIELDS)
@@ -474,6 +490,8 @@ CHANGES = [
     ("render", {"panel_px": 64}, {"render"}),
     ("render", {"fps": 10}, {"render"}),
     ("metrics", {"knn": 4}, {"fsaverage", "reference", "score", "native"}),
+    ("metrics", {"knn_wide": 64}, {"fsaverage", "reference", "score", "native"}),
+    ("metrics", {"knn_wide": 8}, {"fsaverage", "reference", "score", "native"}),
     ("metrics", {"mesh": "fsaverage5"}, {"fsaverage", "reference", "score", "native"}),
     ("metrics", {"min_coverage": 0.8}, {"fsaverage", "reference", "score", "native"}),
     (

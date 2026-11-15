@@ -199,7 +199,7 @@ These follow what milestone 1 does.
   | inventory | `inventory`, 1 | `InventoryConfig` | | none (`subjects.inventory_hash`) |
   | enrich (phase 3) | `enrich`, 1 | `{"columns_sha256": ...}` of `enrich/columns.yaml` | | none |
   | regional (4a) | `regional`, 1 | `{}` | | the dataset's `regional` part |
-  | fsaverage (4b) | `fsaverage`, 1 | `mesh`, `regions`, `knn`, `min_valid_weight`, `thickness_max_mm`, `ceiling_margin_mm`, `min_coverage`, `max_fallback_frac` | `template_id` or `"none"` | `tables/fsavg/<uid>.npz` when the row's `output` is set, else the dataset's `vertex_summary` part |
+  | fsaverage (4b) | `fsaverage`, 2 (2 since D46, the wider search) | `mesh`, `regions`, `knn`, `knn_wide`, `min_valid_weight`, `thickness_max_mm`, `ceiling_margin_mm`, `min_coverage`, `max_fallback_frac` | `template_id` or `"none"` | `tables/fsavg/<uid>.npz` when the row's `output` is set, else the dataset's `vertex_summary` part |
   | reference (4c) | `reference`, 1 | `min_reference_n`, `min_vertex_n`, `mad_smooth_iterations`, `mad_floor_mm`, `cluster_z`, `cluster_min_vertices`, `clusters_kept` | fsaverage hash | `tables/reference/<id>/index.json` and `tables/clusters.parquet` |
   | score | `score`, 1 | `ScoringConfig` | reference hash or `"none"` | `tables/scores.parquet` |
   | select (phase 5) | `select`, 1 | `SelectConfig`, the two sample sizes, the seed | score hash | none (the `selection` rows) |
@@ -474,6 +474,7 @@ class MetricsConfig(_Frozen):
     fsaverage_dir: str | None = None         # --fsaverage DIR; not hashed (the template's content is)
     regions: RegionConfig = RegionConfig()
     knn: int = 8
+    knn_wide: int = 256                      # cap of the wider search for targets the first knn leave (D46); >= knn, equal: off
     min_valid_weight: float = 0.5
     thickness_max_mm: float = 5.0
     ceiling_margin_mm: float = 0.1
@@ -1189,16 +1190,17 @@ class SphereMap:
     nearest_source: Int[np.ndarray, "t"]       # source vertex nearest each target vertex
     nearest_target: Int[np.ndarray, "s"]       # target vertex nearest each source vertex
     flipped: bool                              # the source faces were wound inward and were reversed
+    n_widened: int = 0                         # targets the first k left and the wider search resolved (D46)
 
 def unit_sphere(vertices: Float[np.ndarray, "n 3"]) -> Float[np.ndarray, "n 3"]
     # ValueError("degenerate sphere: ...") for a non-finite or zero radius, or radii more than 1% from their median
-def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: int = 8) -> SphereMap
+def build_sphere_map(source: Surface, target: Float[np.ndarray, "t 3"], *, k: int = 8, k_wide: int = 256) -> SphereMap
 def resample(values: Float[np.ndarray, "s"], smap: SphereMap, *, valid: Bool[np.ndarray, "s"] | None = None,
              min_valid_weight: float = 0.5) -> Float[np.ndarray, "t"]
 ```
 
 - Both spheres are put on the unit sphere. A `scipy.spatial.cKDTree` over the source vertices gives, for each target point `p`, its `k` nearest source vertices, nearest first (`nearest_source` is the first). For `j = 0 .. k-1`, for the points still unresolved, the faces incident to the `j`-th nearest vertex are tested in ascending face index. With face corners `a, b, c`: `det = a . (b x c)`, `c0 = p . (b x c)`, `c1 = p . (c x a)`, `c2 = p . (a x b)`, `s = c0 + c1 + c2`. The face contains `p` when `det > 0`, `s > 0` and every `ci >= -1e-9 * s`. The first containing face wins. Weights are `max(ci, 0)` renormalized. A folded or degenerate face (`det <= 0`) never matches, and nothing is inverted, so no input raises. Before the search, if more than half of the source faces have `det < 0` (a sphere written by another tool, or mirrored), every face is reversed once and `flipped` is set; without this such a sphere matches no face at all and every target silently becomes a nearest-neighbour value (40,962 of 40,962 on the real subject with reversed faces). The order makes the result independent of thread count and platform.
-- Points unresolved after `k` passes get `corners = (nearest,) * 3`, `weights = (1, 0, 0)`, `fallback = True`. Measured on sub-01: 3 and 2 of 40,962.
+- Points unresolved after `k` passes are searched again (decision D46): with `2k` nearest vertices, then twice as many again, up to `k_wide` (the last step takes exactly `k_wide`, at most the number of source vertices), by the same rule, and a step does not test the faces of the vertices that the step before it tested, which failed. A point resolved in the step with `m` neighbours therefore gets the face that the first search with `k = m` gives it; a point resolved by the first `k` keeps its row exactly. `k_wide <= k` turns the wider search off. Points still unresolved get `corners = (nearest,) * 3`, `weights = (1, 0, 0)`, `fallback = True`. Measured on sub-01: 3 and 2 of 40,962 after the first 8 neighbours, 0 after the wider search.
 - `nearest_target` is one KD-tree query of the source vertices against the target sphere (lowest index on a tie).
 - `resample` with `valid`: weights of invalid corners are set to 0. A target whose remaining weight is below `min_valid_weight` is NaN; otherwise the remaining weights are renormalized.
 - One `SphereMap` per hemisphere per subject serves three uses. It is built when needed and not stored (0.2 s). Cluster centroids do not use it: they go to native space through the counterparts stored in `vertex_map.npz` (6.7), which needs no source file.
@@ -1263,7 +1265,7 @@ def assign_strata(subjects: pd.DataFrame, *, min_n: int) -> pd.Series           
 def stratum_members(subjects: pd.DataFrame, stratum: str) -> list[str]          # sorted subject_uids
 ```
 
-- `resample_hemi`: `MetricError("vertex count mismatch", ...)` unless thickness, sphere and (if given) annotation agree in length; `MetricError("degenerate sphere", ...)` from `unit_sphere`, and also when more than `config.max_fallback_frac` of the targets fell back to the nearest neighbour (a folded or otherwise unusable registration; 3 of 40,962 on the real subject). `valid` = thickness finite and `> 0`, and annotation cortex when an annotation is given. Target vertices outside `template_hemi.cortex` are NaN. If fewer than `min_coverage` of the template cortex vertices get a value: `MetricError("low coverage", ...)`. In each of these cases the hemisphere has no map and a flag.
+- `resample_hemi`: `MetricError("vertex count mismatch", ...)` unless thickness, sphere and (if given) annotation agree in length; `MetricError("degenerate sphere", ...)` from `unit_sphere`, and also when more than `config.max_fallback_frac` of the targets fell back to the nearest neighbour (a folded or otherwise unusable registration; 3 of 40,962 on the real subject with the first search alone, 0 with the wider search of D46). `valid` = thickness finite and `> 0`, and annotation cortex when an annotation is given. Target vertices outside `template_hemi.cortex` are NaN. If fewer than `min_coverage` of the template cortex vertices get a value: `MetricError("low coverage", ...)`. In each of these cases the hemisphere has no map and a flag.
 - `global_median`: the median over finite values in cortex and outside `search`, per hemisphere. NaN when fewer than 2.5% of the mesh's vertices qualify (1,024 on fsaverage6).
 - `write_maps` writes `tables/fsavg/<subject_uid>.npz` with `lh_thickness`, `rh_thickness` as `<f2`, NaN for missing, through `_io.write_npz`: 164 kB per subject. A subject with one usable hemisphere stores all-NaN for the other. float16 changes thickness by at most 0.002 mm.
 - Everything downstream (global median, reference, z, clusters) is computed from the stored float16 maps, never from the values in memory, so results can be reproduced from the run directory alone.
@@ -2367,7 +2369,7 @@ On `ds000102` sub-01 with its template:
 - inventory: complete, Tier A and B present; FreeSurfer 6.0.1, major 6; 4 invocations in `recon-all.log`; no T2, FLAIR, hires, expert or edit; finished; holes 41 and 26 in the log and in `aseg.stats`; truncations (39, 225) on `lh` and (93, 434) on `rh`; `recon_flags` holds no `/` and no `ds000102`; the source tree unchanged.
 - stats: `MeanThickness` 2.39047 and `NumVert` 140,304 on `lh`; `CortexVol` read despite the malformed line; 34 parcels per hemisphere; ratio 0.811 within 0.001.
 - template: 40,962 vertices and 81,920 faces per hemisphere, degrees 5 (12 vertices) and 6; `lh` cortex 37,487; pole vertex 12950; `lh` search 4,856, medial 1,851, inferior 1,405, lateral 1,600, control 5,789; `area_source` is `white.avg.area` and the `lh` areas sum to the file's own total (about 82,220 mm2 by the reviewer's measurement, fixed when the fixture is written), while with the file withheld the total is the white-mesh area, 65,096 mm2 within 1; `coarsen_faces` once more equals the faces of `fsaverage5/surf/lh.sphere.reg` exactly.
-- mapping: at most 10 fallback targets per hemisphere (3 and 2 measured); at least 99.5% of the template cortex vertices get a value (37,420 of 37,487 on `lh`); the `lh` map has mean 2.43 mm within 0.02 and a global median between 2.3 and 2.6 mm; whole-hemisphere counts at exactly 5.0 are 16 (`lh`) and 41 (`rh`); the `lh` native search region has 21,484 vertices, none at 4.9 mm or more, so its ceiling fraction is 0.
+- mapping: no fallback target with the wider search (3 and 2 with the first search alone, measured 2026-11-13; 0 and 0 with the wider one, 2026-11-15); at least 99.5% of the template cortex vertices get a value (37,420 of 37,487 on `lh`); the `lh` map has mean 2.43 mm within 0.02 and a global median between 2.3 and 2.6 mm; whole-hemisphere counts at exactly 5.0 are 16 (`lh`) and 41 (`rh`); the `lh` native search region has 21,484 vertices, none at 4.9 mm or more, so its ceiling fraction is 0.
 - render with the template: no -1 among the `fsavg6` entries; `fsaverage_poles` present, the `lh` distance below 3 mm (about 1 mm in the prototype) and both printed (the first data for D12); the tiles byte-identical to a render without the template; time and size bounds as in the existing test.
 - agreement with `mri_surf2surf`: skipped until `tests/data/surf2surf_ds000102_sub-01_lh.npy` exists. To produce it, with FreeSurfer 6 or 7 and the subject and its `fsaverage` in one `SUBJECTS_DIR` (flags from memory of the tool's help, to check against it):
 

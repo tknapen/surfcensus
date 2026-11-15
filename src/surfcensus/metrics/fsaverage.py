@@ -100,7 +100,9 @@ def resample_hemi(
             ", ".join(f"{name} {count}" for name, count in counts.items()) + " vertices",
         )
     try:
-        smap = build_sphere_map(sphere_reg, template_hemi.sphere, k=config.knn)
+        smap = build_sphere_map(
+            sphere_reg, template_hemi.sphere, k=config.knn, k_wide=config.knn_wide
+        )
     except ValueError as exc:
         text = str(exc)
         if not text.startswith(_DEGENERATE):

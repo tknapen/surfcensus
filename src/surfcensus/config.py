@@ -135,9 +135,13 @@ class MetricsConfig(_Frozen):
     """An explicit template directory. Not hashed: the template's content is."""
     regions: RegionConfig = RegionConfig()
     knn: int = Field(default=8, ge=1)
-    """Nearest source vertices whose faces are searched for the one that contains a template
-    vertex. A vertex they leave without a face takes the value of its nearest source
-    vertex, also where a face farther off contains it (docs/metrics.md, The mapping)."""
+    """Nearest source vertices whose faces are searched first for the one that contains a
+    template vertex (docs/metrics.md, The mapping)."""
+    knn_wide: int = Field(default=256, ge=1)
+    """Cap of the wider search: a template vertex that the first ``knn`` neighbours leave
+    without a face is searched again with twice as many, doubling up to this number, and
+    takes the value of its nearest source vertex only when none of those faces contains it.
+    Equal to ``knn``: no wider search, the maps of schema 1 of the stage (decision D46)."""
     min_valid_weight: float = Field(default=0.5, ge=0, le=1)
     thickness_max_mm: float = Field(default=5.0, gt=0)
     ceiling_margin_mm: float = Field(default=0.1, ge=0)
@@ -153,11 +157,21 @@ class MetricsConfig(_Frozen):
     cluster_min_vertices: int = Field(default=1, ge=1)
     clusters_kept: int = Field(default=5, ge=1)
 
+    @model_validator(mode="after")
+    def _wide_at_least_knn(self) -> MetricsConfig:
+        if self.knn_wide < self.knn:
+            raise ValueError(
+                f"knn_wide ({self.knn_wide}) must be at least knn ({self.knn}); "
+                "equal turns the wider search off"
+            )
+        return self
+
 
 FSAVERAGE_STAGE_FIELDS: tuple[str, ...] = (
     "mesh",
     "regions",
     "knn",
+    "knn_wide",
     "min_valid_weight",
     "thickness_max_mm",
     "ceiling_margin_mm",
@@ -552,7 +566,7 @@ STAGE_SCHEMAS: dict[str, int] = {
     "inventory": 1,
     "enrich": 1,
     "regional": 1,
-    "fsaverage": 1,
+    "fsaverage": 2,  # 2: the wider search of the sphere map (decision D46)
     "reference": 1,
     "score": 2,  # 2: scores.parquet gained primary_rank
     "select": 1,

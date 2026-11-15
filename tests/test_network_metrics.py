@@ -101,12 +101,14 @@ def test_the_map_of_the_freesurfer_6_subject(real_subject: Path, template: Templ
             f"median {hemi_map.global_median:.3f} mm, native search region {counts.n_region} "
             f"vertices ({counts.n_near} at 4.9 mm or more, {counts.n_zero} at 0), {seconds:.2f} s"
         )
-        assert hemi_map.n_fallback <= 10 and not hemi_map.flipped
+        assert hemi_map.n_fallback == 0 and not hemi_map.flipped
+        assert smap.n_widened == {"lh": 3, "rh": 2}[hemi]
         assert covered >= 0.995 * n_cortex
         assert 2.3 < hemi_map.global_median < 2.6
         assert np.isnan(hemi_map.thickness[~half.cortex]).all()
         if hemi == "lh":
-            assert (hemi_map.n_fallback, covered) == (3, 37_420)
+            # 3 with the first search alone (2026-11-13); the wider search resolves them
+            assert (hemi_map.n_fallback, smap.n_widened, covered) == (0, 3, 37_420)
             assert np.nanmean(hemi_map.thickness) == pytest.approx(2.43, abs=0.02)
             assert (counts.n_region, counts.n_near, counts.n_zero) == (21_484, 0, 0)
             assert counts.fraction == 0
@@ -216,7 +218,7 @@ def test_a_run_on_both_real_subjects_with_the_template_next_to_them(
 
         summary = read_table(table_path(run_dir, "vertex_summary"), SCHEMAS["vertex_summary"])
         assert (summary["thickness_max_mm"] == 5.0).all()
-        assert (summary["n_fallback"] <= 10).all() and (summary["n_missing_cortex"] < 190).all()
+        assert (summary["n_fallback"] == 0).all() and (summary["n_missing_cortex"] < 190).all()
         assert set(summary["flags"]) == {""} and set(summary["region_kind"]) == {"template"}
         for label, uid in uids.items():
             maps = read_maps(map_path(run_dir, uid))
