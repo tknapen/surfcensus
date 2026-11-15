@@ -28,3 +28,6 @@ media/
 /*.jpg
 /*.webp
 /*.mp4
+
+# worktrees that a coding agent makes for itself: checkouts of this repository, never content
+/.claude/worktrees/
