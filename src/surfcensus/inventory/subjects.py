@@ -13,7 +13,9 @@ the input signature over all of a subject's files, with the identity of the inve
 from __future__ import annotations
 
 import dataclasses
+import errno
 import hashlib
+import os
 import time
 from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -90,6 +92,8 @@ def _read_tier_a(source: Source, record: SubjectRecord, config: InventoryConfig)
                 record, role, byte_range=(0, config.head_bytes - 1) if head else None
             )
         except SourceError as exc:
+            if exc.reason == UNREACHABLE:
+                raise  # the network, not the file: the inventory stops (_Unreachable)
             unread.append((role, exc))
             continue
         key = annex_pointer(data[:POINTER_PROBE_BYTES], ref.size)
@@ -209,7 +213,13 @@ def _pseudonym(catalog: Catalog, key: HashKey, dataset: DatasetRecord) -> str:
 
 def _fetch_stats(source: Source, record: SubjectRecord) -> SourceError | None:
     """Have a remote source fetch the stats files of ``record``; its cache keeps Tier A
-    files after the lease. Nothing is fetched from a local source."""
+    files after the lease. Nothing is fetched from a local source.
+
+    A ``SourceError`` of the file (``changed``, ``unreadable``, ...) is returned, and the
+    subject is read again at the next inventory. What lies in the network, the cache or its
+    disk is raised: ``SourceError("unreachable")`` as it is, a ``ConfigError`` (a cache over
+    its budget) as it is, and an ``OSError`` of a full, over-quota or read-only disk as
+    ``ConfigError("invalid", ...)``."""
     roles = [role for role in STATS_ROLES if role in record.files]
     if source.kind == "local" or not roles:
         return None
@@ -217,8 +227,49 @@ def _fetch_stats(source: Source, record: SubjectRecord) -> SourceError | None:
         with source.lease(record, roles):
             pass
     except SourceError as exc:
+        if exc.reason == UNREACHABLE:
+            raise
         return exc
+    except ConfigError as exc:
+        raise ConfigError(exc.reason, f"{exc.detail}; {_KEPT}") from exc
+    except OSError as exc:
+        if exc.errno in _NO_ROOM:
+            raise ConfigError(
+                "invalid",
+                f"the stats files of a subject could not be fetched: "
+                f"{os.strerror(exc.errno)}; {_KEPT}",
+            ) from exc
+        raise
     return None
+
+
+_KEPT = (
+    "the inventory stopped: the subjects stored before this one are kept, nothing of it "
+    "was stored and no subject was marked absent; run the same command again once there is "
+    "room, and it goes on"
+)
+
+
+UNREACHABLE = "unreachable"
+"""The ``SourceError`` reason of a remote source whose retries ran out (``remote.UNREACHABLE``).
+It stops the inventory (:func:`_stopped_by_network`) instead of failing a dataset or leaving
+a subject to be read again: the next subject would wait out the same retries."""
+_NO_ROOM = (errno.ENOSPC, errno.EDQUOT, errno.EROFS)
+
+
+def _stopped_by_network(
+    catalog: Catalog, pseudonym: str, exc: SourceError, *, at: str, done: int
+) -> SourceError:
+    """The ``SourceError("unreachable", ...)`` that stops the inventory, with one line that
+    says what was kept: the subjects stored before it, and nothing of the subject or listing
+    it was at; no subject is marked absent."""
+    detail = privacy.scrub_with(catalog, exc.detail)
+    return SourceError(
+        UNREACHABLE,
+        f"the bucket could not be reached ({detail}); the inventory of {pseudonym} stopped at "
+        f"{at}: the {done} subject(s) stored before it are kept, nothing of it was stored and "
+        "no subject was marked absent; run the same command again once it can be reached",
+    )
 
 
 def _inventory_dataset(
@@ -251,6 +302,7 @@ def _inventory_dataset(
     done = skipped = 0
     reread: dict[str, int] = {}  # reason -> subjects with a Tier A file that was not read
     stopped: SourceError | None = None
+    current: str | None = None  # the subject being read; None while listing
     try:
         for record in source.subjects(dataset):
             uid = privacy.subject_uid(
@@ -274,6 +326,7 @@ def _inventory_dataset(
                 skipped += 1
                 continue
 
+            current = uid
             read = _read_tier_a(source, record, config.inventory)
             record = _without_content(source, record, read.pointers)
             if record.unfetched:
@@ -314,7 +367,15 @@ def _inventory_dataset(
                 uid, dataset_id, record, provenance, signature, digests=read.digests
             )
             done += 1
-    except SourceError as exc:  # from the listing; reading a subject raises none
+            current = None
+    except SourceError as exc:
+        # From the listing, or the network gone while a subject was read (the only
+        # SourceError that reading a subject raises). A network that cannot be reached stops
+        # the phase, with exit code 2 (decision D47, item 10): recorded as a failed dataset,
+        # it would leave the rest of the run to wait out the same retries.
+        if exc.reason == UNREACHABLE:
+            at = f"subject {current}" if current is not None else "its listing"
+            raise _stopped_by_network(catalog, pseudonym, exc, at=at, done=done) from exc
         stopped = exc
 
     tally.done += done
@@ -442,6 +503,14 @@ def run_inventory(
     ``key`` is not the key the catalog was made with, ``invalid`` when two sources yield the
     same dataset or two subjects get one ``subject_uid``. A ``SourceError`` from listing the
     datasets of a source is raised as it is.
+
+    A remote source that cannot be reached (``SourceError("unreachable")``, from a listing,
+    a Tier A file or the fetch of the stats files) stops the call with a
+    ``SourceError("unreachable", ...)`` that says where: the subjects stored before it stay,
+    nothing of the subject it was at is stored, no subject is marked absent, and the next
+    call goes on, skipping what is stored. A cache over its budget (``ConfigError``) and a
+    full, over-quota or read-only disk under the cache (``ConfigError("invalid", ...)``)
+    stop it in the same way. Any other ``SourceError`` of a Tier A file is not a failure.
     """
     start = time.perf_counter()
     if catalog.meta("key_fingerprint") != key.fingerprint:

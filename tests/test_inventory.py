@@ -118,7 +118,7 @@ class Spy:
         self.reads: list[tuple[str, FileRole, tuple[int, int] | None]] = []
         self.leases: list[tuple[str, tuple[FileRole, ...]]] = []
         self.fail_read: dict[tuple[str, FileRole], BaseException] = {}
-        self.fail_lease: SourceError | None = None
+        self.fail_lease: BaseException | None = None
         self.fail_listing: SourceError | None = None
         self.listed_before_failing = 0
         self.problems: dict[str, str] = {}
@@ -859,14 +859,14 @@ def test_a_listing_that_stops_half_way_keeps_what_it_stored_and_marks_nobody_abs
     bench: Bench,
 ) -> None:
     spy = Spy(bench.source())
-    spy.fail_listing = SourceError("unreachable", "the listing was cut off")
+    spy.fail_listing = SourceError("unreadable", "the listing was cut off")
     spy.listed_before_failing = 2
     report = bench.run(spy)
     pseudonym = bench.pseudonym()
     assert (report.done, report.skipped, report.failed) == (2, 0, 1)
-    assert report.failures == ((f"dataset:{pseudonym}", "unreachable"),)
+    assert report.failures == ((f"dataset:{pseudonym}", "unreadable"),)
     assert report.notes == (
-        f"{pseudonym}: the subjects could not be listed (unreachable: the listing was cut off)",
+        f"{pseudonym}: the subjects could not be listed (unreadable: the listing was cut off)",
     )
     assert [row["subject_label"] for row in bench.rows("SELECT * FROM subjects ORDER BY 3")] == [
         "sub-01",
@@ -940,7 +940,7 @@ def test_inventory_subject_does_not_raise_for_an_unreadable_file(bench: Bench) -
     (record,) = [r for r in source.subjects(source.dataset) if r.subject_label == "sub-01"]
     spy = Spy(source)
     spy.fail_read[("sub-01", FileRole.BUILD_STAMP)] = SourceError("unreadable", "no")
-    spy.fail_read[("sub-01", FileRole.RECON_LOG_RH)] = SourceError("unreachable", "no")
+    spy.fail_read[("sub-01", FileRole.RECON_LOG_RH)] = SourceError("changed", "no")
     found = inventory_subject(spy, record, InventoryConfig())
     whole = inventory_subject(source, record, InventoryConfig())
     # the version then comes from the stamp line of recon-all.log
@@ -1051,14 +1051,14 @@ def test_failures_and_notes_are_ordered_by_unit_and_pseudonym_not_by_source_orde
     first = Spy(bench.source())
     second = Spy(_other_tree(tmp_path))
     for spy in (first, second):
-        spy.fail_listing = SourceError("unreachable", "no answer")
+        spy.fail_listing = SourceError("unreadable", "no answer")
     forward = bench.run(first, second)
     backward = bench.run(second, first)
     pseudonyms = sorted(
         privacy.dataset_pseudonym(bench.key, "local", spy.dataset.identity)
         for spy in (first, second)
     )
-    assert forward.failures == tuple((f"dataset:{p}", "unreachable") for p in pseudonyms)
+    assert forward.failures == tuple((f"dataset:{p}", "unreadable") for p in pseudonyms)
     assert [note.split(":")[0] for note in forward.notes] == pseudonyms
     assert (backward.failures, backward.notes) == (forward.failures, forward.notes)
 
@@ -1192,11 +1192,11 @@ def test_a_subject_without_stats_files_is_not_leased(census: Census, tmp_path: P
 
 
 def test_stats_that_cannot_be_fetched_are_fetched_by_the_next_inventory(census: Census) -> None:
-    census.remote.fail_lease = SourceError("unreachable", f"GET {BUCKET_ROOT}x: 503")
+    census.remote.fail_lease = SourceError("unreadable", f"GET {BUCKET_ROOT}x: 403")
     report = census.run(census.remote)
     assert (report.done, report.failed) == (2, 0)
     (note,) = report.notes
-    assert note.startswith(f"{census.pseudonym}: 2 subject(s)") and "unreachable: 2" in note
+    assert note.startswith(f"{census.pseudonym}: 2 subject(s)") and "unreadable: 2" in note
     rows = census.catalog.query("SELECT fs_version FROM subjects")
     assert [row["fs_version"] for row in rows] == ["6.0.1", "6.0.1"]  # what was read is kept
 
@@ -1238,12 +1238,12 @@ def test_nothing_in_the_report_or_the_log_of_a_census_run_names_a_dataset_or_a_s
     with caplog.at_level(logging.INFO, logger="surfcensus"):
         census.run()
         census.remote.fail_read[("sub-CANARY7", FileRole.RECON_LOG)] = SourceError(
-            "unreachable",
-            f"GET {BUCKET_ROOT}{FS_ROOT}/sub-CANARY7/scripts/recon-all.log of {ACCESSION}: 503",
+            "unreadable",
+            f"GET {BUCKET_ROOT}{FS_ROOT}/sub-CANARY7/scripts/recon-all.log of {ACCESSION}: 403",
         )
         reread = census.run(census.remote, force=True)
         census.remote.fail_listing = SourceError(
-            "unreachable", f"listing {BUCKET_ROOT}{FS_ROOT}/sub-CANARY7/ of {ACCESSION}: 503"
+            "unreadable", f"listing {BUCKET_ROOT}{FS_ROOT}/sub-CANARY7/ of {ACCESSION}: 403"
         )
         shutil.rmtree(census.local.dataset.root)  # "<root> is no longer a directory"
         failed = census.run()
@@ -1251,11 +1251,11 @@ def test_nothing_in_the_report_or_the_log_of_a_census_run_names_a_dataset_or_a_s
     assert reread.failed == 0 and len(reread.notes) == 1
     local = privacy.dataset_pseudonym(DATASET_KEY, "local", census.local.dataset.identity)
     assert failed.failures == tuple(
-        sorted([(f"dataset:{local}", "not found"), (f"dataset:{census.pseudonym}", "unreachable")])
+        sorted([(f"dataset:{local}", "not found"), (f"dataset:{census.pseudonym}", "unreadable")])
     )
     # the accession in the exception's text comes out as the pseudonym
-    assert any(f"of {census.pseudonym}: 503" in note for note in failed.notes)
-    assert "was not read: unreachable:" in caplog.text
+    assert any(f"of {census.pseudonym}: 403" in note for note in failed.notes)
+    assert "was not read: unreadable:" in caplog.text
     assert "the subjects could not be listed" in caplog.text
     said = "\n".join([caplog.text, repr(reread), repr(failed)])
     for canary in canaries:
@@ -1373,3 +1373,126 @@ def test_files_without_content_are_named_without_their_size_in_a_census_run(
     )
     assert row["complete"] == 0 and row["missing_roles"].startswith("t1,lh_white")
     assert census.catalog.failures().empty  # no failure of the inventory
+
+
+# ---------------------------------------------------------------------------------------
+# a network that cannot be reached, a cache over its budget, a full disk (decisions D29 and
+# D47, item 10): the inventory stops, keeps what it stored and marks nobody absent
+
+
+def _without_times(dump: dict[str, list[dict[str, object]]]) -> dict[str, list[dict[str, object]]]:
+    return {
+        table: [{k: v for k, v in row.items() if k not in ("inventoried_at",)} for row in rows]
+        for table, rows in dump.items()
+    }
+
+
+def test_a_listing_that_cannot_be_reached_stops_the_inventory(bench: Bench) -> None:
+    spy = Spy(bench.source())
+    spy.fail_listing = SourceError("unreachable", "fmriprep/: 503 after 5 tries")
+    spy.listed_before_failing = 2
+    with pytest.raises(SourceError) as raised:
+        bench.run(spy)
+    pseudonym = bench.pseudonym()
+    assert raised.value.reason == "unreachable"
+    assert raised.value.detail == (
+        f"the bucket could not be reached (fmriprep/: 503 after 5 tries); the inventory of "
+        f"{pseudonym} stopped at its listing: the 2 subject(s) stored before it are kept, "
+        "nothing of it was stored and no subject was marked absent; run the same command "
+        "again once it can be reached"
+    )
+    labels = [row["subject_label"] for row in bench.rows("SELECT * FROM subjects ORDER BY 3")]
+    assert labels == ["sub-01", "sub-02"]
+    assert bench.rows("SELECT n_subjects_listed FROM datasets") == [{"n_subjects_listed": None}]
+
+    # the same call without the fault goes on: what was stored is skipped
+    again = bench.run(spy.inner)
+    assert (again.done, again.skipped, again.failed) == (1, 2, 0)
+    # a full catalog, then a listing that stops: nobody is marked absent
+    with pytest.raises(SourceError, match="unreachable"):
+        bench.run(spy)
+    assert bench.subject("sub-03")["present"] == 1
+    assert bench.rows("SELECT n_subjects_listed FROM datasets") == [{"n_subjects_listed": 3}]
+
+
+def test_a_tier_a_file_that_cannot_be_reached_stops_the_inventory_at_its_subject(
+    bench: Bench, upserted: list[str]
+) -> None:
+    spy = Spy(bench.source())
+    spy.fail_read[("sub-02", FileRole.RECON_LOG)] = SourceError(
+        "unreachable", "scripts/recon-all.log: ConnectError"
+    )
+    with pytest.raises(SourceError) as raised:
+        bench.run(spy)
+    assert raised.value.reason == "unreachable"
+    assert f"stopped at subject {bench.uid('sub-02')}:" in raised.value.detail
+    assert "the 1 subject(s) stored before it are kept" in raised.value.detail
+    assert upserted == ["sub-01"]  # nothing of sub-02, and the inventory went no further
+    assert bench.rows("SELECT n_subjects_listed FROM datasets") == [{"n_subjects_listed": None}]
+
+    healed = bench.run(spy.inner)
+    assert (healed.done, healed.skipped, healed.failed, healed.notes) == (2, 1, 0, ())
+    # what a run that never met the fault stores
+    after = _without_times(bench.dump())
+    assert bench.run(spy.inner, force=True).done == 3
+    assert _without_times(bench.dump()) == after
+
+
+def test_inventory_subject_raises_for_a_network_that_cannot_be_reached(bench: Bench) -> None:
+    source = bench.source()
+    (record,) = [r for r in source.subjects(source.dataset) if r.subject_label == "sub-01"]
+    spy = Spy(source)
+    spy.fail_read[("sub-01", FileRole.RECON_LOG_RH)] = SourceError("unreachable", "no")
+    with pytest.raises(SourceError, match="unreachable: no"):
+        inventory_subject(spy, record, InventoryConfig())
+
+
+def test_stats_that_cannot_be_reached_stop_a_census_inventory_without_naming_a_dataset(
+    census: Census,
+) -> None:
+    census.remote.fail_lease = SourceError(
+        "unreachable", f"GET {BUCKET_ROOT}{FS_ROOT}/sub-CANARY7/stats/lh.aparc.stats: 503"
+    )
+    with pytest.raises(SourceError) as raised:
+        census.run()
+    text = str(raised.value)
+    assert raised.value.reason == "unreachable" and census.pseudonym in text
+    for canary in (ACCESSION, "CANARY7", "CANARYROOT", "sub-02"):
+        assert canary not in text, canary
+    assert census.catalog.query("SELECT 1 FROM subjects") == []
+    assert census.remote.leases == [("sub-02", STATS_ROLES)]  # the first subject, no further
+
+    census.remote.fail_lease = None
+    assert census.run().done == 3
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        ConfigError("invalid", "the cache would hold 2.1 GB, more than its budget of 2.0 GB"),
+        OSError(28, os.strerror(28)),  # ENOSPC
+        OSError(30, os.strerror(30)),  # EROFS
+    ],
+)
+def test_a_cache_without_room_stops_a_census_inventory(
+    census: Census, fault: BaseException
+) -> None:
+    census.remote.fail_lease = fault
+    with pytest.raises(ConfigError) as raised:
+        census.run()
+    assert raised.value.reason == "invalid" and raised.value.__cause__ is fault
+    assert "the inventory stopped: the subjects stored before this one are kept" in str(
+        raised.value
+    )
+    if isinstance(fault, OSError):
+        assert os.strerror(fault.errno or 0) in raised.value.detail
+    assert census.catalog.query("SELECT 1 FROM subjects") == []
+    census.remote.fail_lease = None
+    assert census.run().done == 3
+
+
+def test_any_other_os_error_of_the_stats_lease_is_raised_as_it_is(census: Census) -> None:
+    census.remote.fail_lease = OSError(5, os.strerror(5))  # EIO
+    with pytest.raises(OSError) as raised:
+        census.run()
+    assert raised.value is census.remote.fail_lease

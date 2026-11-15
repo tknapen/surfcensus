@@ -23,7 +23,8 @@ import math
 import os
 import tempfile
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
@@ -322,8 +323,13 @@ def run_render(
     media_root = Path(ctx.run_dir) / MEDIA_DIR
     done = 0
 
+    leased = _leased(plan.template_id)
+    lease = _FaultGuard(lambda uid: ctx.lease(uid, leased))
+
     def commit(outcomes: Sequence[tuple[str, RenderResult | BaseException]]) -> None:
         nonlocal done
+        # before anything of the batch is written, as for media that cannot be written
+        _stop_at_fault(ctx, outcomes, lease.faulted)
         unwritable = [
             o for _, o in outcomes if isinstance(o, Exception) and _is_unwritable(o, media_root)
         ]
@@ -387,10 +393,9 @@ def run_render(
         video=video,
         force=force,
     )
-    leased = _leased(plan.template_id)
     run_batches(
         pending,
-        lambda uid: ctx.lease(uid, leased),
+        lease,
         work,
         commit,
         batch_subjects=config.cache.batch_subjects,
@@ -601,6 +606,100 @@ def _is_unwritable(exc: Exception, media_root: Path) -> bool:
     if isinstance(exc, RuntimeError):
         return any(os.strerror(code) in str(exc) for code in _NO_ROOM)
     return False
+
+
+UNREACHABLE = "unreachable"
+"""The ``SourceError`` reason of a remote source whose retries ran out (``remote.UNREACHABLE``;
+the name is repeated here because the render package does not import ``remote``)."""
+
+
+def _lease_fault(exc: BaseException) -> bool:
+    """Whether the exception of a lease lies in the network, the cache or its disk and not in
+    the subject: ``SourceError("unreachable")``, a ``ConfigError`` (a cache over its budget
+    is one), an ``OSError`` that says a disk is full, over quota or read-only. ``changed``,
+    ``unreadable``, ``not found`` and ``invalid`` stay failures of their subject (decisions
+    D29 and D47, item 10). The same rule as ``metrics.pipeline.machine_fault``, which the
+    render package does not import."""
+    if isinstance(exc, SourceError):
+        return exc.reason == UNREACHABLE
+    if isinstance(exc, ConfigError):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _NO_ROOM
+
+
+class _FaultGuard:
+    """The lease of the phase, which notes the subjects whose lease raised a fault
+    (:func:`_lease_fault`) and leases nothing more after the first one: the commit of the
+    batch stops the phase whatever the others give, and each would wait out its retries."""
+
+    def __init__(self, lease: Callable[[str], AbstractContextManager[Mapping[FileRole, Path]]]):
+        self._lease = lease
+        self.faulted: dict[str, BaseException] = {}
+        """``subject_uid`` -> the fault its lease raised."""
+
+    @contextmanager
+    def __call__(self, uid: str) -> Iterator[Mapping[FileRole, Path]]:
+        if self.faulted:
+            raise _NotLeased(uid) from next(iter(self.faulted.values()))
+        with ExitStack() as held:
+            try:
+                files = held.enter_context(self._lease(uid))
+            except Exception as exc:
+                if _lease_fault(exc):
+                    self.faulted[uid] = exc
+                raise
+            yield files
+
+
+class _NotLeased(Exception):
+    """A subject that was not leased because an earlier lease of its batch met a fault; the
+    commit stops the phase before it would be recorded."""
+
+
+def _stop_at_fault(
+    ctx: RunContext,
+    outcomes: Sequence[tuple[str, RenderResult | BaseException]],
+    faulted: Mapping[str, BaseException],
+) -> None:
+    """Raise, before the commit of a batch writes anything, when a lease of the batch met a
+    fault (:func:`_lease_fault`): ``SourceError("unreachable", ...)`` for a remote source
+    that cannot be reached, ``ConfigError`` for the rest, with one line that says that
+    nothing of the batch was recorded and that the same command goes on. The renders of
+    the batch that did succeed are whole on disk; the next call finds them complete and
+    records them without rendering them again.
+
+    An exception of a ``ConfigError`` from a render itself counts as well; one of the work
+    that says the media cannot be written is left to :func:`_is_unwritable`, whose words
+    name the media."""
+    fault = next(
+        (
+            o
+            for _, o in outcomes
+            if isinstance(o, BaseException)
+            and (any(o is f for f in faulted.values()) or isinstance(o, ConfigError))
+        ),
+        None,
+    )
+    if fault is None:
+        return
+    batch = "nothing of this batch of renders was recorded"
+    if isinstance(fault, SourceError):
+        raise SourceError(
+            UNREACHABLE,
+            f"the bucket could not be reached ({ctx.scrub(fault.detail)}); {batch}: run the "
+            "same command again once it can be reached, and it goes on from this batch",
+        ) from fault
+    if isinstance(fault, ConfigError):
+        raise ConfigError(
+            fault.reason, f"{fault.detail}; {batch}, and the same command goes on from it"
+        ) from fault
+    assert isinstance(fault, OSError) and fault.errno is not None
+    raise ConfigError(
+        "invalid",
+        f"the source files of a subject could not be fetched: {os.strerror(fault.errno)}; "
+        f"{batch}: run the same command again once there is room, and it goes on from this "
+        "batch",
+    ) from fault
 
 
 def _failure(exc: BaseException) -> tuple[str, str]:

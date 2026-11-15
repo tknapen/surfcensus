@@ -1647,3 +1647,129 @@ def test_the_real_subject_through_a_run_equals_its_direct_render(
     assert row["n_frames"] == len(info.modes["sync"].frames) == 120
     assert run_render(bench.ctx()).skipped == 1
     assert snapshot_tree(real_subject) == source
+
+
+# ------------------------------------- a network, a cache or a disk that fails a lease (D47)
+
+
+def lease_fails(bench: Bench, at: str, fault: BaseException) -> None:
+    """From now on the lease of ``at`` raises ``fault``, as a remote source does whose
+    network, cache or cache disk fails; every lease is still noted in ``bench.leased``."""
+    real = Bench.lease
+
+    def lease(uid: str, roles: Collection[FileRole]):
+        if uid == at:
+            bench.leased.append(uid)
+            raise fault
+        return real(bench, uid, roles)
+
+    bench.lease = lease  # pyrefly: ignore[read-only]
+
+
+FAULTS = [
+    pytest.param(
+        SourceError("unreachable", "surf/lh.white: ConnectError after 5 tries"),
+        SourceError,
+        "the bucket could not be reached (surf/lh.white: ConnectError after 5 tries)",
+        id="unreachable",
+    ),
+    pytest.param(
+        ConfigError("invalid", "the cache would hold 2.1 GB, more than its budget of 2.0 GB"),
+        ConfigError,
+        "the cache would hold 2.1 GB, more than its budget of 2.0 GB; nothing of this batch "
+        "of renders was recorded, and the same command goes on from it",
+        id="budget",
+    ),
+    pytest.param(
+        OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), "/cache/leases/x"),
+        ConfigError,
+        f"the source files of a subject could not be fetched: {os.strerror(errno.ENOSPC)}",
+        id="enospc",
+    ),
+    pytest.param(
+        OSError(errno.EDQUOT, os.strerror(errno.EDQUOT)),
+        ConfigError,
+        f"the source files of a subject could not be fetched: {os.strerror(errno.EDQUOT)}",
+        id="edquot",
+    ),
+]
+
+
+@pytest.mark.parametrize(("fault", "kind", "said"), FAULTS)
+@pytest.mark.parametrize("where", ["first", "second"])
+def test_a_lease_that_meets_a_fault_of_the_machine_stops_the_phase_and_records_nothing(
+    new_bench: Callable[..., Bench],
+    rendered: list[tuple[str, bool, bool]],
+    fault: BaseException,
+    kind: type[Exception],
+    said: str,
+    where: str,
+) -> None:
+    """Recorded against its subject, a fault of the network or the cache would stay: a
+    failed row is not tried again without ``retry_failed``. The phase stops at the batch,
+    records nothing of it, and the same call does the rest once the fault is gone."""
+    labels = ["sub-01", "sub-02", "sub-03", "sub-04"]
+    bench = new_bench(labels, cache=CacheConfig(batch_subjects=2))
+    one, two, three, four = sorted(bench.uid(label) for label in labels)  # as rendered
+    at = three if where == "first" else four
+    lease_fails(bench, at, fault)
+    with pytest.raises(kind) as raised:
+        run_render(bench.ctx())
+    assert said in str(raised.value) and raised.value.__cause__ is fault
+    assert "nothing of this batch of renders was recorded" in str(raised.value)
+    if isinstance(fault, SourceError):
+        assert raised.value.reason == "unreachable"  # type: ignore[attr-defined]
+    rows = bench.rows()
+    assert {uid: row["status"] for uid, row in rows.items()} == {one: "done", two: "done"}
+    # a lease after the fault is not asked for: it would wait out the same retries
+    assert bench.leased == [one, two, three] + ([four] if where == "second" else [])
+    assert uids_of(rendered) == [one, two] + ([three] if where == "second" else [])
+
+    del bench.lease  # the fault is gone
+    tiles = tree_bytes(bench.media(three)) if where == "second" else None
+    report = run_render(bench.ctx())
+    assert (report.done, report.skipped, report.failed) == (2, 2, 0)
+    assert {row["status"] for row in bench.rows().values()} == {"done"}
+    if tiles is not None:  # made before the fault, found whole, recorded as it is
+        assert tree_bytes(bench.media(three)) == tiles
+    # what the call made is what a render that never met the fault makes
+    made = {uid: tree_bytes(bench.media(uid)) for uid in (one, two, three, four)}
+    keys = {uid: row["render_key"] for uid, row in bench.rows().items()}
+    assert run_render(bench.ctx(), force=True).done == 4
+    assert {uid: tree_bytes(bench.media(uid)) for uid in made} == made
+    assert {uid: row["render_key"] for uid, row in bench.rows().items()} == keys
+
+
+def test_a_census_run_says_the_fault_without_a_path_or_an_accession(
+    new_bench: Callable[..., Bench],
+) -> None:
+    bench = new_bench(["sub-01"], census=True)
+    detail = "GET s3://openneuro-derivatives/fmriprep/ds000102-fmriprep/x: 503"
+    lease_fails(bench, bench.uid("sub-01"), SourceError("unreachable", detail))
+    with pytest.raises(SourceError) as raised:
+        run_render(bench.ctx())
+    assert "ds000102" not in str(raised.value) and "s3://" not in str(raised.value)
+    assert bench.rows() == {}
+
+
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [
+        (SourceError("changed", "surf/lh.white: 412"), "source changed"),
+        (SourceError("unreadable", "surf/lh.white: 403"), "render failure"),
+        (SourceError("not found", "surf/lh.white: 404"), "render failure"),
+        (OSError(errno.EIO, os.strerror(errno.EIO)), "render failure"),
+    ],
+)
+def test_a_lease_that_fails_for_its_subject_is_a_row_of_its_subject(
+    new_bench: Callable[..., Bench], fault: BaseException, reason: str
+) -> None:
+    labels = ["sub-01", "sub-02", "sub-03"]
+    bench = new_bench(labels, cache=CacheConfig(batch_subjects=3))
+    one, two, three = sorted(bench.uid(label) for label in labels)
+    lease_fails(bench, two, fault)
+    report = run_render(bench.ctx())
+    assert report.done == 2 and failed(report) == {two: reason}
+    assert bench.leased == [one, two, three]  # the batch went on
+    statuses = {uid: row["status"] for uid, row in bench.rows().items()}
+    assert statuses == {one: "done", two: "failed", three: "done"}

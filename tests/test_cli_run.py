@@ -893,3 +893,48 @@ def test_a_run_of_the_subjects_directory_follows_to_the_dataset_root_within_one_
         "the new place is local, fmriprep, and its subjects would get other identifiers\n"
     )
     assert load_config(other).sources[0].root == str(inner.resolve())
+
+
+def test_a_bucket_that_cannot_be_reached_stops_render_and_inventory_with_exit_code_2(
+    study: Path, run_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A network fault (a remote source whose retries ran out) is no failure of a subject:
+    one line, exit code 2, nothing recorded, and the same command does the work afterwards."""
+    from surfcensus.sources.base import TIER_C, SourceError
+    from surfcensus.sources.local import LocalSource
+
+    fault = SourceError("unreachable", "scripts/recon-all.log: ConnectError after 5 tries")
+
+    def no_network(*args: object, **kwargs: object) -> bytes:
+        raise fault
+
+    with monkeypatch.context() as patched:
+        patched.setattr(LocalSource, "read_bytes", no_network)
+        stopped = cli("inventory", "--run-dir", run_dir)
+    assert stopped.exit_code == 2, stopped.output
+    (line,) = stopped.output.splitlines()
+    assert line.startswith(
+        "unreachable: the bucket could not be reached (scripts/recon-all.log: ConnectError "
+        "after 5 tries); the inventory of D-"
+    ) and line.endswith("run the same command again once it can be reached")
+    assert cli("inventory", "--run-dir", run_dir).exit_code == 0
+
+    real = Run._lease
+
+    def unreachable(self: Run, uid: str, roles):
+        if set(roles) >= set(TIER_C):
+            raise SourceError("unreachable", "mri/T1.mgz: ConnectError after 5 tries")
+        return real(self, uid, roles)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Run, "_lease", unreachable)
+        stopped = cli("render", "--run-dir", run_dir)
+    assert stopped.exit_code == 2, stopped.output
+    assert stopped.output == (
+        "unreachable: the bucket could not be reached (mri/T1.mgz: ConnectError after 5 "
+        "tries); nothing of this batch of renders was recorded: run the same command again "
+        "once it can be reached, and it goes on from this batch\n"
+    )
+    assert "render: 0 done, 1 failed, 2 pending" in lines(cli("status", "--run-dir", run_dir))
+    rest = cli("render", "--run-dir", run_dir)
+    assert rest.exit_code == 1 and "render: 2 done, 0 skipped, 1 failed" in rest.output

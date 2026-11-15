@@ -27,11 +27,14 @@ A phase function receives a ``RunContext`` and never the run, so it names subjec
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import math
+import os
 import shutil
 import time
-from collections.abc import Callable, Collection, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -220,6 +223,112 @@ def _failure(exc: BaseException) -> tuple[str, str]:
     return METRIC_FAILURE, f"{type(exc).__name__}: {exc}"
 
 
+# --- what stops a stage instead of failing a subject (decisions D29 and D47, item 10) -------
+
+UNREACHABLE = "unreachable"
+"""The ``SourceError`` reason of a remote source whose retries ran out (``remote.UNREACHABLE``;
+the name is repeated here because the metrics do not import ``remote``)."""
+_NO_ROOM = (errno.ENOSPC, errno.EDQUOT, errno.EROFS)
+
+
+def machine_fault(exc: BaseException) -> bool:
+    """Whether the exception of a lease or of the work on one subject lies in the machine or
+    the network and not in the subject: a remote source that cannot be reached
+    (``SourceError("unreachable")``), a ``ConfigError`` (a cache over its budget is one),
+    and an ``OSError`` that says that a disk is full, over quota or read-only.
+
+    Recorded against every subject of a batch, such a fault would outlast its cause, since
+    a failed row is not tried again without ``retry_failed``. ``changed``, ``unreadable``,
+    ``not found`` and ``invalid`` of a ``SourceError`` stay failures of their subject."""
+    if isinstance(exc, SourceError):
+        return exc.reason == UNREACHABLE
+    if isinstance(exc, ConfigError):
+        return True
+    return isinstance(exc, OSError) and exc.errno in _NO_ROOM
+
+
+class _FaultGuard:
+    """The lease of a stage, which notes the subjects whose lease raised a fault of the
+    machine (:func:`machine_fault`) and leases nothing more after the first one.
+
+    ``batches.run_batches`` enters the leases of a batch one after another and hands an
+    exception of a lease to the commit as that subject's outcome. Once one lease found the
+    network or the disk gone, the others of the batch would each wait out their retries to
+    the same end, and the commit stops the phase whatever they give; so they are refused at
+    once."""
+
+    def __init__(self, lease: Callable[[str], AbstractContextManager[Mapping[FileRole, Path]]]):
+        self._lease = lease
+        self.faulted: dict[str, BaseException] = {}
+        """``subject_uid`` -> the fault its lease raised."""
+
+    @contextmanager
+    def __call__(self, uid: str) -> Iterator[Mapping[FileRole, Path]]:
+        if self.faulted:
+            first = next(iter(self.faulted.values()))
+            raise _NotLeased(uid) from first
+        with ExitStack() as held:
+            try:
+                files = held.enter_context(self._lease(uid))
+            except Exception as exc:
+                if machine_fault(exc):
+                    self.faulted[uid] = exc
+                raise
+            yield files
+
+
+class _NotLeased(Exception):
+    """A subject of a batch that was not leased because the lease of an earlier one met a
+    fault of the machine; the commit stops the phase before it would be recorded."""
+
+
+def _stop_at_fault(
+    ctx: RunContext,
+    stage: str,
+    outcomes: Sequence[tuple[str, object]],
+    leased: Mapping[str, BaseException],
+) -> None:
+    """Raise, before the commit of a batch writes anything, when an outcome of the batch is
+    a fault of the machine (:func:`machine_fault`): ``SourceError("unreachable", ...)`` for
+    a remote source that cannot be reached, ``ConfigError`` for the rest, each with one line
+    that says that nothing of the batch was recorded and that the same command goes on.
+
+    The maps that workers of the batch wrote before the fault are removed, so that the batch
+    leaves no output: their subjects have no ledger row for them, and the next call makes
+    them again from the same files, with the same bytes. A subject whose earlier map is
+    removed this way (``force``) is pending at the next call, since its output is gone."""
+    fault = next(
+        (o for _, o in outcomes if isinstance(o, BaseException) and machine_fault(o)), None
+    )
+    if fault is None:
+        return
+    for uid, outcome in outcomes:
+        if isinstance(outcome, _Outcome) and outcome.has_map:
+            pass
+    batch = f"nothing of this batch of the {stage} stage was recorded"
+    if isinstance(fault, SourceError):
+        raise SourceError(
+            UNREACHABLE,
+            f"the bucket could not be reached ({ctx.scrub(fault.detail)}); {batch}: run the "
+            "same command again once it can be reached, and it goes on from this batch",
+        ) from fault
+    if isinstance(fault, ConfigError):
+        raise ConfigError(
+            fault.reason, f"{fault.detail}; {batch}, and the same command goes on from it"
+        ) from fault
+    assert isinstance(fault, OSError) and fault.errno is not None
+    where = (
+        "the source files of a subject could not be fetched"
+        if any(o is fault for o in leased.values())
+        else "the output of a subject could not be written"
+    )
+    raise ConfigError(
+        "invalid",
+        f"{where}: {os.strerror(fault.errno)}; {batch}: run the same command again once "
+        "there is room, and it goes on from this batch",
+    ) from fault
+
+
 def _signature(lines: Sequence[str]) -> str:
     return hashlib.sha256("\n".join(lines).encode()).hexdigest()[:16]
 
@@ -314,6 +423,9 @@ def _run_stage(
     _drop_left(ctx, stage, empty)
 
     def commit(outcomes: Sequence[tuple[str, object]]) -> None:
+        # Before anything of the batch is written: a fault of the network, the cache or
+        # the disk stops the phase, so that the same command does the work once it is gone
+        _stop_at_fault(ctx, stage.name, outcomes, lease.faulted)
         touched: dict[str, list[str]] = {}
         frames: dict[str, list[pd.DataFrame]] = {}
         digests: dict[str, dict[FileRole, str]] = {}
@@ -367,9 +479,10 @@ def _run_stage(
             public.set_file_digests(uid, read)
         public.record_work(rows)  # last: a row never stands for rows that are not written
 
+    lease = _FaultGuard(lambda uid: ctx.lease(uid, stage.roles))
     run_batches(
         plan.pending,
-        lambda uid: ctx.lease(uid, stage.roles),
+        lease,
         stage.work,
         commit,
         batch_subjects=ctx.config.cache.batch_subjects,

@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import errno
 import hashlib
 import io
 import logging
+import os
 import shutil
 import sqlite3
 from dataclasses import dataclass
@@ -34,6 +36,7 @@ from synth_tierb import (  # pyrefly: ignore[missing-import]
 
 from surfcensus.config import (
     STAGE_SCHEMAS,
+    CacheConfig,
     ConfigError,
     MetricsConfig,
     RunConfig,
@@ -70,7 +73,7 @@ from surfcensus.render.model import RenderConfig
 from surfcensus.render.vertexmap import read_vertex_map
 from surfcensus.run import Run
 from surfcensus.schemas import SCHEMAS
-from surfcensus.sources.base import HEMIS
+from surfcensus.sources.base import HEMIS, TIER_B, FileRole, SourceError
 from surfcensus.sources.local import LocalSource, local
 from surfcensus.store import CATALOG_FILE, Catalog, read_table, table_path
 from surfcensus.templates import Template, TemplateError
@@ -1581,3 +1584,152 @@ def test_maps_of_the_earlier_schema_are_made_again(
         assert set(after) == set(before) and all(after[u] != before[u] for u in after)
         assert (table(run_dir, "vertex_summary")["n_widened"] == 0).all()
         assert counts(run.metrics(stages=("fsaverage",))) == (0, 3, 0)
+
+
+# ---------------------------------------------------------------------------------------
+# a network, a cache or a disk that fails (decisions D29 and D47, item 10)
+
+
+def fail_lease_of(
+    run: Run, at: str, fault: BaseException, roles: tuple[FileRole, ...]
+) -> list[str]:
+    """From now on the lease of ``at`` for a stage that reads ``roles`` raises ``fault``, as
+    a remote source does whose network, cache or cache disk fails. Returns the list of
+    subjects leased for such a stage, in order."""
+    real = run._lease
+    leased: list[str] = []
+
+    def lease(uid: str, wanted):
+        if tuple(wanted) == roles:
+            leased.append(uid)
+            if uid == at:
+                raise fault
+        return real(uid, wanted)
+
+    run._lease = lease  # pyrefly: ignore[bad-assignment]
+    return leased
+
+
+METRIC_FAULTS = [
+    pytest.param(
+        SourceError("unreachable", "surf/lh.thickness: ReadTimeout after 5 tries"),
+        SourceError,
+        "the bucket could not be reached (surf/lh.thickness: ReadTimeout after 5 tries); "
+        "nothing of this batch of the fsaverage stage was recorded: run the same command "
+        "again once it can be reached, and it goes on from this batch",
+        id="unreachable",
+    ),
+    pytest.param(
+        ConfigError("invalid", "the cache would hold 2.1 GB, more than its budget of 2.0 GB"),
+        ConfigError,
+        "invalid: the cache would hold 2.1 GB, more than its budget of 2.0 GB; nothing of "
+        "this batch of the fsaverage stage was recorded, and the same command goes on from it",
+        id="budget",
+    ),
+    pytest.param(
+        OSError(errno.ENOSPC, os.strerror(errno.ENOSPC)),
+        ConfigError,
+        f"invalid: the source files of a subject could not be fetched: "
+        f"{os.strerror(errno.ENOSPC)}; nothing of this batch of the fsaverage stage was "
+        "recorded: run the same command again once there is room, and it goes on from this "
+        "batch",
+        id="enospc",
+    ),
+    pytest.param(
+        OSError(errno.EROFS, os.strerror(errno.EROFS)),
+        ConfigError,
+        f"invalid: the source files of a subject could not be fetched: {os.strerror(errno.EROFS)}",
+        id="erofs",
+    ),
+]
+
+
+@pytest.mark.parametrize(("fault", "kind", "said"), METRIC_FAULTS)
+def test_a_lease_that_meets_a_fault_of_the_machine_stops_the_metrics_and_records_nothing(
+    synth_template: SyntheticTemplate,
+    tmp_path: Path,
+    fault: BaseException,
+    kind: type[Exception],
+    said: str,
+) -> None:
+    """Recorded against its subject, a network fault would outlast the fault: a failed row
+    is not tried again without ``retry_failed``. The stage stops at the batch; nothing of the
+    batch (ledger row, part row, map, digest) is recorded, and the same call does the rest,
+    to the bytes of a run that never met the fault."""
+    cohort = little_cohort(tmp_path / "subjects", 4, synth_template)
+    config = new_local_config(
+        cohort.root, metrics=SET_OF_THREE, cache=CacheConfig(batch_subjects=2)
+    )  # one salt for both runs: the same uids
+    with Run(tmp_path / "clean", local(cohort.root), config=config) as run:
+        run.inventory()
+        assert counts(run.metrics()) == (4 + 4 + 2, 0, 0)
+    clean = run_files(tmp_path / "clean")
+
+    run_dir = tmp_path / "run"
+    with Run(run_dir, local(cohort.root), config=config) as run:
+        run.inventory()
+        uids = sorted(labels(run).values())  # the order of the batches
+        leased = fail_lease_of(run, uids[3], fault, TIER_B)
+        with pytest.raises(kind) as raised:
+            run.metrics()
+        assert said in str(raised.value) and raised.value.__cause__ is fault
+        assert leased == uids  # the subject leased before the fault is worked on, no more
+        # the first batch is recorded, of the second nothing
+        assert set(ledger(run, "regional")) == set(uids)
+        assert set(ledger(run, "fsaverage")) == set(uids[:2])
+        (part,) = (run_dir / "tables" / "_parts" / "vertex_summary").glob("*.parquet")
+        assert set(pq.read_table(part)["subject_uid"].to_pylist()) == set(uids[:2])
+        assert [uid for uid in uids if map_path(run_dir, uid).exists()] == uids[:2]
+        for uid in uids[2:]:
+            digests = stored_digests(run_dir, uid)
+            assert digests["lh_thickness"] is None and digests["lh_sphere_reg"] is None
+        assert ledger(run, "reference") == {} and ledger(run, "score") == {}
+
+        run._lease = Run._lease.__get__(run)  # the fault is gone  # pyrefly: ignore[bad-assignment]
+        assert counts(run.metrics()) == (2 + 2, 4 + 2, 0)
+    assert run_files(run_dir) == clean
+
+
+@pytest.mark.parametrize(
+    ("fault", "reason"),
+    [
+        (SourceError("changed", "surf/lh.thickness: 412"), "source changed"),
+        (SourceError("unreadable", "surf/lh.thickness: 403"), "unreadable"),
+        (SourceError("not found", "surf/lh.thickness: 404"), "missing file"),
+    ],
+)
+def test_a_lease_that_fails_for_its_subject_fails_that_subject_and_no_other(
+    synth_template: SyntheticTemplate, tmp_path: Path, fault: SourceError, reason: str
+) -> None:
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    with Run(tmp_path / "run", local(cohort.root), config=config) as run:
+        run.inventory()
+        uids = sorted(labels(run).values())
+        leased = fail_lease_of(run, uids[1], fault, TIER_B)
+        report = run.metrics()
+        assert report.failures == ((uids[1], f"fsaverage: {reason}"),)
+        assert leased == uids and set(ledger(run, "fsaverage")) == set(uids)
+
+
+def test_an_output_that_the_disk_has_no_room_for_stops_the_stage(
+    synth_template: SyntheticTemplate, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A map that a worker cannot write on a full disk is the machine's, not the subject's."""
+    from surfcensus.metrics import pipeline
+
+    cohort = little_cohort(tmp_path / "subjects", 3, synth_template)
+    config = new_local_config(cohort.root, metrics=SET_OF_THREE)
+    original = pipeline.write_maps
+
+    def full(path: Path, maps: object) -> None:
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), str(path))
+
+    with Run(tmp_path / "run", local(cohort.root), config=config) as run:
+        run.inventory()
+        monkeypatch.setattr(pipeline, "write_maps", full)
+        with pytest.raises(ConfigError, match="the output of a subject could not be written"):
+            run.metrics()
+        assert ledger(run, "fsaverage") == {}
+        monkeypatch.setattr(pipeline, "write_maps", original)
+        assert counts(run.metrics()) == (3 + 2, 3, 0)

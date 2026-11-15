@@ -375,3 +375,34 @@ def test_a_damaged_vertex_map_is_a_note_and_no_failure(run_copy: Path) -> None:
     assert len(repaired.stdout.splitlines()) == 1
     with Run(run_copy) as run:
         pd.testing.assert_frame_equal(run.clusters(), clusters)
+
+
+def test_a_bucket_that_cannot_be_reached_is_one_line_and_exit_code_2(
+    three_run: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A network fault of a lease (a remote source whose retries ran out) stops the phase
+    and is recorded against no subject, so that the same command does the work afterwards."""
+    from surfcensus.sources.base import TIER_B, SourceError
+
+    real = Run._lease
+
+    def unreachable(self: Run, uid: str, roles):
+        if tuple(roles) == TIER_B:
+            raise SourceError("unreachable", "surf/lh.thickness: ConnectError after 5 tries")
+        return real(self, uid, roles)
+
+    with monkeypatch.context() as patched:
+        patched.setattr(Run, "_lease", unreachable)
+        stopped = cli("metrics", "--run-dir", three_run)
+    assert stopped.exit_code == 2, stopped.output
+    # the warning that there is no template comes first; the stop is one line
+    assert stopped.output.splitlines()[-1] + "\n" == (
+        "unreachable: the bucket could not be reached (surf/lh.thickness: ConnectError after "
+        "5 tries); nothing of this batch of the fsaverage stage was recorded: run the same "
+        "command again once it can be reached, and it goes on from this batch\n"
+    )
+    status = cli("status", "--run-dir", three_run).stdout.splitlines()[1:]
+    assert all(", 0 failed" in line for line in status), status
+    again = cli("metrics", "--run-dir", three_run)
+    # the three maps and the scores; the regional stage was done before the fault
+    assert again.exit_code == 0 and closing(again, 3 + 1, 3, 0), again.output
