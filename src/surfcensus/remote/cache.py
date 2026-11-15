@@ -322,10 +322,22 @@ class Cache:
         pool = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="surfcensus-cache")
         futures: dict[Future[S3Head], tuple[Path, S3Object, _Entry]] = {}
         errors: list[BaseException] = []
+        running = _Running()
+
+        def fetch(obj: S3Object, dest: Path) -> S3Head:
+            # counted, because a Ctrl-C that is taken while the pool starts a thread leaves a
+            # thread that the pool does not know and so does not wait for (_drain)
+            with running.one():
+                if cancel.is_set():
+                    raise SourceError(
+                        "unreachable", f"{PurePosixPath(obj.key).name}: cancelled before it began"
+                    )
+                return client.download(obj.key, dest, expect=obj, cancel=cancel)
+
         try:
             for dest, (obj, entry) in made.items():
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                future = pool.submit(client.download, obj.key, dest, expect=obj, cancel=cancel)
+                future = pool.submit(fetch, obj, dest)
                 futures[future] = (dest, obj, entry)
             pending = set(futures)
             while pending:
@@ -340,12 +352,14 @@ class Cache:
             cancel.set()
             for future in futures:
                 future.cancel()
-            _drain(pool)
-            for future, target in futures.items():
-                entry = target[2]
+            _drain(pool, running)
+            submitted = {target[0]: future for future, target in futures.items()}
+            # every entry, also one whose download was submitted and not noted before the stop
+            for dest, (obj, entry) in made.items():
                 if not entry.ready.is_set():
-                    if future.done() and not future.cancelled():
-                        self._settle(future, target, errors, cancel)
+                    future = submitted.get(dest)
+                    if future is not None and future.done() and not future.cancelled():
+                        self._settle(future, (dest, obj, entry), errors, cancel)
                     # a download that ended well after the stop is not retained
                     entry.error = entry.error or exc
                     entry.ready.set()
@@ -580,14 +594,45 @@ def _wait_ready(entry: _Entry) -> None:
         raise entry.error
 
 
-def _drain(pool: ThreadPoolExecutor) -> None:
+class _Running:
+    """The downloads of one lease that are in progress, counted by the downloads themselves:
+    the pool's own list of threads misses a thread whose start a ``KeyboardInterrupt``
+    interrupted (``ThreadPoolExecutor`` starts a thread and notes it in two steps)."""
+
+    def __init__(self) -> None:
+        self._changed = threading.Condition()
+        self._n = 0
+
+    @contextmanager
+    def one(self) -> Iterator[None]:
+        with self._changed:
+            self._n += 1
+        try:
+            yield
+        finally:
+            with self._changed:
+                self._n -= 1
+                self._changed.notify_all()
+
+    def wait_idle(self) -> None:
+        """Return once no download is in progress, waiting in short steps."""
+        with self._changed:
+            while self._n:
+                self._changed.wait(_POLL_S)
+
+
+def _drain(pool: ThreadPoolExecutor, running: _Running) -> None:
     """Wait for the downloads of a lease that was stopped; they end within one chunk once the
     cancel event is set. A second Ctrl-C does not leave a download writing into the area that
-    the lease is about to remove: it is taken after they ended."""
+    the lease is about to remove: it is taken after they ended. The pool is waited for, and
+    then the downloads that count themselves (``running``): a thread that the pool started
+    and did not note, because the stop came in between, is waited for as well, and a download
+    that begins after this returns sees the cancel event before it writes anything."""
     interrupted: KeyboardInterrupt | None = None
     while True:
         try:
             pool.shutdown(wait=True)
+            running.wait_idle()
             break
         except KeyboardInterrupt as exc:
             interrupted = exc

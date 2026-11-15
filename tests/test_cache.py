@@ -261,6 +261,59 @@ def test_ctrl_c_while_downloads_run_cancels_them_and_removes_the_files(cache: Ca
     assert _files(cache.root) == [] and cache.leased_bytes() == 0
 
 
+def test_a_stop_while_the_pool_starts_a_thread_still_waits_for_its_download(
+    cache: Cache, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ThreadPoolExecutor starts a thread and notes it in two steps. A Ctrl-C taken in between
+    # (seen once in CI on macOS: the lease ended while one download had not stopped) leaves a
+    # running download that the pool does not wait for, and whose future the lease never got.
+    # The stand-in pool makes that state on the last submit: the download runs, its thread is
+    # taken out of the pool's list, and the submit ends with the interrupt.
+    contents = _contents(3)
+    last = sorted(contents)[-1]
+
+    class SlowToStop(StandIn):
+        """The last download takes a while to end once it is cancelled, as one that is in the
+        middle of a chunk does, so a lease that does not wait for it ends before it."""
+
+        def download(self, key, dest, *, expect, cancel=None):  # type: ignore[no-untyped-def]
+            try:
+                return super().download(key, dest, expect=expect, cancel=cancel)
+            finally:
+                if key == last and not self.gate.is_set():  # pyrefly: ignore[missing-attribute]
+                    time.sleep(0.5)
+                    self.stopped.append(key)
+
+    client = SlowToStop(contents)
+    client.gate = threading.Event()
+    client.stopped = []  # pyrefly: ignore[missing-attribute]
+
+    class Interrupted(cache_module.ThreadPoolExecutor):
+        def submit(self, fn, /, *args, **kwargs):  # type: ignore[no-untyped-def]
+            before = set(self._threads)
+            future = super().submit(fn, *args, **kwargs)
+            if len(self._threads) < len(contents):
+                return future
+            for _ in contents:
+                assert client.started.acquire(timeout=HANG_S)
+            self._threads -= self._threads - before
+            raise KeyboardInterrupt
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cache_module, "ThreadPoolExecutor", Interrupted)
+        with pytest.raises(KeyboardInterrupt), cache.lease(client, _objects(contents)):
+            pytest.fail("the lease was not interrupted")
+    # every download had stopped when the lease ended, the one of the unknown thread too
+    assert client.stopped == [last]  # pyrefly: ignore[missing-attribute]
+    assert client.open == 0
+    assert sorted(client.cancelled) == sorted(contents)
+    assert _files(cache.root) == [] and cache.leased_bytes() == 0
+    # and nothing waits for an entry of that lease: the same files can be leased again
+    client.gate.set()
+    with cache.lease(client, _objects(contents)) as paths:
+        assert sorted(p.read_bytes() for p in paths.values()) == sorted(contents.values())
+
+
 def test_retained_roles_are_kept_and_used_again_without_a_request(tmp_path: Path) -> None:
     contents = _contents(3)
     objects = _objects(contents)
