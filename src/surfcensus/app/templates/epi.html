@@ -26,6 +26,9 @@
     <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
     <label class="epi-rate">rate <select id="rate" aria-label="volumes per second"></select>/s</label>
     <span id="rate-note" class="epi-rate-note" aria-live="off"></span>
+    <span class="epi-random" role="group" aria-label="the order of play"><label><input type="checkbox" id="random"> random order <kbd>x</kbd></label>
+      <select id="random-scope" aria-label="what the random order permutes"><option value="stream">whole stream</option><option value="run">run by run</option></select>
+      <span id="random-note" aria-live="off"></span></span>
     <div id="track">
       <div id="segments" role="group" aria-label="the runs of the stream; each jumps to its first volume"></div>
       <input id="time" type="range" min="0" max="0" step="1" value="0" aria-label="volume of the stream">
@@ -52,7 +55,7 @@
       <label>axial <input type="range" data-plane="2" min="0" max="0" step="1"> <output></output></label>
     </div>
     <div class="row">
-      <label><input type="checkbox" id="contours" checked> contours <kbd>s</kbd></label>
+      <label title="the white and pial surfaces of FreeSurfer, drawn as contours on every view"><input type="checkbox" id="contours" checked> surfaces <kbd>s</kbd></label>
       <label><input type="checkbox" id="crosshair" checked> crosshair <kbd>c</kbd></label>
       <label><input type="checkbox" id="traces-on" checked> traces <kbd>t</kbd></label>
       <label>difference scale <select id="diff-scale" aria-label="difference scale, gray levels"></select></label>
@@ -127,6 +130,18 @@
         single volume can be missed at these rates.</b> To see every volume, play at 60 or slower, or step with the
         arrow keys. When a piece of the stream is not loaded yet, playing waits for it at any rate. The stream is held
         in memory in pieces around the current volume, up to <span id="help-memory"></span> for the whole stream.</p>
+      <p><b>Random order</b> (<kbd>x</kbd>), off by default. It plays the existing volumes in another order and
+        changes nothing else: each volume once per loop, then the loop starts again with the same order. Neighbours in
+        that order lie far apart in time, so slow drift, and movement or a change of contrast between distant
+        timepoints, show as flicker that a film in time order hides. <i>whole stream</i>: one order of every volume of
+        every run and session; <i>run by run</i>: the runs in the order of acquisition, the volumes of each in a random
+        order. The order follows from a seed, shown beside the control (1 when the page opens; <kbd>Shift</kbd> +
+        <kbd>x</kbd> takes the next), so the same stream and seed give the same order. Only playing follows it: the
+        arrow keys, <kbd>Home</kbd>, <kbd>End</kbd>, the slider, the runs on the timeline and <kbd>r</kbd> stay in time,
+        so a paused volume can be compared with its neighbours in time. Above 60 per second the rule above holds in
+        the random order: those between two pictures are not shown, none twice in a loop. In a random order the
+        pieces of the stream that the coming volumes need are loaded first; when the stream is larger than the memory
+        held, playing waits for them often.</p>
       <table>
         <tr><th>Key</th><th>Action</th></tr>
         <tr><td><kbd>Space</kbd></td><td>play, pause</td></tr>
@@ -142,14 +157,16 @@
         <tr><td><kbd>q</kbd> <kbd>w</kbd> <kbd>e</kbd></td><td>the moving series, the temporal mean, the temporal SD of the run (stills)</td></tr>
         <tr><td><kbd>n</kbd></td><td>intensity normalization on, off</td></tr>
         <tr><td><kbd>r</kbd>, <kbd>Shift</kbd> + <kbd>r</kbd></td><td>jump to the next, previous run of the stream</td></tr>
-        <tr><td><kbd>s</kbd></td><td>surface contours on, off (held down: off while held)</td></tr>
+        <tr><td><kbd>s</kbd></td><td>surfaces (the white and pial contours) on, off (held down: off while held)</td></tr>
+        <tr><td><kbd>x</kbd></td><td>random order of play on, off (the order of acquisition when off)</td></tr>
+        <tr><td><kbd>Shift</kbd> + <kbd>x</kbd></td><td>the next seed of the random order</td></tr>
         <tr><td><kbd>c</kbd></td><td>crosshair on, off</td></tr>
         <tr><td><kbd>t</kbd></td><td>traces and markers on, off</td></tr>
         <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
       </table>
-      <p>Contours: white surface red, pial surface yellow, both hemispheres, cut at the centre of the slice. In the
-        difference view, whose colours run to red and yellow, they are green (white surface) and magenta (pial), each
-        on a dark outline.</p>
+      <p>Surfaces: the white and pial surfaces as contours, white surface red, pial surface yellow, both hemispheres,
+        cut at the centre of the slice, in every view and on the stills. In the difference view, whose colours run to
+        red and yellow, they are green (white surface) and magenta (pial), each on a dark outline.</p>
       <p><button type="button" id="help-close">close</button></p>
     </div>
   </div>

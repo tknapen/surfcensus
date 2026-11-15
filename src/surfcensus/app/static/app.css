@@ -1631,6 +1631,36 @@ textarea:focus-visible {
   width: 5em;
 }
 
+/* the random order of play (D48): the switch, its scope and the seed with what it does, in one
+   group that keeps one size whatever the note says, so that nothing moves when it is switched */
+.epi .epi-random {
+  display: inline-flex;
+  flex: 0 1 auto;
+  flex-wrap: wrap;
+  gap: 2px 6px;
+  align-items: center;
+  max-width: 100%;
+  white-space: nowrap;
+}
+
+.epi #random-note {
+  display: inline-block;
+  width: 36ch;
+  height: 1.4em;
+  line-height: 1.4em;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 0.85em;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+
+@media (max-width: 560px) {
+  .epi #random-note {
+    width: 30ch;
+  }
+}
+
 /* the legend: the rest of the second row of controls, two lines at most, the whole text in
    its tooltip */
 .epi #legend {

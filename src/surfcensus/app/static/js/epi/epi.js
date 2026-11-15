@@ -8,6 +8,7 @@
 // layers, the rate and the crosshair carry over. What the page says about the run on screen
 // changes beside the pictures.
 import {
+  advanceInOrder,
   boundaries,
   boundaryFraction,
   buildTimeline,
@@ -28,7 +29,10 @@ import {
   planeSize,
   frameRate,
   maySkip,
+  ORDER_SCOPES,
   playbackAdvance,
+  playOrder,
+  positions,
   skipNote,
   pointOf,
   RATES,
@@ -66,6 +70,9 @@ const state = {
   fdLimit: 0.5,
   active: 0,
   help: false,
+  random: false, // play the volumes in a seeded random order (D48); stepping stays in time
+  scope: 'stream', // logic.ORDER_SCOPES: 'stream' (every volume) or 'run' (within each run)
+  seed: 1,
 };
 
 let stream;
@@ -110,7 +117,33 @@ const page = {
   fetchedBytes: 0,
   grownAt: null, // performance.now() when the page said that the stream grew
   startRun: null, // the run the address asked for (#run=<run_uid>) and the page started at, or null
+  random: { on: false, scope: 'stream', seed: 1 }, // the order of play in force (D48)
+  fetchByOrder: true, // in a random order, the chunks are fetched in the order of play (false: around the cursor in time)
 };
+
+// The random order of play in force, or null (the order of acquisition): { order (logic.
+// playOrder), pos (logic.positions of it), id }.
+let play = null;
+
+function setOrder() {
+  play = state.random ? { order: playOrder(timeline, state.scope, state.seed), id: `${state.scope}:${state.seed}` } : null;
+  if (play) play.pos = positions(play.order);
+  page.random = { on: state.random, scope: state.scope, seed: state.seed };
+}
+
+// The place of a volume in the order of play, and the volume at a place.
+function placeOf(g) {
+  return play ? play.pos[g] : g;
+}
+
+function volumeAt(p) {
+  return play ? play.order[p] : p;
+}
+
+// What the store is told about the order of play.
+function playFor(g) {
+  return play && page.fetchByOrder ? { order: play.order, pos: play.pos[g], id: play.id } : null;
+}
 
 // ---- the stream -----------------------------------------------------------------------------
 
@@ -213,7 +246,7 @@ function render(reason = 'other', advanced = 0) {
   const k = segOf(state.g);
   enterSegment(k);
   const streams = streamsOf(state.view);
-  store.want(streams, state.g);
+  store.want(streams, state.g, playFor(state.g));
   views.setGroups(groupsOf(state.view), groupLabels());
   const vols = volumesFor(k, streams);
   writeControls();
@@ -380,6 +413,9 @@ function writeControls() {
     label.querySelector('output').textContent = `${index} of ${grid.shape[plane] - 1}, ${mm.toFixed(1)} mm`;
   }
   $('contours').checked = state.contours;
+  $('random').checked = state.random;
+  $('random-scope').value = state.scope;
+  writeRandomNote();
   $('crosshair').checked = state.crosshair;
   $('traces-on').checked = state.traces;
   $('diff-scale').value = String(state.diffScale);
@@ -538,7 +574,7 @@ function legendText() {
   // what the colours of the difference mean comes first: it is what this view shows
   return (
     `Raw minus preprocessed, of the gray levels on screen: blue raw lower, red raw higher, saturating at ${state.diffScale} gray levels ` +
-    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}); contours green (white surface) and magenta (pial). ${scope}`
+    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}); surfaces green (white) and magenta (pial). ${scope}`
   );
 }
 
@@ -856,6 +892,36 @@ function writeNote(now, reset = false) {
   el.title = text ? `${text}: above the refresh rate of the display not every volume can be put on screen, and an artefact in a single volume can be missed` : '';
 }
 
+// The order of play (D48). Switched on or off, with another scope or seed, playing goes on
+// from the volume on screen; stepping, the slider, the run segments and r stay in time.
+function setRandom(on, scope = state.scope, seed = state.seed) {
+  if (!ORDER_SCOPES.includes(scope)) return;
+  state.random = Boolean(on);
+  state.scope = scope;
+  state.seed = Math.max(1, Math.floor(seed));
+  setOrder();
+  if (state.playing) nextDue = performance.now();
+  writeControls();
+  store.want(streamsOf(state.view), state.g, playFor(state.g));
+}
+
+// Beside the control: the seed, and while the random order is on what it does. A box of one
+// size whatever it holds, the whole text in its tooltip.
+function writeRandomNote() {
+  let text = `seed ${state.seed}`;
+  let title = `the seed of the random order (Shift + x: the next seed); off, the volumes play in the order of acquisition`;
+  if (state.random) {
+    const scope = state.scope === 'run' ? 'run by run' : 'over the whole stream';
+    const waits = store && !store.fits(streamsOf(state.view).length);
+    const once = state.playing && page.skipping ? 'each at most once per loop' : 'every volume once per loop';
+    text += waits ? `: ${once}, waits for loading` : `: ${once}`;
+    title =
+      `random order ${scope}, seed ${state.seed}: the existing volumes in another order, each once per loop (above 60 per second those between two pictures are not shown), nothing else changed; x for the order of acquisition` +
+      (waits ? '. The stream is larger than the memory held, so playing waits while pieces of it are loaded' : '');
+  }
+  setText('random-note', text, title);
+}
+
 function setDiffScale(scale) {
   state.diffScale = scale;
   lut = diffLut(scale);
@@ -896,26 +962,21 @@ function tick(now) {
   if (state.playing && state.kind === 'series' && !state.help) {
     const step = playbackAdvance(nextDue, now, state.rate, page.skipping);
     if (step.n > 0) {
-      const next = wrap(state.g + 1, timeline.total);
-      // the volume that is due; past the end of the stream the loop starts again at the
-      // first volume, and the volumes before the end that fall between two paints are not painted
-      let ahead = Math.min(step.n, timeline.total - 1);
-      if (state.g + ahead >= timeline.total) ahead = timeline.total - state.g;
-      let target = wrap(state.g + ahead, timeline.total);
-      let held = false;
-      if (ahead > 1 && !readyFor(target)) {
-        // the one due is not loaded: the latest loaded volume before it, and the clock waits there
-        held = true;
-        while (ahead > 1 && !readyFor(target)) target = wrap(state.g + --ahead, timeline.total);
-      }
-      if (readyFor(target)) {
-        state.g = target;
-        // at the end of the stream the volumes that were due past it are not carried over
-        nextDue = held ? now + 1000 / state.rate : step.nextDue - ((step.n - ahead) * 1000) / state.rate;
-        if (held) page.holds += 1;
+      // in places of the order of play (the order of acquisition, or the random order in force):
+      // the volume that is due; past the end of the order the loop starts again at its first
+      // place, and the places before the end that fall between two paints are not painted
+      const total = timeline.total;
+      const p = placeOf(state.g);
+      const next = volumeAt(wrap(p + 1, total));
+      const s = advanceInOrder(p, step.n, total, (q) => readyFor(volumeAt(q)));
+      if (s) {
+        state.g = volumeAt(s.pos);
+        // at the end of the order the volumes that were due past it are not carried over
+        nextDue = s.held ? now + 1000 / state.rate : step.nextDue - ((step.n - s.ahead) * 1000) / state.rate;
+        if (s.held) page.holds += 1;
         if (step.resynced) page.resyncs += 1;
         stalled = false;
-        render('play', ahead);
+        render('play', s.ahead);
       } else {
         // the next volume is not loaded: wait for it and do not skip it
         if (!stalled) {
@@ -923,7 +984,7 @@ function tick(now) {
           stalled = true;
           $('status').textContent = `loading volume ${next}`;
         }
-        store.want(streamsOf(state.view), next);
+        store.want(streamsOf(state.view), next, playFor(next));
         nextDue = now;
       }
     }
@@ -1016,6 +1077,8 @@ function onKeyDown(event) {
       traces.resize();
       render('other');
     },
+    x: () => setRandom(!state.random),
+    X: () => setRandom(state.random, state.scope, state.seed + 1),
     '?': () => setHelp(true),
   };
   const action = actions[key];
@@ -1122,6 +1185,14 @@ function buildControls() {
   $('contours').addEventListener('change', (event) => {
     state.contours = event.target.checked;
     drawOverlay();
+  });
+  $('random').addEventListener('change', (event) => {
+    setRandom(event.target.checked);
+    event.target.blur();
+  });
+  $('random-scope').addEventListener('change', (event) => {
+    setRandom(state.random, event.target.value);
+    event.target.blur();
   });
   $('crosshair').addEventListener('change', (event) => {
     state.crosshair = event.target.checked;
@@ -1232,6 +1303,7 @@ async function start() {
     sd: timeline.segments.map((seg) => stream.sessions[seg.session].runs[seg.run].sd_window),
   };
   tables = intensityTables(windows.value, windows.sd, state.normalized);
+  setOrder();
   const tr = streamTraces(timeline, stream.sessions);
   streamData = { total: timeline.total, fd: tr.fd, dvars: tr.dvars, nonSteady: tr.nonSteady, nonSteadySet: new Set(tr.nonSteady), boundaries: boundaries(timeline) };
   store = new Store(stream, timeline, { limitBytes: stream.memory_mib * 1024 * 1024 });
@@ -1328,7 +1400,7 @@ window.__epi = {
   tables: () => tables.map((t) => ({ value: Array.from(t.value), sd: Array.from(t.sd), top: t.top, topSd: t.topSd })),
   stats: () => ({ ...store.stats(), pageRequests: page.requests, pageFetchedBytes: page.fetchedBytes }),
   // Change the state (g, slices, view, kind, rate, playing, diffScale, contours, crosshair,
-  // normalized) and resolve when the panels hold what was asked for.
+  // normalized, random, scope, seed) and resolve when the panels hold what was asked for.
   set(change) {
     if ('view' in change && VIEWS.includes(change.view)) setView(change.view);
     if ('normalized' in change && change.normalized !== state.normalized) setNormalized(change.normalized);
@@ -1355,6 +1427,9 @@ window.__epi = {
     }
     if ('diffScale' in change) setDiffScale(change.diffScale);
     if ('rate' in change) setRate(change.rate);
+    if ('random' in change || 'scope' in change || 'seed' in change) {
+      setRandom('random' in change ? change.random : state.random, change.scope || state.scope, change.seed || state.seed);
+    }
     for (const k of ['contours', 'crosshair']) if (k in change) state[k] = change[k];
     if ('playing' in change) setPlaying(change.playing);
     else render('g' in change ? 'seek' : 'other');
@@ -1404,6 +1479,8 @@ window.__epi = {
     const c = contoursOf.get(contourKey(k));
     return { grid: gridOf(k).grid_key, contours: contourKey(k), loaded: Array.isArray(c) && c.every((x) => x !== null), key: views.overlayKey };
   },
+  // the order of play in force: the volumes in the order a loop shows them
+  order: () => (play ? Array.from(play.order) : Array.from({ length: timeline.total }, (_, g) => g)),
   get place() {
     return state.place.slice();
   },
@@ -1418,6 +1495,7 @@ window.__epi = {
     session: $('session-note').textContent,
     status: $('status').textContent,
     readout: $('readout').textContent,
+    random: $('random-note').textContent,
     badges: $('badges').textContent,
     notice: $('notice').hidden ? '' : $('notice-text').textContent,
   }),

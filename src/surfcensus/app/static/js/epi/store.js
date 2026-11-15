@@ -1,7 +1,7 @@
 // The volume store of the EPI page: the stills of each run on the timeline, and the chunks of
 // the two streams of the whole stream held decoded within one memory limit, loaded by workers
 // around the cursor and ahead of it across run and session boundaries.
-import { chunkIndexOf, desiredChunks, STREAMS, STILLS, streamChunks } from './logic.js';
+import { chunkIndexOf, chunksInOrder, desiredChunks, STREAMS, STILLS, streamChunks } from './logic.js';
 
 export async function sha256Hex(buffer) {
   if (!crypto.subtle) return null; // not a secure context: nothing can be checked
@@ -115,15 +115,33 @@ export class Store {
   }
 
   // Says what is on screen; the store loads what is wanted around it and drops the rest.
-  want(streams, g) {
+  //   play (optional): { order, pos, id } while a random order of play is in force (logic.
+  //   playOrder, the place of the volume on screen in it, and a name of that order): the chunks
+  //   are wanted in the order the coming volumes of that order need them (logic.chunksInOrder)
+  //   instead of around the cursor in time.
+  want(streams, g, play = null) {
     const cursor = chunkIndexOf(this.chunkList, g);
-    const key = `${streams.join('+')}|${cursor}`;
+    let key = `${streams.join('+')}|${cursor}`;
+    let order = null;
+    if (play) {
+      if (!this.chunkOf || this.chunkOf.length !== this.timeline.total) {
+        this.chunkOf = new Int32Array(this.timeline.total);
+        this.chunkList.forEach((c, k) => this.chunkOf.fill(k, c.first, c.first + c.count));
+      }
+      order = chunksInOrder(play.order, this.chunkOf, this.chunkList.length, play.pos);
+      key = `${streams.join('+')}|${play.id}|${order.join(',')}`;
+    }
     if (key !== this.desiredKey) {
       this.desiredKey = key;
-      this.desired = desiredChunks({ sizes: this.sizes, cursor, streams, limitBytes: this.limitBytes });
+      this.desired = desiredChunks({ sizes: this.sizes, cursor, streams, limitBytes: this.limitBytes, order });
       this.desiredSet = new Set(this.desired);
     }
     this.pump();
+  }
+
+  // Whether every chunk of the streams on screen fits the memory limit at once.
+  fits(nStreams) {
+    return nStreams * this.sizes.reduce((a, b) => a + b, 0) <= this.limitBytes;
   }
 
   decodedChunkBytes() {

@@ -8,6 +8,7 @@ The packs are those of ``tests/epi_packs.py``; the shape is the one the server a
 
 from __future__ import annotations
 
+import itertools
 import json
 import math
 import re
@@ -655,3 +656,204 @@ def test_a_ratio_near_a_rounding_boundary_keeps_its_text(js_copy: Path) -> None:
     assert out[1] == ["every 5th volume shown"] * 3 + ["every 5th volume shown"] * 2
     assert out[2] == ["", "", "90% of volumes shown", "90% of volumes shown"]
     assert out[3] == ["90% of volumes shown", "90% of volumes shown", ""]
+
+
+# --- the random order of play (D48) ---------------------------------------------------------
+
+
+def toy_timeline(lengths: list[int]) -> dict[str, Any]:
+    segments, at = [], 0
+    for n in lengths:
+        segments.append({"first": at, "n": n, "chunks": [{"first": 0, "count": n}]})
+        at += n
+    return {"total": at, "segments": segments}
+
+
+@needs_node
+def test_the_generator_and_the_shuffle_follow_the_seed_alone(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const draw = (seed, n) => {\n"
+        "  const r = L.mulberry32(seed); return Array.from({ length: n }, r);\n"
+        "};\n"
+        "const t = input;\n"
+        "output({ a: draw(1, 8), b: draw(1, 8), c: draw(2, 8),\n"
+        "  o1: Array.from(L.playOrder(t, 'stream', 1)),\n"
+        "  o1b: Array.from(L.playOrder(t, 'stream', 1)),\n"
+        "  o2: Array.from(L.playOrder(t, 'stream', 2)), big: draw(4294967295, 3) });\n",
+        toy_timeline([30, 50, 20]),
+    )
+    assert out["a"] == out["b"] and out["a"] != out["c"]
+    assert all(0 <= x < 1 for x in out["a"] + out["c"] + out["big"])
+    assert out["o1"] == out["o1b"] and out["o1"] != out["o2"]
+    # pinned: the first numbers of seed 1, so that a change of the generator is seen (every
+    # browser and Node compute these with the same integer arithmetic)
+    assert out["a"][:3] == pytest.approx(
+        [0.6270739405881613, 0.002735721180215478, 0.5274470399599522]
+    )
+
+
+@needs_node
+@pytest.mark.parametrize("lengths", [[30, 50, 20], [1], [7], [1, 1, 1], [24] * 8])
+def test_each_scope_is_a_permutation_and_run_by_run_keeps_the_runs_in_order(
+    js_copy: Path, lengths: list[int]
+) -> None:
+    timeline = toy_timeline(lengths)
+    out = run_js(
+        js_copy,
+        "const r = {};\n"
+        "for (const scope of L.ORDER_SCOPES) for (const seed of [1, 2, 3]) {\n"
+        "  const o = L.playOrder(input, scope, seed);\n"
+        "  r[`${scope}|${seed}`] = { o: Array.from(o), pos: Array.from(L.positions(o)) };\n"
+        "}\noutput(r);\n",
+        timeline,
+    )
+    total = sum(lengths)
+    for key, got in out.items():
+        order, pos = got["order"] if "order" in got else got["o"], got["pos"]
+        assert sorted(order) == list(range(total)), key
+        assert all(order[pos[g]] == g for g in range(total)) and all(
+            pos[order[p]] == p for p in range(total)
+        )
+        if key.startswith("run|"):
+            for seg in timeline["segments"]:
+                block = order[seg["first"] : seg["first"] + seg["n"]]
+                assert sorted(block) == list(range(seg["first"], seg["first"] + seg["n"]))
+    if total >= 20:
+        # the scope is not ignored: the whole-stream order mixes the runs, run by run does not
+        stream = out["stream|1"]["o"]
+        firsts = [seg["first"] for seg in timeline["segments"]]
+        run_of = [max(k for k, f in enumerate(firsts) if f <= g) for g in stream[: lengths[0]]]
+        assert len(set(run_of)) > 1
+        assert out["stream|1"]["o"] != list(range(total))
+        assert out["run|1"]["o"] != list(range(total))
+
+
+@needs_node
+def test_an_empty_stream_has_an_empty_order_and_no_step(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const t = { total: 0, segments: [] };\n"
+        "const bad = () => {\n"
+        "  try { L.playOrder(t, 'x', 1); return 'no'; } catch { return 'raised'; }\n"
+        "};\n"
+        "output({ s: Array.from(L.playOrder(t, 'stream', 1)),\n"
+        "  r: Array.from(L.playOrder(t, 'run', 1)),\n"
+        "  step: L.advanceInOrder(0, 1, 0, () => true), bad: bad() });\n",
+    )
+    assert out == {"s": [], "r": [], "step": None, "bad": "raised"}
+
+
+def advance_order_js(scope: str, rate: int, frame_ms: float, skip: bool, loops: float) -> str:
+    """Play an order with the clock of the page (playbackAdvance, then advanceInOrder) on a
+    stream where every volume is loaded, from the last place, and return the volumes painted."""
+    return (
+        f"const order = L.playOrder(input, '{scope}', 5);\n"
+        "const pos = L.positions(order);\n"
+        f"let g = order[order.length - 1]; let due = 0; const painted = [];\n"
+        f"const want = {loops} * order.length;\n"
+        f"for (let now = 0; painted.length < want && now < 60000; now += {frame_ms}) {{\n"
+        f"  const s = L.playbackAdvance(due, now, {rate}, {str(skip).lower()});\n"
+        "  if (s.n === 0) continue;\n"
+        "  const a = L.advanceInOrder(pos[g], s.n, order.length, () => true);\n"
+        "  g = order[a.pos]; due = s.nextDue; painted.push(g);\n"
+        "}\noutput({ order: Array.from(order), painted });\n"
+    )
+
+
+@needs_node
+@pytest.mark.parametrize("scope", ["stream", "run"])
+def test_the_clock_paints_the_order_in_force_every_volume_once_per_loop(
+    js_copy: Path, scope: str
+) -> None:
+    timeline = toy_timeline([30, 50, 20])
+    for rate, frame in ((12, 16.7), (60, 16.7), (60, 40.0)):
+        out = run_js(js_copy, advance_order_js(scope, rate, frame, False, 2), timeline)
+        order = out["order"]
+        assert out["painted"] == (order + order)[: len(out["painted"])], (rate, frame)
+        assert len(out["painted"]) == 2 * len(order)
+
+
+@needs_node
+@pytest.mark.parametrize("scope", ["stream", "run"])
+def test_with_skipping_the_painted_volumes_are_a_subsequence_of_the_order(
+    js_copy: Path, scope: str
+) -> None:
+    timeline = toy_timeline([30, 50, 20])
+    out = run_js(js_copy, advance_order_js(scope, 300, 16.7, True, 3), timeline)
+    order = out["order"]
+    place = {g: p for p, g in enumerate(order)}
+    places = [place[g] for g in out["painted"]]
+    loops = 0
+    for a, b in itertools.pairwise(places):
+        if b <= a:
+            assert b == 0, (a, b)  # a loop starts again at the first place, none twice in a loop
+            loops += 1
+    assert loops >= 2
+    assert len(set(out["painted"])) < len(order)  # volumes were left out
+
+
+@needs_node
+def test_a_place_that_is_not_loaded_holds_or_waits(js_copy: Path) -> None:
+    out = run_js(
+        js_copy,
+        "const ready = new Set([3, 4, 5, 6]);\n"
+        "const r = (q) => ready.has(q);\n"
+        "output([L.advanceInOrder(3, 3, 10, r), L.advanceInOrder(3, 1, 10, r),\n"
+        "  L.advanceInOrder(6, 1, 10, r), L.advanceInOrder(4, 5, 10, r),\n"
+        "  L.advanceInOrder(8, 5, 10, () => true), L.advanceInOrder(0, 3, 1, () => true)]);\n",
+    )
+    assert out[0] == {"ahead": 3, "pos": 6, "held": False}
+    assert out[1] == {"ahead": 1, "pos": 4, "held": False}
+    assert out[2] is None  # the next place is not loaded: the clock waits
+    assert out[3] == {
+        "ahead": 2,
+        "pos": 6,
+        "held": True,
+    }  # the latest loaded place before the due one
+    assert out[4] == {
+        "ahead": 2,
+        "pos": 0,
+        "held": False,
+    }  # past the end: place 0, not carried over
+    assert out[5] == {"ahead": 0, "pos": 0, "held": False}  # one volume
+
+
+@needs_node
+def test_the_chunks_are_wanted_in_the_order_the_coming_volumes_need_them(
+    js_copy: Path, shape: dict[str, Any]
+) -> None:
+    out = run_js(
+        js_copy,
+        "const t = L.buildTimeline(input.sessions);\n"
+        "const chunks = L.streamChunks(t);\n"
+        "const chunkOf = [];\n"
+        "for (let g = 0; g < t.total; g++) chunkOf.push(L.chunkIndexOf(chunks, g));\n"
+        "const order = L.playOrder(t, 'stream', 3);\n"
+        "const r = [];\n"
+        "for (const p of [0, 7, t.total - 1]) {\n"
+        "  const c = L.chunksInOrder(order, chunkOf, chunks.length, p);\n"
+        "  const sizes = chunks.map((x) => x.count * 1000);\n"
+        "  const d = L.desiredChunks({ sizes, cursor: c[0], streams: ['raw'],\n"
+        "    limitBytes: 3 * 14000, order: c });\n"
+        "  r.push({ p, c, d });\n"
+        "}\n"
+        "output({ order: Array.from(order), chunkOf, n: chunks.length, r });\n",
+        shape,
+    )
+    order, chunk_of, n = out["order"], out["chunkOf"], out["n"]
+    for case in out["r"]:
+        p = case["p"]
+        want: list[int] = []
+        for k in range(len(order)):
+            c = chunk_of[order[(p + k) % len(order)]]
+            if c not in want:
+                want.append(c)
+        assert case["c"] == want and sorted(want) == list(range(n))
+        # the chunk on screen first, then that of the next volume of the order, within the limit
+        assert case["d"][0] == f"{chunk_of[order[p]]}|raw"
+        assert (
+            case["d"][1] == f"{chunk_of[order[(p + 1) % len(order)]]}|raw"
+            or chunk_of[order[(p + 1) % len(order)]] == chunk_of[order[p]]
+        )
+        assert [k.split("|")[0] for k in case["d"]] == [str(c) for c in want[: len(case["d"])]]

@@ -373,8 +373,10 @@ export function chunkOrder(nChunks, cursor) {
 // First the streams on screen in chunkOrder, then the other stream in the same order. The
 // list stops before the chunk that would exceed the limit, but always holds the cursor's
 // chunk and the next of every stream on screen, whatever the limit. Keys 'index|stream'.
-export function desiredChunks({ sizes, cursor, streams, limitBytes }) {
-  const order = chunkOrder(sizes.length, cursor);
+//   order (optional): the chunks in the order they are wanted (chunksInOrder of a random order
+//   of play), in place of chunkOrder around the cursor; its first entry is the cursor's chunk.
+export function desiredChunks({ sizes, cursor, streams, limitBytes, order: wanted = null }) {
+  const order = wanted || chunkOrder(sizes.length, cursor);
   const out = [];
   let bytes = 0;
   let full = false;
@@ -430,6 +432,103 @@ export function playbackAdvance(nextDue, now, rate, skip, slackMs = 4, resyncMs 
     resynced = true;
   }
   return { n, nextDue: due, resynced };
+}
+
+// ---- the order of play (random order, D48) --------------------------------------------------
+
+// The scopes of a random order: one order of every volume of the stream, or the runs in the
+// order of acquisition with the volumes of each run in a random order.
+export const ORDER_SCOPES = ['stream', 'run'];
+
+// A generator of numbers in [0, 1) from a 32-bit seed (mulberry32). Integer arithmetic only
+// (Math.imul and unsigned shifts) and one exact division by 2^32, so the same seed gives the
+// same numbers in every browser and under Node.
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0;
+    let t = a;
+    t = Math.imul(t ^ (t >>> 15), t | 1);
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Fisher-Yates in place on out[from .. from + n - 1], drawing from `rand`.
+export function shuffleRange(out, from, n, rand) {
+  for (let i = n - 1; i > 0; i--) {
+    const j = Math.floor(rand() * (i + 1));
+    const x = out[from + i];
+    out[from + i] = out[from + j];
+    out[from + j] = x;
+  }
+  return out;
+}
+
+// The order in which playing shows the volumes of the stream: a permutation of 0 .. total - 1
+// (Int32Array; entry p is the volume shown at place p of a loop). scope 'stream': one shuffle
+// of every volume; 'run': the segments in stream order, each one shuffled within itself, one
+// generator for the whole stream in segment order. The same timeline, scope and seed give the
+// same order.
+export function playOrder(timeline, scope, seed) {
+  const total = timeline.total;
+  const out = new Int32Array(total);
+  for (let g = 0; g < total; g++) out[g] = g;
+  const rand = mulberry32(seed);
+  if (scope === 'run') {
+    for (const seg of timeline.segments) shuffleRange(out, seg.first, seg.n, rand);
+  } else if (scope === 'stream') {
+    shuffleRange(out, 0, total, rand);
+  } else {
+    throw new Error(`no such scope of a random order: ${scope}`);
+  }
+  return out;
+}
+
+// The place of every volume in an order: positions(order)[order[p]] === p.
+export function positions(order) {
+  const out = new Int32Array(order.length);
+  for (let p = 0; p < order.length; p++) out[order[p]] = p;
+  return out;
+}
+
+// One step of playing in an order (the order of acquisition, or a random one), in places of
+// that order. p: the place of the volume on screen; n: the volumes due by now
+// (playbackAdvance); total: the volumes of the stream; readyAt(q): whether the volume at place q
+// can be painted. Past the end of the order the loop starts again at place 0, and the places
+// before the end that fall between two paints are not painted. When the place that is due is
+// not loaded, the latest loaded place before it is taken and `held` is true. Returns { ahead
+// (places moved on), pos (the place to paint), held }, or null when the next place is not
+// loaded (the clock waits; nothing is skipped).
+export function advanceInOrder(p, n, total, readyAt) {
+  if (!(total > 0)) return null;
+  let ahead = Math.min(n, total - 1);
+  if (p + ahead >= total) ahead = total - p;
+  let q = wrap(p + ahead, total);
+  let held = false;
+  if (ahead > 1 && !readyAt(q)) {
+    held = true;
+    while (ahead > 1 && !readyAt(q)) q = wrap(p + --ahead, total);
+  }
+  return readyAt(q) ? { ahead, pos: q, held } : null;
+}
+
+// The chunks of the stream in the order the coming volumes of an order need them: the chunk of
+// the volume at place p, then each chunk at the first place after p (wrapping round the end of
+// the order) where a volume of it comes. chunkOf: the index in streamChunks of every volume.
+// Every chunk once; a chunk that no volume of the order holds is left out.
+export function chunksInOrder(order, chunkOf, nChunks, p) {
+  const out = [];
+  const seen = new Uint8Array(nChunks);
+  const total = order.length;
+  for (let k = 0; k < total && out.length < nChunks; k++) {
+    const c = chunkOf[order[(p + k) % total]];
+    if (!seen[c]) {
+      seen[c] = 1;
+      out.push(c);
+    }
+  }
+  return out;
 }
 
 // Whether playing at `rate` may leave volumes unpainted: only above PAINT_EVERY_MAX, and only
