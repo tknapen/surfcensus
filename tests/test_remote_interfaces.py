@@ -161,9 +161,9 @@ METHODS: dict[type, dict[str, tuple[str, ...]]] = {
     S3Client: {
         "__init__": ("bucket", "config", "addressing", "transport", "sleep"),
         "list": ("prefix", "delimiter"),
-        "head": ("key",),
-        "get": ("key", "byte_range", "if_match"),
-        "download": ("key", "dest", "expect", "cancel"),
+        "head": ("key", "location"),
+        "get": ("key", "byte_range", "if_match", "location"),
+        "download": ("key", "dest", "expect", "cancel", "location"),
         "close": (),
     },
     Cache: {
@@ -241,7 +241,6 @@ def test_the_constants() -> None:
 def _stub_calls(tmp_path: Path) -> list[tuple[str, object]]:
     client = S3Client(BUCKET, config=RemoteConfig(), transport=FakeS3({}).transport())
     cache = Cache(tmp_path / "cache", max_bytes=10, secret=bytes(32))
-    obj = S3Object("k/a", 1, "e", "2026-01-01T00:00:00.000Z")
     source = OpenNeuroDerivatives(client=client, cache=cache, accession=ACCESSION)
     record = DatasetRecord(
         "openneuro-derivatives",
@@ -252,19 +251,8 @@ def _stub_calls(tmp_path: Path) -> list[tuple[str, object]]:
         "fmriprep",
         "fmriprep",
     )
-    from surfcensus.remote.s3 import backoff_delay
-
+    # the client (RA) and the cache (RB) are written; the source's listing (RE) is not yet
     return [
-        ("RA: remote/s3.py", lambda: backoff_delay(1)),
-        ("RA: remote/s3.py", lambda: list(client.list("p/"))),
-        ("RA: remote/s3.py", lambda: client.head("k")),
-        ("RA: remote/s3.py", lambda: client.get("k")),
-        ("RA: remote/s3.py", lambda: client.download("k", tmp_path / "x", expect=obj)),
-        ("RB: remote/cache.py", lambda: cache.lease(client, {FileRole.T1: obj})),
-        ("RB: remote/cache.py", lambda: cache.retained(client, obj)),
-        ("RB: remote/cache.py", cache.leased_bytes),
-        ("RB: remote/cache.py", lambda: cache.forget(BUCKET, "k", "e")),
-        ("RB: remote/cache.py", cache.prune),
         ("RE: sources/openneuro_derivatives.py", lambda: list(source.datasets())),
         ("RE: sources/openneuro_derivatives.py", lambda: list(source.subjects(record))),
         ("RE: sources/openneuro_derivatives.py", lambda: source.template_dir(record)),

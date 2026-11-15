@@ -1645,12 +1645,14 @@ METRIC_FAULTS = [
 
 
 @pytest.mark.parametrize(("fault", "kind", "said"), METRIC_FAULTS)
+@pytest.mark.parametrize("at", [2, 3], ids=["first", "second"])
 def test_a_lease_that_meets_a_fault_of_the_machine_stops_the_metrics_and_records_nothing(
     synth_template: SyntheticTemplate,
     tmp_path: Path,
     fault: BaseException,
     kind: type[Exception],
     said: str,
+    at: int,
 ) -> None:
     """Recorded against its subject, a network fault would outlast the fault: a failed row
     is not tried again without ``retry_failed``. The stage stops at the batch; nothing of the
@@ -1669,11 +1671,12 @@ def test_a_lease_that_meets_a_fault_of_the_machine_stops_the_metrics_and_records
     with Run(run_dir, local(cohort.root), config=config) as run:
         run.inventory()
         uids = sorted(labels(run).values())  # the order of the batches
-        leased = fail_lease_of(run, uids[3], fault, TIER_B)
+        leased = fail_lease_of(run, uids[at], fault, TIER_B)
         with pytest.raises(kind) as raised:
             run.metrics()
         assert said in str(raised.value) and raised.value.__cause__ is fault
-        assert leased == uids  # the subject leased before the fault is worked on, no more
+        # a lease after the fault is not asked for: it would wait out the same retries
+        assert leased == uids[: at + 1]
         # the first batch is recorded, of the second nothing
         assert set(ledger(run, "regional")) == set(uids)
         assert set(ledger(run, "fsaverage")) == set(uids[:2])

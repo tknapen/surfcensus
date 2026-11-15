@@ -306,7 +306,17 @@ class S3Client:
             if attempt > self.config.max_retries:
                 tries = "1 attempt" if attempt == 1 else f"{attempt} attempts"
                 raise source_error(UNREACHABLE, location, f"{problem} ({tries})")
-            self.sleep(backoff_delay(attempt, retry_after))
+            self._pause(backoff_delay(attempt, retry_after), cancel)
+
+    def _pause(self, delay: float, cancel: threading.Event | None) -> None:
+        """Wait ``delay`` seconds before a retry. A call that can be cancelled waits on its
+        cancel event when the client sleeps for real, so that a stop (Ctrl-C in a lease) does
+        not wait out a backoff of up to ``RETRY_CAP_S``; the loop then raises
+        :class:`DownloadCancelled`. An injected ``sleep`` is called as it is."""
+        if cancel is not None and self.sleep is time.sleep:
+            cancel.wait(delay)
+        else:
+            self.sleep(delay)
 
     def _status(
         self, response: httpx.Response, location: str, *, missing: str = "changed"

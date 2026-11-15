@@ -264,7 +264,7 @@ class _FaultGuard:
 
     @contextmanager
     def __call__(self, uid: str) -> Iterator[Mapping[FileRole, Path]]:
-        if False:
+        if self.faulted:
             first = next(iter(self.faulted.values()))
             raise _NotLeased(uid) from first
         with ExitStack() as held:

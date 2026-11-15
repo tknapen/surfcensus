@@ -12,6 +12,7 @@ import hashlib
 import os
 import random
 import threading
+import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
 
@@ -682,6 +683,32 @@ def test_a_cancel_stops_within_one_chunk_and_leaves_no_file(tmp_path: Path) -> N
     with pytest.raises(DownloadCancelled):
         client.download(KEY, tmp_path / "big", expect=obj, cancel=cancel)
     assert len(sent) <= 3
+
+
+def test_a_cancel_during_the_wait_before_a_retry_ends_the_wait(tmp_path: Path) -> None:
+    """A client that sleeps for real waits on the cancel event before a retry, so a stop does
+    not wait out the backoff: here the bucket asks for 30 s and the cancel is set while the
+    first answer is made."""
+    cancel = threading.Event()
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.method)
+        cancel.set()
+        return httpx.Response(503, headers={"Retry-After": "30"}, content=b"")
+
+    client = S3Client(
+        BUCKET,
+        config=RemoteConfig(max_concurrency=4, max_retries=3, timeout_s=10),
+        transport=httpx.MockTransport(handler),
+    )
+    obj = S3Object(KEY, 5, "0" * 32, "")
+    started = time.monotonic()
+    with pytest.raises(DownloadCancelled):
+        client.download(KEY, tmp_path / "big", expect=obj, cancel=cancel)
+    # far below the 30 s asked for; the bound only tells a wait that ended from one that did not
+    assert time.monotonic() - started < 15
+    assert asked == ["GET"] and list(tmp_path.iterdir()) == []
 
 
 def test_an_interrupt_during_a_download_passes_and_leaves_no_file(tmp_path: Path) -> None:
