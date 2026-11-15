@@ -89,6 +89,10 @@ class PhaseReport:
     notes: tuple[str, ...] = ()
     """Sentences for the user."""
     seconds: float = 0.0
+    rewritten: int = 0
+    """Of the pack phase: sessions that were written again (their ``session.json`` and the
+    participant's ``stream.json``) while every run of them was current, so that no run counts
+    as done: a run left the session, or its place in the stream moved."""
 
 
 @dataclass(frozen=True)

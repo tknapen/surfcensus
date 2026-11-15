@@ -813,9 +813,13 @@ def _print_pack_report(run: Run, report: PhaseReport) -> None:
     from surfcensus.func.status import unit_names
     from surfcensus.review import pack_line
 
+    again = ""
+    if report.rewritten:
+        noun = "session" if report.rewritten == 1 else "sessions"
+        again = f"; {report.rewritten} {noun} written again"
     typer.echo(
-        f"{report.phase}: {report.done} done, {report.skipped} skipped, {report.failed} failed, "
-        f"{report.seconds:.1f} s"
+        f"{report.phase}: {report.done} done, {report.skipped} skipped, {report.failed} failed"
+        f"{again}, {report.seconds:.1f} s"
     )
     names = unit_names(run.public())
     by_reason: dict[str, list[str]] = {}

@@ -634,6 +634,18 @@ class Route(NamedTuple):
     (``app.queue.has_work_left``), by the one rule of docs/rater_app.md."""
 
 
+NAV_LABELS: dict[str, str] = {
+    "rate": "rating screen",
+    "subjects": "subjects",
+    "review": "review",
+    "epi": "EPI movies",
+}
+"""The one name of each page that the pages link to one another by: the rating screen, the
+subjects page, the review screen and the index of the EPI movies. Every template gets it as
+``nav`` (a global of the template environment), so that a page is called the same on every
+page (review of step 3, F5)."""
+
+
 SUBJECT_ROUTES: tuple[Route, ...] = (
     Route("GET", "/subjects", unblinded=True),
     Route("GET", "/subject/{key}", unblinded=True),

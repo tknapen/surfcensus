@@ -733,6 +733,20 @@ def sessions_pending(run: Run) -> bool:
     return bool(pack_pending(run.context()))
 
 
+def pack_rewrites(run: Run) -> int:
+    """How many functional sessions the pack phase would write again now without packing a
+    run of them (``func.batch.pack_rewrites``): their runs are counted as done by
+    :func:`pack_counts`. 0 where :func:`pack_counts` gives zeros."""
+    from surfcensus.config import epi_settings
+    from surfcensus.func.batch import pack_rewrites as rewrites
+
+    if run.config.mode != "local" or not epi_settings(run.config).enabled:
+        return 0
+    if not run.public().has_func():
+        return 0
+    return rewrites(run.context())
+
+
 def viewable(run: Run) -> int:
     """How many functional runs of the run are packed or can still be packed. With
     :func:`rateable` 0 as well, the run has nothing to show, which is when ``surfcensus
@@ -773,6 +787,14 @@ def pack_line(run: Run, *, behind: bool, after_renders: bool = False) -> str | N
                 f"{RATE_S_PER_VOLUME} s per volume of both streams on {RATE_VOXELS:,} voxels, "
                 "scaled by voxels)"
             )
+    again = pack_rewrites(run)
+    if again:
+        sessions = _plural(again, "session")
+        line += (
+            f"; {sessions} {'is' if again == 1 else 'are'} written again while the app runs"
+            if behind
+            else f"; {sessions} to write again"
+        )
     return line + "."
 
 
@@ -1382,6 +1404,7 @@ def serve_review(
     if app.epi:
         try:
             done, failed, pending = pack_counts(run)
+            again = pack_rewrites(run)
         except Exception:  # as above: the work is saved
             logger.debug("no EPI closing line", exc_info=True)
         else:
@@ -1390,4 +1413,9 @@ def serve_review(
                 line += f", {failed} failed ({retry_hint(run)})"
             if pending:
                 line += f"; {pending} are made at the next call"
+            if again:
+                line += (
+                    f"; {_plural(again, 'session')} {'is' if again == 1 else 'are'} "
+                    "written again at the next call"
+                )
             _say(line + ".")

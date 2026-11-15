@@ -3,8 +3,8 @@
 {% block body %}
 <main id="epi-index" class="epi-index" data-api="{{ api }}" data-state="loading">
   <header class="review-head">
-    <a id="rate-link" href="{{ rate_url }}">rating screen</a>
-    {% if subjects_url is defined %}<a id="subjects-link" href="{{ subjects_url }}">subjects</a>{% endif %}
+    <a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a>
+    {% if subjects_url is defined %}<a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a>{% endif %}
     <h1>EPI movies</h1>
     <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b>, one continuous stream per participant</span>
   </header>

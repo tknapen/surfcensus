@@ -145,7 +145,7 @@ def status_lines(ctx: RunContext) -> list[str]:
     raw data under each session's one registration (decision D36), not faults of the tool.
     Reads the catalog and lists the run directory; writes nothing."""
     from surfcensus.config import epi_settings
-    from surfcensus.func.batch import pack_status
+    from surfcensus.func.batch import pack_rewrites, pack_status
 
     rows = _present(ctx.public)
     if rows is None:
@@ -172,6 +172,9 @@ def status_lines(ctx: RunContext) -> list[str]:
     if epi_settings(ctx.config).enabled:
         done, failed, pending = pack_status(ctx)
         second = f"pack: {done} done, {failed} failed, {pending} pending"
+        rewrites = pack_rewrites(ctx)
+        if rewrites:
+            second += f"; {_plural(rewrites, 'session')} to write again"
         if failed:
             second += f" (tried again with: surfcensus pack --run-dir {ctx.run_dir} --retry-failed)"
     else:

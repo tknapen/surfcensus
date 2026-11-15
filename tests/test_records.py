@@ -128,7 +128,7 @@ def test_provenance_is_what_the_inventory_stores_and_is_re_exported() -> None:
 
 def test_a_phase_report_counts_units_and_names_failures() -> None:
     report = PhaseReport("render", done=2, skipped=5, failed=1, failures=(("ab" * 8, "x"),))
-    assert report.notes == () and report.seconds == 0.0
+    assert report.notes == () and report.seconds == 0.0 and report.rewritten == 0
     assert names(PhaseReport) == [
         "phase",
         "done",
@@ -137,6 +137,8 @@ def test_a_phase_report_counts_units_and_names_failures() -> None:
         "failures",
         "notes",
         "seconds",
+        # sessions of the pack phase written again with every run current (review of step 3)
+        "rewritten",
     ]
 
 

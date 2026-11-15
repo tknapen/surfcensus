@@ -187,13 +187,16 @@ def test_from_the_rating_screen_to_a_run_of_the_subject_and_back_with_the_draft_
 
     target = epi_run.runs[session][1]  # not the first run of the stream
     page.click(f"tr[data-run='{target}'] a")
-    page.wait_for_url(f"{server.url}epi/{FULL}#run={target}")
+    page.wait_for_url(f"{server.url}epi/{FULL}#run={target}&subject={uid}")
     page.wait_for_function("() => window.__epi && window.__epi.shown", timeout=20000)
     assert page.evaluate("window.__epi.page.startRun") == target
     assert run_on_screen(tab) == target
     assert page.evaluate("window.__epi.state.g") > 0
     assert "not in the stream" not in page.evaluate("window.__epi.texts().status")
     assert page.is_visible("#subjects-link")
+    # a link back to the subject page the run link came from (review of step 3, F5)
+    back = page.locator("#subject-back")
+    assert back.is_visible() and back.get_attribute("href") == f"/subject/{uid}"
     no_horizontal_scroll(tab)
     tab.shot("epi_at_run")
 
@@ -204,6 +207,18 @@ def test_from_the_rating_screen_to_a_run_of_the_subject_and_back_with_the_draft_
     labels = ("sub-000", "sub-001", "sub-002")
     assert keys == [*(small_run_uids[label] for label in labels), FULL, HALF]
     assert page.is_visible("#subjects-packing")  # HALF still waits for packs
+    # each count under its heading, as the API gives it (review of step 3, F4)
+    answer = page.evaluate("fetch('/api/subjects').then((r) => r.json())")
+    fields = {"packed": "n_packed", "waiting": "n_pending", "failed": "n_failed"}
+    headings = page.eval_on_selector_all("#subject-rows thead th", "h => h.map((e) => e.innerText)")
+    for row in answer["subjects"]:
+        cells = page.eval_on_selector_all(
+            f"#subject-rows tr[data-key='{row['key']}'] td", "c => c.map((e) => e.innerText)"
+        )
+        for heading, field in fields.items():
+            assert cells[headings.index(heading)] == str(row[field]), (row["key"], heading)
+    half = next(r for r in answer["subjects"] if r["key"] == HALF)
+    assert half["n_pending"] != half["n_failed"]
     no_horizontal_scroll(tab)
     tab.shot("subjects")
 
@@ -225,6 +240,9 @@ def test_from_the_review_screen_to_a_subject_page_and_back_to_its_review(
     page.wait_for_selector("#review[data-state='open']")
     uid = small_run_uids["sub-001"]
     assert page.is_visible("#subjects-link")
+    # and the EPI movies, as every other page links to them (review of step 3, F5)
+    assert page.locator("#epi-index-link").is_visible()
+    assert page.locator("#epi-index-link").get_attribute("href") == "/epi"
     cell = page.locator(f"#subjects tbody tr[data-subject-uid='{uid}'] a")
     assert cell.inner_text() == "1"
     cell.click()
@@ -269,6 +287,7 @@ def test_the_epi_page_asked_for_a_run_that_is_not_in_its_stream_starts_at_the_be
     page.goto(f"{server.url}epi/{FULL}#run={'0' * 16}")
     page.wait_for_function("() => window.__epi && window.__epi.shown", timeout=20000)
     assert page.evaluate("window.__epi.page.startRun") is None
+    assert not page.is_visible("#subject-back")  # opened without a subject page behind it
     assert page.evaluate("window.__epi.state.g") == 0
     page.wait_for_function(
         "() => window.__epi.texts().status.includes('the run asked for is not in the stream now')"

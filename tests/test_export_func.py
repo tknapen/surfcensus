@@ -265,6 +265,11 @@ def test_a_failed_pack_is_a_row_with_its_reason(
     assert failed["packed_at"].iloc[0] == "" and failed["pack_bytes"].iloc[0] == ""
     sessions = read(out, "func_sessions").set_index("session_uid")
     assert sessions.loc[failed["session_uid"].iloc[0], "n_failed"] == "1"
+    # the failed run is not also waiting, and the others of its session are packed (F4)
+    mine = runs[runs["session_uid"] == failed["session_uid"].iloc[0]]
+    row = sessions.loc[failed["session_uid"].iloc[0]]
+    assert row["n_pending"] == "0"
+    assert row["n_packed"] == str(int((mine["pack_state"] == "packed").sum())) != "0"
 
 
 def test_a_later_export_with_the_interface_off_removes_the_functional_files(

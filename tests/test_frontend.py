@@ -35,7 +35,7 @@ from pydantic import BaseModel
 from surfcensus import protocol as protocol_module
 from surfcensus import schemas as table_schemas
 from surfcensus.app import epi_schemas, schemas
-from surfcensus.func.model import CorrectionsInfo, StatementInfo
+from surfcensus.func.model import READING, STREAMS, CorrectionsInfo, StatementInfo
 from surfcensus.protocol import Criterion, Protocol, ScaleLevel
 from surfcensus.render import geometry
 from surfcensus.render.model import (
@@ -668,6 +668,7 @@ def pages() -> dict[str, str]:
         undefined=jinja2.StrictUndefined,
         autoescape=True,
     )
+    environment.globals["nav"] = schemas.NAV_LABELS
     # the three variables the server gives a page, and nothing else
     return {
         route: environment.get_template(name).render(
@@ -726,6 +727,7 @@ def subject_pages() -> dict[str, str]:
         undefined=jinja2.StrictUndefined,
         autoescape=True,
     )
+    environment.globals["nav"] = schemas.NAV_LABELS
     common = {
         "static": STATIC_URL,
         "version": "1.2.3",
@@ -735,6 +737,7 @@ def subject_pages() -> dict[str, str]:
         "review_url": "/review",
         "epi_index_url": "/epi",
         "subjects_url": "/subjects",
+        "streams": STREAMS,
     }
     return {
         "list": environment.get_template("subjects.html").render(api="/api/subjects", **common),
@@ -806,6 +809,7 @@ def test_the_subjects_script_reads_the_fields_of_the_subject_shapes() -> None:
             "label",
             "participant",
             "stream_order",
+            "stream_sessions",
             "stream_rule",
             "anchor_name",
             "anchor_rule",
@@ -2258,3 +2262,136 @@ def test_the_subject_page_says_an_anchor_waits_for_its_pack_while_it_is_pending(
         " (not packed: its registration places the raw stream all the same)",
         " (not packed: its registration places the raw stream all the same)",
     ]
+
+
+NAV_IDS = {
+    "rate-link": "rate",
+    "subjects-link": "subjects",
+    "review-link": "review",
+    "epi-index-link": "epi",
+    "index-link": "epi",
+    "epi-link": "epi",
+}
+"""The id of a link between pages, and the page it names (``schemas.NAV_LABELS``)."""
+
+
+def test_every_page_names_the_other_pages_from_one_list() -> None:
+    """The review of step 3 (F5) found the rating screen called "rating" on one page and
+    "rating screen" on the others, and the subjects page "all subjects", "subjects" and
+    "Subjects". Every link between pages takes its words from ``schemas.NAV_LABELS``."""
+    assert set(schemas.NAV_LABELS) == {"rate", "subjects", "review", "epi"}
+    assert len(set(schemas.NAV_LABELS.values())) == len(schemas.NAV_LABELS)
+    seen = set()
+    for template in sorted(TEMPLATES_DIR.glob("*.html")):
+        text = template.read_text(encoding="utf-8")
+        for found in re.finditer(r'<a id="([a-z-]+-link)"[^>]*>([^<]*)</a>', text):
+            link, words = found.groups()
+            if link not in NAV_IDS:
+                continue
+            seen.add(link)
+            assert words == f"{{{{ nav.{NAV_IDS[link]} }}}}", (template.name, link, words)
+    assert seen == set(NAV_IDS)
+    # the scripts add no such link with words of their own
+    for name, source in js_sources().items():
+        for words in schemas.NAV_LABELS.values():
+            assert f'html("a", "", "{words}")' not in source, (name, words)
+
+
+def test_the_subject_pages_say_of_the_raw_stream_what_the_epi_page_says(
+    subject_pages: dict[str, str],
+) -> None:
+    """They said "nothing done to it but one rigid placement per session", where the EPI page
+    says that the raw series is resampled once, by cubic interpolation, which smooths
+    single-volume detail (review of step 3, F5): both now take the words of one constant."""
+    assert READING.startswith(STREAMS)
+    assert "cubic interpolation" in STREAMS and "smooths single-volume detail" in STREAMS
+    for text in subject_pages.values():
+        assert STREAMS.replace("'", "&#39;") in text
+        assert "nothing done to it but one rigid placement" not in text
+        assert "acquisition</b> and of the <b>processing" not in text
+
+
+@needs_node
+def test_the_subject_page_says_the_corrections_once_for_a_session_and_the_differences_per_run(
+    js_copy: Path,
+) -> None:
+    """A subject with ten runs repeated four lines of corrections in every run (review of step
+    3, F5): what every run of a session has is said once, each line with its source."""
+    said = {"state": "applied", "source": "summary_report", "note": None}
+
+    def corrections(sdc: str | None) -> dict[str, Any]:
+        return {
+            "motion": {**said, "words": None},
+            "sdc": (
+                {**said, "words": sdc} if sdc else {**said, "state": "not applied", "words": "None"}
+            ),
+            "sdc_method": sdc,
+            "slice_timing": {**said, "state": "not applied", "words": "Not applied"},
+            "registration": {**said, "words": "bbregister"},
+            "dof": 6,
+            "sdc_figure_listed": False,
+        }
+
+    same = {"corrections": corrections(None), "rigid": True}
+    other = {"corrections": corrections("FLB"), "rigid": False}
+    out = run_js(
+        js_copy,
+        """
+        import { sharedCorrections, runLink } from "./js/subjects.js";
+        output({
+          three: sharedCorrections([input.same, input.same, input.other]),
+          one: sharedCorrections([input.other]),
+          link: runLink("/epi/abc#run=def", "0123456789abcdef"),
+        });
+        """,
+        {"same": same, "other": other},
+    )
+    assert out["three"]["common"] == [
+        "head-motion correction (summary report)",
+        'no slice-timing correction (summary report: "Not applied")',
+        "registration bbregister, 6 dof (summary report)",
+    ]
+    assert out["three"]["own"] == [
+        ['no distortion correction (summary report: "None")'],
+        ['no distortion correction (summary report: "None")'],
+        [
+            'distortion correction, FLB (summary report: "FLB")',
+            "affine registration, not rigid: used as stored",
+        ],
+    ]
+    assert out["one"]["common"] == [] and len(out["one"]["own"][0]) == 5
+    assert out["link"] == "/epi/abc#run=def&subject=0123456789abcdef"
+
+
+@needs_node
+def test_the_list_of_subjects_puts_each_count_under_its_heading(js_copy: Path) -> None:
+    """A broken copy with the columns waiting and failed swapped passed every test (review of
+    step 3, F4): the headings of the table and the fields drawn under them are read together."""
+    out = run_js(
+        js_copy,
+        """
+        import { LIST_COLUMNS, flaggedRuns } from "./js/subjects.js";
+        output({ columns: LIST_COLUMNS, flagged: flaggedRuns(input).map((r) => r.run_uid) });
+        """,
+        {
+            "runs": [
+                # the flag of the catalog decides, whatever the displacement (a session's
+                # limit need not be 10 mm)
+                {"run_uid": "a", "frame": {"max_mm": 3.0, "flagged": True}},
+                {"run_uid": "b", "frame": {"max_mm": 12.0, "flagged": False}},
+                {"run_uid": "c", "frame": None},
+            ]
+        },
+    )
+    assert out["flagged"] == ["a"]
+    template = (TEMPLATES_DIR / "subjects.html").read_text(encoding="utf-8")
+    head = re.findall(r'<th scope="col">([^<]+)</th>', template)
+    assert head[3:-1] == [heading for heading, _ in out["columns"]]
+    assert dict(out["columns"]) == {
+        "sessions": "n_sessions",
+        "runs": "n_runs",
+        "packed": "n_packed",
+        "waiting": "n_pending",
+        "failed": "n_failed",
+        "flagged": "n_flagged",
+    }

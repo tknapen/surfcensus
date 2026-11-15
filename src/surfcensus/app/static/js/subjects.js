@@ -114,6 +114,24 @@ export function correctionLines(corrections) {
   return lines;
 }
 
+// What the pipeline applied to each run, as the page lists it: the lines of correctionLines,
+// and a line for a registration that is not rigid.
+function runCorrections(funcRun) {
+  const lines = correctionLines(funcRun.corrections);
+  if (funcRun.rigid === false) lines.push("affine registration, not rigid: used as stored");
+  return lines;
+}
+
+// The corrections of a session's runs, said once for the session where every run has them:
+// `common` are the lines of every run (each with its source), `own` the other lines of each
+// run, in the order of `runs`. A session of one run says them for the run.
+export function sharedCorrections(runs) {
+  const lines = runs.map(runCorrections);
+  if (runs.length < 2) return { common: [], own: lines };
+  const common = lines[0].filter((line) => lines.every((other) => other.includes(line)));
+  return { common, own: lines.map((own) => own.filter((line) => !common.includes(line))) };
+}
+
 export function frameText(funcFrame, limit) {
   if (!funcFrame) return "not checked";
   const text = `${funcFrame.max_mm.toFixed(2)} mm at most, ${funcFrame.mean_mm.toFixed(2)} mean`;
@@ -155,6 +173,16 @@ function say(text) {
 
 // --- the list ---------------------------------------------------------------------------
 
+// The counts of a row of the list, by the heading of their column (templates/subjects.html).
+export const LIST_COLUMNS = [
+  ["sessions", "n_sessions"],
+  ["runs", "n_runs"],
+  ["packed", "n_packed"],
+  ["waiting", "n_pending"],
+  ["failed", "n_failed"],
+  ["flagged", "n_flagged"],
+];
+
 function drawList(listing) {
   const body = byId("subject-rows").tBodies[0];
   const lines = listing.subjects.map((subjectRow) => {
@@ -164,12 +192,10 @@ function drawList(listing) {
     cell(line, link(subjectRow.url, subjectRow.label || subjectRow.key));
     cell(line, subjectRow.dataset);
     cell(line, surfaceText(subjectRow), `surface-${subjectRow.surface.replace(/ /g, "-")}`);
-    cell(line, String(subjectRow.n_sessions));
-    cell(line, String(subjectRow.n_runs));
-    cell(line, String(subjectRow.n_packed));
-    cell(line, String(subjectRow.n_pending));
-    cell(line, String(subjectRow.n_failed));
-    cell(line, String(subjectRow.n_flagged), subjectRow.n_flagged ? "flagged" : "");
+    for (const [heading, field] of LIST_COLUMNS) {
+      const flagged = heading === "flagged" && subjectRow[field] ? "flagged" : "";
+      cell(line, String(subjectRow[field]), flagged).dataset.column = heading;
+    }
     cell(line, subjectRow.epi_url ? link(subjectRow.epi_url, "open the stream") : "no functional runs");
     return line;
   });
@@ -220,11 +246,29 @@ export function anchorSuffix(funcSession) {
   return " (not packed: its registration places the raw stream all the same)";
 }
 
-function sessionFacts(funcSession, nSessions) {
+// The place of a session in its participant's stream. The stream counts every present
+// session of the participant (stream_sessions); a page can hold only some of them, when some
+// sessions use a session-wise FreeSurfer subject (sub-X_ses-Y) and the others sub-X.
+export function streamPlace(funcSession, onPage) {
+  const total = funcSession.stream_sessions;
+  const order = `sessions ordered ${STREAM_RULE_TEXT[funcSession.stream_rule] || funcSession.stream_rule}`;
+  if (total <= 1) return `the only session; ${order}`;
+  const place = `session ${funcSession.stream_order + 1} of ${total}`;
+  if (onPage >= total) return `${place}; ${order}`;
+  const here = `${onPage} of them ${onPage === 1 ? "is" : "are"} on this page`;
+  return `${place} in this participant's stream; ${here}; ${order}`;
+}
+
+// The runs of a session that the frame check flagged, as the catalog records it (the flag of
+// the run, under the session's own limit, not a limit of the page).
+export function flaggedRuns(funcSession) {
+  return funcSession.runs.filter((funcRun) => Boolean(funcRun.frame && funcRun.frame.flagged));
+}
+
+function sessionFacts(funcSession, onPage, common) {
   const facts = html("dl", "session-facts");
   const fact = (term, text) => facts.append(html("dt", "", term), html("dd", "", text));
-  const place = nSessions > 1 ? `${funcSession.stream_order + 1} of ${nSessions} sessions, ` : "";
-  fact("in the stream", `${place}sessions ordered ${STREAM_RULE_TEXT[funcSession.stream_rule] || funcSession.stream_rule}`);
+  fact("in the stream", streamPlace(funcSession, onPage));
   if (funcSession.fs_subject) fact("FreeSurfer subject", funcSession.fs_subject);
   const anchorName = funcSession.anchor_name || funcSession.anchor_run_uid;
   let anchorText = anchorName ? `${anchorName}${anchorSuffix(funcSession)}` : "none";
@@ -235,7 +279,7 @@ function sessionFacts(funcSession, nSessions) {
     "registration",
     "one rigid placement of the raw data for the whole session, that of the anchor run's stored registration",
   );
-  const flagged = funcSession.runs.filter((funcRun) => funcRun.frame && funcRun.frame.flagged);
+  const flagged = flaggedRuns(funcSession);
   const checks = [];
   if (flagged.length) {
     checks.push(
@@ -253,12 +297,25 @@ function sessionFacts(funcSession, nSessions) {
     checks.push("a shared frame of the runs is not plausible");
   }
   fact("frame check", `${checks.join("; ")}.`);
+  if (common.length) {
+    const list = html("ul", "corrections");
+    for (const text of common) list.append(html("li", "", text));
+    const dd = html("dd");
+    dd.append(list);
+    facts.append(html("dt", "", "preprocessing applied to every run"), dd);
+  }
   if (funcSession.problem) fact("problem", funcSession.problem);
   if (!funcSession.shown) fact("stream", "not in the stream yet: no session.json of it in the run directory");
   return facts;
 }
 
-function runTable(funcSession) {
+// The address of the EPI page at a run, with the subject page it is opened from, so that the
+// EPI page can link back to it (#run=<run_uid>&subject=<key>).
+export function runLink(epiUrl, key) {
+  return `${epiUrl}&subject=${encodeURIComponent(key)}`;
+}
+
+function runTable(funcSession, key, own) {
   const table = html("table", "subjects runs");
   const head = html("tr");
   for (const name of ["#", "run", "state", "volumes", "TR", "displacement under the session's registration", "raw affine", "preprocessing applied"]) {
@@ -268,7 +325,7 @@ function runTable(funcSession) {
   }
   table.createTHead().append(head);
   const body = table.createTBody();
-  funcSession.runs.forEach((funcRun) => {
+  funcSession.runs.forEach((funcRun, at) => {
     const line = html("tr");
     line.dataset.run = funcRun.run_uid;
     line.dataset.state = funcRun.state;
@@ -276,7 +333,7 @@ function runTable(funcSession) {
     const name = cell(line, html("span", "run-name", funcRun.name || funcRun.run_uid), "run-cell");
     if (funcRun.anchor) name.append(html("span", "anchor-badge", "anchor"));
     if (funcRun.epi_url) {
-      name.append(html("br"), link(funcRun.epi_url, "open the EPI page at this run", "run-link"));
+      name.append(html("br"), link(runLink(funcRun.epi_url, key), "open the EPI page at this run", "run-link"));
     } else if (funcRun.state === "packed") {
       name.append(html("br"), html("span", "hint", "not in the stream yet"));
     }
@@ -287,8 +344,10 @@ function runTable(funcSession) {
     cell(line, frameText(funcRun.frame, funcSession.frame_limit_mm), funcRun.frame && funcRun.frame.flagged ? "flagged wrap" : "wrap");
     cell(line, funcRun.raw_affine ? AFFINE_TEXT[funcRun.raw_affine] || funcRun.raw_affine : "", funcRun.raw_affine === "header, unchecked" ? "flagged wrap" : "wrap");
     const list = html("ul", "corrections");
-    for (const text of correctionLines(funcRun.corrections)) list.append(html("li", "", text));
-    if (funcRun.rigid === false) list.append(html("li", "flagged", "affine registration, not rigid: used as stored"));
+    for (const text of own[at]) {
+      list.append(html("li", text.startsWith("affine registration, not rigid") ? "flagged" : "", text));
+    }
+    if (!own[at].length) list.append(html("li", "hint", "as for every run of the session (above)"));
     cell(line, list, "wrap corrections-cell");
     body.append(line);
   });
@@ -308,8 +367,9 @@ function drawPage(subjectPage) {
     section.dataset.session = funcSession.session_uid;
     const title = html("h2", "", sessionName(funcSession));
     if (funcSession.participant) title.append(html("span", "session-of", ` ${funcSession.participant}`));
-    section.append(title, sessionFacts(funcSession, counts[funcSession.participant_uid]));
-    if (funcSession.runs.length) section.append(runTable(funcSession));
+    const shared = sharedCorrections(funcSession.runs);
+    section.append(title, sessionFacts(funcSession, counts[funcSession.participant_uid], shared.common));
+    if (funcSession.runs.length) section.append(runTable(funcSession, subjectPage.subject.key, shared.own));
     else section.append(html("p", "hint", "No functional run is listed in this session."));
     return section;
   });

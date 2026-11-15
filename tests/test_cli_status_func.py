@@ -97,3 +97,52 @@ def test_export_writes_the_two_functional_tables_and_says_so_in_the_manifest(
     manifest = json.loads((out / "manifest.json").read_text())
     assert set(manifest["epi"]) == {"config_hashes", "sources"}
     assert len((out / "func_runs.csv").read_text().splitlines()) == 1 + 19
+
+
+@pytest.mark.parametrize("how", ["no longer reads", "truncated"])
+def test_a_failed_pack_keeps_its_detail_for_status_and_the_subject_page(
+    folder: SyntheticFuncDataset, inventoried: Path, how: str
+) -> None:
+    """A preprocessed series that no longer reads at the pack (the same size and time as at the
+    inventory, so the listing does not change) was stored with no detail: the lease lists such
+    a run as ``pack failure`` with the reason in its plan, and the worker kept only the runs
+    its plan still calls packable (seen in passing by the review of step 3). A series cut in
+    half and inventoried again kept its detail already; both are checked."""
+    import os
+    import sqlite3
+
+    from fastapi.testclient import TestClient
+
+    from surfcensus.app.server import create_app
+
+    (series,) = (folder.deriv_root / "sub-02" / "func").glob(
+        "*task-nback_run-2_space-T1w_desc-preproc_bold.nii.gz"
+    )
+    data, stat = series.read_bytes(), series.stat()
+    if how == "truncated":
+        series.write_bytes(data[: len(data) // 2])
+        assert cli("inventory", "--run-dir", inventoried).exit_code == 0
+    else:
+        series.write_bytes(bytes(b ^ 0x5A for b in data))
+        os.utime(series, ns=(stat.st_atime_ns, stat.st_mtime_ns))
+    assert cli("pack", "--run-dir", inventoried).exit_code == 1
+    with sqlite3.connect(inventoried / "catalog.sqlite") as db:
+        ((reason, detail),) = db.execute("SELECT reason, detail FROM packs WHERE status = 'failed'")
+    assert reason == "pack failure"
+    assert detail and (series.name in detail or "pre_bold" in detail), detail
+    assert str(folder.raw_root) not in detail and "/tmp" not in detail
+    result = cli("status", "--run-dir", inventoried, "--failures")
+    (line,) = [row for row in result.output.splitlines() if row.startswith("pack ")]
+    assert line.endswith(f"(sub-02 task-nback_run-2): pack failure: {detail}"), line
+    with TestClient(create_app(inventoried), base_url="http://127.0.0.1") as client:
+        rows = client.get("/api/subjects").json()["subjects"]
+        runs = [
+            run
+            for row in rows
+            for session in client.get(f"/api/subjects/{row['key']}").json()["sessions"]
+            for run in session["runs"]
+            if run["state"] == "failed"
+        ]
+    assert [(r["name"], r["reason"], r["detail"]) for r in runs] == [
+        ("task-nback_run-2", "pack failure", detail)
+    ]

@@ -356,6 +356,10 @@ class FuncSessionOut(_Shape):
     """The ``ses-`` label without ``ses-``; empty for a participant without sessions."""
     stream_order: int = Field(ge=0)
     """The place of the session in its participant's stream (``func_sessions.stream_order``)."""
+    stream_sessions: int = Field(ge=1)
+    """How many present sessions the participant's stream has, on this page or not: a
+    participant whose sessions use a session-wise FreeSurfer subject (``sub-X_ses-Y``) for
+    some and ``sub-X`` for others has them on two rows of the subjects page."""
     stream_rule: StreamRule
     """How the participant's sessions were put in that order (decision D42)."""
     subject_uid: str | None

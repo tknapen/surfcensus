@@ -1253,6 +1253,14 @@ async function start() {
   } else {
     page.startRun = asked;
   }
+  // the subject page a run link came from (#run=<run_uid>&subject=<key>, added by that page),
+  // as a link back; in a run directory only (the pack-only page has no such link)
+  const back = $('subject-back');
+  const from = new URLSearchParams(window.location.hash.slice(1)).get('subject');
+  if (back && from && /^[0-9a-f]{16}$/.test(from)) {
+    back.href = `/subject/${from}`;
+    back.hidden = false;
+  }
   state.g = segment(k0).first;
   const first = gridOf(k0);
   state.slices = first.shape.map((n) => Math.floor(n / 2));

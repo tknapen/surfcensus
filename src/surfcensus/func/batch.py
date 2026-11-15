@@ -438,6 +438,23 @@ def _counts(planned: _Planned) -> tuple[int, int, int]:
     return done, failed, len(runs) - done - failed
 
 
+def _rewrites(planned: _Planned) -> int:
+    """Pending sessions in which no run counts as pending: every run is current or failed and
+    not tried again, so the call writes the session again (a run left it, or its place in the
+    stream moved) and packs nothing."""
+    plan, cat = planned.plan, planned.catalog
+    return sum(
+        all(run in planned.current or run in plan.failed for run in cat.sessions[uid].runs)
+        for uid in plan.pending
+    )
+
+
+def pack_rewrites(ctx: RunContext) -> int:
+    """How many sessions :func:`run_pack` would write again now without packing a run of
+    them; :func:`pack_status`, which counts runs, does not see them."""
+    return _rewrites(_plan(ctx, sessions=None, force=False, retry_failed=False))
+
+
 def pack_status(ctx: RunContext) -> tuple[int, int, int]:
     """Packable runs that are packed, failed and pending now, for ``surfcensus status``: what
     :func:`run_pack` would find."""
@@ -612,6 +629,12 @@ def pack_session_unit(
     failures: dict[str, tuple[str, str | None]] = {}
     for item in info.runs:
         if item.run not in packable:
+            # a run that the inventory found packable and the lease no longer can (a file of
+            # it that no longer reads): the parent records it as failed with this reason and
+            # detail, which were lost before (review of step 3); the parent takes only the
+            # runs it tried
+            if item.reason is not None:
+                failures[item.run] = (item.reason, item.detail)
             continue
         if item.reason is None:
             pack = read_pack(session_dir, item.run)
@@ -924,6 +947,8 @@ def run_pack(
     touched: set[str] = set()
     processed: set[str] = set()
     # sessions whose pack_session ran to its end in this call
+    rewritten = 0
+    # of those, sessions in which every run tried was kept: written again, nothing packed
 
     def failed_row(session_uid: str, run: str, reason: str, detail: str | None) -> PackRow:
         return PackRow(
@@ -937,7 +962,7 @@ def run_pack(
         )
 
     def commit(outcomes: Sequence[tuple[str, SessionResult | BaseException]]) -> None:
-        nonlocal done, skipped
+        nonlocal done, skipped, rewritten
         unwritable = [
             o for _, o in outcomes if isinstance(o, OSError) and _is_unwritable(o, epi_root)
         ]
@@ -975,6 +1000,8 @@ def run_pack(
             processed.add(uid)
             _store_digests(ctx, cat, uid, outcome.packs)
             kept = set(outcome.kept)
+            if all(run in kept for run in tried):
+                rewritten += 1
             for run in tried:
                 if run in kept:
                     skipped += 1
@@ -1073,4 +1100,5 @@ def run_pack(
         failed=len(failures),
         failures=tuple(sorted(failures.items())),
         seconds=time.perf_counter() - started,
+        rewritten=rewritten,
     )

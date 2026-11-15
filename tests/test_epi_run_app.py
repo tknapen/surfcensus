@@ -193,6 +193,14 @@ def without_epi_answers(client: TestClient, run_dir: Path, sessions: tuple[str, 
             answer = client.get(path, headers=headers)
             no_route(answer)
             assert answer.headers["cache-control"] == unknown.headers["cache-control"]
+        # every other method as on a path that is no route (review of step 3, F3)
+        for method in ("POST", "HEAD", "OPTIONS", "PUT", "DELETE"):
+            body = {"json": {}} if method in ("POST", "PUT") else {}
+            assert client.request(method, "/no-such-route", **body).status_code == 404
+            answer = client.request(method, path, **body)
+            assert answer.status_code == 404, (method, path)
+            if method != "HEAD":
+                assert answer.json() == NO_ROUTE
     assert client.get("/api/session").json()["epi_url"] is None
 
 
@@ -370,7 +378,7 @@ def test_the_page_of_a_participant_plays_its_stream_from_the_run(
     assert 'data-poll="30"' in page and 'data-waiting="false"' in page
     assert 'data-poll-waiting="5" data-poll-idle="30"' in page
     assert f'data-index-api="/api/epi" data-participant="{FULL}"' in page
-    assert '<a id="index-link" href="/epi">all participants</a>' in page
+    assert '<a id="index-link" href="/epi">EPI movies</a>' in page
     assert '<a id="rate-link" href="/">rating screen</a>' in page
     assert '<span id="packing" class="epi-packing" data-waiting="false">' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)

@@ -222,14 +222,15 @@ class ReviewPage {
     return cell;
   }
 
-  // In a run with functional data, one link in the header to the subject pages.
+  // In a run with functional data, the links in the header to the subject pages and to the
+  // EPI movies, which the page holds hidden with the names of the other pages.
   subjectsLink() {
     if (this.subjectsLinked || !this.review.columns.includes("func_sessions")) return;
     this.subjectsLinked = true;
-    const target = html("a", "", "subjects");
-    target.id = "subjects-link";
-    target.href = api.routePath("subjectsPage");
-    byId("rate-link").after(target);
+    byId("subjects-link").href = api.routePath("subjectsPage");
+    byId("epi-index-link").href = api.routePath("epiPage");
+    byId("subjects-link").hidden = false;
+    byId("epi-index-link").hidden = false;
   }
 
   // The subject named by the address (`#subject=<uid>`, the link of a subject page), opened

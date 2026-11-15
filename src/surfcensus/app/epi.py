@@ -44,7 +44,6 @@ from typing import Any, TypeVar
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
-from jinja2 import Environment, FileSystemLoader, StrictUndefined
 from pydantic import BaseModel
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
@@ -59,12 +58,12 @@ from surfcensus.app.server import (
     NO_STORE,
     STATIC_DIR,
     STATIC_URL,
-    TEMPLATES_DIR,
     ServerHandle,
     _errors,
     _Guard,
     _listen,
     _security_headers,
+    page_environment,
 )
 from surfcensus.config import ConfigError
 from surfcensus.func import (
@@ -454,9 +453,7 @@ def create_epi_app(
             "missing", f"{Path(out_dir) / STREAM_JSON} is not there or is not one of this version"
         )
     version = surfcensus.__version__
-    pages = Environment(
-        loader=FileSystemLoader(TEMPLATES_DIR), undefined=StrictUndefined, autoescape=True
-    )
+    pages = page_environment()
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False)
     hosts = frozenset(LOCAL_HOSTS if allowed_hosts is None else allowed_hosts)
     app.add_middleware(_Guard, allowed_hosts=hosts, headers=_security_headers(None))

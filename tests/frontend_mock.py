@@ -168,6 +168,7 @@ class _Mock:
         self.pages = Environment(
             loader=FileSystemLoader(TEMPLATES_DIR), undefined=StrictUndefined, autoescape=True
         )
+        self.pages.globals["nav"] = schemas.NAV_LABELS
 
     # --- the queue ------------------------------------------------------------------------
 

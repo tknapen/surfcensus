@@ -272,3 +272,42 @@ def test_runs_left_out_by_epi_runs_are_a_reason_and_no_failure(inventoried: Path
     assert int(found.group(1)) < 11
     rows = named_failures(inventoried)
     assert not [row for row in rows if row[2] == "not selected"]
+
+
+def test_a_session_to_write_again_is_said_by_status_and_counted_by_pack(
+    folder: SyntheticFuncDataset, packed: Path
+) -> None:
+    """A packed run that leaves the data: its session is written again (session.json without
+    the run) although every run left is current. status said "0 pending" and pack "0 done"
+    for that work (review of step 3, F6)."""
+    gone = [
+        path
+        for root in (folder.raw_root / "sub-01", folder.deriv_root / "sub-01")
+        for path in root.rglob("*ses-1_task-rest_run-3_*")
+    ]
+    assert gone
+    for path in gone:
+        path.unlink()
+    assert cli("inventory", "--run-dir", packed).exit_code == 0
+    # the run that left is no longer counted, although its rows wait for the pack (F4)
+    assert lines(packed)[0].startswith(
+        "func_inventory: 3 sessions of 2 participants, 18 runs: 10 can be packed, 8 cannot"
+    )
+    second = lines(packed)[1]
+    assert second == "pack: 10 done, 0 failed, 0 pending; 1 session to write again"
+    assert second.startswith(status.STATUS_PREFIXES[1])
+    from surfcensus.review import pack_line
+
+    with Run(packed, migrate=False) as run:
+        assert pack_line(run, behind=True) == (
+            "EPI packs: 10 of 10 runs made; 1 session is written again while the app runs."
+        )
+        assert pack_line(run, behind=False) == (
+            "EPI packs: 10 of 10 runs made; 1 session to write again."
+        )
+    result = cli("pack", "--run-dir", packed)
+    assert result.exit_code == 0, result.output
+    assert re.match(
+        r"pack: 0 done, 10 skipped, 0 failed; 1 session written again, \d+\.\d s", result.output
+    ), result.output
+    assert lines(packed)[1] == "pack: 10 done, 0 failed, 0 pending"

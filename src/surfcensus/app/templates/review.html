@@ -3,7 +3,9 @@
 {% block body %}
 <main id="review" class="review" data-state="loading">
   <header class="review-head">
-    <a id="rate-link" href="/">rating</a>
+    <a id="rate-link" href="/">{{ nav.rate }}</a>
+    <a id="subjects-link" href="/subjects" hidden>{{ nav.subjects }}</a>
+    <a id="epi-index-link" href="/epi" hidden>{{ nav.epi }}</a>
     <h1>Review</h1>
     <form id="filter-form" class="filter-form">
       <input id="filter" type="text" autocomplete="off" spellcheck="false"

@@ -41,6 +41,7 @@ from surfcensus.app.server import create_app
 from surfcensus.config import EpiConfig, load_config, with_changes, write_config
 from surfcensus.func.batch import recorded_states
 from surfcensus.func.model import corrections_info
+from surfcensus.records import PackRow
 from surfcensus.store import EPI_DIR, PublicCatalog
 
 BASE = "http://127.0.0.1"
@@ -212,7 +213,21 @@ def no_route(client: TestClient, key: str) -> None:
             assert answer.status_code == 404, path
             assert answer.json() == NO_ROUTE
             assert answer.headers["cache-control"] == unknown.headers["cache-control"]
+        other_methods_as_no_route(client, path)
     assert client.get("/api/session").json()["epi_url"] is None
+
+
+def other_methods_as_no_route(client: TestClient, path: str) -> None:
+    """POST, HEAD, OPTIONS, PUT and DELETE answer as on a path that is no route (they gave
+    405 "the route does not take that method": review of step 3, F3)."""
+    for method in ("POST", "HEAD", "OPTIONS", "PUT", "DELETE"):
+        body = {"json": {}} if method in ("POST", "PUT") else {}
+        unknown = client.request(method, "/no-such-route", **body)
+        answer = client.request(method, path, **body)
+        assert unknown.status_code == 404
+        assert answer.status_code == 404, (method, path)
+        if method != "HEAD":
+            assert answer.json() == unknown.json() == NO_ROUTE, (method, path)
 
 
 def test_a_census_run_answers_the_subject_routes_as_no_route(
@@ -398,6 +413,8 @@ def test_the_page_of_a_subject_has_every_session_and_run_with_what_the_catalog_s
     assert listed["session_uid"] == session["session_uid"] == epi_run.sessions[FULL][0]
     assert listed["participant"] == LABELS[FULL] and listed["participant_uid"] == FULL
     assert listed["stream_rule"] == "session label" and listed["stream_order"] == 0
+    # FULL has its second session on a row of its own: the stream still has two (F1)
+    assert listed["stream_sessions"] == len(epi_run.sessions[FULL]) == 2
     assert listed["shown"] is True
     runs = runs_of[session["session_uid"]]
     assert [r["run_uid"] for r in listed["runs"]] == [
@@ -601,3 +618,105 @@ def test_nothing_is_written_into_the_packs_or_the_catalog_by_the_pages(
     after = {p: p.stat().st_mtime_ns for p in (epi_run.run_dir / EPI_DIR).rglob("*") if p.is_file()}
     assert after == before
     assert (epi_run.run_dir / "catalog.sqlite").read_bytes() == catalog
+
+
+def test_a_render_that_fails_while_the_app_runs_is_render_failed_until_the_queue_moves(
+    client: TestClient, epi_run: EpiRun, small_run_uids: dict[str, str]
+) -> None:
+    """When "render failed" is seen (review of step 3, F7): the server gives a failed render
+    its unratable label when it starts and when the queue next moves (``sync_unratable``).
+    A render that fails behind the running app is "render failed" on the subjects page until
+    then, and "unratable" with the reason of the render after it."""
+    key = sorted(small_run_uids.items())[-1][1]
+
+    def row() -> dict[str, Any]:
+        rows = ok(client.get("/api/subjects"), shapes.SubjectsOut)["subjects"]
+        return next(r for r in rows if r["key"] == key)
+
+    assert row()["surface"] == "rendered"
+    connection = sqlite3.connect(epi_run.run_dir / "catalog.sqlite")
+    with connection:
+        connection.execute(
+            "UPDATE renders SET status = 'failed', reason = 'render failure', "
+            "detail = 'unreadable input (T1.mgz: truncated)' WHERE subject_uid = ?",
+            (key,),
+        )
+    connection.close()
+    assert (row()["surface"], row()["surface_reason"]) == ("render failed", "render failure")
+    assert client.get("/api/next").status_code == 200
+    assert (row()["surface"], row()["surface_reason"]) == ("unratable", "render failure")
+
+
+# --- what broken copies of step 3 got past (review of step 3, F4) -------------------------------
+
+
+def test_the_counts_and_links_on_a_fixture_where_they_differ(
+    app_run: Path, packed: PackedStream, small_run_uids: dict[str, str]
+) -> None:
+    """A fixture on which the counts that the review's broken copies confused are not equal:
+    sub-001 has a packed session and HALF's second session (one failed run, the others
+    pending, not in the stream); HALF's first session names a FreeSurfer subject that the run
+    does not list; and one run of HALF's second session is recorded as packed, although the
+    stream does not hold its session yet."""
+    ids = session_ids(packed)
+    gone = small_run_uids["sub-002"]  # made absent below: a FreeSurfer subject that left
+    epi = add_epi(
+        app_run,
+        packed,
+        subject_uid=small_run_uids["sub-001"],
+        subject_uids={ids[HALF][1]: small_run_uids["sub-001"], ids[HALF][0]: gone},
+    )
+    second = epi.sessions[HALF][1]
+    with PublicCatalog.open(epi.run_dir) as public:
+        packable = {r["run_uid"] for r in public.func_runs().to_dict("records") if r["packable"]}
+    waiting = [r for r in epi.runs[second] if r in packable and r not in epi.failed]
+    assert len(waiting) >= 2
+    connection = sqlite3.connect(epi.run_dir / "catalog.sqlite")
+    with connection:
+        connection.execute("UPDATE subjects SET present = 0 WHERE subject_uid = ?", (gone,))
+    connection.close()
+    # a run of a session the stream does not hold, recorded as packed
+    with PublicCatalog.open(epi.run_dir, readonly=False) as public:
+        public.record_packs(
+            [
+                PackRow(
+                    run_uid=waiting[-1],
+                    session_uid=second,
+                    config_hash=EpiConfig().pack_hash(),
+                    input_signature="0" * 16,
+                    status="done",
+                    pack_key="1" * 16,
+                    path=f"{EPI_DIR}/{HALF}/{second}/{waiting[-1]}",
+                )
+            ]
+        )
+    with serving(epi.run_dir) as client:
+        listing = ok(client.get("/api/subjects"), shapes.SubjectsOut)
+        rows = {r["key"]: r for r in listing["subjects"]}
+        mine = ok(client.get(f"/api/subjects/{small_run_uids['sub-001']}"), shapes.SubjectPageOut)
+        half = ok(client.get(f"/api/subjects/{HALF}"), shapes.SubjectPageOut)
+        review = ok(client.get("/api/review"), schemas.ReviewOut)
+    sessions, runs_of = catalog_view(epi.run_dir)
+
+    # a session whose FreeSurfer subject is not present is on its participant's row
+    assert [s["session_uid"] for s in half["sessions"]] == [epi.sessions[HALF][0]]
+    assert rows[HALF]["n_sessions"] == 1 and gone not in rows
+
+    # the counts of sub-001: packed, failed and pending differ, and none is the number of runs
+    own = [s for s in sessions if s["subject_uid"] == small_run_uids["sub-001"]]
+    counts = expected_counts(own, runs_of)
+    row = rows[small_run_uids["sub-001"]]
+    assert {k: row[k] for k in counts} == counts
+    assert counts["n_failed"] == 1 and counts["n_pending"] > 0
+    assert len({counts["n_packed"], counts["n_pending"], counts["n_runs"]}) == 3
+    func = {r["subject_uid"]: (r["func_sessions"], r["func_packed"]) for r in review["rows"]}
+    assert func[small_run_uids["sub-001"]] == (2, counts["n_packed"])
+
+    # a packed run of a session that the stream does not show has no link into it, and the
+    # anchor of a session whose anchor is not packed is said not to be
+    (listed,) = [s for s in mine["sessions"] if s["session_uid"] == second]
+    assert listed["shown"] is False
+    states = {r["run_uid"]: (r["state"], r["epi_url"]) for r in listed["runs"]}
+    assert states[waiting[-1]] == ("packed", None)
+    anchor = next(r for r in listed["runs"] if r["anchor"])
+    assert anchor["state"] != "packed" and listed["anchor_packed"] is False

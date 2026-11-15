@@ -27,13 +27,18 @@ from pydantic import BaseModel, ConfigDict, Field
 from surfcensus.func import PACK_FORMAT, PACK_VERSION
 from surfcensus.records import AffineChoice, AnchorRule, Corrections, CorrectionState
 
-READING = (
+STREAMS = (
     "Raw: the raw BIDS series, resampled once (cubic interpolation) onto the grid of the"
     " preprocessed series by the session's one rigid placement, that of the anchor run's"
     " registration, and nothing else done to it; that resampling smooths single-volume detail"
     " slightly and enters the difference. Preprocessed: the series as the pipeline wrote it."
-    " Their difference, and how each lies on the white and pial contours, is what this page"
-    " shows: quality control of the raw data and of the preprocessing."
+)
+"""What the two streams are: the first sentences of :data:`READING`, which the subject pages
+say as well, so that every page says the same of the raw stream (review of step 3, F5)."""
+
+READING = (
+    STREAMS + " Their difference, and how each lies on the white and pial contours, is what"
+    " this page shows: quality control of the raw data and of the preprocessing."
 )
 """What the page says under its title (docs/epi_interface.md, The page in the package)."""
 

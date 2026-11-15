@@ -17,9 +17,11 @@ from __future__ import annotations
 import copy
 import logging
 import multiprocessing
+import os
 import pickle
 import signal
 import sys
+import threading
 import traceback
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ProcessPoolExecutor, as_completed
@@ -171,11 +173,55 @@ def _start_worker(level: int) -> None:
     global _collector
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    _end_with_parent()
     _collector = _Collector()
     logger = get_logger()
     logger.handlers[:] = [_collector]
     logger.setLevel(level)
     logger.propagate = False
+
+
+WORKER_ORPHANED_EXIT = 70
+"""The exit code of a worker that ended because its parent was gone."""
+
+
+def _end_with_parent() -> None:
+    """End this worker as soon as the process that started it is gone.
+
+    A parent that is killed with SIGKILL (or dies otherwise without stopping its pool) cannot
+    tell its workers to end, and a spawned worker of ``ProcessPoolExecutor`` learns of it only
+    through the queues, which here it never does: one that has finished its task blocks for
+    good writing its result into a pipe that nobody reads, and an idle one blocks for good
+    reading its next call, since it holds a write end of the call queue itself (seen in the
+    review of step 3 of the EPI interface). So each worker has a daemon thread that waits on
+    the sentinel of its parent (``multiprocessing.parent_process().sentinel``: under ``spawn``
+    on POSIX the read end of a pipe whose only write end the parent holds, which becomes
+    readable at end of file when the parent is gone; the parent's process handle on Windows)
+    and then ends the process at once with ``os._exit``. ``os._exit`` and not ``sys.exit``:
+    the main thread may be blocked in a pipe or in the middle of the work, and nothing of a
+    worker's own cleanup is of use to a parent that is gone; what it leaves (a hidden
+    temporary file or directory of a render or a pack) is what any killed process leaves, and
+    the next command of the run removes it.
+
+    While the parent lives, the thread only waits: a normal end, Ctrl-C and SIGTERM of the
+    command (where the parent waits for the work that runs) are as they were. A parent that
+    is stopped (SIGSTOP) and not dead is not noticed.
+    """
+    parent = multiprocessing.parent_process()
+    if parent is None:
+        return
+    sentinel = parent.sentinel
+
+    def watch() -> None:
+        from multiprocessing.connection import wait
+
+        try:
+            wait([sentinel])
+        except OSError:
+            return
+        os._exit(WORKER_ORPHANED_EXIT)
+
+    threading.Thread(target=watch, name="surfcensus-parent-watch", daemon=True).start()
 
 
 @dataclass(frozen=True)

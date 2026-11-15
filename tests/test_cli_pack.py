@@ -376,3 +376,124 @@ def test_pack_says_what_is_there_to_pack(tmp_path: Path, inventoried: Path) -> N
     result = cli("pack", "--run-dir", plain)
     assert result.exit_code == 0, result.output
     assert "EPI packs: none; this run has no functional run that can be packed." in result.output
+
+
+# --- workers end with a parent that is killed (review of step 3, F2) --------------------------
+
+_WATCHED = """
+import os
+import sys
+import time
+from pathlib import Path
+
+import surfcensus.func.batch as b
+
+MARKS = Path(os.environ["SURFCENSUS_TEST_MARKS"])
+MODE = os.environ["SURFCENSUS_TEST_MODE"]
+f = b.pack_session_unit
+
+
+def slow(*args, **kwargs):
+    # "busy": every session takes a minute; "idle": the first session that starts takes a
+    # minute, the others are packed as they are and their worker waits for its next call
+    if MODE == "idle":
+        try:
+            os.close(os.open(MARKS / "long", os.O_CREAT | os.O_EXCL))
+        except FileExistsError:
+            out = f(*args, **kwargs)
+            (MARKS / f"done-{os.getpid()}").touch()
+            return out
+    (MARKS / f"busy-{os.getpid()}").touch()
+    time.sleep(60)
+    return f(*args, **kwargs)
+
+
+b.pack_session_unit = slow
+
+if __name__ == "__main__":
+    from surfcensus.cli import app
+
+    sys.argv[0] = "surfcensus"
+    app()
+"""
+"""``surfcensus`` with slowed packs, as a file: the spawned workers import it as their main
+module, so that the patched function reaches them."""
+
+
+def _children(pid: int) -> list[int]:
+    """The processes whose parent is ``pid``, from ``/proc``."""
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            fields = (entry / "stat").read_text().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if int(fields[1]) == pid:
+            found.append(int(entry.name))
+    return found
+
+
+def _alive(pid: int) -> bool:
+    try:
+        state = (Path("/proc") / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
+
+
+@pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="reads /proc")
+@pytest.mark.parametrize("mode", ["busy", "idle"])
+def test_the_workers_of_a_command_end_when_it_is_killed(
+    inventoried: Path, tmp_path: Path, mode: str
+) -> None:
+    """A parent killed with SIGKILL left its spawned workers alive for good, one blocked in
+    writing its result and one in reading its next call (review of step 3, F2). Each worker
+    now watches its parent and ends when it is gone, busy or idle."""
+    script = tmp_path / "watched.py"
+    script.write_text(_WATCHED, encoding="utf-8")
+    marks = tmp_path / "marks"
+    marks.mkdir()
+    env = os.environ | {"SURFCENSUS_TEST_MARKS": str(marks), "SURFCENSUS_TEST_MODE": mode}
+    process = subprocess.Popen(
+        [sys.executable, str(script), "pack", "--run-dir", str(inventoried), "--jobs", "2"],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=env,
+        start_new_session=True,
+    )
+    workers: list[int] = []
+    try:
+        deadline = time.monotonic() + 120
+        while True:
+            assert process.poll() is None, "the command ended early"
+            assert time.monotonic() < deadline, sorted(p.name for p in marks.iterdir())
+            names = {p.name for p in marks.iterdir()}
+            busy = [n for n in names if n.startswith("busy-")]
+            done = [n for n in names if n.startswith("done-")]
+            if (mode == "busy" and len(busy) == 2) or (mode == "idle" and busy and done):
+                break
+            time.sleep(0.1)
+        time.sleep(0.3)  # the idle worker is back at its queue
+        workers = [int(name.split("-", 1)[1]) for name in busy + done]
+        assert set(workers) <= set(_children(process.pid))
+        process.kill()
+        process.wait()
+        deadline = time.monotonic() + 10
+        while any(_alive(pid) for pid in workers) and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert [pid for pid in workers if _alive(pid)] == []
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        for pid in workers:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(pid, signal.SIGKILL)
+    # the next call packs what the killed one did not record
+    result = cli("pack", "--run-dir", inventoried)
+    assert result.exit_code == 0, result.output
+    assert re.match(r"pack: \d+ done, \d+ skipped, 0 failed", result.output)
+    assert {status for _, status in _packs(inventoried)} == {"done"}
+    assert not [p for p in (inventoried / EPI_DIR).rglob(".*") if p.name.endswith(".tmp")]

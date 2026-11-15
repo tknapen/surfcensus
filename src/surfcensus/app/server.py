@@ -101,12 +101,12 @@ from surfcensus.app.queue import (
     subjects_left,
     subjects_skipped,
 )
-from surfcensus.app.schemas import AppMode
+from surfcensus.app.schemas import ROUTES, SUBJECT_ROUTES, AppMode
 from surfcensus.calibration import CalibrationSet, load_calibration, validate_calibration
 from surfcensus.config import ConfigError, epi_settings, load_config
 from surfcensus.export.tables import frame_csv, marks_frame, ratings_frame, subjects_frame
 from surfcensus.func.batch import RecordedState, recorded_states
-from surfcensus.func.model import CorrectionsInfo
+from surfcensus.func.model import STREAMS, CorrectionsInfo
 from surfcensus.log import get_logger
 from surfcensus.privacy import scrub
 from surfcensus.protocol import install_protocol, load_protocol, marks_required
@@ -193,6 +193,31 @@ _STREAM_RULES = ("acquisition time", "session label")
 EPI_INDEX_URL = "/epi"
 EPI_API = "/api/epi"
 EPI_MEDIA_URL = "/epi-media"
+
+
+def page_environment() -> Environment:
+    """The templates of the pages, with the names the pages link to one another by
+    (``schemas.NAV_LABELS``) as the global ``nav``."""
+    pages = Environment(
+        loader=FileSystemLoader(TEMPLATES_DIR), undefined=StrictUndefined, autoescape=True
+    )
+    pages.globals["nav"] = schemas.NAV_LABELS
+    return pages
+
+
+def _offered_only() -> re.Pattern[str]:
+    """The paths of the routes that answer only where the EPI pages are offered: those of the
+    EPI pages (under ``/epi`` and ``/api/epi``) and of the subject pages."""
+    paths = [r.path for r in ROUTES if r.path.startswith(("/epi", "/api/epi"))]
+    paths += [r.path for r in SUBJECT_ROUTES]
+    parts = []
+    for path in paths:
+        pattern = re.escape(path).replace(r"\{path\}", ".+")
+        parts.append(re.sub(r"\\\{[a-z_]+\\\}", "[^/]+", pattern))
+    return re.compile("|".join(f"(?:{part})" for part in parts))
+
+
+_OFFERED_ONLY = _offered_only()
 EPI_POLL_S = 5
 """How often, in seconds, the EPI pages of a participant whose packs are still being made
 ask the server again (the stream grows behind the app)."""
@@ -533,9 +558,7 @@ class _App:
             raise ConfigError("invalid", "the server needs at least one host to answer for")
         self.render_hash = self.config.render.config_hash()
         self.version = surfcensus.__version__
-        self.pages = Environment(
-            loader=FileSystemLoader(TEMPLATES_DIR), undefined=StrictUndefined, autoescape=True
-        )
+        self.pages = page_environment()
         self._renders = _Lru(RENDER_CACHE)
         self._indices = _Lru(INDEX_CACHE)
         self._scores: tuple[object, pd.DataFrame | None] | None = None
@@ -1893,12 +1916,15 @@ class _App:
                 )
             )
         label = participant.get("participant") if local else None
+        # the present sessions of the participant's stream, also those on another row
+        in_stream = sum(1 for s in view.sessions if str(s["participant_uid"]) == participant_uid)
         return FuncSessionOut(
             session_uid=session_uid,
             participant_uid=participant_uid,
             participant=None if label is None else str(label),
             label=_text(row.get("session_label")) or "",
             stream_order=max(0, _int(row.get("stream_order")) or 0),
+            stream_sessions=max(1, in_stream),
             stream_rule=rule if rule in _STREAM_RULES else "session label",  # type: ignore[arg-type]
             subject_uid=_text(row.get("subject_uid")),
             fs_subject=_text(row.get("fs_subject")) if local else None,
@@ -1942,6 +1968,7 @@ class _App:
             "review_url": "/review",
             "epi_index_url": EPI_INDEX_URL,
             "subjects_url": SUBJECTS_URL,
+            "streams": STREAMS,
         }
         if key is None:
             text = self.pages.get_template("subjects.html").render(api=SUBJECTS_API, **common)
@@ -2225,9 +2252,15 @@ def create_app(
     )
 
     @app.exception_handler(StarletteHTTPException)
-    async def _no_route(_request: Request, exc: StarletteHTTPException) -> Response:
+    async def _no_route(request: Request, exc: StarletteHTTPException) -> Response:
         said = {404: "there is no such route", 405: "the route does not take that method"}
-        return _errors(exc.status_code, [("request", said.get(exc.status_code, "refused"))])
+        status = exc.status_code
+        # a route of the EPI or the subject pages on a run that does not offer them answers
+        # as a route that does not exist, whatever the method (review of step 3, F3)
+        if status == 405 and _OFFERED_ONLY.fullmatch(request.url.path) is not None:
+            if not await run_in_threadpool(state.epi_offered):
+                status = 404
+        return _errors(status, [("request", said.get(status, "refused"))])
 
     @app.exception_handler(RequestValidationError)
     async def _not_valid(_request: Request, exc: RequestValidationError) -> Response:

@@ -3,18 +3,17 @@
 {% block body %}
 <main id="subjects-page" class="subjects-page" data-page="one" data-key="{{ key }}" data-api="{{ api }}" data-poll="{{ poll_s }}" data-state="loading">
   <header class="review-head">
-    <nav class="subjects-nav" aria-label="other pages"><a id="rate-link" href="{{ rate_url }}">rating screen</a><a id="subjects-link" href="{{ subjects_url }}">all subjects</a><a id="review-link" href="{{ review_url }}">review</a><a id="epi-index-link" href="{{ epi_index_url }}">EPI movies</a></nav>
+    <nav class="subjects-nav" aria-label="other pages"><a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a><a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a><a id="review-link" href="{{ review_url }}">{{ nav.review }}</a><a id="epi-index-link" href="{{ epi_index_url }}">{{ nav.epi }}</a></nav>
     <h1 id="subject-name">Subject</h1>
     <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b>, session by session</span>
   </header>
   <p id="subjects-packing" class="subjects-packing" role="status" hidden></p>
   <p id="subjects-message" class="message" role="status" hidden></p>
   <section id="surface" class="subject-surface" aria-label="Surfaces"></section>
-  <p class="hint">The EPI stream of a participant plays every packed run, session after session, as one moving picture:
-    the <b>raw</b> series with nothing done to it but one rigid placement per session in the anatomy (that of the
-    anchor run's registration), for quality control of the raw data (motion, artefacts in single volumes, distortion
-    and dropout as acquired, movement between runs); and the series as the pipeline wrote it, for quality control of
-    the <b>preprocessing</b> (what was corrected, what remains, how it lies on the white and pial contours). The state of
+  <p class="hint">The EPI stream of a participant plays every packed run, session after session, as one moving picture.
+    {{ streams }} The raw stream is there for quality control of the <b>raw data</b> (motion, artefacts in single volumes,
+    distortion and dropout as acquired, movement between runs); the preprocessed one for quality control of the
+    <b>preprocessing</b> (what was corrected, what remains, how it lies on the white and pial contours). The state of
     a run is what the catalog records under the present pack settings.</p>
   <div id="sessions" class="subject-sessions"></div>
 </main>
