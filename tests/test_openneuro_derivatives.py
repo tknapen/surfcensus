@@ -395,10 +395,17 @@ def test_globs_list_only_the_matching_subject_prefixes(tmp_path: Path) -> None:
     assert fake.log == []
 
 
-def test_an_interrupt_while_subjects_are_listed_ends_the_listing(tmp_path: Path) -> None:
+@pytest.mark.parametrize("how", ["signal", "flag"])
+def test_an_interrupt_while_subjects_are_listed_ends_the_listing(tmp_path: Path, how: str) -> None:
     """Ctrl-C (and SIGTERM, which the commands turn into it) while the subject prefixes are
     listed in threads: the listings not yet started are dropped, no request is retried, and
-    the source can be used again."""
+    the source can be used again.
+
+    The interrupt comes while the main thread already waits for the listings, once as a
+    signal that reaches the main thread and once as the flag alone, which is what the main
+    thread gets when the system hands the signal to another thread. The second case needs
+    the wait in short steps: with one wait without a timeout this test ended at its own
+    deadline (the macOS cells of CI, 2026-11-15)."""
     import _thread
     import signal
     import threading
@@ -424,9 +431,15 @@ def test_an_interrupt_while_subjects_are_listed_ends_the_listing(tmp_path: Path)
     def interrupt() -> None:
         for _ in range(2):  # both workers hold a listing
             assert started.acquire(timeout=60)
-        _thread.interrupt_main()
+        time.sleep(0.2)  # the main thread is waiting by now; the other order passes as well
+        if how == "signal":
+            main = threading.main_thread().ident
+            assert main is not None
+            signal.pthread_kill(main, signal.SIGINT)
+        else:
+            _thread.interrupt_main()
         # the held listings go on only once the interrupt stopped the client
-        deadline = time.monotonic() + 60
+        deadline = time.monotonic() + 20
         while not remote.client.stopped.is_set() and time.monotonic() < deadline:
             time.sleep(0.01)
         release.set()

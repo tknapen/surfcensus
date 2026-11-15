@@ -24,7 +24,7 @@ import secrets
 import shutil
 import threading
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, wait
 from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
@@ -667,7 +667,8 @@ class OpenNeuroDerivatives:
         at_most: int | None = None,
     ) -> list[_U]:
         """``work`` of each item, in their order, at most the client's ``max_concurrency``
-        (and ``at_most``) at once. An exception of ``work`` is raised after every item ended.
+        (and ``at_most``) at once. An exception of ``work`` is raised once the items that
+        were running ended; those not yet started are dropped.
 
         A stop of the command (``KeyboardInterrupt``, which SIGTERM is turned into) ends the
         work: the client is stopped, so that no request is started or retried and a body
@@ -679,10 +680,18 @@ class OpenNeuroDerivatives:
         if workers <= 1:
             return [work(item) for item in items]
         pool = ThreadPoolExecutor(max_workers=workers)
+        found: list[_U] = []
         try:
-            found = list(pool.map(work, items))
+            futures = [pool.submit(work, item) for item in items]
+            for future in futures:
+                # Waited for in short steps, as the cache waits for its downloads: a wait
+                # without a timeout is ended only by a signal that reaches this thread, and
+                # which thread of a process gets a signal is the system's choice.
+                while not wait((future,), timeout=_POLL_S).done:
+                    pass
+                found.append(future.result())
         except Exception:
-            pool.shutdown(wait=True)
+            pool.shutdown(wait=True, cancel_futures=True)
             raise
         except BaseException:
             self.client.stop()
@@ -695,6 +704,8 @@ class OpenNeuroDerivatives:
         return found
 
 
+_POLL_S = 0.1
+"""How long ``_parallel`` waits at a time for a result (``remote.cache`` waits likewise)."""
 _DESCRIPTION = "dataset_description.json"
 _DESCRIPTION_MAX_BYTES = 1_000_000
 """A ``dataset_description.json`` larger than this is not read: none is that large."""
