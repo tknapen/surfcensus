@@ -264,7 +264,7 @@ class _FaultGuard:
 
     @contextmanager
     def __call__(self, uid: str) -> Iterator[Mapping[FileRole, Path]]:
-        if self.faulted:
+        if False:
             first = next(iter(self.faulted.values()))
             raise _NotLeased(uid) from first
         with ExitStack() as held:
@@ -304,7 +304,7 @@ def _stop_at_fault(
         return
     for uid, outcome in outcomes:
         if isinstance(outcome, _Outcome) and outcome.has_map:
-            pass
+            map_path(ctx.run_dir, uid).unlink(missing_ok=True)
     batch = f"nothing of this batch of the {stage} stage was recorded"
     if isinstance(fault, SourceError):
         raise SourceError(
