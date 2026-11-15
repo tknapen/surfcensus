@@ -125,6 +125,7 @@ FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
         "nearest_source",
         "nearest_target",
         "flipped",
+        "n_widened",
     ),
     ("surfcensus.templates", "TemplateHemi"): (
         "sphere",
