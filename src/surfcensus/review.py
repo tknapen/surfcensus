@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -510,11 +510,15 @@ def remote_estimate(
     jobs: int,
     batch_subjects: int,
     max_bytes: int,
+    mapped: Collection[str] = (),
+    rendered: Collection[str] = (),
 ) -> RemoteEstimate:
     """:class:`RemoteEstimate` of ``records``, the listed subjects of ``dataset`` of the
     remote ``source``. ``template_needed``: the run takes its template from the
     ``fsaverage`` next to the subjects; ``n_first``: the renders the app waits for (None:
-    every one)."""
+    every one). ``mapped`` and ``rendered``: the labels of the subjects whose thickness
+    maps, and whose render, a continued run holds (:func:`_held`); their Tier B and their
+    render files are left out."""
     from surfcensus.sources.base import TIER_A, TIER_B, TIER_C
 
     cache = getattr(source, "cache", None)
@@ -542,13 +546,20 @@ def remote_estimate(
     with_spheres = not template_needed or template > 0
     render_roles = (*TIER_C, *_RENDER_SPHERES) if with_spheres else TIER_C
     tier_a = sum(_sum_roles(r, TIER_A, kept) for r in records)
-    tier_bs = [_sum_roles(r, TIER_B, never) for r in records]
-    complete = [r for r in records if all(role in r.files for role in RENDER_ROLES)]
+    tier_bs = [_sum_roles(r, TIER_B, never) for r in records if r.subject_label not in mapped]
+    complete = [
+        r
+        for r in records
+        if all(role in r.files for role in RENDER_ROLES) and r.subject_label not in rendered
+    ]
     renders = sorted((_sum_roles(r, render_roles, never) for r in complete), reverse=True)
-    first_n = len(renders) if n_first is None else min(n_first, len(renders))
+    # the app waits for ``n_first`` renders in all, those the run holds among them
+    first_n = (
+        len(renders) if n_first is None else min(max(n_first - len(rendered), 0), len(renders))
+    )
     largest_b = max(tier_bs, default=0)
     batch = min(batch_subjects, max(1, max_bytes // largest_b)) if largest_b else batch_subjects
-    peak_b = largest_b * min(batch, len(records))
+    peak_b = largest_b * min(batch, len(tier_bs))
     # the renders leased at once: a call that renders everything before it ends takes
     # batches of ``batch_subjects``; otherwise the renders before the app are one batch and
     # those behind it come ``jobs`` at a time; each is lowered to fit ``max_bytes``, as
@@ -583,11 +594,39 @@ def estimate_line(estimate: RemoteEstimate, *, new: bool) -> str:
             "listed sizes; the files of each batch are removed after it, and at most "
             f"{size_text(estimate.peak)} of source files are on disk at once."
         )
+    if estimate.in_all == 0:
+        return (
+            "To fetch: nothing but the listing; this run holds its template, the maps and the "
+            "renders of the subjects listed."
+        )
     return (
         f"To fetch: at most {size_text(estimate.before_app)} before the first rating screen "
-        f"and {size_text(estimate.in_all)} in all, an estimate from the listed sizes; what this "
-        "run holds already is not fetched again."
+        f"and {size_text(estimate.in_all)} in all, an estimate from the listed sizes; the maps "
+        "and renders that this run holds are left out, and are made again only where a file "
+        "or a setting changed."
     )
+
+
+def _held(run: Run) -> tuple[set[str], set[str]]:
+    """The labels of the present subjects of a continued run whose thickness maps are in
+    ``tables/fsavg/``, and of those whose render is recorded as done: what the estimate of
+    a later call leaves out. Names and rows only, nothing is opened; a map or render that
+    a changed file or setting makes pending again is fetched all the same, which is why the
+    estimate of a continued run is said as it is."""
+    from surfcensus.metrics.pipeline import FSAVG_DIR
+
+    public = run.public()
+    subjects = public.subjects()
+    labels = {
+        str(row.subject_uid): str(row.subject_label)
+        for row in subjects[subjects["present"].to_numpy(dtype=bool)].itertuples(index=False)
+    }
+    renders = public.renders()
+    done = set(renders.loc[renders["status"] == "done", "subject_uid"].astype(str))
+    mapped = {
+        label for uid, label in labels.items() if (run.run_dir / FSAVG_DIR / f"{uid}.npz").is_file()
+    }
+    return mapped, {label for uid, label in labels.items() if uid in done}
 
 
 def _template_needed(run_dir: Path, stored: RunConfig | None, fsaverage: Path | str | None) -> bool:
@@ -613,12 +652,16 @@ def _cache_bytes(run_dir: Path) -> int:
     from surfcensus.remote.cache import CACHE_DIR, LOCK_FILE
 
     total = 0
+    seen: set[tuple[int, int]] = set()  # the template's tree is hard links to retained files
     for directory, _, files in os.walk(run_dir / CACHE_DIR):
         for name in files:
             if name == LOCK_FILE:
                 continue
             with suppress(OSError):
-                total += os.lstat(os.path.join(directory, name)).st_size
+                found = os.lstat(os.path.join(directory, name))
+                if (found.st_dev, found.st_ino) not in seen:
+                    seen.add((found.st_dev, found.st_ino))
+                    total += found.st_size
     return total
 
 
@@ -698,6 +741,7 @@ def _open_remote_run(
         config = run.config if run is not None else None
         settings = config.cache if config is not None else CacheConfig()
         wanted = None if not serve or serve_after == 0 else serve_after or DEFAULT_SERVE_AFTER
+        mapped, rendered = _held(run) if run is not None else (set(), set())
         estimate = remote_estimate(
             source,
             dataset,
@@ -707,6 +751,8 @@ def _open_remote_run(
             jobs=jobs,
             batch_subjects=settings.batch_subjects,
             max_bytes=settings.max_bytes,
+            mapped=mapped,
+            rendered=rendered,
         )
         new = run is None
         if new and subjects is None and estimate.before_app > REMOTE_GUARD_BYTES:

@@ -328,6 +328,20 @@ def test_the_peak_of_the_estimate_follows_the_batches_that_are_leased(fake: Fake
     needed = estimate(template_needed=True)
     assert needed.template > 0
     assert needed.peak == tier_a + needed.template + with_spheres * 3
+    # a continued run: the maps and the renders that it holds are left out, and the app
+    # waits for one render in all, which the run has
+    labels = [r.subject_label for r in records]
+    held = estimate(n_first=1, mapped=labels[:2], rendered=labels[:1])
+    assert held.tier_b == of(records[2], TIER_B)
+    assert held.renders == sum(of(r, (*TIER_C, *spheres)) for r in records[1:])
+    assert (held.first, held.n_first) == (0, 0)
+    everything = estimate(mapped=labels, rendered=labels)
+    assert (everything.tier_b, everything.renders, everything.first) == (0, 0, 0)
+    assert reviewing.estimate_line(everything, new=False).startswith("To fetch: at most ")
+    nothing = reviewing.RemoteEstimate(
+        subjects=3, tier_a=0, tier_b=0, template=0, first=0, n_first=0, renders=0, peak=0
+    )
+    assert reviewing.estimate_line(nothing, new=False).startswith("To fetch: nothing but the")
 
 
 def test_a_second_review_changes_nothing_and_fetches_nothing_but_the_listing(
@@ -343,7 +357,8 @@ def test_a_second_review_changes_nothing_and_fetches_nothing_but_the_listing(
     }
     said = capsys.readouterr().err
     assert f"Run directory: {run_dir} (continued)" in said
-    assert "To fetch: at most " in said and "what this run holds already" in said
+    # the run holds its template, every map and every render: the estimate says so
+    assert "To fetch: nothing but the listing; this run holds" in said
     assert "Rendered: 3 of 3 subjects." in said
     # the listing, and the description it reads the fMRIPrep version from; no other file
     gets = [entry.key for entry in fake.log if entry.method == "GET"]
