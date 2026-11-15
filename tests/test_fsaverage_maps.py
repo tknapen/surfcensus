@@ -37,6 +37,7 @@ from synth_tierb import (  # pyrefly: ignore[missing-import]
     add_tier_b,
     cohort_patches,
     expected_thickness,
+    warp_directions,
 )
 
 from surfcensus._io import read_npz, sha256_file, write_npz
@@ -337,6 +338,30 @@ def test_too_many_fallbacks_are_a_degenerate_sphere(
     )
     with pytest.raises(MetricError, match="degenerate sphere"):
         resample_hemi(thickness, holed, half, annot=annot, config=refused)
+
+
+def test_a_hemisphere_that_the_wider_search_resolves_gets_a_map_and_its_count(
+    plain: SyntheticSubject, tpl4: Template
+) -> None:
+    """The subject's sphere sheared by a strong extra warp: the first search leaves more than
+    ``max_fallback_frac`` of the targets, which was ``degenerate sphere`` before the wider
+    search (and is with ``knn_wide = knn``); the wider search resolves them, and the
+    hemisphere gets a map that says how many it resolved (decision D46)."""
+    half = tpl4.hemis["lh"]
+    thickness, sphere, annot = tier_b(plain, "lh")
+    sheared = Surface(
+        warp_directions(registration.unit_sphere(sphere.vertices), 1.5) * 100.0, sphere.faces
+    )
+    first_only = MetricsConfig(mesh="fsaverage4", knn_wide=8)
+    with pytest.raises(MetricError) as caught:
+        resample_hemi(thickness, sheared, half, annot=annot, config=first_only)
+    assert caught.value.reason == "degenerate sphere"
+    n_left = int(caught.value.detail.split(" of ")[0])
+    assert n_left == 71 > CONFIG4.max_fallback_frac * len(half.sphere)  # 71 of 2,562, measured
+    hemi_map, smap = resample_hemi(thickness, sheared, half, annot=annot, config=CONFIG4)
+    assert hemi_map.n_fallback == 0 and hemi_map.n_widened == smap.n_widened == n_left
+    # no leftover: the count is 0, not missing
+    assert resample_hemi(thickness, sphere, half, annot=annot, config=CONFIG4)[0].n_widened == 0
 
 
 @pytest.mark.parametrize(

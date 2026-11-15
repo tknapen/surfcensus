@@ -20,6 +20,7 @@ from pathlib import Path
 import nibabel.freesurfer as fs
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 import pytest
 from synth import snapshot_tree  # pyrefly: ignore[missing-import]
 from synth_template import SyntheticTemplate  # pyrefly: ignore[missing-import]
@@ -1509,6 +1510,7 @@ def test_the_mapping_counts_are_those_of_resample_hemi_on_the_same_files(
             )
             row = planted_run.summary.loc[(planted_run.uids[subject.path.name], hemi)]
             assert row["n_fallback"] == hemi_map.n_fallback
+            assert row["n_widened"] == hemi_map.n_widened  # a count where there is a map, 0 too
             assert row["n_missing_cortex"] == hemi_map.n_missing_cortex
             assert row["global_median_mm"] == pytest.approx(hemi_map.global_median, rel=1e-6)
             n_fallback[subject.path.name, hemi] = hemi_map.n_fallback
@@ -1534,7 +1536,10 @@ def test_the_wider_search_resolves_the_folds_and_not_the_hole(planted_run: Plant
     assert int(narrow.fallback.sum()) == int(wide.fallback.sum()) + wide.n_widened
     assert not (wide.fallback & ~narrow.fallback).any()
     row = planted_run.summary.loc[(planted_run.uids["sub-001"], "lh")]
-    assert row["n_fallback"] == int(wide.fallback.sum())
+    assert (row["n_fallback"], row["n_widened"]) == (31, 10)
+    # every other hemisphere has a map and no leftover: 0, not null
+    others = planted_run.summary.drop(index=(planted_run.uids["sub-001"], "lh"))
+    assert others["n_widened"].notna().all() and (others["n_widened"] == 0).all()
 
 
 def test_maps_of_the_earlier_schema_are_made_again(
@@ -1551,8 +1556,19 @@ def test_maps_of_the_earlier_schema_are_made_again(
             run.inventory()
             assert counts(run.metrics()) == (3 + 3 + 2, 0, 0)
             before = ledger(run, "fsaverage")
+    # the tables as the version before wrote them: without the column n_widened
+    written = [table_path(run_dir, "vertex_summary")]
+    written += sorted((run_dir / "tables" / "_parts" / "vertex_summary").glob("*.parquet"))
+    for path in written:
+        pq.write_table(pq.read_table(path).drop_columns(["n_widened"]), path)
     with Run(run_dir) as run:
+        # read, not refused, before the stage writes them again: the column is null
+        assert table(run_dir, "vertex_summary")["n_widened"].isna().all()
+        # the scores alone wait for maps of the present schema, and say so without a traceback
+        report = run.metrics(stages=("score",))
+        assert report.failures == (("run", "score: reference not current"),)
         assert counts(run.metrics(stages=("fsaverage",))) == (3, 0, 0)
         after = ledger(run, "fsaverage")
         assert set(after) == set(before) and all(after[u] != before[u] for u in after)
+        assert (table(run_dir, "vertex_summary")["n_widened"] == 0).all()
         assert counts(run.metrics(stages=("fsaverage",))) == (0, 3, 0)

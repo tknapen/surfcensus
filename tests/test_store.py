@@ -2522,6 +2522,7 @@ def summary_rows(uids: Sequence[str], *, n_native: int = 1000) -> pd.DataFrame:
             "thickness_max_mm": 5.0,
             "template_id": None,
             "n_fallback": None,
+            "n_widened": None,
             "n_missing_cortex": None,
             "global_median_mm": np.nan,
             "region_kind": "annot",
@@ -2771,3 +2772,29 @@ def test_the_queue_order_of_the_small_run_is_that_of_its_scores(small_run: Path)
     uids = sorted(scores["subject_uid"])
     assert not scores["flags"].str.contains("partial_score").any()
     assert store.queue_order(uids, scores, blind=False, seed=0) == scores["subject_uid"].tolist()
+
+
+def test_a_table_written_before_a_column_was_added_is_read_with_it_null(tmp_path: Path) -> None:
+    """``vertex_summary`` gained ``n_widened`` with decision D46. A part or table written
+    before, without it, is read and merged with the column null, until its stage writes the
+    rows again; a table that lacks any other column is still another schema."""
+    uids = ["0" * 16, "1" * 16]
+    path = store.upsert_part(
+        tmp_path, "vertex_summary", "D-0123abcd", summary_rows(uids), replace_uids=uids
+    )
+    written = pq.read_table(path)
+    pq.write_table(written.drop_columns(["n_widened"]), path)
+    old = store.read_table(path, SCHEMAS["vertex_summary"])
+    assert list(old.columns) == SCHEMAS["vertex_summary"].names
+    assert old["n_widened"].isna().all() and len(old) == 4
+    merged = store.merge_parts(tmp_path, "vertex_summary", present=uids)
+    assert pq.read_table(merged).schema.equals(SCHEMAS["vertex_summary"].remove_metadata())
+    # writing rows of the present schema into the old part
+    store.upsert_part(
+        tmp_path, "vertex_summary", "D-0123abcd", summary_rows(uids[:1]), replace_uids=uids[:1]
+    )
+    assert pq.read_table(path).schema.equals(SCHEMAS["vertex_summary"].remove_metadata())
+    for dropped in (["n_fallback"], ["n_widened", "n_fallback"]):
+        pq.write_table(written.drop_columns(dropped), path)
+        with pytest.raises(ValueError, match="another schema"):
+            store.read_table(path, SCHEMAS["vertex_summary"])

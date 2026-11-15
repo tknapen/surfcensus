@@ -104,7 +104,7 @@ VERTEX_SUMMARY = _schema(
     _required(_INT32, "n_native"),
     _required(_FLOAT32, "thickness_max_mm"),
     _nullable(_STRING, "template_id"),
-    _nullable(_INT32, "n_fallback", "n_missing_cortex"),
+    _nullable(_INT32, "n_fallback", "n_widened", "n_missing_cortex"),
     _nullable(_FLOAT32, "global_median_mm"),
     _required(_STRING, "region_kind"),
     _nullable(_INT32, "search_n", "search_n_exact", "search_n_near", "search_n_zero"),
@@ -114,7 +114,15 @@ VERTEX_SUMMARY = _schema(
     _nullable(_FLOAT32, "ceiling_frac_annot"),
     _required(_STRING, "flags"),
 )
-"""One row per subject and hemisphere: resampling facts and ceiling counts."""
+"""One row per subject and hemisphere: resampling facts and ceiling counts. ``n_fallback``:
+template vertices that no searched face holds; ``n_widened``: those that the first search
+(``metrics.knn``) left and the wider search resolved (decision D46); both null for a
+hemisphere without a map."""
+
+ADDED_COLUMNS: frozenset[str] = frozenset({"n_widened"})
+"""Nullable columns added to a table after it was first written. A part or table written
+before, which lacks only such columns, is read with them null (``store``), so that a run of
+an earlier version can be read and merged until its stage writes the rows again."""
 
 CLUSTERS = _schema(
     _required(_STRING, "subject_uid", "reference_id", "hemi", "region"),

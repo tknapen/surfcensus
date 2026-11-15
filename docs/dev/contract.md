@@ -1249,6 +1249,7 @@ from surfcensus.reference.load import ReferenceMaps      # the dataclass lives t
 class HemiMap:
     thickness: Float[np.ndarray, "v"]         # float32 mm; NaN = missing or outside the template cortex
     n_fallback: int
+    n_widened: int                            # targets the first search left and the wider one resolved (D46)
     n_missing_cortex: int                     # template cortex vertices without a value
     global_median: float
     flipped: bool                             # the sphere's winding was reversed (6.4)
@@ -1418,7 +1419,7 @@ String columns are Arrow `string`. Floats are `float32` unless noted. Key column
 | `n_native` | int32 | vertices in the thickness file |
 | `thickness_max_mm` | float32 | observed maximum |
 | `template_id` | string, nullable | null when no template or no map |
-| `n_fallback`, `n_missing_cortex` | int32, nullable | |
+| `n_fallback`, `n_widened`, `n_missing_cortex` | int32, nullable | `n_fallback`: targets in no searched face; `n_widened`: targets the first search (`knn`) left and the wider search resolved (D46); null without a map. A part or table written before `n_widened` existed is read with it null (`schemas.ADDED_COLUMNS`) |
 | `global_median_mm` | float32, nullable | from the stored float16 map |
 | `region_kind` | string | `template`, `annot` or `none`: the kind behind `ceiling_frac` |
 | `search_n`, `search_n_exact`, `search_n_near`, `search_n_zero` | int32, nullable | ceiling counts, native search region of `region_kind` |

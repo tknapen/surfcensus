@@ -153,6 +153,7 @@ FIELDS: dict[tuple[str, str], tuple[str, ...]] = {
     ("surfcensus.metrics.fsaverage", "HemiMap"): (
         "thickness",
         "n_fallback",
+        "n_widened",
         "n_missing_cortex",
         "global_median",
         "flipped",

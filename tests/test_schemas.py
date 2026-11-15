@@ -74,6 +74,7 @@ def test_vertex_summary_columns() -> None:
         "thickness_max_mm",
         "template_id",
         "n_fallback",
+        "n_widened",
         "n_missing_cortex",
         "global_median_mm",
         "region_kind",

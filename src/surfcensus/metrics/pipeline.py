@@ -523,6 +523,7 @@ def _hemisphere(
         row.update(
             template_id=template.template_id,
             n_fallback=hemi_map.n_fallback,
+            n_widened=hemi_map.n_widened,
             n_missing_cortex=hemi_map.n_missing_cortex,
             global_median_mm=median if math.isfinite(median) else None,
         )

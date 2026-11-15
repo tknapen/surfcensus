@@ -63,6 +63,9 @@ class HemiMap:
     value is missing and outside the template cortex."""
     n_fallback: int
     """Target vertices that took the value of the nearest source vertex."""
+    n_widened: int
+    """Target vertices that the first search left and the wider search resolved
+    (``SphereMap.n_widened``, decision D46)."""
     n_missing_cortex: int
     """Template cortex vertices without a value."""
     global_median: float
@@ -137,6 +140,7 @@ def resample_hemi(
     hemi_map = HemiMap(
         thickness=stored,
         n_fallback=n_fallback,
+        n_widened=smap.n_widened,
         n_missing_cortex=n_cortex - n_value,
         global_median=global_median(stored, template_hemi),
         flipped=smap.flipped,

@@ -60,7 +60,7 @@ from surfcensus.records import (
     WorkRow,
     func_signature,
 )
-from surfcensus.schemas import KEYS, SCHEMAS, split_flags
+from surfcensus.schemas import ADDED_COLUMNS, KEYS, SCHEMAS, split_flags
 from surfcensus.sources import base
 from surfcensus.sources.base import (
     HEMIS,
@@ -2757,9 +2757,27 @@ def _write(path: Path, table: pa.Table) -> None:
 
 def _read(path: Path, schema: pa.Schema | None) -> pa.Table:
     table = pq.read_table(path).replace_schema_metadata(None)
-    if schema is not None and not table.schema.equals(schema.remove_metadata()):
-        raise ValueError(f"{path.name} was written with another schema than the one asked for")
-    return table
+    if schema is None:
+        return table
+    wanted = schema.remove_metadata()
+    if table.schema.equals(wanted):
+        return table
+    # a table written before nullable columns were added to its schema: those are null
+    missing = [field for field in wanted if field.name not in table.schema.names]
+    if missing and all(field.nullable and field.name in ADDED_COLUMNS for field in missing):
+        earlier = pa.schema([field for field in wanted if field not in missing])
+        if table.schema.equals(earlier):
+            columns = {name: table.column(name) for name in table.schema.names}
+            return pa.table(
+                [
+                    columns[field.name]
+                    if field.name in columns
+                    else pa.nulls(len(table), type=field.type)
+                    for field in wanted
+                ],
+                schema=wanted,
+            )
+    raise ValueError(f"{path.name} was written with another schema than the one asked for")
 
 
 def _unique(table: pa.Table, key: Sequence[str], what: str) -> None:
