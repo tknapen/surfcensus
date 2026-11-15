@@ -142,7 +142,7 @@ def epi_with(
     ``raw`` cannot be cleared, only replaced. ``raw`` is stored absolute, links resolved. Raises
     ``ConfigError("invalid", ...)`` for a raw dataset that is not a directory and for a
     census run with the interface on (``RunConfig`` refuses it)."""
-    from surfcensus.config import EpiConfig, epi_settings
+    from surfcensus.config import EpiConfig, epi_defaults, epi_settings
 
     if enabled is None and runs is None and raw is None:
         return config
@@ -164,8 +164,7 @@ def epi_with(
         raise ConfigError("invalid", " ".join(str(exc).split())) from exc
     if changed == current:
         return config
-    defaults = EpiConfig() if config.mode == "local" else EpiConfig(enabled=False)
-    if changed == defaults:
+    if changed == epi_defaults(config):
         # back to the defaults (``--no-epi`` then ``--epi``): no section, so config.yaml has
         # the bytes it had before an EPI option was given (review of step 2)
         return with_changes(config, epi=None)
@@ -183,6 +182,15 @@ def epi_run_stems(sources: Sequence[Source], raw: Path | str | None) -> list[str
     stems: list[str] | None = None
     for source in sources:
         if source.kind != "local":
+            # a dataset of a bucket: the stems of its functional listing (decision D50), from
+            # listings alone; a source without one has no functional part here
+            remote_stems = getattr(source, "func_stems", None)
+            if remote_stems is None:
+                continue
+            for record in source.datasets():
+                found = remote_stems(record)
+                if found is not None:
+                    stems = [*(stems or []), *found]
             continue
         for record in source.datasets():
             func = func_source_of(record, None if raw is None else Path(raw))
@@ -284,6 +292,9 @@ class Run:
         self._template: Template | None = None
         self._template_looked_for = False
         self._no_template: tuple[str, int] | None = None  # the message, the level it was logged at
+        self.func_left_out_note: str | None = None
+        """What the last :meth:`func_inventory` left out of the functional tree of a dataset of
+        a bucket, as one sentence; None when nothing was."""
         if source is None:
             given: tuple[Source, ...] = ()
         elif isinstance(source, Sequence):
@@ -773,13 +784,21 @@ class Run:
         ``config.yaml``; returns whether it changed. A glob of ``runs`` that matches no
         functional run is refused before it is stored (:func:`refuse_unmatched_epi_runs`),
         and a raw dataset whose participant folders hold the run directory is refused."""
+        if raw is not None and any(stored.kind != "local" for stored in self.config.sources):
+            raise ConfigError(
+                "invalid",
+                "--raw: a run on a dataset of a bucket reads the raw series of its dataset "
+                "from s3://openneuro.org; a raw folder is not taken",
+            )
         changed = epi_with(self.config, enabled=enabled, runs=runs, raw=raw)
         if changed == self.config:
             return False
         from surfcensus.config import epi_settings
 
         settings = epi_settings(changed)
-        if runs:
+        remote = any(stored.kind != "local" for stored in self.config.sources)
+        # a dataset of a bucket is listed for its functional files only with the interface on
+        if runs and (settings.enabled or not remote):
             stems = epi_run_stems(self._sources(), settings.raw)
             refuse_unmatched_epi_runs(stems, runs)
         earlier = self.config
@@ -1043,12 +1062,67 @@ class Run:
             bucket, _, base = str(row["root"]).removeprefix("s3://").partition("/")
             key = f"{base}{row['fs_dir']}/{row['location']}"
             keep.add(cache.name(bucket, key, row["etag_or_mtime"]))
+        keep |= self._func_tree_names()
         removed = cache.prune_retained(keep)
         if removed:
             get_logger().info(
                 "removed %d files from the cache that the run no longer needs", removed
             )
         return removed
+
+    def _remote_func_trees(self) -> list[tuple[int, str | None, Path]]:
+        """The present functional sources of datasets of a bucket with the tree each names in
+        this run's cache: ``(func_id, raw_found, tree)``, the tree found by the name of its
+        entry under this run's ``cache/retained/`` and not by the stored absolute root, so that
+        a run directory that was moved or copied finds its trees (decision D50)."""
+        from surfcensus.remote.cache import CACHE_DIR, RETAINED
+
+        if not self._catalog.public().has_func():
+            return []
+        rows = self._catalog.query(
+            "SELECT f.func_id, f.deriv_root, f.raw_found FROM func_sources f "
+            "JOIN datasets d USING (dataset_id) WHERE f.present = 1 AND d.source != 'local'"
+        )
+        found = []
+        for row in rows:
+            stored = Path(str(row["deriv_root"])).parent  # .../<h[:2]>/<h>/func
+            name = stored.parent.name
+            tree = self.run_dir / CACHE_DIR / RETAINED / name[:2] / name / stored.name
+            found.append((int(row["func_id"]), row["raw_found"], tree))
+        return found
+
+    def _follow_func_trees(self) -> None:
+        """Point the stored roots of the functional sources of datasets of a bucket at their
+        trees in this run's cache when the run directory was moved or copied (the stored roots
+        are absolute): ``Catalog.relocate_func``, which keeps every identifier."""
+        from surfcensus.sources.openneuro_derivatives import FUNC_TREE_DERIV, FUNC_TREE_RAW
+
+        rows = {
+            int(row["func_id"]): str(row["deriv_root"])
+            for row in self._catalog.query("SELECT func_id, deriv_root FROM func_sources")
+        }
+        for func_id, raw_found, tree in self._remote_func_trees():
+            deriv = tree / FUNC_TREE_DERIV
+            if rows.get(func_id) != str(deriv) and deriv.is_dir():
+                self._catalog.relocate_func(
+                    func_id, str(deriv), str(tree / FUNC_TREE_RAW), raw_found
+                )
+
+    def _func_tree_names(self) -> set[str]:
+        """The names under ``retained/`` that the functional tree of every present functional
+        source of a dataset of a bucket needs (decision D50): the tree's own entry and the
+        objects its ``FUNC_TREE_OBJECTS`` names. Earlier trees, and objects that no present
+        tree names, are not among them."""
+        from surfcensus.sources.openneuro_derivatives import tree_objects
+
+        names: set[str] = set()
+        for _, _, tree in self._remote_func_trees():
+            objects = tree_objects(tree)
+            if objects is None:
+                continue
+            names.add(tree.parent.name)
+            names.update(objects)
+        return names
 
     def _pseudonyms(self, datasets: Collection[str] | None) -> list[str] | None:
         """Accessions or pseudonyms, as a user names datasets, to pseudonyms."""
@@ -1447,9 +1521,104 @@ class Run:
 
         if self.config.mode != "local" or not epi_settings(self.config).enabled:
             return PhaseReport(phase=FUNC_INVENTORY_PHASE, done=0, skipped=0, failed=0, failures=())
-        return run_func_inventory(
-            self._catalog, self._sources(), self.config, run_key(self.config), force=force
+        sources = self._sources()
+        left_out = self._func_trees(sources)
+        report = run_func_inventory(
+            self._catalog, sources, self.config, run_key(self.config), force=force
         )
+        if left_out:
+            listed = ", ".join(left_out[:_MAX_LEFT_OUT])
+            more = (
+                f" and {len(left_out) - _MAX_LEFT_OUT} more"
+                if len(left_out) > _MAX_LEFT_OUT
+                else ""
+            )
+            note = (
+                f"{len(left_out)} functional file(s) of the bucket could not be fetched (changed "
+                f"since they were listed, or refused) and are left out: {listed}{more}; their "
+                "runs get the planner's reason, and the next call tries a new listing"
+            )
+            report = dataclasses.replace(report, notes=(*report.notes, note))
+        self.func_left_out_note = note if left_out else None
+        return report
+
+    def _func_trees(self, sources: Sequence[Source]) -> list[str]:
+        """Fetch the functional files of every dataset of a bucket into the retained cache, as
+        a tree of links that the functional inventory reads (``OpenNeuroDerivatives.func_tree``,
+        decision D50), before anything of the inventory is recorded; returns the places that
+        could not be fetched (relative to the tree). A disk that does not hold what is to be
+        fetched is refused before anything of it is fetched; a bucket that cannot be reached
+        raises ``SourceError("unreachable", ...)`` and a full disk ``ConfigError``, and nothing
+        is recorded."""
+        left: list[str] = []
+        for source in sources:
+            tree_of = getattr(source, "func_tree", None) if source.kind != "local" else None
+            if tree_of is None:
+                continue
+            for record in source.datasets():
+                self._room_for_func(source, record)
+                try:
+                    tree = tree_of(record)
+                except SourceError as exc:
+                    if exc.reason != "unreachable":
+                        raise
+                    raise SourceError(
+                        "unreachable",
+                        "the bucket could not be reached while the functional files of the "
+                        f"dataset were fetched ({exc.detail}); nothing was recorded: run the "
+                        "same command again once it can be reached",
+                    ) from exc
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                        raise
+                    raise ConfigError(
+                        "invalid",
+                        f"the disk of {self.run_dir} is full: the functional files of the "
+                        "dataset could not be fetched; make room and run the same command "
+                        "again, or turn the EPI interface off with --no-epi",
+                    ) from exc
+                if tree is not None:
+                    left += list(tree.left_out)
+        return left
+
+    def _room_for_func(self, source: object, record: DatasetRecord) -> None:
+        """Refuse, before anything of them is fetched, the functional files of a dataset of a
+        bucket when the free space of the cache's disk does not hold them (what the retained
+        cache holds already is not fetched again and not counted)."""
+        from surfcensus.remote.cache import CACHE_DIR
+
+        func_size = getattr(source, "func_size", None)
+        need = 0 if func_size is None else func_size(record)[0]
+        free = free_bytes(self.run_dir / CACHE_DIR)
+        if not need or free is None:
+            return
+        if free < need:
+            raise ConfigError(
+                "invalid",
+                f"the disk of {self.run_dir} has {size_text(free)} free, and the functional "
+                f"files of the EPI interface take {size_text(need)}: make room, name fewer "
+                "subjects with --subjects, or turn the EPI interface off with --no-epi",
+            )
+
+    def remote_func_pending(self) -> tuple[int, int]:
+        """The bytes of functional files that the next functional inventory fetches from the
+        buckets, and the participants they are of; ``(0, 0)`` with the EPI interface off or
+        without a dataset of a bucket. Lists what is not listed yet (the functional listing of
+        a remote source), fetches nothing."""
+        from surfcensus.config import epi_settings
+
+        if self.config.mode != "local" or not epi_settings(self.config).enabled:
+            return 0, 0
+        total = participants = 0
+        for source in self._sources():
+            func_size = getattr(source, "func_size", None) if source.kind != "local" else None
+            if func_size is None:
+                continue
+            for record in source.datasets():
+                size, n = func_size(record)
+                total += size
+                participants += n
+        return total, participants
 
     def pack(
         self,
@@ -1479,6 +1648,7 @@ class Run:
 
         if self.config.mode != "local":
             raise ConfigError("invalid", "a census run has no EPI interface; nothing is packed")
+        self._follow_func_trees()
         context = self.context()
         if not epi_settings(self.config).enabled:
             return run_pack(context, jobs=jobs, sessions=sessions)  # removes nothing, packs nothing
@@ -1516,8 +1686,9 @@ class Run:
         if self.config.mode != "local" or not self.public().has_func():
             return []
         rows = self._catalog.query(
-            "SELECT deriv_root, raw_root, raw_found, connector, pipeline_version "
-            "FROM func_sources WHERE present = 1 ORDER BY func_id"
+            "SELECT f.deriv_root, f.raw_root, f.raw_found, f.connector, f.pipeline_version, "
+            "d.source, d.accession FROM func_sources f JOIN datasets d USING (dataset_id) "
+            "WHERE f.present = 1 ORDER BY f.func_id"
         )
         return [dict(row) for row in rows]
 
@@ -1735,6 +1906,10 @@ class Run:
         self.close()
 
 
+_MAX_LEFT_OUT = 5
+"""Functional files left out of a tree that a note names; the rest are counted."""
+
+
 def free_bytes(path: Path) -> int | None:
     """The free space of the file system that holds ``path`` (or its nearest existing
     parent); None when it cannot be told."""
@@ -1838,13 +2013,20 @@ def _remote_from_config(
         expected = privacy.dataset_pseudonym(run_key(run_config), config.kind, accession)
         if expected != config.dataset:
             raise ConfigError("key", f"the dataset given is not {config.dataset} of {CONFIG_FILE}")
-    from surfcensus.remote import FMRIPREP_PREFIX
+    from surfcensus.remote import FMRIPREP_PREFIX, RAW_BUCKET
     from surfcensus.remote.cache import CACHE_DIR, Cache
     from surfcensus.remote.s3 import S3Client
     from surfcensus.sources.openneuro_derivatives import OpenNeuroDerivatives
 
     assert config.bucket is not None  # SourceConfig checks it
     client = S3Client(config.bucket, config=run_config.remote, transport=transport)
+    # the raw bucket of the EPI interface (decision D50): no request is made unless the
+    # run's EPI interface is on
+    raw_client = (
+        S3Client(RAW_BUCKET, config=run_config.remote, transport=transport)
+        if config.dataset is not None
+        else None
+    )
     cache = Cache(
         run_dir / CACHE_DIR,
         max_bytes=run_config.cache.max_bytes,
@@ -1858,4 +2040,5 @@ def _remote_from_config(
         accession=accession if config.dataset is not None else None,
         subjects=config.subjects,
         pseudonym=config.dataset,
+        raw_client=raw_client,
     )

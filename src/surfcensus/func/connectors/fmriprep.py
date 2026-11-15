@@ -500,6 +500,15 @@ def _forms(suffix: str) -> tuple[str, ...]:
     return (suffix,)
 
 
+_READ_FUNC_FORMS = frozenset(
+    form
+    for roles in FUNC_SUFFIXES.values()
+    for candidates in roles.values()
+    for suffix in candidates
+    for form in _forms(suffix)
+)
+
+
 def _variant(suffix: str) -> str:
     return suffix.lstrip("_").split(".", 1)[0]
 
@@ -527,6 +536,31 @@ def _ref(
     role: FuncRole, path: Path, root: Path, st: os.stat_result, variant: str | None
 ) -> FuncFileRef:
     return bids.file_ref(role, "deriv", path, root, st, variant)
+
+
+def reads_func_name(name: str) -> bool:
+    """Whether a file of ``sub-X/[ses-Y/]func/`` is one that :meth:`FmriprepConnector.list_runs`
+    gives a role in either generation: its stem followed by exactly one of the suffixes of
+    :data:`FUNC_SUFFIXES` (a ``.nii.gz`` suffix also in its ``.nii`` form). The preprocessed
+    series in other spaces, the native series and everything else are not. For a remote
+    dataset, which files of the bucket the tree of the EPI interface holds (decision D50)."""
+    stem = _stem_of(name)
+    if stem is None:
+        return False
+    return name[len(stem) :] in _READ_FUNC_FORMS
+
+
+def reads_figure_name(name: str) -> bool:
+    """Whether a file of ``sub-X/figures/`` is one of :data:`FIGURE_SUFFIXES` of a run."""
+    stem = _stem_of(name)
+    return stem is not None and name[len(stem) :] in FIGURE_SUFFIXES.values()
+
+
+def fsnative_names(participant: str, session: str | None) -> tuple[str, ...]:
+    """The names :meth:`FmriprepConnector.session_files` looks for in ``anat/``: of the
+    session's folder (``sub-X_ses-Y<FSNATIVE_SUFFIX>``) and of the subject's."""
+    names = [f"{participant}_ses-{session}{FSNATIVE_SUFFIX}"] if session is not None else []
+    return (*names, f"{participant}{FSNATIVE_SUFFIX}")
 
 
 class FmriprepConnector:

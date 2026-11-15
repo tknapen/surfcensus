@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import errno
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -29,11 +30,11 @@ from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass, field
 from fnmatch import fnmatchcase
 from pathlib import Path, PurePosixPath
-from typing import TYPE_CHECKING, TypeVar
+from typing import TYPE_CHECKING, Literal, TypeVar
 
 from surfcensus.config import ConfigError, SourceConfig
 from surfcensus.log import get_logger
-from surfcensus.remote import FMRIPREP_PREFIX, UNREACHABLE, dataset_prefix
+from surfcensus.remote import FMRIPREP_PREFIX, UNREACHABLE, dataset_prefix, raw_prefix
 from surfcensus.sources.base import (
     HEMIS,
     TIER_A,
@@ -111,6 +112,7 @@ class OpenNeuroDerivatives:
         accession: str | None = None,
         subjects: Sequence[str] = (),
         pseudonym: str | None = None,
+        raw_client: S3Client | None = None,
     ) -> None:
         if not prefix.endswith("/") or _ACCESSION.search(prefix):
             raise ValueError(f"the prefix of a remote source names no dataset: {prefix!r}")
@@ -120,6 +122,10 @@ class OpenNeuroDerivatives:
         if accession is None and (given or pseudonym is not None):
             raise ValueError("subject globs and a pseudonym are for a source of one dataset")
         self.client = client
+        self.raw_client = raw_client
+        """The client of the raw OpenNeuro bucket (``remote.RAW_BUCKET``), for the EPI
+        interface of one dataset (decision D50); None: the source has no functional files.
+        Making it makes no request; it is asked only when the run's EPI interface is on."""
         self.cache = cache
         self.prefix = prefix
         self.accession = accession
@@ -129,6 +135,19 @@ class OpenNeuroDerivatives:
     @property
     def bucket(self) -> str:
         return self.client.bucket
+
+    def _clients(self) -> tuple[S3Client, ...]:
+        return (self.client,) if self.raw_client is None else (self.client, self.raw_client)
+
+    def stop(self) -> None:
+        """Stop both clients (``S3Client.stop``): no request is started or retried."""
+        for client in self._clients():
+            client.stop()
+
+    def close(self) -> None:
+        """Close both clients."""
+        for client in self._clients():
+            client.close()
 
     def bind(self, *, cache: Cache, pseudonym: str | None = None) -> None:
         """Called by the run that takes the source: its cache and, for one dataset, its
@@ -417,6 +436,227 @@ class OpenNeuroDerivatives:
         names = [*required, *(name for name in (*optional, _BUILD_STAMP) if name in listed)]
         return sum(listed[name].size for name in names)
 
+    # --- the functional files of the EPI interface (decision D50) ---------------------------
+
+    def func_listing(self, dataset: DatasetRecord) -> FuncListing | None:
+        """What the EPI interface reads of the selected subjects of ``dataset``, from listings
+        alone (no file is fetched): per participant (the leading ``sub-<label>`` of a selected
+        FreeSurfer subject that has files) the raw files of ``s3://openneuro.org/dsXXXXXX/``
+        and the fMRIPrep files of the derivative that the planner and the connector read, and
+        the FreeSurfer files of the contours (``func.inventory.FS_FILES``) of every selected
+        subject of the participant, each under its place in the tree.
+
+        Raw: ``dataset_description.json`` and ``*_bold.json`` at the root of the dataset; in
+        ``sub-P/`` and ``sub-P/ses-*/`` the ``*_bold.json`` (inherited sidecars), the
+        ``sessions.tsv`` and the ``scans.tsv``; in ``sub-P/[ses-*/]func/`` every
+        ``*_bold.nii[.gz]`` and ``*_bold.json``. Derivative: ``dataset_description.json``; in
+        ``sub-P/[ses-*/]func/`` the files of the roles the connector lists in either
+        generation (``fmriprep.reads_func_name``); in ``sub-P/[ses-*/]anat/`` the
+        ``from-T1w_to-fsnative`` transform; in ``sub-P/figures/`` the summary and validation
+        reports and the distortion figure. Nothing else: no events, physio, sbref, other
+        spaces or anatomy. A participant without such a derivative ``func/`` file is left
+        out. None for a source without a raw client, a dataset of another layout than
+        ``fmriprep``, and when no participant is left. Kept for the life of the source.
+        Raises ``SourceError`` as the listings do."""
+        if self.raw_client is None or self.accession is None or dataset.layout != "fmriprep":
+            return None
+        memo = self._memo()
+        with memo.lock:
+            if dataset.identity in memo.func_listings:
+                return memo.func_listings[dataset.identity]
+        from surfcensus.func.connectors.fmriprep import (
+            fsnative_names,
+            reads_figure_name,
+            reads_func_name,
+        )
+        from surfcensus.func.inventory import FS_FILES
+
+        raw_client = self.raw_client
+        records = [r for r in self.subjects(dataset) if r.problem is None and r.files]
+        by_participant: dict[str, list[SubjectRecord]] = {}
+        for record in records:
+            found = _PARTICIPANT.match(record.subject_label)
+            if found is not None:
+                by_participant.setdefault(found.group(0), []).append(record)
+        base = self._base_key(dataset)
+        raw_base = raw_prefix(dataset.identity)
+        files: dict[str, tuple[FuncBucket, S3Object]] = {}
+        participants: list[str] = []
+        for participant, subjects in sorted(by_participant.items()):
+            derivs: dict[str, S3Object] = {}
+            for entry in self.client.list(f"{base}{participant}/"):
+                if isinstance(entry, str):
+                    continue
+                parts = entry.key[len(base) :].split("/")
+                if _deriv_wanted(
+                    parts, participant, reads_func_name, reads_figure_name, fsnative_names
+                ):
+                    derivs["/".join(parts)] = entry
+            if not any(place.split("/")[-2] == "func" for place in derivs):
+                continue
+            participants.append(participant)
+            for place, obj in derivs.items():
+                files[f"{FUNC_TREE_DERIV}/{place}"] = ("deriv", obj)
+            for entry in raw_client.list(f"{raw_base}{participant}/"):
+                if isinstance(entry, str):
+                    continue
+                parts = entry.key[len(raw_base) :].split("/")
+                if _raw_wanted(parts, participant):
+                    files[f"{FUNC_TREE_RAW}/{'/'.join(parts)}"] = ("raw", entry)
+            for subject in subjects:
+                for role in FS_FILES:
+                    ref = subject.files.get(role)
+                    if ref is not None:
+                        place = f"{FUNC_TREE_FS}/{subject.subject_label}/{ref.location}"
+                        files[place] = ("deriv", self._object(subject, ref))
+        listing = None
+        if participants:
+            description = self._object_at(f"{base}{_DESCRIPTION}")
+            if description is not None:
+                files[f"{FUNC_TREE_DERIV}/{_DESCRIPTION}"] = ("deriv", description)
+            for entry in raw_client.list(raw_base, delimiter="/"):
+                if isinstance(entry, str):
+                    continue
+                name = entry.key[len(raw_base) :]
+                if name == _DESCRIPTION or name.endswith(_BOLD_JSON):
+                    files[f"{FUNC_TREE_RAW}/{name}"] = ("raw", entry)
+            listing = FuncListing(
+                files=dict(sorted(files.items())), participants=tuple(participants)
+            )
+        with memo.lock:
+            memo.func_listings[dataset.identity] = listing
+        return listing
+
+    def func_size(self, dataset: DatasetRecord) -> tuple[int, int]:
+        """The bytes of :meth:`func_listing` that :meth:`func_tree` would fetch now (a whole
+        retained copy is not fetched again; before the source is bound to a cache every byte
+        counts), and the number of participants it holds; ``(0, 0)`` without a listing."""
+        listing = self.func_listing(dataset)
+        if listing is None:
+            return 0, 0
+        cache = self.cache
+        total = 0
+        for kind, obj in listing.files.values():
+            if cache is not None:
+                kept = cache.path_for(
+                    self._client_of(kind).bucket, obj.key, obj.etag, retained=True
+                )
+                if _is_whole(kept, obj.size):
+                    continue
+            total += obj.size
+        return total, len(listing.participants)
+
+    def func_tree(self, dataset: DatasetRecord) -> FuncTree | None:
+        """The functional files of :meth:`func_listing` downloaded into the retained cache and
+        laid out as a folder tree that the path-based planner of ``func/`` reads as it reads a
+        local folder: ``retained/<h[:2]>/<h>/func/`` with ``raw/`` (a BIDS dataset) and
+        ``deriv/`` (the derivative, with ``sourcedata/freesurfer/<subject>/`` inside it), hard
+        links to the retained files (copies with their times where the file system takes no
+        hard link). ``h`` is ``Cache.name`` of the bucket, the dataset's prefix and a digest
+        over the place, bucket, size and ETag of every file listed, as the template's tree is
+        named. The tree is built in this process's lease area and renamed into place in one
+        step, with :data:`FUNC_TREE_OBJECTS` (the cache names of the objects it links, and the
+        places left out) in it, so that no partial tree ever has that name. A tree that is
+        whole is returned without a download. None without a listing.
+
+        A file whose object changed or went since it was listed (404, 412, another ETag, a
+        body that is not the listed one) or that may not be read (403) is left out of the
+        tree and named in ``left_out``: the run it belongs to then gets the planner's own
+        reason. A bucket that cannot be reached raises ``SourceError("unreachable", ...)`` and
+        leaves no tree. A stop (Ctrl-C, SIGTERM) stops both clients and leaves nothing partial
+        under ``retained/`` (``Cache.retained``). Kept for the life of the source.
+        ``ConfigError`` before the source was bound to a cache."""
+        memo = self._memo()
+        with memo.lock:
+            if dataset.identity in memo.func_trees:
+                return memo.func_trees[dataset.identity]
+        listing = self.func_listing(dataset)
+        if listing is None:
+            return None
+        cache = self.cache
+        if cache is None:
+            raise ConfigError(
+                "invalid",
+                "a remote source hands out its functional files once a run has given it its cache",
+            )
+        digest = hashlib.sha256(
+            "\n".join(
+                f"{place}\t{self._client_of(kind).bucket}\t{obj.size}\t{obj.etag}"
+                for place, (kind, obj) in listing.files.items()
+            ).encode()
+        ).hexdigest()
+        target = cache.path_for(
+            self.bucket, f"{self._base_key(dataset)}{FUNC_TREE}", digest, retained=True
+        )
+        whole = _func_tree_whole(target, listing)
+        if whole is None:
+            places = list(listing.files)
+
+            def kept(place: str) -> Path | SourceError:
+                kind, obj = listing.files[place]
+                try:
+                    return cache.retained(self._client_of(kind), obj)
+                except SourceError as exc:
+                    if exc.reason == UNREACHABLE:
+                        raise
+                    return _placed(exc, (place,))
+
+            found = self._parallel(kept, places)
+            links: dict[str, Path] = {}
+            left: list[str] = []
+            for place, path in zip(places, found, strict=True):
+                if isinstance(path, SourceError):
+                    left.append(place)
+                else:
+                    links[place] = path
+            names = sorted(
+                cache.name(self._client_of(kind).bucket, obj.key, obj.etag)
+                for place, (kind, obj) in listing.files.items()
+                if place in links
+            )
+            record = json.dumps({"objects": names, "left_out": left}, indent=1) + "\n"
+            _build_tree(
+                cache,
+                target,
+                links,
+                extra={FUNC_TREE_OBJECTS: record.encode()},
+                dirs=(FUNC_TREE_RAW, FUNC_TREE_DERIV),
+                what="functional",
+            )
+            whole = tuple(left)
+        tree = FuncTree(
+            root=target,
+            raw=target / FUNC_TREE_RAW,
+            deriv=target / FUNC_TREE_DERIV,
+            fs_subjects=target / FUNC_TREE_FS,
+            left_out=whole,
+        )
+        with memo.lock:
+            memo.func_trees[dataset.identity] = tree
+        return tree
+
+    def func_stems(self, dataset: DatasetRecord) -> list[str] | None:
+        """The derivative stems of the preprocessed series of the selected participants
+        (``sub-01_ses-1_task-rest_run-1``), from :meth:`func_listing`, for the check of an
+        ``--epi-runs`` glob before it is stored; None without a listing."""
+        listing = self.func_listing(dataset)
+        if listing is None:
+            return None
+        stems = []
+        for place in listing.files:
+            name = place.rsplit("/", 1)[-1]
+            found = _PRE_BOLD.search(name)
+            if place.split("/")[-2] == "func" and found is not None:
+                stems.append(name[: found.start()])
+        return sorted(dict.fromkeys(stems))
+
+    def _client_of(self, kind: FuncBucket) -> S3Client:
+        if kind == "deriv":
+            return self.client
+        if self.raw_client is None:
+            raise ConfigError("invalid", "this source has no client of the raw bucket")
+        return self.raw_client
+
     # --- helpers -------------------------------------------------------------------------------
 
     def _memo(self) -> _Memo:
@@ -671,8 +911,9 @@ class OpenNeuroDerivatives:
         were running ended; those not yet started are dropped.
 
         A stop of the command (``KeyboardInterrupt``, which SIGTERM is turned into) ends the
-        work: the client is stopped, so that no request is started or retried and a body
-        being read is given up, the items not yet started are dropped, and the interrupt is
+        work: the clients (that of the raw bucket too) are stopped, so that no request is
+        started or retried and a body being read is given up, the items not yet started are
+        dropped, and the interrupt is
         raised once the running ones ended, which a stalled read delays by its timeout at
         most (``remote.s3.READ_STALL_S``). The client can be used again afterwards."""
         items = list(items)
@@ -694,11 +935,14 @@ class OpenNeuroDerivatives:
             pool.shutdown(wait=True, cancel_futures=True)
             raise
         except BaseException:
-            self.client.stop()
+            clients = self._clients()
+            for client in clients:
+                client.stop()
             try:
                 pool.shutdown(wait=True, cancel_futures=True)
             finally:
-                self.client.stopped.clear()
+                for client in clients:
+                    client.stopped.clear()
             raise
         pool.shutdown(wait=True)
         return found
@@ -716,6 +960,126 @@ _MAX_NAMES = 10
 _TIER_A_AT_ONCE = len(TIER_A)
 """At most this many Tier A (or template) files are fetched at once, under the client's
 limit: the seven Tier A files of a subject in one round."""
+
+FUNC_TREE = "func"
+"""The name of the functional tree of a dataset in the retained cache (decision D50)."""
+FUNC_TREE_RAW = "raw"
+"""The raw BIDS dataset in the tree: the files of ``s3://openneuro.org/dsXXXXXX/``."""
+FUNC_TREE_DERIV = "deriv"
+"""The fMRIPrep derivative in the tree: the files of ``fmriprep/dsXXXXXX-fmriprep/``."""
+FUNC_TREE_FS = f"{FUNC_TREE_DERIV}/sourcedata/freesurfer"
+"""Where the tree holds the FreeSurfer subjects of the contours, whatever ``fs_root`` the
+dataset has: the place ``func.discover`` finds them in a local fMRIPrep output."""
+FUNC_TREE_OBJECTS = ".objects.json"
+"""The file of a tree that names the cache names of the objects it links (keyed with the run
+secret) and the places left out; written last, inside the tree, so that ``Run.prune_cache``
+keeps those objects and a tree without it is not whole."""
+FuncBucket = Literal["raw", "deriv"]
+_PARTICIPANT = re.compile(r"sub-[A-Za-z0-9]+")
+"""The participant of a FreeSurfer subject directory, as the inventory reads it."""
+_BOLD_JSON = "_bold.json"
+_RAW_SERIES = ("_bold.nii.gz", "_bold.nii", _BOLD_JSON)
+_PRE_BOLD = re.compile(r"_space-[A-Za-z0-9]+_desc-preproc_bold\.nii(\.gz)?$")
+
+
+@dataclass(frozen=True)
+class FuncListing:
+    """What :meth:`OpenNeuroDerivatives.func_listing` found: place in the tree ->
+    (bucket kind, object), and the participants it covers."""
+
+    files: Mapping[str, tuple[FuncBucket, S3Object]]
+    participants: tuple[str, ...]
+
+    @property
+    def size(self) -> int:
+        return sum(obj.size for _, obj in self.files.values())
+
+
+@dataclass(frozen=True)
+class FuncTree:
+    """The functional tree of a dataset in the retained cache: its folders, and the places
+    (relative to ``root``) that were listed and could not be fetched."""
+
+    root: Path
+    raw: Path
+    deriv: Path
+    fs_subjects: Path
+    left_out: tuple[str, ...] = ()
+
+
+def _deriv_wanted(
+    parts: Sequence[str],
+    participant: str,
+    reads_func: Callable[[str], bool],
+    reads_figure: Callable[[str], bool],
+    fsnative: Callable[[str, str | None], tuple[str, ...]],
+) -> bool:
+    """Whether a key of the derivative below ``sub-P/`` (split at ``/``, ``sub-P`` first) is
+    one the EPI interface reads."""
+    if not parts or parts[0] != participant:
+        return False
+    if len(parts) == 3 and parts[1] == "figures":
+        return reads_figure(parts[2])
+    session = None
+    if len(parts) == 4:
+        if not parts[1].startswith("ses-"):
+            return False
+        session = parts[1][len("ses-") :]
+    elif len(parts) != 3:
+        return False
+    if parts[-2] == "func":
+        return reads_func(parts[-1])
+    if parts[-2] == "anat":
+        return parts[-1] in fsnative(participant, session)
+    return False
+
+
+def _raw_wanted(parts: Sequence[str], participant: str) -> bool:
+    """Whether a key of a raw dataset below ``sub-P/`` (split at ``/``) is one the EPI
+    interface reads: a series or sidecar in ``func/``, an inherited ``*_bold.json`` of the
+    subject or a session, the ``sessions.tsv`` and the ``scans.tsv``."""
+    if not parts or parts[0] != participant:
+        return False
+    name = parts[-1]
+    if len(parts) == 2:
+        return name.endswith(_BOLD_JSON) or name in (
+            f"{participant}_sessions.tsv",
+            f"{participant}_scans.tsv",
+        )
+    in_session = parts[1].startswith("ses-")
+    if len(parts) == 3:
+        if parts[1] == "func":
+            return name.endswith(_RAW_SERIES)
+        return in_session and (name.endswith(_BOLD_JSON) or name.endswith("_scans.tsv"))
+    if len(parts) == 4:
+        return in_session and parts[2] == "func" and name.endswith(_RAW_SERIES)
+    return False
+
+
+def _func_tree_whole(target: Path, listing: FuncListing) -> tuple[str, ...] | None:
+    """The places left out of a whole tree at ``target`` (from its :data:`FUNC_TREE_OBJECTS`),
+    or None when there is no whole tree: the file is missing or cannot be read, or a place
+    that it does not name as left out is missing or not at its listed size."""
+    try:
+        record = json.loads((target / FUNC_TREE_OBJECTS).read_text(encoding="utf-8"))
+        left = tuple(str(place) for place in record["left_out"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    out = set(left)
+    for place, (_, obj) in listing.files.items():
+        if place not in out and not _is_whole(target / place, obj.size):
+            return None
+    return left
+
+
+def tree_objects(tree_root: Path) -> list[str] | None:
+    """The cache names that a functional tree links, from its :data:`FUNC_TREE_OBJECTS`;
+    None when it cannot be read (``Run.prune_cache``)."""
+    try:
+        record = json.loads((Path(tree_root) / FUNC_TREE_OBJECTS).read_text(encoding="utf-8"))
+        return [str(name) for name in record["objects"]]
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
 
 
 @dataclass
@@ -752,6 +1116,8 @@ class _Memo:
     subjects: dict[str, tuple[bool, dict[FileRole, FileRef]]] = field(default_factory=dict)
     templates: dict[str, dict[str, S3Object]] = field(default_factory=dict)
     tier_a: dict[tuple[object, ...], _Fetched] = field(default_factory=dict)
+    func_listings: dict[str, FuncListing | None] = field(default_factory=dict)
+    func_trees: dict[str, FuncTree | None] = field(default_factory=dict)
 
 
 def _file_refs(listed: Mapping[str, S3Object]) -> dict[FileRole, FileRef]:
@@ -823,23 +1189,42 @@ def _tree_whole(target: Path, wanted: Mapping[str, S3Object]) -> bool:
     return all(_is_whole(target / name, obj.size) for name, obj in wanted.items())
 
 
-def _build_tree(cache: Cache, target: Path, files: Mapping[str, Path]) -> None:
-    """Lay ``files`` (place in the template to retained file) out below ``target``: hard
-    links (or copies) in a directory of this process's lease area, which is renamed to
-    ``target`` in one step. When another process put a whole tree there first, it is kept."""
+def _build_tree(
+    cache: Cache,
+    target: Path,
+    files: Mapping[str, Path],
+    *,
+    extra: Mapping[str, bytes] | None = None,
+    dirs: Sequence[str] = (),
+    what: str = "template",
+) -> None:
+    """Lay ``files`` (place in the tree to retained file) out below ``target``: hard links
+    (or copies that keep the file's times) in a directory of this process's lease area,
+    beside the files of ``extra`` (place to bytes, written last) and the empty folders
+    ``dirs``, which is renamed to ``target`` in one step. When another process put a whole
+    tree there first, it is kept."""
     # the staging tree is written into this process's lease area, whose lock the cache takes
     # on first use; when every file was retained already no call has taken it yet, and an
     # area without its lock could be pruned by another process or cleared by the first lease
-    staging = cache.hold_area() / f".template.{secrets.token_hex(8)}"
+    staging = cache.hold_area() / f".{what}.{secrets.token_hex(8)}"
     tree = staging / target.name
     try:
+        tree.mkdir(parents=True)
+        for name in dirs:
+            (tree / name).mkdir(parents=True, exist_ok=True)
         for name, source in files.items():
             dest = tree / name
             dest.parent.mkdir(parents=True, exist_ok=True)
             try:
                 os.link(source, dest)
             except OSError:
-                shutil.copyfile(source, dest)
+                # a copy keeps the times, so that the listing facts of the planner (size and
+                # modification time) are those of the retained file, as for a hard link
+                shutil.copy2(source, dest)
+        for name, data in (extra or {}).items():
+            dest = tree / name
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            dest.write_bytes(data)
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
             os.rename(tree, target)
@@ -852,8 +1237,11 @@ def _build_tree(cache: Cache, target: Path, files: Mapping[str, Path]) -> None:
             ):
                 raise ConfigError(
                     "invalid",
-                    "the cache holds an incomplete template directory; remove the run's "
+                    f"the cache holds an incomplete {what} directory; remove the run's "
                     "cache/retained folder and run the command again",
                 ) from exc
+            for name, data in (extra or {}).items():
+                if not (target / name).is_file():
+                    (target / name).write_bytes(data)
     finally:
         shutil.rmtree(staging, ignore_errors=True)

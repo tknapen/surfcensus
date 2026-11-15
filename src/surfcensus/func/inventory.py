@@ -44,7 +44,12 @@ from typing import TYPE_CHECKING
 from surfcensus.func import bids
 from surfcensus.func import connectors as connectors_
 from surfcensus.func.connectors.base import Connector, ConnectorError
-from surfcensus.func.discover import FuncFolders, folders_of, func_source_of
+from surfcensus.func.discover import (
+    FuncFolders,
+    folders_of,
+    func_source_of,
+    func_source_of_tree,
+)
 from surfcensus.records import (
     FUNC_INVENTORY_PHASE,
     NO_PREPROCESSED_SERIES,
@@ -1051,20 +1056,29 @@ def run_func_inventory(
     # 1. every listing, before anything is recorded
     found: list[_Dataset] = []
     for source in sources:
-        if source.kind != "local":
+        tree_of = getattr(source, "func_tree", None) if source.kind != "local" else None
+        if source.kind != "local" and tree_of is None:
             continue
         for record in source.datasets():
             dataset_id = _dataset_id(catalog, record)
             if dataset_id is None:
                 continue
-            func = func_source_of(record, raw)
+            if tree_of is not None:
+                # a dataset of a bucket: its functional files as a tree in the run's cache,
+                # fetched by Run.func_inventory before this (decision D50)
+                tree = tree_of(record)
+                func = None if tree is None else func_source_of_tree(record, tree)
+                subjects_dir = None if tree is None else Path(tree.fs_subjects)
+            else:
+                func = func_source_of(record, raw)
+                subjects_dir = Path(record.root) / record.fs_root
             if func is None:
                 continue
             stored = catalog.func_source(dataset_id)
             if stored is not None and stored.connector == func.connector:
                 func = replace(func, deriv_identity=stored.deriv_identity)
             connector = connectors_.connector(func.connector)
-            folders = folders_of(func, Path(record.root) / record.fs_root)
+            folders = folders_of(func, subjects_dir)
             listings = [
                 list_participant(folders, connector, participant)
                 for participant in participants_of(folders)

@@ -2093,7 +2093,16 @@ class Catalog:
                 (session_uid,),
             )
             fs_subjects_dir = None
-            if session["subject_uid"] is not None:
+            assert source is not None  # the foreign key
+            dataset = self._db.one(
+                "SELECT source FROM datasets WHERE dataset_id = ?", (source["dataset_id"],)
+            )
+            if dataset is not None and dataset["source"] != "local":
+                # a dataset of a bucket: its FreeSurfer subjects are in the functional tree
+                # of the run's cache, beside the derivative (decision D50)
+                if session["fs_subject"] is not None:
+                    fs_subjects_dir = str(Path(source["deriv_root"], *FUNC_TREE_FS_PARTS))
+            elif session["subject_uid"] is not None:
                 subject = self._db.one(
                     "SELECT d.root, s.fs_dir FROM subjects s JOIN datasets d USING (dataset_id) "
                     "WHERE s.subject_uid = ?",
@@ -2831,6 +2840,11 @@ def read_table(path: Path | str, schema: pa.Schema | None = None) -> pd.DataFram
 def media_dir(run_dir: Path | str, subject_uid: str) -> Path:
     """``media/<subject_uid>`` of a run directory: the render of one subject."""
     return Path(run_dir) / MEDIA_DIR / subject_uid
+
+
+FUNC_TREE_FS_PARTS = ("sourcedata", "freesurfer")
+"""Where the functional tree of a dataset of a bucket holds the FreeSurfer subjects, relative
+to its derivative (``sources.openneuro_derivatives.FUNC_TREE_FS``)."""
 
 
 def epi_participant_dir(run_dir: Path | str, participant_uid: str) -> Path:

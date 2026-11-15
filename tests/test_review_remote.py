@@ -787,9 +787,6 @@ def test_an_unreadable_file_fails_its_subject_and_no_other(tmp_path: Path, fake:
     [
         ({"relocate": True}, "does not move"),
         ({"raw": "/tmp"}, "--raw"),
-        ({"epi": True}, "no EPI interface"),
-        ({"epi": False}, "no EPI interface"),
-        ({"epi_runs": ["*rest*"]}, "--epi-runs"),
         ({"field_strength": 3.0}, "--field-strength"),
     ],
 )

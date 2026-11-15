@@ -374,9 +374,6 @@ def test_serve_on_a_remote_run_needs_no_bucket(tmp_path: Path, served: tuple[Fak
     [
         ("--relocate",),
         ("--raw", "/tmp"),
-        ("--epi",),
-        ("--no-epi",),
-        ("--epi-runs", "*rest*"),
         ("--field-strength", "3"),
     ],
     ids=lambda option: option[0],

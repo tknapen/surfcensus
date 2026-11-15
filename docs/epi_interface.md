@@ -688,6 +688,26 @@ What was changed:
 
 What stays: the functional columns at the end of the review table; a SIGSTOP of the parent is not noticed by its workers; a collision of a `subject_uid` and a `participant_uid` is not checked; no person has looked at any of the pages.
 
+## From a bucket dataset (2026-11-15)
+
+His words: "i'd like to have an epi interface that i can also start up with a single uvx command". Decision D50. One command now prepares both interfaces for a dataset of the OpenNeuroDerivatives bucket, on the user's machine:
+
+```
+uvx --from git+https://github.com/tknapen/surfcensus surfcensus review openneuro:ds000102 --subjects sub-01 --epi
+```
+
+- What it does. After the surface inventory, the functional files of the participants of the selected FreeSurfer subjects are fetched anonymously and read-only: the raw series and their sidecars from `s3://openneuro.org/dsXXXXXX/`, the fMRIPrep files the connector reads from `s3://openneuro-derivatives/fmriprep/dsXXXXXX-fmriprep/`, and the T1, white and pial surfaces of the contours (the list is in `docs/decisions.md`, D50). They are kept in the run's retained cache and laid out there as a folder tree of hard links (`cache/retained/<hh>/<h>/func/raw/` and `.../func/deriv/`), and the functional inventory, the planner and the pack phase of the sections above run on that tree as they run on a local folder. Then the metrics, the first render, the app, and behind the app the rest of the renders and the packs, as for a folder (Step 2 as built).
+- The tool writes no NIfTI file and no image volume of its own. The cache holds the bucket's files as they are, as it already holds `T1.mgz`; the packs in `epi/` are the display cache, as for a folder.
+- Off unless asked for: a remote review without `--epi` has the interface off, makes no request to the raw bucket and writes the `config.yaml` it wrote before. `--epi` is stored, `--no-epi` turns it off again, `--epi-runs` selects what is packed (every file of a participant is fetched all the same in this version). `--raw` is refused.
+- `--epi` delays the first rating screen by the functional download, and the estimate says so: `..., 143.1 MB of it the functional files of 1 subject for the EPI movies, fetched before the metrics, so before the first rating screen, ...`. The 2 GB guard of a new run counts those bytes, and a disk that does not hold them is refused before any of them is fetched.
+- The functional block names the dataset, not the cache: `Functional: 2 runs in 1 session of 1 participant in openneuro:ds000102 (fMRIPrep 21.0.2), raw series from s3://openneuro.org; 2 can be packed (T1w space).`
+- Faults: a bucket that cannot be reached stops the call with exit code 2 and records nothing against a session; the same command goes on once it can be reached. A functional file that changed since it was listed, went or is refused is left out of the tree, one line names it, and its run gets the planner's reason (a raw series left out gives `no raw series`). Ctrl-C and SIGTERM during the downloads stop both clients and leave nothing partial in the cache.
+- `pack`, `status`, `serve` and `export` with `--run-dir` make no request (the tree is on disk); `inventory --run-dir` fetches as `review` does. A run directory that was moved or copied follows its trees.
+- A participant whose FreeSurfer subject is not selected is not fetched. A run whose only preprocessed series is in another space than T1w is listed as `no preprocessed series`, where a folder says `native space only` or `standard space only`: the tree does not hold such series.
+- What is outside `catalog.sqlite`: the accession is in the name of the default run directory and in the content of the bucket's files under `cache/` (now also the raw `dataset_description.json` and sidecars, which may name the dataset); not in `config.yaml`, `epi/`, the export or a served answer (`tests/test_remote_canary.py`).
+
+Measured once on the real buckets, `ds000102` sub-01 (one shared 4-core Linux machine): the app 20.2 s after the start, 210.2 MB in 64 requests before it, both packs made 51.6 s after the start; the same command again at the app after 2.5 s with 295 kB of listings and nothing packed; every decoded volume of both streams equals that of a local review of the cached copies, whose inputs lack only the run's validation report (an empty file of the bucket), so the content digests differ by that input (`docs/dev/remote_plan.md`, section 13, has the lines). Tested without the network on the synthetic folder of the tests laid out as the two buckets (`tests/test_review_remote_epi.py`): every pack's content digest equals that of a local review. No person has looked at the page of a remote run.
+
 ## Scope
 
 In scope: local folders that hold a raw BIDS dataset, an fMRIPrep derivative of it and the FreeSurfer subjects of that derivative; one app with a page per interface and per subject; the phases that list functional runs and pack them; their tables, tests and build order; the connector interface of O29 with one implementation, fMRIPrep.

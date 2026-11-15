@@ -70,6 +70,8 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
     # module -> name -> parameter names of a function, or None for a class or a constant
     "surfcensus.remote": {
         "DERIVATIVES_BUCKET": None,
+        "RAW_BUCKET": None,
+        "raw_prefix": ("accession",),
         "FMRIPREP_PREFIX": None,
         "MAX_CONCURRENCY": None,
         "ENDPOINT_ENV": None,
@@ -127,6 +129,19 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "OpenNeuroDerivatives": None,
         "accession_of": ("common_prefix", "prefix"),
         "dataset_root": ("bucket", "accession", "prefix"),
+        # the EPI interface of a dataset of the bucket (decision D50)
+        "FUNC_TREE": None,
+        "FUNC_TREE_RAW": None,
+        "FUNC_TREE_DERIV": None,
+        "FUNC_TREE_FS": None,
+        "FUNC_TREE_OBJECTS": None,
+        "FuncListing": None,
+        "FuncTree": None,
+        "tree_objects": ("tree_root",),
+    },
+    "surfcensus.func.discover": {
+        "remote_identity": ("record", "connector"),
+        "func_source_of_tree": ("record", "tree"),
     },
     "surfcensus.sources.patterns": {
         "roles_from_keys": ("names",),
@@ -177,7 +192,15 @@ METHODS: dict[type, dict[str, tuple[str, ...]]] = {
         "prune": (),
     },
     OpenNeuroDerivatives: {
-        "__init__": ("client", "cache", "prefix", "accession", "subjects", "pseudonym"),
+        "__init__": (
+            "client",
+            "cache",
+            "prefix",
+            "accession",
+            "subjects",
+            "pseudonym",
+            "raw_client",
+        ),
         "bind": ("cache", "pseudonym"),
         "config": (),
         "datasets": ("only",),
@@ -185,6 +208,12 @@ METHODS: dict[type, dict[str, tuple[str, ...]]] = {
         "read_bytes": ("subject", "role", "byte_range"),
         "lease": ("subject", "roles"),
         "template_dir": ("dataset",),
+        "func_listing": ("dataset",),
+        "func_size": ("dataset",),
+        "func_tree": ("dataset",),
+        "func_stems": ("dataset",),
+        "stop": (),
+        "close": (),
     },
 }
 

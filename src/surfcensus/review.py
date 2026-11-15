@@ -448,15 +448,15 @@ def _refuse_for_remote(
     raw: Path | str | None,
 ) -> None:
     """The options that a review of a remote dataset does not take, each refused with one
-    line (decision D47, items 4 and 7)."""
+    line (decision D47, item 7; since decision D50 ``--epi``, ``--no-epi`` and ``--epi-runs``
+    are taken, and ``--raw`` alone is refused)."""
     if relocate:
         raise ConfigError("invalid", "a remote dataset does not move; --relocate is for local data")
-    if raw is not None or epi is not None or epi_runs:
-        given = "--raw" if raw is not None else "--epi-runs" if epi_runs else "--epi/--no-epi"
+    if raw is not None:
         raise ConfigError(
             "invalid",
-            f"{given}: a review of a remote dataset has no EPI interface; the functional "
-            "files of a bucket dataset are not read",
+            "--raw: a review of a remote dataset reads the raw series of its dataset from "
+            "s3://openneuro.org (with --epi); a raw folder is not taken",
         )
     if field_strength is not None:
         raise ConfigError(
@@ -490,14 +490,20 @@ class RemoteEstimate:
     larger of one batch of the metrics and one of the renders."""
     everything: bool = False
     """The call renders every subject before it ends (no app, or ``--serve-after 0``)."""
+    func: int = 0
+    """Bytes of the functional files of the EPI interface (``--epi``, decision D50): fetched
+    after the surface inventory and before the metrics, so before the first rating screen,
+    and kept in the retained cache."""
+    func_subjects: int = 0
+    """The participants those files are of."""
 
     @property
     def before_app(self) -> int:
-        return self.tier_a + self.tier_b + self.template + self.first
+        return self.tier_a + self.tier_b + self.template + self.func + self.first
 
     @property
     def in_all(self) -> int:
-        return self.tier_a + self.tier_b + self.template + self.renders
+        return self.tier_a + self.tier_b + self.template + self.func + self.renders
 
 
 def _sum_roles(record: SubjectRecord, roles: Sequence[FileRole], skip: Callable[..., bool]) -> int:
@@ -516,11 +522,14 @@ def remote_estimate(
     jobs: int,
     batch_subjects: int,
     max_bytes: int,
+    epi: bool = False,
 ) -> RemoteEstimate:
     """:class:`RemoteEstimate` of ``records``, the listed subjects of ``dataset`` of the
     remote ``source``, for a run that holds nothing yet. ``template_needed``: the run takes
     its template from the ``fsaverage`` next to the subjects; ``n_first``: the renders the
-    app waits for (None: every one, a call that renders everything before it ends)."""
+    app waits for (None: every one, a call that renders everything before it ends); ``epi``:
+    the EPI interface is on, and the functional files of the selected participants are
+    counted (``func_size`` of the source, which lists them)."""
     from surfcensus.sources.base import TIER_A, TIER_B, TIER_C
 
     cache = getattr(source, "cache", None)
@@ -540,6 +549,19 @@ def remote_estimate(
     def never(record: SubjectRecord, ref: Any) -> bool:
         return False
 
+    # with the EPI interface on, the FreeSurfer files of the contours are retained with the
+    # functional files, and the render leases those copies without a request (decision D50)
+    shared: set[str] = set()
+    listing = getattr(source, "func_listing", None) if epi else None
+    if listing is not None:
+        found = listing(dataset)
+        if found is not None:
+            shared = {obj.key for kind, obj in found.files.values() if kind == "deriv"}
+
+    def in_tree(record: SubjectRecord, ref: Any) -> bool:
+        base = dataset.root.removeprefix(f"s3://{source.bucket}/")
+        return f"{base}{record.fs_dir}/{ref.location}" in shared
+
     template = 0
     if template_needed:
         template = int(source.template_size(dataset) or 0)
@@ -550,7 +572,7 @@ def remote_estimate(
     tier_a = sum(_sum_roles(r, TIER_A, kept) for r in records)
     tier_bs = [_sum_roles(r, TIER_B, never) for r in records]
     complete = [r for r in records if all(role in r.files for role in RENDER_ROLES)]
-    renders = sorted((_sum_roles(r, render_roles, never) for r in complete), reverse=True)
+    renders = sorted((_sum_roles(r, render_roles, in_tree) for r in complete), reverse=True)
     first_n = len(renders) if n_first is None else min(n_first, len(renders))
     largest_b = max(tier_bs, default=0)
     batch = min(batch_subjects, max(1, max_bytes // largest_b)) if largest_b else batch_subjects
@@ -563,6 +585,9 @@ def remote_estimate(
     fits = min(batch_subjects, max(1, max_bytes // largest_c)) if largest_c else batch_subjects
     at_once = fits if n_first is None else max(min(first_n, fits), min(jobs, fits))
     peak_c = largest_c * min(at_once, len(renders))
+    func = func_subjects = 0
+    if epi and getattr(source, "func_size", None) is not None:
+        func, func_subjects = source.func_size(dataset)
     return RemoteEstimate(
         subjects=len(records),
         tier_a=tier_a,
@@ -571,8 +596,10 @@ def remote_estimate(
         first=sum(renders[:first_n]),
         n_first=first_n,
         renders=sum(renders),
-        peak=tier_a + template + max(peak_b, peak_c),
+        peak=tier_a + template + func + max(peak_b, peak_c),
         everything=n_first is None,
+        func=func,
+        func_subjects=func_subjects,
     )
 
 
@@ -582,6 +609,8 @@ def estimate_line(estimate: RemoteEstimate, *, app: bool = True) -> str:
     what = [f"Tier A and B of {_plural(estimate.subjects, 'subject')}"]
     if estimate.template:
         what.append("the fsaverage template")
+    if estimate.func:
+        what.append("the functional files")
     if estimate.n_first:
         what.append(_plural(estimate.n_first, "render"))
     if app:
@@ -591,20 +620,41 @@ def estimate_line(estimate: RemoteEstimate, *, app: bool = True) -> str:
         )
     else:
         head = f"To fetch: {size_text(estimate.in_all)} in all ({', '.join(what)})"
+    head += func_words(estimate.func, estimate.func_subjects, app=app)
     return (
         f"{head}, an estimate from the listed sizes; the files of each batch are removed after "
         f"it, and at most {size_text(estimate.peak)} of source files are on disk at once."
     )
 
 
-def continued_line(run: Run, *, template_bytes: int, n_first: int | None, app: bool) -> str:
+def func_words(size: int, participants: int, *, app: bool) -> str:
+    """``, 115.3 MB of it the functional files of 1 subject for the EPI movies, fetched
+    before the metrics`` (decision D50); empty without functional bytes."""
+    if not size:
+        return ""
+    when = ", fetched before the metrics, so before the first rating screen" if app else ""
+    return (
+        f", {size_text(size)} of it the functional files of "
+        f"{_plural(participants, 'subject')} for the EPI movies{when}"
+    )
+
+
+def continued_line(
+    run: Run,
+    *,
+    template_bytes: int,
+    n_first: int | None,
+    app: bool,
+    func: tuple[int, int] = (0, 0),
+) -> str:
     """The line of a continued run, said after its inventory: what ``metrics`` and
     ``render`` would lease now by their own plans (``Run.remote_pending``), so that a map or
     a render that a changed file or setting makes pending again is counted, and what the run
     holds is not. ``n_first``: the renders the app waits for in all (None: every one)."""
     maps, renders, exact = run.remote_pending()
     tier_b, in_renders = sum(maps.values()), sum(renders.values())
-    in_all = template_bytes + tier_b + in_renders
+    func_bytes, func_subjects = func
+    in_all = template_bytes + func_bytes + tier_b + in_renders
     if in_all == 0:
         return (
             "To fetch: nothing more; the maps and the renders of this run are those of the "
@@ -613,6 +663,8 @@ def continued_line(run: Run, *, template_bytes: int, n_first: int | None, app: b
     what = []
     if template_bytes:
         what.append("the fsaverage template")
+    if func_bytes:
+        what.append("the functional files")
     if maps:
         what.append(f"Tier B of {_plural(len(maps), 'subject')}")
     if renders:
@@ -622,7 +674,9 @@ def continued_line(run: Run, *, template_bytes: int, n_first: int | None, app: b
         done = render_counts(run)[0]
         waited = len(renders) if n_first is None else min(max(n_first - done, 0), len(renders))
         first = sum(sorted(renders.values(), reverse=True)[:waited])
-        line += f", {size_text(template_bytes + tier_b + first)} of it before the rating screen"
+        before = template_bytes + func_bytes + tier_b + first
+        line += f", {size_text(before)} of it before the rating screen"
+    line += func_words(func_bytes, func_subjects, app=app)
     return line + ", an estimate from the listed sizes; what this run holds is not fetched again."
 
 
@@ -694,6 +748,8 @@ def _open_remote_run(
     serve_after: int | None,
     jobs: int,
     fsaverage: Path | str | None,
+    epi: bool | None = None,
+    epi_runs: Sequence[str] | None = None,
 ) -> tuple[Run, bool, int]:
     """The run of a review of the remote dataset ``ref``, made or opened, with the options
     given written into it, whether it is new, and the bytes of the ``fsaverage`` next to
@@ -702,7 +758,8 @@ def _open_remote_run(
     read, and a run that names no subjects is refused when that exceeds
     :data:`REMOTE_GUARD_BYTES` (decision D47, item 3), before anything is written. For a
     continued run the caller says it after the inventory (:func:`continued_line`)."""
-    from surfcensus.config import RemoteConfig
+    from surfcensus.config import RemoteConfig, epi_settings
+    from surfcensus.remote import RAW_BUCKET
     from surfcensus.remote.s3 import S3Client
     from surfcensus.run import remote_index
     from surfcensus.sources.openneuro_derivatives import OpenNeuroDerivatives
@@ -721,12 +778,19 @@ def _open_remote_run(
         globs = stored.sources[index].subjects
     else:
         globs = ()
-    client = S3Client(
-        ref.bucket,
-        config=stored.remote if stored is not None else RemoteConfig(),
-        transport=transport,
+    settings = stored.remote if stored is not None else RemoteConfig()
+    client = S3Client(ref.bucket, config=settings, transport=transport)
+    # the raw bucket of the EPI interface (decision D50); asked only when it is on
+    raw_client = S3Client(RAW_BUCKET, config=settings, transport=transport)
+    source = OpenNeuroDerivatives(
+        client=client, accession=ref.accession, subjects=globs, raw_client=raw_client
     )
-    source = OpenNeuroDerivatives(client=client, accession=ref.accession, subjects=globs)
+    # the EPI interface of this call: as given, else as the run has it (off for a new run)
+    epi_on = (
+        bool(epi)
+        if epi is not None
+        else (stored is not None and index is not None and epi_settings(stored).enabled)
+    )
     run: Run | None = None
     if stored is not None:
         # another source's run is "other root" here, before anything is listed
@@ -754,7 +818,8 @@ def _open_remote_run(
                 + _offline_remedy(run, run_dir),
             ) from exc
         config = run.config if run is not None else None
-        settings = config.cache if config is not None else CacheConfig()
+        cache_settings = config.cache if config is not None else CacheConfig()
+        new_run = run is None
         wanted = None if not serve or serve_after == 0 else serve_after or DEFAULT_SERVE_AFTER
         needed = _template_needed(run_dir, stored, fsaverage)
         estimate = remote_estimate(
@@ -764,10 +829,15 @@ def _open_remote_run(
             template_needed=needed,
             n_first=wanted,
             jobs=jobs,
-            batch_subjects=settings.batch_subjects,
-            max_bytes=settings.max_bytes,
+            batch_subjects=cache_settings.batch_subjects,
+            max_bytes=cache_settings.max_bytes,
+            epi=epi_on and new_run,
         )
         new = run is None
+        if epi_on and epi_runs:
+            from surfcensus.run import refuse_unmatched_epi_runs
+
+            refuse_unmatched_epi_runs(source.func_stems(dataset), epi_runs)
         if new and subjects is None and estimate.before_app > REMOTE_GUARD_BYTES:
             before = " before the first rating screen" if serve else ""
             raise ConfigError(
@@ -786,6 +856,11 @@ def _open_remote_run(
                 app["require_marks"] = require_marks
             base = new_local_config(None, app=app, render_video=bool(video))
             run = Run(run_dir, source, config=base, transport=transport)
+        if epi is not None or epi_runs is not None:
+            # stored as for a folder (decision D50): --epi turns the interface on, --no-epi
+            # off again, --epi-runs selects what is packed; a glob that matches no
+            # functional run of the selected participants is refused before it is stored
+            run.set_epi(enabled=epi, runs=epi_runs)
         _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
         if new:
             _say(estimate_line(estimate, app=serve))
@@ -1034,6 +1109,19 @@ def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
 
     places = []
     for folder in run.func_folders():
+        version = folder["pipeline_version"]
+        pipeline = "fMRIPrep" if folder["connector"] == "fmriprep" else str(folder["connector"])
+        pipeline += f" {version}" if isinstance(version, str) else ""
+        if folder.get("source", "local") != "local":
+            # a dataset of a bucket: named as on the command line, never by the tree in the
+            # cache that the planner reads (decision D50)
+            from surfcensus.remote import RAW_BUCKET, REMOTE_SCHEME
+
+            places.append(
+                f"{REMOTE_SCHEME}:{folder['accession']} ({pipeline}), raw series from "
+                f"s3://{RAW_BUCKET}"
+            )
+            continue
         deriv_root = Path(str(folder["deriv_root"]))
         raw_root = None if folder["raw_root"] is None else Path(str(folder["raw_root"]))
         # both folders named the same way: relative to the path when both lie in it, else
@@ -1044,9 +1132,6 @@ def functional_lines(run: Run, path: Path | str | None = None) -> list[str]:
         ):
             common = None
         deriv = _shown_place(deriv_root, common)
-        version = folder["pipeline_version"]
-        pipeline = "fMRIPrep" if folder["connector"] == "fmriprep" else str(folder["connector"])
-        pipeline += f" {version}" if isinstance(version, str) else ""
         if raw_root is None:
             raw = "no raw dataset found (give it with --raw DIR)"
         else:
@@ -1580,6 +1665,8 @@ def open_review(
             serve_after=serve_after,
             jobs=jobs,
             fsaverage=fsaverage,
+            epi=epi,
+            epi_runs=epi_runs,
         )
     else:
         named = Path(path)
@@ -1623,6 +1710,7 @@ def open_review(
                         template_bytes=template_bytes,
                         n_first=None if everything else serve_after or DEFAULT_SERVE_AFTER,
                         app=serve,
+                        func=run.remote_func_pending(),
                     )
                 )
         # the functional inventory reads listings and small files only (D33: the time to the
@@ -1630,6 +1718,8 @@ def open_review(
         run.func_inventory()
         for line in functional_lines(run, named):
             _say(line)
+        if run.func_left_out_note is not None:
+            _say(f"  {run.func_left_out_note}.")
 
         _with_fsaverage(run, fsaverage)
         report = run.metrics(jobs=jobs)

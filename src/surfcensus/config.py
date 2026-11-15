@@ -535,13 +535,22 @@ def dump_config(config: RunConfig) -> str:
     return yaml.safe_dump(data, sort_keys=True)
 
 
+def epi_defaults(config: RunConfig) -> EpiConfig:
+    """What the EPI interface of a run is when its ``config.yaml`` has no section ``epi``: on
+    in a local run of folders; off in a census run (the EPI phases do not run there) and in a
+    local run on a dataset of a bucket (``review openneuro:dsXXXXXX``), whose functional files
+    are fetched only once ``--epi`` asks for them (decision D50)."""
+    if config.mode != "local" or any(stored.kind != "local" for stored in config.sources):
+        return EpiConfig(enabled=False)
+    return EpiConfig()
+
+
 def epi_settings(config: RunConfig) -> EpiConfig:
-    """The settings of the EPI interface of a run: its section ``epi``, else the defaults,
-    which have the interface on in a local run and off in a census run (the EPI phases do
-    not run there)."""
+    """The settings of the EPI interface of a run: its section ``epi``, else
+    :func:`epi_defaults`."""
     if config.epi is not None:
         return config.epi
-    return EpiConfig() if config.mode == "local" else EpiConfig(enabled=False)
+    return epi_defaults(config)
 
 
 def write_config(run_dir: Path | str, config: RunConfig, *, exclusive: bool = False) -> None:

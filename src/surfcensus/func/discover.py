@@ -34,7 +34,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from surfcensus.func import bids
 from surfcensus.func import connectors as connectors_
@@ -253,6 +253,41 @@ def func_source_of(record: DatasetRecord, raw: Path | None = None) -> FuncSource
         raw_root=None if raw_root is None else str(raw_root),
         deriv_found=how,
         raw_found=raw_how,
+    )
+
+
+def remote_identity(record: DatasetRecord, connector: str) -> str:
+    """The ``deriv_identity`` of the functional source of a dataset of a bucket (decision
+    D50): the dataset's root in the bucket (``s3://<bucket>/fmriprep/dsXXXXXX-fmriprep/``) and
+    the connector, a text that no path of this machine enters, so that a moved run directory
+    or a new tree in its cache keeps every ``participant_uid``, ``session_uid`` and
+    ``run_uid``. Private, like every identity: it stays in the catalog."""
+    return f"{record.root}#{connector}"
+
+
+def func_source_of_tree(record: DatasetRecord, tree: Any) -> FuncSourceRecord | None:
+    """The functional source of a dataset of a bucket from its functional tree in the run's
+    cache (``OpenNeuroDerivatives.func_tree``: ``deriv``, ``raw`` and ``fs_subjects``), or None
+    when no connector recognises the tree's derivative. The derivative is the one that holds
+    the FreeSurfer subjects of the dataset (``surface layout``), and the raw dataset that of
+    the same accession in ``s3://openneuro.org``, recorded as ``dataset root``: the BIDS
+    dataset whose derivative it is. The roots are those of the tree and follow it at every
+    inventory; the identity is :func:`remote_identity`."""
+    deriv = Path(tree.deriv)
+    if not deriv.is_dir():
+        return None
+    found = _detect(deriv)
+    if found is None:
+        return None
+    match = found[1]
+    return FuncSourceRecord(
+        connector=match.connector,
+        match=match,
+        deriv_root=str(deriv),
+        deriv_identity=remote_identity(record, match.connector),
+        raw_root=str(tree.raw),
+        deriv_found="surface layout",
+        raw_found="dataset root",
     )
 
 

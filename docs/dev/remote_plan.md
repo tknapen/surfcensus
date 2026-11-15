@@ -211,3 +211,40 @@ The independent review (two reviewers, commit `e64c6c3`; one on the data path, t
 After the first CI run of the stage (2026-11-15): both macOS cells failed one test, the interrupt while subject prefixes are listed, and both Linux cells passed. The source waited for its listings with one wait without a timeout. Such a wait is ended by a signal that reaches the main thread; the test set the interrupt as a flag (`_thread.interrupt_main`), which a main thread that already waits does not see, so on macOS the test ran to its own deadline of 60 s. The source now waits in steps of 0.1 s, as the cache does for its downloads, so a stop is seen whichever thread the system hands the signal to, and the test sends the interrupt both ways with the main thread already waiting (the flag case fails on the code before, after 20 s). Whether a real Ctrl-C on macOS ever reached another thread than the main one was not observed.
 
 Not checked: the 2 GB guard on a real listing; a `SlowDown`, a 403 or a truncated body from the real bucket; more than three real subjects in one run; macOS, Windows, network file systems; the app's review screen and subject pages on a remote run; two processes on one run directory while one prunes.
+
+## 13. The EPI interface of a bucket dataset (2026-11-15, decision D50)
+
+`surfcensus review openneuro:dsXXXXXX --subjects GLOB --epi` prepares both interfaces in one command. This changes item 4 of D47 and the refusal of `--epi`, `--no-epi` and `--epi-runs` in section 4 and in departure 3 of section 12: those options are taken now, and `--raw` alone is refused. Where this section and the sections above disagree, this section holds.
+
+- The second bucket. `remote.RAW_BUCKET = "openneuro.org"`, read by a second `S3Client` of the same `RemoteConfig` and the same guard, path addressing (the name has a dot). `OpenNeuroDerivatives(raw_client=...)` holds it; `run.from_config` makes it for a source of one dataset, and `review` for the source it makes. Making it makes no request. `stop()` and `close()` of the source act on both clients, `_parallel` stops both on an interrupt, and both count in `remote.stats()`, whose limit of 8 open requests holds for the process.
+- The listing. `OpenNeuroDerivatives.func_listing(dataset)`: per participant of the selected FreeSurfer subjects, one listing of `fmriprep/dsXXXXXX-fmriprep/sub-P/` and one of `dsXXXXXX/sub-P/` in the raw bucket, then one listing of the derivative's `dataset_description.json` and one delimiter listing of the raw dataset's root. The files kept are those of `docs/decisions.md`, D50. Kept for the life of the source; nothing is listed of the raw bucket while the interface is off.
+- The tree. `func_tree(dataset)` retains every listed file (`Cache.retained`, keyed names) and builds `retained/<hh>/<h>/func/` with `raw/`, `deriv/`, `deriv/sourcedata/freesurfer/<subject>/` and `.objects.json` (the cache names of the objects it links, and the places left out) as hard links, in the lease area, renamed into place in one step (`_build_tree`, which the template uses as well and which now keeps the times of a copy). `h` is `Cache.name(bucket, <dataset prefix>func, <digest of place, bucket, size and ETag of every listed file>)`. A tree whose `.objects.json` reads and whose files are at their listed sizes is whole and is returned without a request.
+- The phases. `Run.func_inventory` checks the free disk against `func_size` (what is not retained yet), builds the trees, then calls `func.inventory.run_func_inventory`, which for a source with `func_tree` builds the `FuncSourceRecord` from the tree (`func.discover.func_source_of_tree`, identity `func.discover.remote_identity`) and lists the tree's derivative as it lists a folder. `Catalog.func_lease_facts` gives the tree's `deriv/sourcedata/freesurfer` as the FreeSurfer subjects directory of a session of such a dataset. `Run.pack` first points stored roots at the trees of this run's cache (`_follow_func_trees`) when the run directory was moved or copied.
+- The cache. `Run.prune_cache` keeps the entry of every present tree and the objects of its `.objects.json` (`_func_tree_names`), found by the entry's name under this run's `cache/retained/`, not by the stored absolute root.
+- The command. `config.epi_defaults`: off for a local run with a source of a bucket, so `config.yaml` without `--epi` is as before. `_open_remote_run` stores `--epi`, `--no-epi` and `--epi-runs` (`Run.set_epi`, which refuses `--raw` on such a run), refuses an `--epi-runs` glob that matches no stem of the listing before a new run is made, and adds the functional bytes to the estimate (`RemoteEstimate.func`, `func_words`) and to the 2 GB guard; with the interface on, a render does not count the FreeSurfer files that the tree retains. A continued run counts what `Run.remote_func_pending` would fetch. The functional block names the dataset (`in openneuro:dsXXXXXX (fMRIPrep 21.0.2), raw series from s3://openneuro.org`), and a line names the files left out.
+
+Measured on the real buckets (one shared 4-core Linux machine, Python 3.13, through the proxy of the building environment, one run; `ds000102` sub-01 only):
+
+```
+Listing openneuro:ds000102 in s3://openneuro-derivatives, anonymously and read-only ...
+Run directory: .../ds000102-surfcensus-run (new)
+To fetch: 236.7 MB before the first rating screen (Tier A and B of 1 subject, the fsaverage template, the functional files, 1 render), 236.7 MB in all, 143.1 MB of it the functional files of 1 subject for the EPI movies, fetched before the metrics, so before the first rating screen, an estimate from the listed sizes; the files of each batch are removed after it, and at most 222.5 MB of source files are on disk at once.
+Found 1 subject in openneuro:ds000102 (fMRIPrep layout, FreeSurfer 6.0.1, of the subjects matching sub-01).
+Functional: 2 runs in 1 session of 1 participant in openneuro:ds000102 (fMRIPrep 21.0.2), raw series from s3://openneuro.org; 2 can be packed (T1w space).
+Scores: 1 subject; 1 ranked on ceiling fraction and occipital-to-control ratio, without a reference (decision D16).
+Rendered: 1 of 1 subject.
+EPI packs: 0 of 2 runs made; 2 are made while the app runs (about 33 s in one process, an estimate: 0.114 s per volume of both streams on 109,368 voxels, scaled by voxels).
+Rating app: http://127.0.0.1:36895/ (Ctrl-C to stop)
+EPI movies: http://127.0.0.1:36895/epi
+  20.2 s from the start of the command to the app; 210.2 MB fetched in 64 requests.
+All EPI packs are made: 2 of 2 runs can be viewed.
+0 rated, 1 to go. Run the same command to continue. Export: surfcensus export --run-dir .../ds000102-surfcensus-run
+Fetched 210.2 MB in 64 requests in all; 143.8 MB of source files left in the cache.
+EPI packs: 2 of 2 runs made.
+```
+
+- 20.2 s to the app by the command's clock, 210.2 MB in 64 requests before it and nothing after it; both packs were written 51.6 s after the command was started. The estimate (236.7 MB) counted the T1, white and pial twice, in the functional files and in the render, which leases the retained copies without a request; that was corrected after this run, so the estimate of the same command is now about 28 MB lower (not run again on the real bucket).
+- The same command again: `To fetch: nothing more`, the app after 2.5 s, 295 kB in 10 requests (listings and the derivative's description), nothing planned or packed.
+- Every decoded volume of both streams of both runs equals that of a local review of the copies in the pytest cache (`tests/test_network_review_remote_epi.py`). The content digests differ: the remote tree holds the run's validation report (an empty file in the bucket), which the cached copies of the local fixture lack, and the report is among a pack's inputs; every other input has the same size and SHA-256.
+
+Not checked: the 23.2 and later generation of fMRIPrep on the bucket; a dataset whose raw dataset is missing from `s3://openneuro.org` (the runs would be `no raw series`); a participant with sessions on the real bucket; a 404 or 403 of the real bucket on a functional file (tested on the fake only); macOS; a person looking at the page.

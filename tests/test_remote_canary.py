@@ -146,3 +146,46 @@ def test_the_search_finds_a_leak(tmp_path: Path) -> None:
     found = leaks(tmp_path, [FIRST, "sub-CANARY7"])
     assert ("notes.txt", f"content holds {FIRST}") in found
     assert (f"{CACHE_DIR}/sub-CANARY7", "name holds sub-CANARY7") in found
+
+
+def test_a_review_with_the_epi_interface_keeps_its_accession_in_the_catalog(
+    tmp_path: Path,
+) -> None:
+    """``review openneuro:dsXXXXXX --epi`` (decision D50): the functional files of both
+    buckets are kept under ``cache/`` (their content is the bucket's, as it is; their names
+    are searched), and nothing else of the run, the packs of ``epi/`` and the export
+    included, names the accession, a key or an ETag of either bucket."""
+    from synth_func import write_review_folder  # pyrefly: ignore[missing-import]
+
+    from surfcensus.remote import RAW_BUCKET
+
+    folder = write_review_folder(tmp_path / "data")
+    raw = tmp_path / "buckets" / RAW_BUCKET
+    raw.mkdir(parents=True)
+    (raw / FIRST).symlink_to(folder.raw_root.resolve(), target_is_directory=True)
+    deriv = tmp_path / "buckets" / BUCKET / "fmriprep"
+    deriv.mkdir(parents=True)
+    (deriv / f"{FIRST}-fmriprep").symlink_to(folder.deriv_root.resolve(), target_is_directory=True)
+    fake = FakeS3({RAW_BUCKET: raw, BUCKET: deriv.parent}, page_size=7)
+    run_dir = tmp_path / "run"
+    review(
+        f"openneuro:{FIRST}",
+        run_dir=run_dir,
+        serve=False,
+        jobs=1,
+        epi=True,
+        transport=fake.transport(),
+    ).close()
+    export_run(run_dir)
+    assert any((run_dir / "epi").iterdir())
+    assert (run_dir / "export" / "func_runs.csv").is_file()
+    words = [FIRST, "fmriprep/ds", "s3://", f"{RAW_BUCKET}/"]
+    for bucket in (RAW_BUCKET, BUCKET):
+        for key in fake.keys(bucket):
+            if "/sub-" not in key and not key.endswith("dataset_description.json"):
+                continue
+            words.append(key)
+            path = fake.buckets[bucket].joinpath(*key.split("/"))
+            words.append(hashlib.md5(path.read_bytes()).hexdigest())  # the ETag
+    assert leaks(run_dir, words) == []
+    assert fake.signed == [] and fake.methods <= {"GET", "LIST"}

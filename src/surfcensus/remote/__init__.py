@@ -40,6 +40,7 @@ __all__ = [
     "ENDPOINT_ENV",
     "FMRIPREP_PREFIX",
     "MAX_CONCURRENCY",
+    "RAW_BUCKET",
     "REMOTE_SCHEME",
     "RETRIED_STATUSES",
     "SLOW_DOWN",
@@ -51,6 +52,7 @@ __all__ = [
     "dataset_prefix",
     "default_transport",
     "parse_remote_path",
+    "raw_prefix",
     "read_only",
     "record_bytes",
     "record_request",
@@ -63,6 +65,12 @@ __all__ = [
 
 DERIVATIVES_BUCKET = "openneuro-derivatives"
 """The OpenNeuroDerivatives bucket, listable anonymously (checked 2026-11-01)."""
+
+RAW_BUCKET = "openneuro.org"
+"""The bucket of the raw OpenNeuro datasets, ``s3://openneuro.org/dsXXXXXX/``, listable
+anonymously (checked 2026-11-01). A review of a remote dataset with the EPI interface on
+(``--epi``) reads the raw functional series of its participants from here, through a client of
+its own behind the same guard (decision D50); path addressing, since the name has a dot."""
 
 FMRIPREP_PREFIX = "fmriprep/"
 """The prefix under which the bucket holds one ``dsXXXXXX-fmriprep/`` prefix per dataset. A
@@ -151,6 +159,11 @@ class RemoteRef:
 def dataset_prefix(accession: str, prefix: str = FMRIPREP_PREFIX) -> str:
     """``fmriprep/dsXXXXXX-fmriprep/``: the prefix of one dataset below ``prefix``."""
     return prefix + _DATASET_PREFIX.format(accession=accession)
+
+
+def raw_prefix(accession: str) -> str:
+    """``dsXXXXXX/``: the prefix of a raw dataset in :data:`RAW_BUCKET`."""
+    return f"{accession}/"
 
 
 def parse_remote_path(text: str | os.PathLike[str]) -> RemoteRef | None:

@@ -49,7 +49,14 @@ The dataset is read anonymously and read-only (GET requests alone, at most 8 at 
 - `--subjects` takes shell patterns and is kept for later calls. Without it every subject of the dataset is reviewed: for `ds000102` (26 subjects) that is 460 MB before the rating screen and 1.4 GB in all. A new review that would fetch more than 2 GB before the rating screen stops and asks for `--subjects`; `--subjects '*'` means all of them.
 - Every call lists the dataset, so `review` needs the network also when everything is rendered. Without it, `surfcensus serve --run-dir ./ds000102-surfcensus-run` opens the rating app on what is rendered, with no request to the bucket. If the network fails while subjects are still being rendered behind the app, the rendering pauses, says so, and tries again every 30 s.
 - Ctrl-C stops it; the same command again goes on and fetches nothing twice that the run holds. On a small disk fewer subjects are fetched at a time; a disk that does not hold the files of one subject (about 40 MB) or the template is refused before anything is fetched for them.
-- Not for a remote dataset: the EPI movies (`--raw`, `--epi`, `--epi-runs`), `--field-strength` and `--relocate` are refused. `render-subject`, `epi-session` and `inventory --source` read folders only.
+- Both interfaces in one command: `--epi` also fetches the raw and the preprocessed EPI series of the chosen subjects (from `s3://openneuro.org` and the derivative, read the same way) and packs them for the EPI movies, which the app offers at `/epi`:
+
+  ```
+  uvx --from git+https://github.com/tknapen/surfcensus surfcensus review openneuro:ds000102 --subjects sub-01 --epi
+  ```
+
+  The functional files are fetched before the rating screen opens, so they delay it; the line `To fetch:` says by how much (`143.1 MB of it the functional files of 1 subject for the EPI movies`). Measured on 2026-11-15 for `ds000102` sub-01 on one 4-core Linux machine: the rating screen 20 s after the command, after 210 MB of downloads, both EPI movies ready 52 s after the command; the same command again was at the app in 2.5 s. The functional files and the subject's T1 and surfaces stay in the run's cache (about 144 MB for this subject), as the bucket has them; nothing writes an image volume of its own. `--epi` is kept for later calls, `--no-epi` turns it off, `--epi-runs GLOB` chooses the runs that are packed. Without `--epi` nothing is asked of the raw bucket.
+- Not for a remote dataset: `--raw`, `--field-strength` and `--relocate` are refused. `render-subject`, `epi-session` and `inventory --source` read folders only.
 
 What the install costs, measured on 2026-11-14 on the same machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
 
