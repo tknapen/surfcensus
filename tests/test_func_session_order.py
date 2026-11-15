@@ -48,9 +48,32 @@ from surfcensus.store import Catalog
 D = datetime.datetime
 TEST_FIRST = {"test": "1900-01-02T09:00:00", "retest": "1900-02-03T09:00:00"}
 """Shifted years, as anonymised public datasets write them: test before retest."""
-DATE_WORDS = re.compile(r"190[01]-|T(09|10):[0-9]{2}|01-0[12]")
-"""What a date of the tests would look like anywhere it leaked (no hex digest holds a ``-`` or
-a ``:``)."""
+_DATE_WORDS = re.compile(r"190[01]-|T(09|10):[0-9]{2}|01-0[12]")
+_OWN_TIMES = re.compile(
+    r"\b2[0-9]{3}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}[0-9.]*(?:Z|[+-][0-9]{2}:[0-9]{2})?"
+)
+
+
+class _DateWords:
+    """What a date of the tests would look like anywhere it leaked (no hex digest holds a
+    ``-`` or a ``:``). The times that the run itself records (``packed_at`` and the like,
+    in this century) are taken out first: the test must not depend on the hour or the day
+    it runs at, and the dates of the tests are in 1900 and 1901."""
+
+    @staticmethod
+    def search(text: str) -> re.Match[str] | None:
+        return _DATE_WORDS.search(_OWN_TIMES.sub("", text))
+
+
+DATE_WORDS = _DateWords()
+
+
+def test_the_date_check_finds_a_test_date_and_not_the_time_a_run_records() -> None:
+    for own in ("2026-11-15T09:14:15+00:00", "2027-01-01T10:59:59Z", "2026-03-01T09:00:00.250"):
+        assert DATE_WORDS.search(f"('done', None, 12, '{own}')") is None
+    for leaked in ("1900-01-02T09:00:00", "acq T10:00 of the session", "1901-03-01", "on 01-02"):
+        assert DATE_WORDS.search(f"x {leaked} y") is not None
+    assert DATE_WORDS.search("2026-11-15T09:14:15+00:00 and 1900-02-03T09:30:00.5") is not None
 
 
 # --- reading a date ---------------------------------------------------------------------------
