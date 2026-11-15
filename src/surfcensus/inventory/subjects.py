@@ -264,10 +264,16 @@ def _stopped_by_network(
     says what was kept: the subjects stored before it, and nothing of the subject or listing
     it was at; no subject is marked absent."""
     detail = privacy.scrub_with(catalog, exc.detail)
+    if done == 0:
+        kept = "no subject was stored before it"
+    elif done == 1:
+        kept = "the 1 subject stored before it is kept"
+    else:
+        kept = f"the {done} subjects stored before it are kept"
     return SourceError(
         UNREACHABLE,
         f"the bucket could not be reached ({detail}); the inventory of {pseudonym} stopped at "
-        f"{at}: the {done} subject(s) stored before it are kept, nothing of it was stored and "
+        f"{at}: {kept}, nothing of it was stored and "
         "no subject was marked absent; run the same command again once it can be reached",
     )
 
@@ -326,7 +332,8 @@ def _inventory_dataset(
                 skipped += 1
                 continue
 
-            current = uid
+            # a local run names its subjects by label, a census run by uid (decision D20)
+            current = record.subject_label if config.mode == "local" else uid
             read = _read_tier_a(source, record, config.inventory)
             record = _without_content(source, record, read.pointers)
             if record.unfetched:

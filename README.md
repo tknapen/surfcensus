@@ -6,7 +6,7 @@ Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the s
 
 ## Status
 
-Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`, which since the quick-start follow-up installs in one line and finds the subjects of a downloaded or DataLad-cloned dataset by itself. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
+Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`, which since the quick-start follow-up installs in one line and finds the subjects of a downloaded or DataLad-cloned dataset by itself. `surfcensus review openneuro:dsXXXXXX` does the same for a dataset of the public OpenNeuroDerivatives bucket that is not on disk. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
 
 ## Quick start
 
@@ -36,6 +36,20 @@ What happens. The command lists and scores the subjects, renders the first one a
 Files that are not fetched. A dataset cloned with DataLad (or `git clone` of a git-annex repository) holds its files by name before their content is fetched. `review` fetches nothing and changes nothing in the dataset: it names the subjects whose files have no content, the size, and one command that fetches them, for example `Fetch them (28.5 MB) with: datalad -C /data/ds000102 get derivatives/fmriprep/sourcedata/freesurfer/sub-01/mri/T1.mgz ...`. A subdataset that is not installed (an empty `derivatives/`) gets the command that installs it (`datalad -C /data/ds000102 get -n derivatives`). Run the command, then the same `review` again: the subjects are picked up without further options. A subject that cannot be rendered is shown to nobody and is listed as unratable with its reason.
 
 Where your work goes. Your data is only read: nothing is written into the dataset, a subject directory or the directory that holds your subjects. Everything goes into a run directory, `surfcensus-run` beside the folder you named, or beside the dataset that holds it, never inside it: a BIDS dataset with the subjects below its `derivatives/`, an fMRIPrep output with a `dataset_description.json`, or a DataLad dataset (`--run-dir DIR` puts it elsewhere). A plain git repository is not recognised, so in one the run can land inside its work tree; give `--run-dir` there. Two datasets in one folder would share that `surfcensus-run`: the second is told which `--run-dir` to give (`surfcensus-run` with the dataset's name in front), and is found there the next time. Ratings and marks are in `app.sqlite` there; `surfcensus export --run-dir /path/to/surfcensus-run` writes them as tables (below). Ctrl-C stops the app, and the same command again continues where you were.
+
+A dataset that is not on your disk. For a dataset of the OpenNeuroDerivatives bucket (fMRIPrep output of OpenNeuro datasets, with its FreeSurfer subjects), name it instead of a folder:
+
+```
+surfcensus review openneuro:ds000102 --subjects 'sub-0[12]'
+```
+
+The dataset is read anonymously and read-only (GET requests alone, at most 8 at once, no credential). The command lists it, says how much it will fetch from the listed sizes, fetches the files of a few subjects at a time into the run directory and removes them once they are scored and rendered. What it keeps is the renders, the scores and the small log and stats files. Measured on 2026-11-15 on one 4-core Linux machine: the rating screen of the two subjects above was up 20 s after the command, after 109 MB of downloads (148 MB in all, about 40 MB of it the `fsaverage` template that comes with the dataset), with at most 40 MB of subject files on disk at once; the renders and maps are byte for byte those of the same files on disk.
+
+- The run goes to `./ds000102-surfcensus-run` in the directory you are in (`--run-dir DIR` otherwise). The dataset's accession is in that name, in `catalog.sqlite` and in the text of the kept log files, and nowhere else in the run; the rating screen names no dataset.
+- `--subjects` takes shell patterns and is kept for later calls. Without it every subject of the dataset is reviewed: for `ds000102` (26 subjects) that is 460 MB before the rating screen and 1.4 GB in all. A new review that would fetch more than 2 GB before the rating screen stops and asks for `--subjects`; `--subjects '*'` means all of them.
+- Every call lists the dataset, so `review` needs the network also when everything is rendered. Without it, `surfcensus serve --run-dir ./ds000102-surfcensus-run` opens the rating app on what is rendered, with no request to the bucket. If the network fails while subjects are still being rendered behind the app, the rendering pauses, says so, and tries again every 30 s.
+- Ctrl-C stops it; the same command again goes on and fetches nothing twice that the run holds. On a small disk fewer subjects are fetched at a time; a disk that does not hold the files of one subject (about 40 MB) or the template is refused before anything is fetched for them.
+- Not for a remote dataset: the EPI movies (`--raw`, `--epi`, `--epi-runs`), `--field-strength` and `--relocate` are refused. `render-subject`, `epi-session` and `inventory --source` read folders only.
 
 What the install costs, measured on 2026-11-14 on the same machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
 
@@ -157,7 +171,7 @@ When the folder holds an fMRIPrep derivative with functional runs below `derivat
 ## Planned
 
 - The rating app for a team: several raters at once with their own links, a calibration set that every rater rates first, adjudication of disagreements, and a dashboard.
-- `pip install surfcensus` from PyPI, and `surfcensus review openneuro:dsXXXXXX` on a dataset that is not on disk, streamed from the public bucket (decision O20).
+- `pip install surfcensus` from PyPI.
 - A normative reference to score small sets against, built from rated census subjects.
 - The OpenNeuro census: the same pipeline over FreeSurfer outputs in public OpenNeuro derivatives, to measure how common these errors are and how often quantitative checks miss them. See `docs/phases.md`.
 

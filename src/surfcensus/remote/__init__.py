@@ -88,12 +88,18 @@ STATUS_REASONS: dict[int, str] = {403: "unreadable", 404: "changed", 412: "chang
 """The ``SourceError`` reason of an HTTP status of a request for an object that a listing
 named (decision D47, item 10). A 404 or 412 says that the object changed after it was listed;
 a 403 that it may not be read. None of these is retried. A listing that cannot be had is
-``not found`` (404) or ``unreadable`` (403); retries that run out are ``unreachable``."""
+``not found`` (404) or ``unreadable`` (403); retries that run out are ``unreachable``.
 
-RETRIED_STATUSES: frozenset[int] = frozenset({500, 502, 503, 504})
+Every other status that is no success and is not retried (a 407 of a proxy, a 401, a
+redirect, a 400) says something about the way to the bucket and not about the object: it is
+``unreachable`` at once, so that a phase stops and records it against no subject (review of
+the remote stage, 2026-11-15)."""
+
+RETRIED_STATUSES: frozenset[int] = frozenset({429, 500, 502, 503, 504})
 """Statuses that are retried, with exponential backoff and full jitter, up to
 ``RemoteConfig.max_retries``; besides them connection errors, read timeouts, a body cut short
-and a body whose MD5 is not its ETag. ``SlowDown`` comes as a 503."""
+and a body whose MD5 is not its ETag. ``SlowDown`` comes as a 503; a 429 is what a proxy
+on the way answers when it limits the rate."""
 
 SLOW_DOWN = "SlowDown"
 """The ``Code`` of S3's error body that asks a client to send fewer requests."""

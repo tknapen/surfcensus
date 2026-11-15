@@ -230,7 +230,7 @@ def test_the_constants() -> None:
         412: "changed",
         416: "invalid",
     }
-    assert remote.RETRIED_STATUSES == {500, 502, 503, 504}
+    assert remote.RETRIED_STATUSES == {429, 500, 502, 503, 504}
     assert (remote.SLOW_DOWN, remote.UNREACHABLE) == ("SlowDown", "unreachable")
     assert CACHE_DIR == "cache"
 
@@ -427,6 +427,60 @@ def test_the_endpoint_of_the_tests_is_loopback_only(
     assert fake.methods == {"GET"}
     monkeypatch.delenv(remote.ENDPOINT_ENV)
     assert isinstance(default_transport().inner, httpx.HTTPTransport)  # no request made
+
+
+def test_the_endpoint_of_the_tests_keeps_the_timeouts_of_a_request() -> None:
+    """The request that goes on to the test server carries the extensions of the one it
+    replaces, which is where ``httpx`` keeps the timeouts: without them a stalled test
+    server would hold a request for good."""
+    from surfcensus.remote import transport as transport_module
+
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, content=b"x")
+
+    moved = transport_module._Endpoint(
+        httpx.URL("http://127.0.0.1:9"), httpx.MockTransport(handler)
+    )
+    with httpx.Client(transport=moved, trust_env=False, timeout=httpx.Timeout(7, read=3)) as http:
+        http.get(f"https://{BUCKET}.s3.amazonaws.com/k?list-type=2")
+    (request,) = seen
+    assert request.url == f"http://127.0.0.1:9/{BUCKET}/k?list-type=2"
+    assert request.extensions["timeout"] == {"connect": 7, "read": 3, "write": 7, "pool": 7}
+
+
+@pytest.mark.parametrize(
+    ("no_proxy", "exempt"),
+    [
+        ("", False),
+        ("*", True),
+        ("amazonaws.com", True),
+        (".amazonaws.com", True),
+        ("*.s3.amazonaws.com", True),
+        ("s3.amazonaws.com", True),
+        ("localhost, 127.0.0.1 ,amazonaws.com", True),
+        ("ws.com", False),  # no dot boundary: another domain
+        ("aws.com", False),
+        ("example.org,localhost", False),
+        # one bucket's own host exempts nothing: the transport serves every bucket
+        (f"{BUCKET}.s3.amazonaws.com", False),
+    ],
+)
+def test_no_proxy_exempts_the_bucket_hosts_at_a_dot(
+    no_proxy: str, exempt: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from surfcensus.remote import transport as transport_module
+
+    for name in ("HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    assert transport_module._environment_proxy() is None
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", no_proxy)
+    assert transport_module._environment_proxy() == (
+        None if exempt else "http://proxy.invalid:3128"
+    )
 
 
 def test_the_client_puts_the_guard_under_every_request(monkeypatch: pytest.MonkeyPatch) -> None:

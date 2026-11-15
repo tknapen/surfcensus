@@ -15,6 +15,23 @@ The rater can pause and scrub frame by frame. Scrubbing is the main way experien
 
 The gist (`tknapen/85d9a23a09c95d15f4b23ba1965fa54d`) uses `freeview -cmd` with `-viewport sagittal`, `-slice x 127 127` and `-ss` per slice, then ffmpeg. It is kept as the `freeview` backend for publication figures and for comparison. That backend is not built yet: milestone 1 has the default backend only, and `--backend freeview` is an option of the census `render` command (`architecture.md`). The default backend is pure Python (nibabel, numpy and matplotlib). It needs no X server, FreeSurfer install or license, produces identical output for a given input, config and locked environment (decision D18), and parallelizes across processes.
 
+### Checked against Freeview's source and against VTK (2026-11-15)
+
+Tomas asked whether the surfaces are drawn as Freeview draws them. No Freeview binary could be run (FreeSurfer's download host is not reachable from the building environment), so this is a check against its source at v7.4.1 and against VTK, the library it draws with, not against the program.
+
+What Freeview does, read in `freeview/` at v7.4.1: a surface vertex goes from tkr RAS to scanner RAS through the volume geometry in the surface file's footer (`FSSurface.cpp`: vox2ras times the inverse of vox2ras-tkr of that geometry) and from there into the grid of the displayed volume; the 2D contour is a `vtkCutter` of the mesh with a plane at the slice position (`LayerSurface.cpp`), which `-slice x y z` puts through the centre of the named voxel (`MainWindow.cpp`, `OriginalIndexToRAS` of the integer index); the image is resliced by nearest neighbour and shown by a `vtkImageActor` without interpolation (`LayerMRI.cpp`); the default line width of a contour is 2 (`LayerPropertySurface.cpp`).
+
+Recomputed on `ds000102` sub-01 (FreeSurfer 6.0.1) and `ds003020` sub-UTS01 (7.3.2), with nibabel and numpy for Freeview's matrices and VTK 9.7.2 from PyPI for the cut and, off screen under Xvfb with Mesa, for the frames:
+
+- Placement. Freeview's chain and this renderer's (the vox2ras-tkr of `T1.mgz` alone) put every vertex of the four surfaces at the same voxel coordinates in both subjects (largest difference 0): the footer's `c_ras` equals the T1's. With the footer shifted by 0.5 mm the same comparison gives 0.5 voxel.
+- The cut. `vtkCutter` and `MeshSlicer` give the same number of segments in each of 144 planes per subject (12 per voxel axis and surface; 293,362 and 289,859 segments), with endpoints within 3e-14 and 6e-6 voxel.
+- Pixels. VTK shows voxel 3 of a test image from 2.5 to 3.5 and a line at 3.0 in its middle, which is the voxel convention of Geometry above.
+- Tiles. For 21 tiles per subject (7 per panel), frames of the same slices at 4 px per mm, made with the VTK classes and settings named above, against the tiles of a render: the grayscale tiles differ from the VTK image by 1.7 and 1.5 of 255 on average (the lossy WebP) and by at least 7.3 with the VTK frame one voxel off; of about 88,000 and 85,000 contour pixels of the tiles, 99% lie within 1.4 px (0.35 mm) of a VTK line of width 1 and the same holds the other way round, with a mean offset of at most 0.07 px. The largest distances (up to 9.5 px) are three single pixels, each looked at: a piece of contour shorter than a pixel, where the surface grazes the plane, that one rasterizer lights and the other leaves faint.
+
+What differs, by design or by rasterizer: Freeview's line is 2 px wide and, as read, not antialiased, and in the VTK frames a line of width 2 sits 0.2 to 0.35 px to one side of the cut, while the tiles' line is 1.25 px, antialiased, joined and centred; the pial line is drawn over the white one, so where the two surfaces coincide (the medial wall) only the pial colour shows; colours, intensity window, crop and zoom are this renderer's; and a surface whose footer geometry differs from the displayed volume would be placed by Freeview through the footer and here through the T1 header (neither subject is such a case).
+
+Not checked: a Freeview binary with its own VTK build and graphics driver; any other subject. The by-eye comparison of milestone 1 stays open for that reason. The scripts of this check are not in the repository.
+
 ## Geometry
 
 Coordinates: FreeSurfer surfaces are in tkr RAS (surface RAS): x to the subject's right, y anterior, z superior, in mm. `T1.mgz` is normally a conformed 256³ 1 mm volume; nibabel gives its voxel-to-tkr-RAS affine via `MGHHeader.get_vox2ras_tkr()`. Nothing in the renderer assumes 1 mm or 256³: all geometry is in mm and is converted through the affine, so `-hires` volumes work (decision D18).

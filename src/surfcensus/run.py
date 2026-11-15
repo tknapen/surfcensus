@@ -9,6 +9,7 @@ method imports the phase it calls and hands it the public side of the run
 from __future__ import annotations
 
 import dataclasses
+import errno
 import logging
 import os
 import sqlite3
@@ -879,21 +880,74 @@ class Run:
         record = self._catalog.subject_record(subject_uid)
         return self._source_of(record.dataset).lease(record, roles)
 
-    def _remote_roles_bytes(self, roles: Collection[FileRole]) -> list[int]:
-        """Per present subject of a remote dataset, the bytes of its listed files of
-        ``roles``, from the private catalog: what one lease of the subject downloads at most."""
+    def remote_bytes(self, roles: Collection[FileRole]) -> dict[str, int]:
+        """``subject_uid`` -> the bytes of the listed files of ``roles``, for every present
+        subject of a remote dataset that has one of them, from the private catalog: what one
+        lease of the subject downloads at most. Empty for a run without a remote dataset."""
         if not roles or all(stored.kind == "local" for stored in self.config.sources):
-            return []
+            return {}
         marks = ", ".join("?" for _ in roles)
         rows = self._catalog.query(
-            "SELECT SUM(f.size) AS total FROM files f "
+            "SELECT f.subject_uid AS uid, SUM(f.size) AS total FROM files f "
             "JOIN subjects s ON s.subject_uid = f.subject_uid "
             "JOIN datasets d ON d.dataset_id = s.dataset_id "
             f"WHERE d.source != 'local' AND s.present = 1 AND f.role IN ({marks}) "
-            "GROUP BY f.subject_uid",
+            "GROUP BY f.subject_uid ORDER BY f.subject_uid",
             tuple(FileRole(role).value for role in roles),
         )
-        return [int(row["total"] or 0) for row in rows]
+        return {str(row["uid"]): int(row["total"] or 0) for row in rows}
+
+    def remote_pending(self) -> tuple[dict[str, int], dict[str, int], bool]:
+        """What a plain ``metrics`` and ``render`` would lease now from the remote datasets
+        of the run, from the catalog alone: ``subject_uid`` -> listed bytes of the Tier B
+        files of the subjects whose thickness maps are pending, the same for the render
+        files of the subjects whose render is pending, and whether that is exact.
+
+        It is exact when the run's pinned template reads from ``templates/<id>/``: the plans
+        are then those of the phases. Without it (a run that never got to its template)
+        every present subject counts for both, an upper bound. Call it after an inventory,
+        so that the catalog holds the present listing."""
+        from surfcensus.metrics.pipeline import pending_maps
+        from surfcensus.render.batch import pending_renders
+        from surfcensus.templates import TEMPLATES_DIR, read_template
+
+        tier_b, render = self.remote_bytes(TIER_B), self.remote_bytes(RENDER_LEASED)
+        template = None
+        pinned = self._catalog.meta("template_id")
+        if pinned is not None:
+            try:
+                template = read_template(self.run_dir / TEMPLATES_DIR / pinned)
+            except (OSError, ValueError):
+                template = None
+        complete = set(self.public().subject_uids(complete=True))
+        if template is None or template.template_id != pinned:
+            return tier_b, {uid: n for uid, n in render.items() if uid in complete}, False
+        context = self.context()
+        maps = set(pending_maps(context, template=template))
+        renders = set(pending_renders(context, template=template))
+        return (
+            {uid: n for uid, n in tier_b.items() if uid in maps},
+            {uid: n for uid, n in render.items() if uid in renders},
+            True,
+        )
+
+    def refuse_over_budget(self) -> None:
+        """Refuse, before anything is fetched for them, the metrics and renders of a run
+        with a remote dataset whose largest subject leases more than ``cache.max_bytes``."""
+        for roles, what in ((TIER_B, "metrics"), (RENDER_LEASED, "renders")):
+            self._largest_within_budget(self.remote_bytes(roles), what)
+
+    def _largest_within_budget(self, sizes: Mapping[str, int], what: str) -> int:
+        largest = max(sizes.values(), default=0)
+        settings = self.config.cache
+        if largest > settings.max_bytes:
+            raise ConfigError(
+                "invalid",
+                f"the {what} lease {size_text(largest)} of source files for one subject, more "
+                f"than the cache's budget of {size_text(settings.max_bytes)} (cache.max_bytes "
+                f"in {CONFIG_FILE}): raise cache.max_bytes",
+            )
+        return largest
 
     @contextmanager
     def _remote_batches(self, roles: Collection[FileRole], what: str) -> Iterator[None]:
@@ -902,41 +956,37 @@ class Run:
         One batch leases at most ``cache.batch_subjects`` subjects at once, each at most the
         largest subject's files of ``roles``. When that exceeds ``cache.max_bytes`` the batch
         size is lowered for the length of the block (one line at info level), so that a
-        lease never raises ``CacheBudgetError``; a single subject over the budget is refused
-        (``ConfigError("invalid", ...)``), as is a call when the disk of the cache has less
-        free space than one batch and ``DISK_MARGIN_BYTES``. Nothing happens for a run
-        without a remote dataset."""
-        from surfcensus.remote.cache import CACHE_DIR, DISK_MARGIN_BYTES
+        lease never raises ``CacheBudgetError``, and lowered further to what the free space
+        of the cache's disk holds beside a margin for what the phase writes
+        (:func:`disk_margin`). A single subject over the budget is refused
+        (``ConfigError("invalid", ...)``), as is a call when that free space does not hold
+        the files of one subject. Nothing happens for a run without a remote dataset."""
+        from surfcensus.remote.cache import CACHE_DIR
 
-        sizes = self._remote_roles_bytes(roles)
-        largest = max(sizes, default=0)
+        largest = self._largest_within_budget(self.remote_bytes(roles), what)
         if largest == 0:
             yield
             return
         settings = self.config.cache
-        if largest > settings.max_bytes:
-            raise ConfigError(
-                "invalid",
-                f"the {what} of one subject lease {size_text(largest)} of source files, more than "
-                f"the cache's budget of {size_text(settings.max_bytes)} (cache.max_bytes in "
-                f"{CONFIG_FILE}): raise cache.max_bytes",
-            )
         batch = min(settings.batch_subjects, max(1, settings.max_bytes // largest))
         free = free_bytes(self.run_dir / CACHE_DIR)
-        need = batch * largest
-        if free is not None and free < need + DISK_MARGIN_BYTES:
-            raise ConfigError(
-                "invalid",
-                f"the disk of {self.run_dir} has {size_text(free)} free, and the {what} need "
-                f"{size_text(need)} for a batch of {batch} subject(s) beside a margin of "
-                f"{size_text(DISK_MARGIN_BYTES)}: make room, or lower cache.batch_subjects in "
-                f"{CONFIG_FILE}",
-            )
+        if free is not None:
+            # what is left for source files once room is kept for what the phase writes
+            usable = free - disk_margin(free)
+            if usable < largest:
+                raise ConfigError(
+                    "invalid",
+                    f"the disk of {self.run_dir} has {size_text(free)} free; the {what} lease "
+                    f"{size_text(largest)} of source files for one subject at a time and write "
+                    "their results beside them: make room",
+                )
+            batch = min(batch, usable // largest)
         if batch == settings.batch_subjects:
             yield
             return
         get_logger().info(
-            "batches of %d subjects for the %s, so that one batch fits cache.max_bytes",
+            "batches of %d subjects for the %s, so that one batch fits the cache's budget "
+            "and the free disk space",
             batch,
             what,
         )
@@ -1182,8 +1232,59 @@ class Run:
         template_dir = getattr(source, "template_dir", None)
         if template_dir is None:
             return None
-        found = template_dir(record)
+        self._room_for_template(source, record)
+        try:
+            found = template_dir(record)
+        except SourceError as exc:
+            if exc.reason != "unreachable":
+                raise
+            raise SourceError(
+                "unreachable",
+                f"the bucket could not be reached while the fsaverage template of the dataset "
+                f"was fetched ({exc.detail}); nothing was recorded: run the same command again "
+                "once it can be reached",
+            ) from exc
+        except OSError as exc:
+            if exc.errno not in (errno.ENOSPC, errno.EDQUOT):
+                raise
+            raise ConfigError(
+                "invalid",
+                f"the disk of {self.run_dir} is full: the fsaverage template of the dataset "
+                "could not be fetched; make room and run the same command again, or give a "
+                "template that is on this machine with --fsaverage DIR",
+            ) from exc
         return found if isinstance(found, Path) else None
+
+    def _room_for_template(self, source: object, record: DatasetRecord) -> None:
+        """Refuse, before anything of it is fetched, the download of a remote dataset's
+        ``fsaverage`` when the disk of the cache does not hold it. What the retained cache
+        holds already (an earlier call that was stopped) is counted as there."""
+        from surfcensus.remote.cache import CACHE_DIR, RETAINED
+
+        template_size = getattr(source, "template_size", None)
+        size = None if template_size is None else template_size(record)
+        free = free_bytes(self.run_dir / CACHE_DIR)
+        if not size or free is None:
+            return
+        held = 0
+        seen: set[tuple[int, int]] = set()
+        for directory, _, names in os.walk(self.run_dir / CACHE_DIR / RETAINED):
+            for name in names:
+                try:
+                    found = os.lstat(os.path.join(directory, name))
+                except OSError:
+                    continue
+                if (found.st_dev, found.st_ino) not in seen:
+                    seen.add((found.st_dev, found.st_ino))
+                    held += found.st_size
+        need = max(size - held, 0)
+        if free < need:
+            raise ConfigError(
+                "invalid",
+                f"the disk of {self.run_dir} has {size_text(free)} free, and the fsaverage "
+                f"template of the dataset takes {size_text(need)}: make room, or give a "
+                "template that is on this machine with --fsaverage DIR",
+            )
 
     def _no_template_message(self, exc: TemplateNotFound) -> str:
         names = {
@@ -1648,14 +1749,24 @@ def free_bytes(path: Path) -> int | None:
         return None
 
 
+def disk_margin(free: int) -> int:
+    """The part of ``free`` bytes of disk that a phase on remote data leaves for what it
+    writes (maps, media, tables): ``DISK_MARGIN_BYTES``, and on a small disk a quarter of
+    what is free, so that a review of a few subjects is not refused for a margin it does
+    not need."""
+    from surfcensus.remote.cache import DISK_MARGIN_BYTES
+
+    return min(DISK_MARGIN_BYTES, max(free, 0) // 4)
+
+
 def size_text(n: int) -> str:
-    """A number of bytes as people read it: ``0 MB``, ``45 kB``, ``40.8 MB``, ``1.25 GB``
-    (powers of ten)."""
+    """A number of bytes as people read it: ``0 kB``, ``45 kB``, ``40.8 MB``, ``1.25 GB``
+    (powers of ten). A unit is left only once the number would read as 1000 of it."""
     if n <= 0:
-        return "0 MB"
-    if n < 1_000_000:
+        return "0 kB"
+    if n < 999_500:
         return f"{max(1, round(n / 1e3))} kB"
-    if n < 1_000_000_000:
+    if n < 999_950_000:
         return f"{n / 1e6:.1f} MB"
     return f"{n / 1e9:.2f} GB"
 

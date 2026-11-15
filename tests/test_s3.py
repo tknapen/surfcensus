@@ -9,6 +9,7 @@ network: every request goes to ``tests/fakes3.py`` or to a stand-in transport.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import random
 import threading
@@ -392,7 +393,12 @@ def status_transport(status: int, code: str = "X") -> httpx.MockTransport:
         (403, "AccessDenied", "unreadable"),
         (412, "PreconditionFailed", "changed"),
         (416, "InvalidRange", "invalid"),
-        (400, "InvalidRequest", "unreadable"),
+        # what says something about the way to the bucket and not about the object: no row
+        # of a subject (a proxy's 407, a 401, a redirect, a request the server refuses)
+        (400, "InvalidRequest", "unreachable"),
+        (401, "X", "unreachable"),
+        (407, "X", "unreachable"),
+        (301, "PermanentRedirect", "unreachable"),
     ],
 )
 def test_statuses_map_to_reasons_without_retry(
@@ -485,7 +491,9 @@ def test_retry_after_is_honoured_up_to_the_cap(fake: FakeS3) -> None:
     assert sleeps.waits == [7.0, RETRY_CAP_S]
 
 
-def test_a_body_whose_md5_is_not_its_etag_is_retried_then_unreachable(tmp_path: Path) -> None:
+def test_a_body_whose_md5_is_not_its_etag_is_retried_then_changed(tmp_path: Path) -> None:
+    """Once the retries ran out it is the object that does not have its listed bytes: a row
+    of its subject (``changed``), not a bucket that cannot be reached."""
     md5 = hashlib.md5(CONTENT).hexdigest()
     calls: list[int] = []
 
@@ -496,14 +504,14 @@ def test_a_body_whose_md5_is_not_its_etag_is_retried_then_unreachable(tmp_path: 
     client, sleeps = make(transport=httpx.MockTransport(handler), retries=2)
     with pytest.raises(SourceError) as caught:
         client.get(KEY)
-    assert caught.value.reason == "unreachable"
-    assert "MD5" in caught.value.detail
+    assert caught.value.reason == "changed"
+    assert "MD5" in caught.value.detail and "(3 attempts)" in caught.value.detail
     assert (len(calls), len(sleeps.waits)) == (3, 2)
     assert_private(caught.value)
     calls.clear()
     with pytest.raises(SourceError) as caught:
         client.download(KEY, tmp_path / "out", expect=S3Object(KEY, len(CONTENT), md5, ""))
-    assert caught.value.reason == "unreachable"
+    assert caught.value.reason == "changed"
     assert len(calls) == 3
     assert list(tmp_path.iterdir()) == []
 
@@ -709,6 +717,159 @@ def test_a_cancel_during_the_wait_before_a_retry_ends_the_wait(tmp_path: Path) -
     # far below the 30 s asked for; the bound only tells a wait that ended from one that did not
     assert time.monotonic() - started < 15
     assert asked == ["GET"] and list(tmp_path.iterdir()) == []
+
+
+def test_a_429_is_retried_like_a_503() -> None:
+    answers = iter([429, 429, 200])
+    md5 = hashlib.md5(CONTENT).hexdigest()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        status = next(answers)
+        if status != 200:
+            return httpx.Response(status, content=b"slow down")
+        return httpx.Response(200, headers={"ETag": f'"{md5}"'}, content=CONTENT)
+
+    client, sleeps = make(transport=httpx.MockTransport(handler), retries=3)
+    body, _ = client.get(KEY)
+    assert body == CONTENT and len(sleeps.waits) == 2
+
+
+def test_a_redirect_is_not_followed(tmp_path: Path) -> None:
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.url.host)
+        return httpx.Response(301, headers={"Location": "https://elsewhere.example/x"})
+
+    client, _ = make(transport=httpx.MockTransport(handler))
+    for call in (
+        lambda: client.get(KEY),
+        lambda: client.head(KEY),
+        lambda: client.download(KEY, tmp_path / "x", expect=S3Object(KEY, 5, "0" * 32, "")),
+        lambda: list(client.list(PREFIX)),
+    ):
+        asked.clear()
+        with pytest.raises(SourceError) as caught:
+            call()
+        assert caught.value.reason == "unreachable"
+        assert asked == [f"{BUCKET}.s3.amazonaws.com"]  # one request, none to the other host
+        assert "elsewhere" not in caught.value.detail
+
+
+def test_an_answer_with_another_etag_than_the_listed_one_is_changed(tmp_path: Path) -> None:
+    """Also when the body is the listed one: the header says which object was sent."""
+    md5 = hashlib.md5(CONTENT).hexdigest()
+    other = "f" * 32
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, headers={"ETag": f'"{other}"'}, content=CONTENT)
+
+    client, sleeps = make(transport=httpx.MockTransport(handler))
+    with pytest.raises(SourceError) as caught:
+        client.download(KEY, tmp_path / "out", expect=S3Object(KEY, len(CONTENT), md5, ""))
+    assert caught.value.reason == "changed" and "ETag" in caught.value.detail
+    assert (len(calls), sleeps.waits) == (1, []) and list(tmp_path.iterdir()) == []
+    with pytest.raises(SourceError) as caught:
+        client.get(KEY, if_match=md5)
+    assert caught.value.reason == "changed"
+
+
+def test_an_answer_without_an_etag_is_not_the_buckets(tmp_path: Path) -> None:
+    """A page that something on the way sends with 200 (a proxy, a portal) has no ETag: the
+    way to the bucket is at fault, not the object, and nothing is retried."""
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(200, content=b"<html>sign in</html>")
+
+    client, sleeps = make(transport=httpx.MockTransport(handler))
+    with pytest.raises(SourceError) as caught:
+        client.download(KEY, tmp_path / "out", expect=S3Object(KEY, 20, "0" * 32, ""))
+    assert caught.value.reason == "unreachable" and "no ETag" in caught.value.detail
+    assert (len(calls), sleeps.waits) == (1, []) and list(tmp_path.iterdir()) == []
+    with pytest.raises(SourceError) as caught:
+        client.get(KEY, if_match="0" * 32)
+    assert caught.value.reason == "unreachable"
+
+
+def test_a_stopped_client_starts_and_retries_nothing(tmp_path: Path) -> None:
+    asked: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        asked.append(request.method)
+        return httpx.Response(503, headers={"Retry-After": "30"}, content=b"")
+
+    client = S3Client(
+        BUCKET,
+        config=RemoteConfig(max_concurrency=4, max_retries=3, timeout_s=10),
+        transport=httpx.MockTransport(handler),
+    )
+    # stopped while the first answer is on its way: the wait of 30 s ends and no retry is made
+    timer = threading.Timer(0.2, client.stop)
+    timer.start()
+    started = time.monotonic()
+    with pytest.raises(DownloadCancelled):
+        list(client.list(PREFIX))
+    timer.join()
+    assert time.monotonic() - started < 15 and asked == ["GET"]
+    # and nothing is started while it is stopped, by any call
+    for call in (
+        lambda: client.get(KEY),
+        lambda: client.head(KEY),
+        lambda: client.download(KEY, tmp_path / "x", expect=S3Object(KEY, 5, "0" * 32, "")),
+    ):
+        with pytest.raises(DownloadCancelled):
+            call()
+    assert asked == ["GET"] and list(tmp_path.iterdir()) == []
+    client.stopped.clear()
+    with pytest.raises(SourceError):
+        client.head(KEY)
+    assert len(asked) > 1
+
+
+def test_a_stop_ends_a_body_that_is_being_read() -> None:
+    client_box: list[S3Client] = []
+
+    def body() -> Iterator[bytes]:
+        yield b"a" * 1000
+        client_box[0].stop()
+        yield b"b" * 1000
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, headers={"ETag": '"x-1"'}, content=body())
+
+    client, _ = make(transport=httpx.MockTransport(handler))
+    client_box.append(client)
+    with pytest.raises(DownloadCancelled):
+        client.get(KEY)
+
+
+def test_a_read_that_stalls_is_given_up_after_the_stall_bound() -> None:
+    client, _ = make()
+    assert client.http.timeout.read == 10  # the fixture's timeout_s, below the bound
+    slow = S3Client(BUCKET, config=RemoteConfig(timeout_s=120), transport=FakeS3({}).transport())
+    assert slow.http.timeout.read == s3mod.READ_STALL_S == 30
+    assert slow.http.timeout.connect == 120
+
+
+def test_no_request_url_reaches_a_log(caplog: pytest.LogCaptureFixture, tmp_path: Path) -> None:
+    """``httpx`` logs every request with its URL at INFO; for the bucket hosts those lines
+    are dropped, since the URL holds the accession, the key and the subject label."""
+    write(tmp_path / BUCKET, KEY, CONTENT)
+    fake = FakeS3({BUCKET: tmp_path / BUCKET})
+    client, _ = make(fake)
+    with caplog.at_level(logging.DEBUG):
+        client.get(KEY)
+        list(client.list(PREFIX))
+        # a request of someone else's client to another host is logged as before
+        other = httpx.Client(transport=httpx.MockTransport(lambda r: httpx.Response(200)))
+        other.get("https://example.org/page")
+    text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "example.org/page" in text
+    assert "ds999999" not in text and "sub-01" not in text and "amazonaws" not in text
 
 
 def test_an_interrupt_during_a_download_passes_and_leaves_no_file(tmp_path: Path) -> None:

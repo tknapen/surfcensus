@@ -667,13 +667,32 @@ class OpenNeuroDerivatives:
         at_most: int | None = None,
     ) -> list[_U]:
         """``work`` of each item, in their order, at most the client's ``max_concurrency``
-        (and ``at_most``) at once. An exception of ``work`` is raised after every item ended."""
+        (and ``at_most``) at once. An exception of ``work`` is raised after every item ended.
+
+        A stop of the command (``KeyboardInterrupt``, which SIGTERM is turned into) ends the
+        work: the client is stopped, so that no request is started or retried and a body
+        being read is given up, the items not yet started are dropped, and the interrupt is
+        raised once the running ones ended, which a stalled read delays by its timeout at
+        most (``remote.s3.READ_STALL_S``). The client can be used again afterwards."""
         items = list(items)
         workers = min(len(items), self.client.config.max_concurrency, at_most or len(items))
         if workers <= 1:
             return [work(item) for item in items]
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            return list(pool.map(work, items))
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            found = list(pool.map(work, items))
+        except Exception:
+            pool.shutdown(wait=True)
+            raise
+        except BaseException:
+            self.client.stop()
+            try:
+                pool.shutdown(wait=True, cancel_futures=True)
+            finally:
+                self.client.stopped.clear()
+            raise
+        pool.shutdown(wait=True)
+        return found
 
 
 _DESCRIPTION = "dataset_description.json"

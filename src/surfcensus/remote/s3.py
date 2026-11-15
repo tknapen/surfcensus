@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import email.utils
 import hashlib
+import logging
 import math
 import os
 import random
@@ -75,6 +76,38 @@ RETRY_CAP_S = 30.0
 
 CHUNK_BYTES = 1 << 20
 """A download writes and checks its cancel event per chunk of this size."""
+
+READ_STALL_S = 30.0
+"""A read that receives no byte for this long is given up (and retried), whatever
+``RemoteConfig.timeout_s`` says for the rest of a request. It bounds how long a stop of the
+command waits for a request that stalls: nothing can interrupt a read that is blocked."""
+
+_NOT_THE_BUCKET = "the answer has no ETag, so it is not an answer of the bucket"
+
+
+class _NoRequestUrls(logging.Filter):
+    """Keeps the request lines of ``httpx`` for the bucket hosts out of every log: ``httpx``
+    logs each request with its URL at INFO, and the URL of a bucket request holds the
+    accession, the key and the subject label, which no log may hold (decisions D10, D20).
+    Records of requests to other hosts pass."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            text = record.getMessage()
+        except Exception:  # a record that cannot be formatted is not ours to judge
+            return True
+        return _S3_HOST not in text
+
+
+_S3_HOST = "s3.amazonaws.com"
+_quiet = _NoRequestUrls()
+
+
+def _quiet_httpx() -> None:
+    """Install :class:`_NoRequestUrls` on the ``httpx`` logger, once."""
+    logger = logging.getLogger("httpx")
+    if _quiet not in logger.filters:
+        logger.addFilter(_quiet)
 
 
 @dataclass(frozen=True)
@@ -132,10 +165,16 @@ class _Retry(Exception):
     """An answer that is tried again: a retried status, a body cut short, a body whose MD5
     is not its ETag. ``problem`` holds no URL, key or ETag."""
 
-    def __init__(self, problem: str, retry_after: float | None = None) -> None:
+    def __init__(
+        self, problem: str, retry_after: float | None = None, *, final: str = UNREACHABLE
+    ) -> None:
         super().__init__(problem)
         self.problem = problem
         self.retry_after = retry_after
+        self.final = final
+        """The reason of the ``SourceError`` when the retries run out with this problem:
+        ``unreachable`` for what lies on the way; ``changed`` for a body that never has the
+        MD5 of its listed ETag, which lies in the object and is a row of its subject."""
 
 
 def _unquote(etag: str | None) -> str:
@@ -238,14 +277,30 @@ class S3Client:
         )
         # trust_env=False: proxies from the environment would be mounted beside the
         # transport and pass around the guard; default_transport() takes the proxy itself
+        _quiet_httpx()
         self.http = httpx.Client(
             transport=self.transport,
             trust_env=False,
             follow_redirects=False,
-            timeout=config.timeout_s,
+            # a read that gets no byte for READ_STALL_S is given up and retried: that is also
+            # the longest a stop waits for a request that stalls
+            timeout=httpx.Timeout(config.timeout_s, read=min(config.timeout_s, READ_STALL_S)),
         )
         self.slots = threading.BoundedSemaphore(config.max_concurrency)
         """At most ``config.max_concurrency`` requests of this client at once."""
+        self.stopped = threading.Event()
+        """Set by :meth:`stop`: no request of this client is started or retried any more."""
+
+    def stop(self) -> None:
+        """End what this client is doing, for a command that is being stopped (Ctrl-C,
+        SIGTERM): no new attempt is made, a wait before a retry ends, and a body that is
+        being read is given up at its next chunk; each call raises
+        :class:`DownloadCancelled`. A read that receives nothing ends with its timeout
+        (:data:`READ_STALL_S`). The client makes no request afterwards."""
+        self.stopped.set()
+
+    def _cancelled(self, cancel: threading.Event | None) -> bool:
+        return self.stopped.is_set() or (cancel is not None and cancel.is_set())
 
     @property
     def endpoint(self) -> str:
@@ -284,8 +339,9 @@ class S3Client:
         hidden = (url, *secret, *(quote(part, safe="") for part in secret))
         attempt = 0
         while True:
-            if cancel is not None and cancel.is_set():
+            if self._cancelled(cancel):
                 raise DownloadCancelled(UNREACHABLE, f"{location}: the download was cancelled")
+            final = UNREACHABLE
             try:
                 with (
                     self.slots,
@@ -293,7 +349,7 @@ class S3Client:
                 ):
                     return handle(response)
             except _Retry as retry:
-                problem, retry_after = retry.problem, retry.retry_after
+                problem, retry_after, final = retry.problem, retry.retry_after, retry.final
             except httpx.ProxyError as exc:
                 # the proxy refused the bucket: a fault of the machine, not of a request
                 raise source_error(
@@ -304,18 +360,25 @@ class S3Client:
             attempt += 1
             if attempt > self.config.max_retries:
                 tries = "1 attempt" if attempt == 1 else f"{attempt} attempts"
-                raise source_error(UNREACHABLE, location, f"{problem} ({tries})")
+                raise source_error(final, location, f"{problem} ({tries})")
             self._pause(backoff_delay(attempt, retry_after), cancel)
 
     def _pause(self, delay: float, cancel: threading.Event | None) -> None:
         """Wait ``delay`` seconds before a retry. A call that can be cancelled waits on its
-        cancel event when the client sleeps for real, so that a stop (Ctrl-C in a lease) does
-        not wait out a backoff of up to ``RETRY_CAP_S``; the loop then raises
-        :class:`DownloadCancelled`. An injected ``sleep`` is called as it is."""
-        if cancel is not None and self.sleep is time.sleep:
-            cancel.wait(delay)
-        else:
+        cancel event and on the client's stop when the client sleeps for real, so that a stop
+        (Ctrl-C in a lease or a listing) does not wait out a backoff of up to
+        ``RETRY_CAP_S``; the loop then raises :class:`DownloadCancelled`. An injected
+        ``sleep`` is called as it is."""
+        if self.sleep is not time.sleep:
             self.sleep(delay)
+            return
+        until = time.monotonic() + delay
+        while not self._cancelled(cancel):
+            left = until - time.monotonic()
+            if left <= 0:
+                return
+            # either event ends the wait: the call's own cancel, or a stop of the client
+            (cancel or self.stopped).wait(min(left, 0.1 if cancel is not None else left))
 
     def _status(
         self, response: httpx.Response, location: str, *, missing: str = "changed"
@@ -341,7 +404,9 @@ class S3Client:
             raise _Retry(said, _retry_after(response.headers.get("retry-after")))
         if status == 404:
             raise source_error(missing, location, said)
-        reason = STATUS_REASONS.get(status, "unreadable")
+        # any other status says something about the way to the bucket (a proxy's 407, a
+        # redirect), not about the object: no row of a subject
+        reason = STATUS_REASONS.get(status, UNREACHABLE)
         raise source_error(reason, location, said)
 
     # --- listing ------------------------------------------------------------------------------
@@ -382,7 +447,7 @@ class S3Client:
     def _read_page(self, response: httpx.Response) -> tuple[list[S3Object | str], str | None]:
         if response.status_code != 200:
             self._status(response, LISTING, missing="not found")
-        body = _read_body(response)
+        body = _read_body(response, self.stopped)
         try:
             root = ElementTree.fromstring(body)
         except ElementTree.ParseError:
@@ -483,8 +548,10 @@ class S3Client:
             status = response.status_code
             if status not in (200, 206):
                 self._status(response, where)
-            body = _read_body(response)
+            body = _read_body(response, self.stopped)
             head = _head_of(response, len(body))
+            if if_match is not None and not head.etag:
+                raise source_error(UNREACHABLE, where, _NOT_THE_BUCKET)
             if if_match is not None and head.etag != _unquote(if_match):
                 raise source_error("changed", where, "the object's ETag is not the listed one")
             if status == 206:
@@ -518,9 +585,12 @@ class S3Client:
         and, for an ETag without ``-``, its MD5, then renamed to ``dest``. ``dest`` never
         holds a partial file. When ``cancel`` is set, or the call is interrupted, the
         temporary file is removed and the call raises (``KeyboardInterrupt`` passes
-        through) within one chunk. 412, or an answer whose size or ETag is not that of
-        ``expect``, raises ``SourceError("changed", ...)``; a body cut short or whose MD5
-        does not match, once the retries ran out, ``SourceError("unreachable", ...)``.
+        through) within one chunk, or, while no byte arrives, when the read times out
+        (:data:`READ_STALL_S`). 412, or an answer whose size or ETag is not that of
+        ``expect``, raises ``SourceError("changed", ...)``, and so does a body whose MD5 is
+        not its ETag once the retries ran out (the object, not the way to it); a body cut
+        short, once the retries ran out, ``SourceError("unreachable", ...)``, as does an
+        answer without an ETag (a page of something on the way, not of the bucket).
 
         A cancel raises :class:`DownloadCancelled`, a ``SourceError`` with the reason
         ``unreachable``. The temporary name is ``.<name of dest>.<16 hex digits>.tmp`` in the
@@ -534,6 +604,8 @@ class S3Client:
             if response.status_code != 200:
                 self._status(response, where)
             head = _head_of(response, expect.size)
+            if not head.etag:
+                raise source_error(UNREACHABLE, where, _NOT_THE_BUCKET)
             if head.etag != etag:
                 raise source_error("changed", where, "the object's ETag is not the listed one")
             length = _int_header(response, "content-length")
@@ -545,7 +617,7 @@ class S3Client:
                 written = 0
                 with open(temporary, "xb") as out:
                     for chunk in response.iter_bytes(CHUNK_BYTES):
-                        if cancel is not None and cancel.is_set():
+                        if self._cancelled(cancel):
                             raise DownloadCancelled(
                                 UNREACHABLE, f"{where}: the download was cancelled"
                             )
@@ -555,7 +627,7 @@ class S3Client:
                 if written != expect.size:
                     raise _Retry(f"the body has {_size_word(written, expect.size)}")
                 if md5 is not None and digest.hexdigest() != md5:
-                    raise _Retry("the body's MD5 is not its ETag")
+                    raise _Retry("the body's MD5 is not its ETag", final="changed")
                 os.replace(temporary, dest)
             except BaseException:
                 temporary.unlink(missing_ok=True)
@@ -603,11 +675,14 @@ def _size_word(written: int, expected: int) -> str:
     return "fewer bytes than its listing says" if written < expected else "more bytes than listed"
 
 
-def _read_body(response: httpx.Response) -> bytes:
+def _read_body(response: httpx.Response, stopped: threading.Event | None = None) -> bytes:
     """The whole body of a streamed answer, checked against its ``Content-Length``: a body
-    that is shorter (or longer) raises :class:`_Retry`."""
+    that is shorter (or longer) raises :class:`_Retry`. ``stopped`` (the client's stop) ends
+    the reading at the next chunk with :class:`DownloadCancelled`."""
     body = bytearray()
     for chunk in response.iter_bytes():
+        if stopped is not None and stopped.is_set():
+            raise DownloadCancelled(UNREACHABLE, "the request was cancelled")
         body += chunk
     expected = _int_header(response, "content-length")
     if expected is not None and len(body) != expected:
@@ -619,4 +694,4 @@ def _check_md5(body: bytes, etag: str) -> None:
     """Raise :class:`_Retry` when ``etag`` is an MD5 and ``body`` does not have it."""
     md5 = _md5_of(etag)
     if md5 is not None and hashlib.md5(body, usedforsecurity=False).hexdigest() != md5:
-        raise _Retry("the body's MD5 is not its ETag")
+        raise _Retry("the body's MD5 is not its ETag", final="changed")

@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import shutil
 import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ from surfcensus import run as run_module
 from surfcensus.app.server import create_app
 from surfcensus.config import (
     CONFIG_FILE,
+    CacheConfig,
     ConfigError,
     MetricsConfig,
     RemoteConfig,
@@ -216,10 +218,9 @@ def test_what_a_remote_review_says(
     lines = captured.err.splitlines()
     assert lines[0] == f"Listing {TEXT} in s3://{BUCKET}, anonymously and read-only ..."
     assert lines[1] == f"Run directory: {run_dir} (new)"
-    assert (
-        lines[2].startswith("To fetch: ")
-        and " before the first rating screen (Tier A and" in lines[2]
-    )
+    # a call without the app: what it fetches in all, and no word of a rating screen
+    assert lines[2].startswith("To fetch: ") and " in all (Tier A and" in lines[2]
+    assert "rating screen" not in lines[2]
     assert "of 3 subjects, the fsaverage template, 3 renders)" in lines[2]
     assert "an estimate from the listed sizes" in lines[2]
     assert lines[3] == f"Found 3 subjects in {TEXT} (fMRIPrep layout, FreeSurfer 6.0.1)."
@@ -328,20 +329,6 @@ def test_the_peak_of_the_estimate_follows_the_batches_that_are_leased(fake: Fake
     needed = estimate(template_needed=True)
     assert needed.template > 0
     assert needed.peak == tier_a + needed.template + with_spheres * 3
-    # a continued run: the maps and the renders that it holds are left out, and the app
-    # waits for one render in all, which the run has
-    labels = [r.subject_label for r in records]
-    held = estimate(n_first=1, mapped=labels[:2], rendered=labels[:1])
-    assert held.tier_b == of(records[2], TIER_B)
-    assert held.renders == sum(of(r, (*TIER_C, *spheres)) for r in records[1:])
-    assert (held.first, held.n_first) == (0, 0)
-    everything = estimate(mapped=labels, rendered=labels)
-    assert (everything.tier_b, everything.renders, everything.first) == (0, 0, 0)
-    assert reviewing.estimate_line(everything, new=False).startswith("To fetch: at most ")
-    nothing = reviewing.RemoteEstimate(
-        subjects=3, tier_a=0, tier_b=0, template=0, first=0, n_first=0, renders=0, peak=0
-    )
-    assert reviewing.estimate_line(nothing, new=False).startswith("To fetch: nothing but the")
 
 
 def test_a_second_review_changes_nothing_and_fetches_nothing_but_the_listing(
@@ -357,8 +344,11 @@ def test_a_second_review_changes_nothing_and_fetches_nothing_but_the_listing(
     }
     said = capsys.readouterr().err
     assert f"Run directory: {run_dir} (continued)" in said
-    # the run holds its template, every map and every render: the estimate says so
-    assert "To fetch: nothing but the listing; this run holds" in said
+    # the run holds its template, every map and every render: said after the inventory
+    assert "To fetch: nothing more; the maps and the renders of this run are those of" in said
+    lines = said.splitlines()
+    found = next(i for i, line in enumerate(lines) if line.startswith("Found 3 subjects"))
+    assert lines[found + 1].startswith("To fetch: nothing more;")
     assert "Rendered: 3 of 3 subjects." in said
     # the listing, and the description it reads the fMRIPrep version from; no other file
     gets = [entry.key for entry in fake.log if entry.method == "GET"]
@@ -484,7 +474,7 @@ def test_the_app_opens_at_the_first_render_and_the_others_follow(
     assert files_under(run_dir / CACHE_DIR / LEASES) == []
 
 
-def test_a_fault_of_the_bucket_behind_the_app_is_said_and_the_next_call_goes_on(
+def test_a_bucket_that_fails_behind_the_app_is_tried_again_until_it_answers(
     tmp_path: Path,
     fake: FakeS3,
     opened: list[tuple[Run, ReviewApp | None]],
@@ -492,8 +482,9 @@ def test_a_fault_of_the_bucket_behind_the_app_is_said_and_the_next_call_goes_on(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The bucket becomes unreachable while the renderer behind the app works: one line
-    says so, the app keeps serving what is rendered, nothing of the batch is recorded, and
-    the next call renders the rest."""
+    says that rendering is paused, the app keeps serving what is rendered, nothing of the
+    batch is recorded, and the renderer tries again by itself, so the others are rendered
+    once the bucket answers (the rating screen says that the next one opens by itself)."""
     gate = threading.Event()
     original = reviewing._render_rest
 
@@ -502,6 +493,7 @@ def test_a_fault_of_the_bucket_behind_the_app_is_said_and_the_next_call_goes_on(
         original(*args, **kwargs)
 
     monkeypatch.setattr(reviewing, "_render_rest", held)
+    monkeypatch.setattr(reviewing, "REMOTE_RETRY_S", 0.2)
     run_dir = tmp_path / "run"
     # no retries, so that a reset is "unreachable" at once
     new_remote_run(fake, run_dir, remote=RemoteConfig(max_retries=0, max_concurrency=4))
@@ -511,18 +503,60 @@ def test_a_fault_of_the_bucket_behind_the_app_is_said_and_the_next_call_goes_on(
     rendered_first = set(queue_of(run_dir)[:1])
     fake.fault("*/mri/T1.mgz", "reset", times=None)
     gate.set()
-    assert app.wait_rendered(120)
-    assert app.render_problem is not None and app.render_problem.startswith("unreachable:")
-    said = capsys.readouterr().err
-    assert "Rendering stopped: unreachable: " in said
-    assert "The app goes on with the subjects that are rendered" in said
-    assert FAKE_ACCESSION not in app.render_problem
+    deadline = time.monotonic() + 60
+    while not app.render_paused and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.render_paused and app.rendering and app.render_problem is None
     with httpx.Client(base_url=app.url, trust_env=False) as client:
         answer = client.get("/api/next").json()
         assert answer["status"] == "assignment"
         assert answer["assignment"]["subject_uid"] in rendered_first
     assert render_counts(run) == (1, 0, 2)  # nothing of the stopped batch is recorded
+    # the bucket answers again: the renderer goes on without a new call
+    fake.clear()
+    assert app.wait_rendered(120)
+    assert app.render_problem is None and render_counts(run) == (3, 0, 0)
+    said = capsys.readouterr().err
+    assert said.count("Rendering paused: unreachable: ") == 1  # said once, however often tried
+    assert "It is tried again every 0.2 s while the app runs" in said
+    assert "All renders are made: 3 of 3 subjects can be rated." in said
+    assert FAKE_ACCESSION not in said.split("Rendering paused", 1)[1]
     app.stop()
+    run.close()
+    opened.clear()
+    assert files_under(run_dir / CACHE_DIR / LEASES) == []
+
+
+def test_a_stop_ends_a_renderer_that_waits_for_the_bucket(
+    tmp_path: Path,
+    fake: FakeS3,
+    opened: list[tuple[Run, ReviewApp | None]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    gate = threading.Event()
+    original = reviewing._render_rest
+
+    def held(*args: Any, **kwargs: Any) -> None:
+        gate.wait(60)
+        original(*args, **kwargs)
+
+    monkeypatch.setattr(reviewing, "_render_rest", held)
+    monkeypatch.setattr(reviewing, "REMOTE_RETRY_S", 3600.0)
+    run_dir = tmp_path / "run"
+    new_remote_run(fake, run_dir, remote=RemoteConfig(max_retries=0, max_concurrency=4))
+    run, app = open_review(TEXT, run_dir=run_dir, jobs=1, port=0, transport=fake.transport())
+    opened.append((run, app))
+    assert app is not None
+    fake.fault("*/mri/T1.mgz", "reset", times=None)
+    gate.set()
+    deadline = time.monotonic() + 60
+    while not app.render_paused and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert app.render_paused
+    started = time.monotonic()
+    app.stop()  # the wait of an hour ends with the stop
+    assert time.monotonic() - started < 30 and not app.rendering
+    assert render_counts(run) == (1, 0, 2)
     run.close()
     opened.clear()
     fake.clear()
@@ -591,6 +625,116 @@ def test_review_without_a_template_ranks_and_renders_without_counterparts(
     said = capsys.readouterr().err
     assert "the fsaverage template" not in said  # nothing of a template was estimated
     assert FAKE_ACCESSION not in caplog.text
+
+
+def _object_bytes(fake: FakeS3) -> int:
+    """The listed bytes of the objects that were fetched (listings and the description of
+    the dataset left out)."""
+    keys = [
+        e.key
+        for e in fake.log
+        if e.method == "GET" and e.key and not e.key.endswith("dataset_description.json")
+    ]
+    return sum(fake.buckets[BUCKET].joinpath(*key.split("/")).stat().st_size for key in keys)
+
+
+def _to_fetch(said: str) -> str:
+    (line,) = [line for line in said.splitlines() if line.startswith("To fetch:")]
+    return line
+
+
+def test_the_estimate_of_a_continued_run_counts_what_is_made_again(
+    run_dir: Path, fake: FakeS3, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Review of the remote stage: on a finished run the line said that nothing would be
+    fetched while every render was made again (the video turned on; media that are gone).
+    It is the plan of the phases now, said after the inventory."""
+    capsys.readouterr()
+    with remote_review(fake, run_dir, video=True) as run:
+        in_renders = sum(run.remote_bytes(run_module.RENDER_LEASED).values())
+        assert render_counts(run) == (3, 0, 0)
+    line = _to_fetch(capsys.readouterr().err)
+    assert line.startswith(f"To fetch: {run_module.size_text(in_renders)} in all (3 renders)")
+    assert "at most" not in line and "rating screen" not in line
+    assert _object_bytes(fake) == in_renders  # what was said is what was fetched
+    # one subject's media gone: its render is counted, and nothing else
+    fake.clear()
+    uids = uids_by_label(run_dir)
+    shutil.rmtree(run_dir / "media" / uids["sub-002"])
+    with remote_review(fake, run_dir) as run:
+        one = run.remote_bytes(run_module.RENDER_LEASED)[uids["sub-002"]]
+    line = _to_fetch(capsys.readouterr().err)
+    assert line.startswith(f"To fetch: {run_module.size_text(one)} in all (1 render)")
+    assert _object_bytes(fake) == one
+    # and a call that finds everything in place says so
+    fake.clear()
+    remote_review(fake, run_dir).close()
+    assert _to_fetch(capsys.readouterr().err).startswith("To fetch: nothing more;")
+    assert _object_bytes(fake) == 0
+
+
+def test_a_listing_that_cannot_be_had_names_the_app_of_a_run_that_has_renders(
+    run_dir: Path, fake: FakeS3, tmp_path: Path
+) -> None:
+    """Review of the remote stage: with the bucket unreachable, ``review`` on a finished run
+    stopped at the listing and never said that the run can be rated without the bucket."""
+    before = {p: p.stat().st_mtime_ns for p in files_under(run_dir) if "cache" not in p.parts}
+    fake.fault("*", "reset", times=None)
+    with pytest.raises(SourceError) as caught:
+        remote_review(fake, run_dir)
+    said = str(caught.value)
+    assert caught.value.reason == "unreachable" and "nothing was changed" in said
+    assert (
+        f"surfcensus serve --run-dir {run_dir}" in said and "3 subjects that are rendered" in said
+    )
+    # the accession is in the name of the run directory only (decision D47, item 2)
+    assert FAKE_ACCESSION not in said.replace(str(run_dir), "")
+    after = {p: p.stat().st_mtime_ns for p in files_under(run_dir) if "cache" not in p.parts}
+    assert after == before
+    # a new run has nothing to serve: the same command later
+    with pytest.raises(SourceError) as caught:
+        remote_review(fake, tmp_path / "new")
+    assert "Run the same command again once it can be reached" in str(caught.value)
+    assert "serve" not in str(caught.value) and not (tmp_path / "new").exists()
+
+
+def test_a_folder_of_the_same_name_is_said(
+    tmp_path: Path,
+    fake: FakeS3,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / TEXT).mkdir()
+    remote_review(fake, tmp_path / "run", subjects=["*"]).close()
+    lines = capsys.readouterr().err.splitlines()
+    assert lines[0] == (
+        f"A folder named {TEXT} is here as well; this reads the dataset of the bucket. "
+        f"To review the folder, give it as ./{TEXT}"
+    )
+    assert lines[1].startswith("Listing ")
+    # every subject was asked for with '*': no subject set is said
+    (found,) = [line for line in lines if line.startswith("Found ")]
+    assert found == f"Found 3 subjects in {TEXT} (fMRIPrep layout, FreeSurfer 6.0.1)."
+
+
+@pytest.mark.parametrize(
+    ("n", "text"),
+    [
+        (0, "0 kB"),
+        (1, "1 kB"),
+        (45_580, "46 kB"),
+        (999_499, "999 kB"),
+        (999_500, "1.0 MB"),
+        (999_999, "1.0 MB"),
+        (40_776_795, "40.8 MB"),
+        (999_949_999, "999.9 MB"),
+        (999_950_000, "1.00 GB"),
+        (1_440_000_000, "1.44 GB"),
+    ],
+)
+def test_a_size_is_said_in_one_unit(n: int, text: str) -> None:
+    assert run_module.size_text(n) == text
 
 
 # --- the phases on faults of single files (tests/test_pipeline.py) --------------------------------
@@ -727,7 +871,7 @@ def test_a_batch_larger_than_the_budget_is_made_smaller(
 ) -> None:
     shutil.rmtree(run_dir / "media")
     with Run(run_dir, transport=fake.transport()) as run:
-        largest = max(run._remote_roles_bytes(run_module.RENDER_LEASED))
+        largest = max(run.remote_bytes(run_module.RENDER_LEASED).values())
         settings = run.config.cache.model_dump() | {"max_bytes": largest + 1, "batch_subjects": 3}
         run.config = with_changes(run.config, cache=settings)
         with caplog.at_level(logging.INFO, logger="surfcensus"):
@@ -748,17 +892,70 @@ def test_a_subject_larger_than_the_budget_is_refused(run_dir: Path, fake: FakeS3
         assert render_counts(run) == (0, 0, 3)
 
 
-def test_a_disk_without_room_for_a_batch_is_refused(
+def test_a_disk_without_room_for_one_subject_is_refused(
     run_dir: Path, fake: FakeS3, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     shutil.rmtree(run_dir / "media")
-    monkeypatch.setattr(run_module, "free_bytes", lambda path: 1_000_000)
     with Run(run_dir, transport=fake.transport()) as run:
+        largest = max(run.remote_bytes(run_module.RENDER_LEASED).values())
+        # a quarter of a small disk is kept for what the phase writes: this leaves less than
+        # the files of one subject
+        monkeypatch.setattr(run_module, "free_bytes", lambda path: largest + largest // 4)
         with pytest.raises(ConfigError) as caught:
             run.render()
-        assert "free" in str(caught.value) and "make room" in str(caught.value)
+        said = str(caught.value)
+        assert "free" in said and "for one subject at a time" in said and "make room" in said
+        assert "batch_subjects" not in said  # a setting that could not help is not advised
         assert render_counts(run) == (0, 0, 3)
         assert fake.log == []  # refused before any lease
+
+
+def test_a_small_disk_gets_smaller_batches_and_no_refusal(
+    run_dir: Path,
+    fake: FakeS3,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Review of the remote stage: a margin of 500 MB refused a review that needed 2 MB on a
+    disk with 373 MB free. The margin is a quarter of a small disk, and the batch is made
+    as small as the rest holds."""
+    assert run_module.disk_margin(373_000_000) == 373_000_000 // 4
+    assert run_module.disk_margin(100_000_000_000) == 500_000_000
+    shutil.rmtree(run_dir / "media")
+    with Run(run_dir, transport=fake.transport()) as run:
+        largest = max(run.remote_bytes(run_module.RENDER_LEASED).values())
+        # room for two subjects' files beside the margin
+        monkeypatch.setattr(run_module, "free_bytes", lambda path: (largest * 2 + 10) * 4 // 3)
+        with caplog.at_level(logging.INFO, logger="surfcensus"):
+            report = run.render()
+        assert (report.done, report.failed) == (3, 0)
+        assert "batches of 2 subjects for the renders" in caplog.text
+        assert run.config.cache.batch_subjects == 32  # for that call only
+
+
+def test_a_template_that_the_disk_does_not_hold_is_refused_before_it_is_fetched(
+    tmp_path: Path, fake: FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(run_module, "free_bytes", lambda path: 1_000_000)
+    run_dir = tmp_path / "run"
+    with pytest.raises(ConfigError) as caught:
+        remote_review(fake, run_dir)
+    said = str(caught.value)
+    assert "the fsaverage template of the dataset takes" in said and "--fsaverage DIR" in said
+    assert not any("/fsaverage/" in (e.key or "") for e in fake.log if e.method == "GET")
+    assert FAKE_ACCESSION not in said
+
+
+def test_a_subject_over_the_budget_is_refused_before_the_template_is_fetched(
+    tmp_path: Path, fake: FakeS3
+) -> None:
+    run_dir = tmp_path / "run"
+    new_remote_run(fake, run_dir, cache=CacheConfig(max_bytes=1000))
+    with pytest.raises(ConfigError) as caught:
+        remote_review(fake, run_dir)
+    assert "cache.max_bytes" in str(caught.value)
+    gets = [e.key or "" for e in fake.log if e.method == "GET"]
+    assert not any("/fsaverage/" in key or "/surf/" in key or "/mri/" in key for key in gets)
 
 
 def test_the_cache_keeps_what_the_present_subjects_name_and_drops_the_rest(

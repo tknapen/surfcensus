@@ -26,6 +26,17 @@ Why this source comes first: one organization ran one pipeline across many datas
 
 Not every dataset is guaranteed to contain FreeSurfer outputs; a run with `--fs-no-reconall` would not. Phase 2 measures this.
 
+Reading it (built 2026-11-15 for one dataset at a time; `architecture.md`, Sources): `surfcensus review openneuro:dsXXXXXX`. Checked on the real bucket for `ds000102` (sub-01, sub-02) and `ds003020` (sub-UTS01), anonymously and with GET alone:
+
+- The listing of a subject prefix is one page (309 and 337 keys); every ETag of the two subjects is a one-part MD5, so every byte that was fetched was checked against its listing. A multipart ETag (none was seen) would be checked for its size only.
+- A wrong `If-Match` is answered with 412, and the bucket sends `x-amz-version-id` (not stored: traceability rests on the ETag and the SHA-256 of what was read).
+- A new review of two subjects of `ds000102` fetched 148.2 MB in 60 requests (109.0 MB in 52 before the rating screen, 19.6 s after the command was given; one shared 4-core Linux machine behind a proxy, one run); the command had estimated 147.8 and 108.7 MB from the listing. At most 39.8 MB lay under `cache/leases/` at once. The same command on the finished run made 7 requests (355 kB: listings and `dataset_description.json`) and was at the app in 3.0 s. One subject of `ds003020` (FreeSurfer 7.3.2): 86.1 MB in 38 requests, 19.3 s.
+- A remote and a local review of the same files gave the same bytes: all 355 media files and the thickness maps of `ds000102` sub-01 and sub-02, the same template id (`b710aa6e0467`), equal table rows; for `ds003020` sub-UTS01 everything but the template id, since the remote run takes the `fsaverage` next to that dataset.
+- A run stopped by SIGTERM during the downloads, and one killed with SIGKILL, finished at the next call with the files of an uninterrupted run.
+- `review openneuro:ds000102` without `--subjects` estimates 460.2 MB before the first rating screen and 1.44 GB in all for its 26 subjects. That run was not made (it waits for Tomas's word); nothing larger than three subjects was fetched.
+
+Not checked: a `SlowDown` of the real bucket, a 403 on a real object, the older `freesurfer/` root on the real bucket, throughput on another network, macOS.
+
 ## Embedded derivatives in raw OpenNeuro datasets (secondary source)
 
 Raw datasets live in `s3://openneuro.org/dsXXXXXX/` (anonymous HTTPS listing returned 200 on 2026-11-01). Some contain author-supplied `derivatives/` with FreeSurfer outputs, under varied paths: `derivatives/freesurfer/`, `derivatives/fmriprep/sourcedata/freesurfer/`, `derivatives/fmriprep/freesurfer/`, and idiosyncratic ones. FreeSurfer versions, flags and manual edits differ.

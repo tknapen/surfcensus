@@ -391,6 +391,34 @@ def test_options_for_local_data_are_refused_with_one_line(
     assert fake.log == [] and not (tmp_path / "run").exists()
 
 
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("render-subject", TEXT, "--out", "media"),
+        ("epi-session", TEXT, "--subject", "sub-001", "--out", "packs"),
+        ("inventory", "--run-dir", "run", "--source", TEXT),
+    ],
+)
+def test_the_commands_that_read_folders_say_so_for_a_bucket_dataset(
+    tmp_path: Path,
+    served: tuple[FakeS3, str],
+    arguments: tuple[str, ...],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review of the remote stage: they answered "not a directory" or "missing surface"."""
+    fake, _ = served
+    monkeypatch.chdir(tmp_path)
+    result = cli(*arguments)
+    said = " ".join(result.output.split())
+    assert result.exit_code == 2, result.output
+    assert "does not read" in said and f"surfcensus review {TEXT}" in said
+    assert fake.log == [] and list(tmp_path.iterdir()) == []
+    # a folder of that name is a folder: the command goes on to read it
+    (tmp_path / TEXT).mkdir()
+    result = cli(*arguments)
+    assert "does not read" not in " ".join(result.output.split())
+
+
 def test_a_text_that_names_no_dataset_is_refused(
     tmp_path: Path, served: tuple[FakeS3, str]
 ) -> None:

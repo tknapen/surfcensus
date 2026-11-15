@@ -22,7 +22,7 @@ import sys
 import threading
 import time
 import webbrowser
-from collections.abc import Callable, Collection, Sequence
+from collections.abc import Callable, Sequence
 from contextlib import closing, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -427,6 +427,10 @@ def _record_blind(run: Run, blind: bool) -> None:
 
 # --- a dataset of the OpenNeuroDerivatives bucket (docs/dev/remote_plan.md, section 4) ----------
 
+REMOTE_RETRY_S = 30.0
+"""The renderer behind the app tries a bucket that cannot be reached again after this many
+seconds, for as long as the app runs."""
+
 REMOTE_GUARD_BYTES = 2_000_000_000
 """A new review of a remote dataset that names no subjects (``--subjects``) stops when the
 estimate of what it fetches before the first rating screen exceeds this, and asks for
@@ -484,6 +488,8 @@ class RemoteEstimate:
     peak: int
     """The source files on disk at once at most: the kept Tier A files and template, and the
     larger of one batch of the metrics and one of the renders."""
+    everything: bool = False
+    """The call renders every subject before it ends (no app, or ``--serve-after 0``)."""
 
     @property
     def before_app(self) -> int:
@@ -510,15 +516,11 @@ def remote_estimate(
     jobs: int,
     batch_subjects: int,
     max_bytes: int,
-    mapped: Collection[str] = (),
-    rendered: Collection[str] = (),
 ) -> RemoteEstimate:
     """:class:`RemoteEstimate` of ``records``, the listed subjects of ``dataset`` of the
-    remote ``source``. ``template_needed``: the run takes its template from the
-    ``fsaverage`` next to the subjects; ``n_first``: the renders the app waits for (None:
-    every one). ``mapped`` and ``rendered``: the labels of the subjects whose thickness
-    maps, and whose render, a continued run holds (:func:`_held`); their Tier B and their
-    render files are left out."""
+    remote ``source``, for a run that holds nothing yet. ``template_needed``: the run takes
+    its template from the ``fsaverage`` next to the subjects; ``n_first``: the renders the
+    app waits for (None: every one, a call that renders everything before it ends)."""
     from surfcensus.sources.base import TIER_A, TIER_B, TIER_C
 
     cache = getattr(source, "cache", None)
@@ -546,20 +548,13 @@ def remote_estimate(
     with_spheres = not template_needed or template > 0
     render_roles = (*TIER_C, *_RENDER_SPHERES) if with_spheres else TIER_C
     tier_a = sum(_sum_roles(r, TIER_A, kept) for r in records)
-    tier_bs = [_sum_roles(r, TIER_B, never) for r in records if r.subject_label not in mapped]
-    complete = [
-        r
-        for r in records
-        if all(role in r.files for role in RENDER_ROLES) and r.subject_label not in rendered
-    ]
+    tier_bs = [_sum_roles(r, TIER_B, never) for r in records]
+    complete = [r for r in records if all(role in r.files for role in RENDER_ROLES)]
     renders = sorted((_sum_roles(r, render_roles, never) for r in complete), reverse=True)
-    # the app waits for ``n_first`` renders in all, those the run holds among them
-    first_n = (
-        len(renders) if n_first is None else min(max(n_first - len(rendered), 0), len(renders))
-    )
+    first_n = len(renders) if n_first is None else min(n_first, len(renders))
     largest_b = max(tier_bs, default=0)
     batch = min(batch_subjects, max(1, max_bytes // largest_b)) if largest_b else batch_subjects
-    peak_b = largest_b * min(batch, len(tier_bs))
+    peak_b = largest_b * min(batch, len(records))
     # the renders leased at once: a call that renders everything before it ends takes
     # batches of ``batch_subjects``; otherwise the renders before the app are one batch and
     # those behind it come ``jobs`` at a time; each is lowered to fit ``max_bytes``, as
@@ -577,56 +572,58 @@ def remote_estimate(
         n_first=first_n,
         renders=sum(renders),
         peak=tier_a + template + max(peak_b, peak_c),
+        everything=n_first is None,
     )
 
 
-def estimate_line(estimate: RemoteEstimate, *, new: bool) -> str:
-    """``To fetch: 108.2 MB before the first rating screen (...), 148.0 MB in all, ...``."""
+def estimate_line(estimate: RemoteEstimate, *, app: bool = True) -> str:
+    """The line of a new run: ``To fetch: 108.2 MB before the first rating screen (...),
+    148.0 MB in all, ...``; for a call without the app, what it fetches in all."""
     what = [f"Tier A and B of {_plural(estimate.subjects, 'subject')}"]
     if estimate.template:
         what.append("the fsaverage template")
     if estimate.n_first:
         what.append(_plural(estimate.n_first, "render"))
-    if new:
-        return (
+    if app:
+        head = (
             f"To fetch: {size_text(estimate.before_app)} before the first rating screen "
-            f"({', '.join(what)}), {size_text(estimate.in_all)} in all, an estimate from the "
-            "listed sizes; the files of each batch are removed after it, and at most "
-            f"{size_text(estimate.peak)} of source files are on disk at once."
+            f"({', '.join(what)}), {size_text(estimate.in_all)} in all"
         )
-    if estimate.in_all == 0:
-        return (
-            "To fetch: nothing but the listing; this run holds its template, the maps and the "
-            "renders of the subjects listed."
-        )
+    else:
+        head = f"To fetch: {size_text(estimate.in_all)} in all ({', '.join(what)})"
     return (
-        f"To fetch: at most {size_text(estimate.before_app)} before the first rating screen "
-        f"and {size_text(estimate.in_all)} in all, an estimate from the listed sizes; the maps "
-        "and renders that this run holds are left out, and are made again only where a file "
-        "or a setting changed."
+        f"{head}, an estimate from the listed sizes; the files of each batch are removed after "
+        f"it, and at most {size_text(estimate.peak)} of source files are on disk at once."
     )
 
 
-def _held(run: Run) -> tuple[set[str], set[str]]:
-    """The labels of the present subjects of a continued run whose thickness maps are in
-    ``tables/fsavg/``, and of those whose render is recorded as done: what the estimate of
-    a later call leaves out. Names and rows only, nothing is opened; a map or render that
-    a changed file or setting makes pending again is fetched all the same, which is why the
-    estimate of a continued run is said as it is."""
-    from surfcensus.metrics.pipeline import FSAVG_DIR
-
-    public = run.public()
-    subjects = public.subjects()
-    labels = {
-        str(row.subject_uid): str(row.subject_label)
-        for row in subjects[subjects["present"].to_numpy(dtype=bool)].itertuples(index=False)
-    }
-    renders = public.renders()
-    done = set(renders.loc[renders["status"] == "done", "subject_uid"].astype(str))
-    mapped = {
-        label for uid, label in labels.items() if (run.run_dir / FSAVG_DIR / f"{uid}.npz").is_file()
-    }
-    return mapped, {label for uid, label in labels.items() if uid in done}
+def continued_line(run: Run, *, template_bytes: int, n_first: int | None, app: bool) -> str:
+    """The line of a continued run, said after its inventory: what ``metrics`` and
+    ``render`` would lease now by their own plans (``Run.remote_pending``), so that a map or
+    a render that a changed file or setting makes pending again is counted, and what the run
+    holds is not. ``n_first``: the renders the app waits for in all (None: every one)."""
+    maps, renders, exact = run.remote_pending()
+    tier_b, in_renders = sum(maps.values()), sum(renders.values())
+    in_all = template_bytes + tier_b + in_renders
+    if in_all == 0:
+        return (
+            "To fetch: nothing more; the maps and the renders of this run are those of the "
+            "files listed and of its settings."
+        )
+    what = []
+    if template_bytes:
+        what.append("the fsaverage template")
+    if maps:
+        what.append(f"Tier B of {_plural(len(maps), 'subject')}")
+    if renders:
+        what.append(_plural(len(renders), "render"))
+    line = f"To fetch: {'' if exact else 'at most '}{size_text(in_all)} in all ({', '.join(what)})"
+    if app and renders:
+        done = render_counts(run)[0]
+        waited = len(renders) if n_first is None else min(max(n_first - done, 0), len(renders))
+        first = sum(sorted(renders.values(), reverse=True)[:waited])
+        line += f", {size_text(template_bytes + tier_b + first)} of it before the rating screen"
+    return line + ", an estimate from the listed sizes; what this run holds is not fetched again."
 
 
 def _template_needed(run_dir: Path, stored: RunConfig | None, fsaverage: Path | str | None) -> bool:
@@ -697,12 +694,14 @@ def _open_remote_run(
     serve_after: int | None,
     jobs: int,
     fsaverage: Path | str | None,
-) -> tuple[Run, bool]:
+) -> tuple[Run, bool, int]:
     """The run of a review of the remote dataset ``ref``, made or opened, with the options
-    given written into it, and whether it is new. The dataset and its subjects are listed
-    first, and what will be fetched is said from the listed sizes before any file is read;
-    a new run that names no subjects is refused when that exceeds
-    :data:`REMOTE_GUARD_BYTES` (decision D47, item 3), before anything is written."""
+    given written into it, whether it is new, and the bytes of the ``fsaverage`` next to
+    the subjects when the run will fetch it. The dataset and its subjects are listed first.
+    For a new run, what will be fetched is said from the listed sizes before any file is
+    read, and a run that names no subjects is refused when that exceeds
+    :data:`REMOTE_GUARD_BYTES` (decision D47, item 3), before anything is written. For a
+    continued run the caller says it after the inventory (:func:`continued_line`)."""
     from surfcensus.config import RemoteConfig
     from surfcensus.remote.s3 import S3Client
     from surfcensus.run import remote_index
@@ -735,31 +734,46 @@ def _open_remote_run(
     try:
         if run is not None:
             _apply_options(run, blind=blind, require_marks=require_marks, video=video, force=force)
+        if Path(ref.text).is_dir():
+            # decision D47, item 8: the text is the remote dataset also where a folder has
+            # that name
+            _say(
+                f"A folder named {ref.text} is here as well; this reads the dataset of the "
+                f"bucket. To review the folder, give it as ./{ref.text}"
+            )
         _say(f"Listing {ref.text} in s3://{ref.bucket}, anonymously and read-only ...")
-        dataset = next(iter(source.datasets()))
-        records = list(source.subjects(dataset))
+        try:
+            dataset = next(iter(source.datasets()))
+            records = list(source.subjects(dataset))
+        except SourceError as exc:
+            if exc.reason != "unreachable":
+                raise
+            raise SourceError(
+                "unreachable",
+                f"the bucket could not be reached ({exc.detail}); nothing was changed. "
+                + _offline_remedy(run, run_dir),
+            ) from exc
         config = run.config if run is not None else None
         settings = config.cache if config is not None else CacheConfig()
         wanted = None if not serve or serve_after == 0 else serve_after or DEFAULT_SERVE_AFTER
-        mapped, rendered = _held(run) if run is not None else (set(), set())
+        needed = _template_needed(run_dir, stored, fsaverage)
         estimate = remote_estimate(
             source,
             dataset,
             records,
-            template_needed=_template_needed(run_dir, stored, fsaverage),
+            template_needed=needed,
             n_first=wanted,
             jobs=jobs,
             batch_subjects=settings.batch_subjects,
             max_bytes=settings.max_bytes,
-            mapped=mapped,
-            rendered=rendered,
         )
         new = run is None
         if new and subjects is None and estimate.before_app > REMOTE_GUARD_BYTES:
+            before = " before the first rating screen" if serve else ""
             raise ConfigError(
                 "invalid",
                 f"this dataset lists {_plural(estimate.subjects, 'subject')}, about "
-                f"{size_text(estimate.before_app)} to fetch before the first rating screen, more "
+                f"{size_text(estimate.before_app)} to fetch{before}, more "
                 f"than {size_text(REMOTE_GUARD_BYTES)}: name the subjects to review with "
                 "--subjects GLOB (for example --subjects 'sub-0[1-5]'), or --subjects '*' "
                 "for all of them",
@@ -773,12 +787,31 @@ def _open_remote_run(
             base = new_local_config(None, app=app, render_video=bool(video))
             run = Run(run_dir, source, config=base, transport=transport)
         _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
-        _say(estimate_line(estimate, new=new))
-        return run, new
+        if new:
+            _say(estimate_line(estimate, app=serve))
+        return run, new, estimate.template
     except BaseException:
         if run is not None:
             run.close()
         raise
+
+
+def _offline_remedy(run: Run | None, run_dir: Path) -> str:
+    """What to do when the bucket cannot be reached at the listing: the same command later,
+    and, for a run that has renders, the app without the bucket."""
+    again = "Run the same command again once it can be reached"
+    if run is None:
+        return again
+    try:
+        done = render_counts(run)[0]
+    except Exception:  # the remedy must not hide the fault it is said for
+        done = 0
+    if not done:
+        return again
+    return (
+        f"{again}; the {_plural(done, 'subject')} that {'is' if done == 1 else 'are'} rendered "
+        f"can be rated without the bucket: surfcensus serve --run-dir {run_dir}"
+    )
 
 
 def _refuse_in_fsaverage(run_dir: Path, fsaverage: Path | str) -> None:
@@ -825,7 +858,7 @@ def _say_inventory(run: Run, path: Path | str | None = None, *, where: str | Non
     if versions:
         described.append("FreeSurfer " + ", ".join(versions))
     globs = [glob for source in run.config.sources for glob in source.subjects]
-    if globs:
+    if globs and tuple(globs) != ("*",):
         # a subject set that is narrower than the directory is said, since it is kept
         described.append("of the subjects matching " + ", ".join(globs))
     if where is None:
@@ -1322,6 +1355,7 @@ class ReviewApp:
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renderer: threading.Thread | None = field(default=None, repr=False)
     _problem: list[str] = field(default_factory=list, repr=False)
+    _paused: bool = field(default=False, repr=False)
     _packing: bool = field(default=False, repr=False)
 
     @property
@@ -1343,6 +1377,12 @@ class ReviewApp:
     def render_problem(self) -> str | None:
         """Why the renderer behind the app gave up, if it did."""
         return self._problem[0] if self._problem else None
+
+    @property
+    def render_paused(self) -> bool:
+        """Whether the renderer behind the app waits for a bucket that cannot be reached
+        (it tries again every :data:`REMOTE_RETRY_S` seconds)."""
+        return self._paused and self.rendering
 
     def in_progress(self) -> str | None:
         """What the worker behind the app is at (``EPI packs`` or ``renders``), or None."""
@@ -1388,23 +1428,48 @@ def _render_rest(
     of step 2 of the EPI interface). The stop request of the app ends either between two
     batches. A failure of the run or the machine ends it and is said; the app goes on."""
     try:
-        # a remote dataset is reached through a source and a cache of this Run's own, which
-        # share the lease area of this process and its budget with those of the caller
-        with Run(run_dir, transport=transport) as run:
-            _with_fsaverage(run, fsaverage)
-            cache = run.config.cache.model_dump() | {"batch_subjects": jobs}
-            run.config = with_changes(run.config, cache=cache)
-            if render:
-                report = run.render(jobs=jobs, stop=app._stop.is_set)
-                if app._stop.is_set():
+        paused = False
+        while True:
+            try:
+                # a remote dataset is reached through a source and a cache of this Run's
+                # own, which share the lease area of this process and its budget with those
+                # of the caller
+                with Run(run_dir, transport=transport) as run:
+                    _with_fsaverage(run, fsaverage)
+                    cache = run.config.cache.model_dump() | {"batch_subjects": jobs}
+                    run.config = with_changes(run.config, cache=cache)
+                    if render:
+                        report = run.render(jobs=jobs, stop=app._stop.is_set)
+                        if app._stop.is_set():
+                            return
+                        done, failed, _ = render_counts(run)
+                        _say(
+                            f"All renders are made: {done} of {_plural(total, 'subject')} "
+                            "can be rated."
+                        )
+                        if failed:
+                            _say_failures(run, report, "not rendered")
+                    if pack:
+                        app._packing = True
+                        _pack_rest(run, jobs, app)
+                return
+            except SourceError as exc:
+                # a bucket that cannot be reached is tried again while the app runs: the
+                # rating screen says that the next subject opens by itself, and nothing of
+                # the batch that stopped was recorded, so the next try goes on from it
+                if exc.reason != "unreachable" or app._stop.is_set():
+                    raise
+                if not paused:
+                    paused = True
+                    _say(
+                        f"Rendering paused: {' '.join(str(exc).split())}. It is tried again "
+                        f"every {REMOTE_RETRY_S:g} s while the app runs; the subjects that "
+                        "are rendered can be rated meanwhile."
+                    )
+                app._paused = True
+                if app._stop.wait(REMOTE_RETRY_S):
                     return
-                done, failed, _ = render_counts(run)
-                _say(f"All renders are made: {done} of {_plural(total, 'subject')} can be rated.")
-                if failed:
-                    _say_failures(run, report, "not rendered")
-            if pack:
-                app._packing = True
-                _pack_rest(run, jobs, app)
+                app._paused = False
     except (ConfigError, SourceError, OSError, sqlite3.Error) as exc:
         problem = " ".join(str(exc).split())
         app._problem.append(problem)
@@ -1502,7 +1567,7 @@ def open_review(
         run_dir = Path.cwd() / ref.run_dir_name if run_dir is None else Path(run_dir)
         if fsaverage is not None:
             _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
-        run, new = _open_remote_run(
+        run, new, template_bytes = _open_remote_run(
             ref,
             run_dir,
             subjects=subjects,
@@ -1547,6 +1612,19 @@ def open_review(
         _say_inventory(run, named, where=None if ref is None else ref.text)
         if report.failed:
             _say_failures(run, report, "not read")
+        if ref is not None:
+            # before anything more is fetched: a subject that the cache's budget cannot hold
+            run.refuse_over_budget()
+            if not new:
+                everything = not serve or serve_after == 0
+                _say(
+                    continued_line(
+                        run,
+                        template_bytes=template_bytes,
+                        n_first=None if everything else serve_after or DEFAULT_SERVE_AFTER,
+                        app=serve,
+                    )
+                )
         # the functional inventory reads listings and small files only (D33: the time to the
         # rating screen does not grow with the functional data); the packs come behind the app
         run.func_inventory()

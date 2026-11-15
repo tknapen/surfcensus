@@ -796,6 +796,18 @@ def metrics_pending(
     )
 
 
+def pending_maps(ctx: RunContext, *, template: Template | None) -> list[str]:
+    """The subjects whose thickness maps a plain ``run_metrics`` would make now (the pending
+    units of the ``fsaverage`` stage, which are the ones whose Tier B files it leases);
+    none without a template. Opens no source file and records nothing."""
+    if template is None:
+        return []
+    found: list[str] = []
+    for stage in _stages(ctx, template, None, ("fsaverage",), for_work=False):
+        found.extend(_plan(ctx, stage, force=False, retry_failed=False).pending)
+    return found
+
+
 def run_metrics(
     ctx: RunContext,
     *,

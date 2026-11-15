@@ -161,7 +161,14 @@ class _Endpoint(httpx.BaseTransport):
         url = self.endpoint.copy_with(path=path, query=request.url.query or None)
         headers = httpx.Headers(request.headers)
         headers["Host"] = url.netloc.decode("ascii")
-        moved = httpx.Request(request.method, url, headers=headers, stream=request.stream)
+        # the extensions carry the timeouts of the request
+        moved = httpx.Request(
+            request.method,
+            url,
+            headers=headers,
+            stream=request.stream,
+            extensions=request.extensions,
+        )
         return self.inner.handle_request(moved)
 
     def close(self) -> None:
@@ -174,10 +181,22 @@ def _environment_proxy() -> str | None:
     if not proxy:
         return None
     exempt = os.environ.get("NO_PROXY") or os.environ.get("no_proxy") or ""
-    for entry in (part.strip().lower() for part in exempt.split(",")):
-        if entry == "*" or (entry and _S3_HOST.endswith(entry.lstrip("*").lstrip("."))):
-            return None
+    if any(_no_proxy_covers(part, _S3_HOST) for part in exempt.split(",")):
+        return None
     return proxy
+
+
+def _no_proxy_covers(entry: str, host: str) -> bool:
+    """Whether one entry of ``NO_PROXY`` exempts every bucket host, which are ``host`` and
+    its subdomains: ``*``, ``host`` itself or a domain above it, matched at a dot
+    (``amazonaws.com`` and ``.s3.amazonaws.com`` do, ``ws.com`` does not). An entry for one
+    bucket's own host exempts nothing: the transport serves every bucket, so it is made
+    with the proxy or without it."""
+    entry = entry.strip().lower()
+    if entry == "*":
+        return True
+    entry = entry.lstrip("*").lstrip(".")
+    return bool(entry) and (host == entry or host.endswith("." + entry))
 
 
 def default_transport() -> ReadOnlyTransport:

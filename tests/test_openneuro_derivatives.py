@@ -395,6 +395,58 @@ def test_globs_list_only_the_matching_subject_prefixes(tmp_path: Path) -> None:
     assert fake.log == []
 
 
+def test_an_interrupt_while_subjects_are_listed_ends_the_listing(tmp_path: Path) -> None:
+    """Ctrl-C (and SIGTERM, which the commands turn into it) while the subject prefixes are
+    listed in threads: the listings not yet started are dropped, no request is retried, and
+    the source can be used again."""
+    import _thread
+    import signal
+    import threading
+    import time
+
+    labels = tuple(f"sub-{n:02d}" for n in range(12))
+    dataset(tmp_path / "b", labels=labels)
+    fake = FakeS3({BUCKET: tmp_path / "b"})
+    remote = source(fake, concurrency=2)
+    (record,) = remote.datasets()
+    fake.clear()
+    release = threading.Event()
+    started = threading.Semaphore(0)
+    listing = remote.client.list
+
+    def held(prefix: str, **kwargs: object) -> object:
+        started.release()
+        assert release.wait(60)
+        return listing(prefix, **kwargs)  # type: ignore[arg-type]
+
+    remote.client.list = held  # type: ignore[method-assign]
+
+    def interrupt() -> None:
+        for _ in range(2):  # both workers hold a listing
+            assert started.acquire(timeout=60)
+        _thread.interrupt_main()
+        # the held listings go on only once the interrupt stopped the client
+        deadline = time.monotonic() + 60
+        while not remote.client.stopped.is_set() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        release.set()
+
+    before = signal.signal(signal.SIGINT, signal.default_int_handler)
+    thread = threading.Thread(target=interrupt)
+    thread.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            list(remote.subjects(record))
+    finally:
+        signal.signal(signal.SIGINT, before)
+        thread.join(60)
+    # the two listings that were held found the client stopped; the other ten never started
+    assert fake.log == []
+    assert not remote.client.stopped.is_set()
+    remote.client.list = listing  # type: ignore[method-assign]
+    assert [s.subject_label for s in remote.subjects(record)] == list(labels)
+
+
 def test_a_glob_that_matches_nothing_names_ten_subjects(tmp_path: Path) -> None:
     labels = tuple(f"sub-{n:02d}" for n in range(14))
     dataset(tmp_path / "b", labels=labels)

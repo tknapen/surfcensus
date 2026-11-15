@@ -215,6 +215,22 @@ def render_pending(
     return len(plan.pending)
 
 
+def pending_renders(ctx: RunContext, *, template: Template | None = None) -> list[str]:
+    """The subjects that a plain ``run_render`` would render now, in its order: those of
+    :func:`render_pending` by ``subject_uid``. Opens no source file and records nothing."""
+    plan = _plan(
+        ctx,
+        template_id=None if template is None else template.template_id,
+        datasets=None,
+        subjects=None,
+        all_subjects=None,
+        video=None,
+        force=False,
+        retry_failed=False,
+    )
+    return list(plan.pending)
+
+
 def run_render(
     ctx: RunContext,
     *,

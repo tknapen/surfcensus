@@ -293,6 +293,34 @@ def test_retain_keeps_every_role(cache: Cache) -> None:
     assert client.calls == [] and len(_files(cache.root)) == 3
 
 
+def test_a_retained_download_is_staged_outside_retained(cache: Cache) -> None:
+    """While ``Cache.retained`` downloads, its partial file lies in the lease area of the
+    process: ``retained/`` holds nothing of the object until the whole file is renamed in."""
+    contents = _contents(1, size=50_000)
+    (obj,) = _objects(contents).values()
+    client = StandIn(contents)
+    client.gate = threading.Event()
+    done: list[Path] = []
+    thread = threading.Thread(target=lambda: done.append(cache.retained(client, obj)))
+    thread.start()
+    try:
+        assert client.started.acquire(timeout=HANG_S)
+        deadline = time.monotonic() + HANG_S
+        partial: list[Path] = []
+        while not partial and time.monotonic() < deadline:
+            partial = [p for p in cache.root.rglob("*") if p.is_file() and p.name != LOCK_FILE]
+        assert partial
+        assert all(RETAINED not in p.relative_to(cache.root).parts for p in partial)
+        assert not any(p.is_file() for p in (cache.root / RETAINED).rglob("*"))
+    finally:
+        client.gate.set()
+        thread.join(HANG_S)
+    (kept,) = done
+    assert RETAINED in kept.relative_to(cache.root).parts
+    assert kept.read_bytes() == contents[obj.key]
+    assert _files(cache.root) == [kept]
+
+
 def test_retained_never_holds_a_partial_file(cache: Cache) -> None:
     contents = _contents(2, size=200_000)
     objects = _objects(contents)

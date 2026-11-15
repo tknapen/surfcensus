@@ -1397,7 +1397,7 @@ def test_a_listing_that_cannot_be_reached_stops_the_inventory(bench: Bench) -> N
     assert raised.value.reason == "unreachable"
     assert raised.value.detail == (
         f"the bucket could not be reached (fmriprep/: 503 after 5 tries); the inventory of "
-        f"{pseudonym} stopped at its listing: the 2 subject(s) stored before it are kept, "
+        f"{pseudonym} stopped at its listing: the 2 subjects stored before it are kept, "
         "nothing of it was stored and no subject was marked absent; run the same command "
         "again once it can be reached"
     )
@@ -1425,8 +1425,10 @@ def test_a_tier_a_file_that_cannot_be_reached_stops_the_inventory_at_its_subject
     with pytest.raises(SourceError) as raised:
         bench.run(spy)
     assert raised.value.reason == "unreachable"
-    assert f"stopped at subject {bench.uid('sub-02')}:" in raised.value.detail
-    assert "the 1 subject(s) stored before it are kept" in raised.value.detail
+    # a local run names its subjects by label (review of the remote stage: it said the uid)
+    assert "stopped at subject sub-02:" in raised.value.detail
+    assert bench.uid("sub-02") not in raised.value.detail
+    assert "the 1 subject stored before it is kept" in raised.value.detail
     assert upserted == ["sub-01"]  # nothing of sub-02, and the inventory went no further
     assert bench.rows("SELECT n_subjects_listed FROM datasets") == [{"n_subjects_listed": None}]
 

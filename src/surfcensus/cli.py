@@ -78,6 +78,20 @@ def main(
     configure_cli_logging(verbose)
 
 
+def _folders_only(given: Path | None, option: str) -> None:
+    """``render-subject``, ``inventory --source`` and ``epi-session`` read folders; a dataset
+    of the bucket (``openneuro:dsXXXXXX``) is read by ``review`` alone, and is said so and
+    not looked for as a folder. A folder of that name is taken (as ``./openneuro:...`` too)."""
+    if given is None or not str(given).startswith("openneuro:") or given.exists():
+        return
+    raise typer.BadParameter(
+        f"{given} names a dataset of the OpenNeuroDerivatives bucket, which this command does "
+        f"not read: it takes a folder. Use `surfcensus review {given}`, which fetches the "
+        "dataset's subjects and makes a run that the other commands open with --run-dir.",
+        param_hint=option,
+    )
+
+
 @app.command("render-subject")
 def render_subject(
     subject_dir: Path = typer.Argument(..., help="A FreeSurfer subject directory."),
@@ -103,6 +117,7 @@ def render_subject(
     from surfcensus.render.model import PANEL_ORDER
     from surfcensus.templates import TemplateError, TemplateNotFound
 
+    _folders_only(subject_dir, "SUBJECT_DIR")
     if not out.strip():  # an unset shell variable; as a path it would be the current directory
         raise typer.BadParameter("the output path is empty", param_hint="--out")
     target = Path(out)
@@ -177,6 +192,7 @@ def epi_session_command(
     no_browser: bool = typer.Option(False, "--no-browser", help="With --serve: open no browser."),
 ) -> None:
     """Pack the raw and preprocessed EPI series of one subject, without a run directory."""
+    _folders_only(path, "PATH")
     # step 1 of docs/epi_interface.md: quality control of the raw data and of the
     # preprocessing, one subject, view only
     from surfcensus.func.api import epi_subject
@@ -563,6 +579,7 @@ def inventory(
 ) -> None:
     """List the subjects of a source and record what each has (phase 2), then the
     functional runs of the folder (phase 2f)."""
+    _folders_only(source, "--source")
     if relocate not in (None, _RELOCATE_ANY) and not re.fullmatch(r"D-[0-9a-f]+", relocate):
         raise typer.BadParameter(
             "takes a dataset pseudonym (D-xxxxxxxx) or nothing", param_hint="--relocate"
@@ -1076,6 +1093,13 @@ def review_command(
             doing = behind[0].in_progress() if behind else None
             if doing is None:
                 return _RECORDED_STAYS
+            if behind[0].fetched_from is not None:
+                # a remote dataset: what the worker behind the app was fetching is given up
+                # with the process (review of the remote stage: the line said otherwise)
+                return (
+                    f"{_RECORDED_STAYS}; what was being fetched is dropped, and the next call "
+                    "clears what is left of it in the cache"
+                )
             return f"{_RECORDED_STAYS}; the {doing} in progress end first"
 
         with _stops_at_signals(recorded) as signals:
