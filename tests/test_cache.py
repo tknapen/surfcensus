@@ -125,6 +125,18 @@ def _files(root: Path) -> list[Path]:
     return sorted(p for p in root.rglob("*") if p.is_file() and p.name != LOCK_FILE)
 
 
+@pytest.fixture(autouse=True)
+def _ctrl_c_as_in_a_terminal() -> Iterator[None]:
+    """SIGINT raises ``KeyboardInterrupt`` in the test process, also when the suite was
+    started with SIGINT ignored (``cmd &`` from a shell without job control, ``nohup``, some
+    schedulers): ``_thread.interrupt_main`` does nothing for an ignored signal."""
+    before = signal.signal(signal.SIGINT, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGINT, before)
+
+
 @pytest.fixture
 def cache(tmp_path: Path) -> Iterator[Cache]:
     made = Cache(tmp_path / "cache", max_bytes=10**9, secret=SECRET)

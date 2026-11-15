@@ -1,8 +1,9 @@
-"""The download cache of a run: ``<run>/cache/`` (work package RB).
+"""The download cache of a run: ``<run>/cache/``.
 
-Laid down by work package R0 (docs/dev/remote_plan.md): the layout of the directory, the
-names of its files (keyed with the run secret, so that no name can be matched to the bucket
-listing), the constructor and the signatures with the behaviour each method must have.
+The layout of the directory and the names of its files (keyed with the run secret, so that
+no name can be matched to the bucket listing), the leases of a batch, the retained copies,
+the lock of each process's lease area and the pruning of what ended processes and earlier
+versions left (docs/dev/remote_plan.md, section 5).
 
 Layout::
 
@@ -28,7 +29,7 @@ import threading
 import time
 from collections.abc import Collection, Iterator, Mapping
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING
@@ -483,6 +484,64 @@ class Cache:
         if removed:
             get_logger().info("removed %d files that ended processes left in the cache", removed)
         return removed
+
+    def prune_retained(self, keep: Collection[str]) -> int:
+        """Remove every object of ``retained/`` whose name (:meth:`name`) is not in ``keep``,
+        with its directory (the template's tree of links among them); returns the number of
+        files removed. For ``Run.prune_cache``, which knows which names the run still
+        needs. An object that is being retained by this process now is not removed."""
+        root = self.root / RETAINED
+        wanted = set(keep)
+        state = _area_state(self.area)
+        removed = 0
+        try:
+            groups = sorted(root.iterdir())
+        except FileNotFoundError:
+            return 0
+        for group in groups:
+            if group.is_symlink() or not group.is_dir():
+                continue
+            for entry in sorted(group.iterdir()):
+                if entry.name in wanted or entry.is_symlink() or not entry.is_dir():
+                    continue
+                with state.lock:
+                    busy = any(
+                        path.parent == entry and lock.locked()
+                        for path, lock in state.retaining.items()
+                    )
+                if not busy:
+                    removed += _remove_tree(entry)
+            _rmdir_empty(group)
+        return removed
+
+    def release(self) -> None:
+        """End this process's hold on its lease area when no lease of it is open: the area,
+        its lock file included, is removed, so that a command that ends leaves nothing under
+        ``leases/``. A later lease takes the area again. Does nothing while a lease or a
+        retaining download of this process is open."""
+        state = _area_state(self.area)
+        with state.lock:
+            if state.descriptor is None or state.entries or state.bytes:
+                return
+            if any(lock.locked() for lock in state.retaining.values()):
+                return
+            descriptor, state.descriptor = state.descriptor, None
+            state.retaining.clear()
+            try:
+                if descriptor >= 0:
+                    for child in list(self.area.iterdir()):
+                        if child.name != LOCK_FILE:
+                            _remove_tree(child)
+                    # the file goes while it is locked, as in a prune
+                    with suppress(FileNotFoundError):
+                        (self.area / LOCK_FILE).unlink()
+                    _rmdir_empty(self.area)
+                    _rmdir_empty(self.area.parent)
+            except FileNotFoundError:
+                pass
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
 
     def hold_area(self) -> Path:
         """This process's lease area with its lock held, for a caller that writes a directory

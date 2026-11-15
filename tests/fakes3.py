@@ -15,7 +15,7 @@ for tests that run a command in a subprocess, which reaches it through
 ``SURFCENSUS_S3_ENDPOINT``. Requests may be virtual-hosted (``<bucket>.s3.amazonaws.com``) or
 path-style (``s3.amazonaws.com/<bucket>/``, or the loopback server).
 
-Faults are injected by key pattern (:meth:`FakeS3.fault`): 500, 503, a 503 ``SlowDown`` body,
+Faults are injected by key pattern (:meth:`FakeS3.fault`): 403, 500, 503, a 503 ``SlowDown`` body,
 a body cut short, a connection reset. :meth:`FakeS3.mutate_after_list` changes the content of
 an object once a listing has named it, without touching the file, so that its ETag at GET
 differs from the listed one. A request log and a high-water mark of concurrent requests are
@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 
 NAMESPACE = "http://s3.amazonaws.com/doc/2006-03-01/"
 S3_HOST = "s3.amazonaws.com"
-FaultKind = Literal["500", "503", "slowdown", "truncate", "reset"]
+FaultKind = Literal["403", "500", "503", "slowdown", "truncate", "reset"]
 SIGNED_QUERY = {
     "x-amz-signature",
     "x-amz-credential",
@@ -339,6 +339,8 @@ class FakeS3:
         headers: Mapping[str, str],
         listing: bool,
     ) -> _Reply:
+        if fault.kind == "403":
+            return _error(403, "AccessDenied", "access denied")
         if fault.kind == "500":
             return _error(500, "InternalError", "we encountered an internal error")
         if fault.kind in ("503", "slowdown"):

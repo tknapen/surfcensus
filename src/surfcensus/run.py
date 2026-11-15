@@ -37,6 +37,8 @@ from surfcensus.privacy import HashKey
 from surfcensus.records import FUNC_INVENTORY_PHASE, METRIC_STAGES, PhaseReport, RunContext
 from surfcensus.sources.base import (
     HEMIS,
+    TIER_B,
+    TIER_C,
     DatasetRecord,
     FileRole,
     Hemi,
@@ -60,6 +62,11 @@ if TYPE_CHECKING:
     from surfcensus.records import SessionWork
     from surfcensus.remote.cache import Cache
     from surfcensus.templates import Template, TemplateNotFound
+
+
+RENDER_LEASED: tuple[FileRole, ...] = (*TIER_C, FileRole.LH_SPHERE_REG, FileRole.RH_SPHERE_REG)
+"""The roles that a render leases at most (both ``sphere.reg`` with a template), for the
+disk bound of a render on remote data."""
 
 
 def other_root_hint(
@@ -402,8 +409,19 @@ class Run:
                 self._remote_row(source, described.dataset)
 
     def _bind(self, source: RemoteSource, stored: SourceConfig) -> None:
-        """Give a remote source the cache of this run and, in a local run, its pseudonym."""
-        source.bind(cache=self._remote_cache(), pseudonym=stored.dataset)
+        """Give a remote source the cache of this run and, in a local run, its pseudonym, and
+        remove what ended processes left in the cache (:meth:`_pruned`)."""
+        cache = self._remote_cache()
+        source.bind(cache=cache, pseudonym=stored.dataset)
+        self._pruned(cache)
+
+    @staticmethod
+    def _pruned(cache: Cache | None) -> None:
+        """``Cache.prune``: the lease areas of processes of this host that ended without
+        cleaning up (killed, say) are removed when a remote source is built. Areas of live
+        processes and of other hosts are left."""
+        if cache is not None:
+            cache.prune()
 
     def _remote_cache(self) -> Cache:
         """The cache of this run's downloads, keyed with the run secret."""
@@ -733,10 +751,14 @@ class Run:
             raise ConfigError(
                 "invalid", f"--raw {raw} lies inside the run directory {self.run_dir}"
             )
+        also = [*self._template_places(), *self._raw_places()]
         subjects_dir = getattr(source, "subjects_dir", None)
         if not isinstance(subjects_dir, Path):
+            # a remote source reads nothing on this machine but the fsaverage directories
+            # of this call and of a FreeSurfer install, which are only read as well
+            if also:
+                refuse_in_sources(self.run_dir, [], what="run", also=also)
             return
-        also = [*self._template_places(), *self._raw_places()]
         refuse_in_sources(self.run_dir, [subjects_dir], what="run", also=also)
 
     def set_epi(
@@ -818,6 +840,8 @@ class Run:
                 secret=secret,
             )
             self._refuse_inside(source)
+            if stored.kind != "local":
+                self._pruned(getattr(source, "cache", None))
             self._built[index] = source
         return self._built[index]
 
@@ -854,6 +878,127 @@ class Run:
     ) -> AbstractContextManager[Mapping[FileRole, Path]]:
         record = self._catalog.subject_record(subject_uid)
         return self._source_of(record.dataset).lease(record, roles)
+
+    def _remote_roles_bytes(self, roles: Collection[FileRole]) -> list[int]:
+        """Per present subject of a remote dataset, the bytes of its listed files of
+        ``roles``, from the private catalog: what one lease of the subject downloads at most."""
+        if not roles or all(stored.kind == "local" for stored in self.config.sources):
+            return []
+        marks = ", ".join("?" for _ in roles)
+        rows = self._catalog.query(
+            "SELECT SUM(f.size) AS total FROM files f "
+            "JOIN subjects s ON s.subject_uid = f.subject_uid "
+            "JOIN datasets d ON d.dataset_id = s.dataset_id "
+            f"WHERE d.source != 'local' AND s.present = 1 AND f.role IN ({marks}) "
+            "GROUP BY f.subject_uid",
+            tuple(FileRole(role).value for role in roles),
+        )
+        return [int(row["total"] or 0) for row in rows]
+
+    @contextmanager
+    def _remote_batches(self, roles: Collection[FileRole], what: str) -> Iterator[None]:
+        """The disk bound of a phase on remote data (docs/dev/remote_plan.md, section 5).
+
+        One batch leases at most ``cache.batch_subjects`` subjects at once, each at most the
+        largest subject's files of ``roles``. When that exceeds ``cache.max_bytes`` the batch
+        size is lowered for the length of the block (one line at info level), so that a
+        lease never raises ``CacheBudgetError``; a single subject over the budget is refused
+        (``ConfigError("invalid", ...)``), as is a call when the disk of the cache has less
+        free space than one batch and ``DISK_MARGIN_BYTES``. Nothing happens for a run
+        without a remote dataset."""
+        from surfcensus.remote.cache import CACHE_DIR, DISK_MARGIN_BYTES
+
+        sizes = self._remote_roles_bytes(roles)
+        largest = max(sizes, default=0)
+        if largest == 0:
+            yield
+            return
+        settings = self.config.cache
+        if largest > settings.max_bytes:
+            raise ConfigError(
+                "invalid",
+                f"the {what} of one subject lease {size_text(largest)} of source files, more than "
+                f"the cache's budget of {size_text(settings.max_bytes)} (cache.max_bytes in "
+                f"{CONFIG_FILE}): raise cache.max_bytes",
+            )
+        batch = min(settings.batch_subjects, max(1, settings.max_bytes // largest))
+        free = free_bytes(self.run_dir / CACHE_DIR)
+        need = batch * largest
+        if free is not None and free < need + DISK_MARGIN_BYTES:
+            raise ConfigError(
+                "invalid",
+                f"the disk of {self.run_dir} has {size_text(free)} free, and the {what} need "
+                f"{size_text(need)} for a batch of {batch} subject(s) beside a margin of "
+                f"{size_text(DISK_MARGIN_BYTES)}: make room, or lower cache.batch_subjects in "
+                f"{CONFIG_FILE}",
+            )
+        if batch == settings.batch_subjects:
+            yield
+            return
+        get_logger().info(
+            "batches of %d subjects for the %s, so that one batch fits cache.max_bytes",
+            batch,
+            what,
+        )
+        earlier = self.config
+        self.config = with_changes(earlier, cache=settings.model_dump() | {"batch_subjects": batch})
+        try:
+            yield
+        finally:
+            if self.config.cache.batch_subjects == batch:
+                self.config = with_changes(
+                    self.config,
+                    cache=self.config.cache.model_dump()
+                    | {"batch_subjects": earlier.cache.batch_subjects},
+                )
+
+    def prune_cache(self) -> int:
+        """Remove what the run no longer needs from the retained cache of its remote
+        datasets; returns the number of files removed.
+
+        An object is kept while a ``files`` row of a present subject names it (key and
+        ETag, as ``Cache.name`` keys it): Tier A files and ``cache.retain_roles`` of the
+        subjects the run has now. The rest is a file of an earlier version of a subject or
+        of a subject that left, or the ``fsaverage`` next to the subjects with its tree;
+        it is removed only once the run's pinned template reads from ``templates/<id>/``,
+        since before that the rest may be the template the next call is built from.
+        ``Run.metrics`` calls this at its end on a run with a remote dataset."""
+        from surfcensus.remote.cache import CACHE_DIR, Cache
+        from surfcensus.templates import TEMPLATES_DIR, read_template
+
+        remote = [i for i, stored in enumerate(self.config.sources) if stored.kind != "local"]
+        if not remote or not (self.run_dir / CACHE_DIR).is_dir():
+            return 0
+        pinned = self._catalog.meta("template_id")
+        if pinned is None:
+            return 0
+        try:
+            if read_template(self.run_dir / TEMPLATES_DIR / pinned).template_id != pinned:
+                return 0
+        except (OSError, ValueError):
+            return 0
+        cache = Cache(
+            self.run_dir / CACHE_DIR,
+            max_bytes=self.config.cache.max_bytes,
+            secret=self._catalog.run_secret(),
+        )
+        rows = self._catalog.query(
+            "SELECT d.root, s.fs_dir, f.location, f.etag_or_mtime FROM files f "
+            "JOIN subjects s ON s.subject_uid = f.subject_uid "
+            "JOIN datasets d ON d.dataset_id = s.dataset_id "
+            "WHERE d.source != 'local' AND s.present = 1"
+        )
+        keep: set[str] = set()
+        for row in rows:
+            bucket, _, base = str(row["root"]).removeprefix("s3://").partition("/")
+            key = f"{base}{row['fs_dir']}/{row['location']}"
+            keep.add(cache.name(bucket, key, row["etag_or_mtime"]))
+        removed = cache.prune_retained(keep)
+        if removed:
+            get_logger().info(
+                "removed %d files from the cache that the run no longer needs", removed
+            )
+        return removed
 
     def _pseudonyms(self, datasets: Collection[str] | None) -> list[str] | None:
         """Accessions or pseudonyms, as a user names datasets, to pseudonyms."""
@@ -908,6 +1053,7 @@ class Run:
         """:meth:`template`, saying that there is none at ``level``: a render mentions it
         only to those who ask for more output, because the metrics say it aloud."""
         from surfcensus.templates import (
+            TEMPLATE_GONE,
             TEMPLATES_DIR,
             TemplateError,
             TemplateNotFound,
@@ -922,15 +1068,37 @@ class Run:
             return self._template
         pinned = self._catalog.meta("template_id")
         cache = self.run_dir / TEMPLATES_DIR
-        adjacent, adjacent_id = self._adjacent_template()
-        try:
-            found = find_template(
+        adjacent_id: int | None = None
+
+        def find(adjacent: Path | None) -> Template:
+            return find_template(
                 config=self.config.metrics,
                 adjacent=adjacent,
                 cache_dir=cache,
                 pinned=pinned,
                 retemplate=retemplate,
             )
+
+        try:
+            # The fsaverage next to the subjects is looked for only when nothing before it
+            # gives the template: a pinned template whose templates/<id>/ reads, the
+            # directory of this call and that of a FreeSurfer install. For a remote dataset
+            # looking for it downloads it (about 40 MB), so a run that holds its template
+            # lists and fetches nothing for it.
+            try:
+                found = find(None)
+            except TemplateNotFound:
+                if self.config.metrics.fsaverage_dir is not None:
+                    raise
+                adjacent, adjacent_id = self._adjacent_template()
+                found = find(adjacent)
+            except TemplateError as exc:
+                if pinned is None or retemplate or TEMPLATE_GONE not in str(exc):
+                    raise
+                adjacent, adjacent_id = self._adjacent_template()
+                if adjacent is None:
+                    raise
+                found = find(adjacent)
         except TemplateNotFound as exc:
             if self.config.metrics.fsaverage_dir is not None:
                 raise  # a directory that was asked for and cannot be used is no "none found"
@@ -974,11 +1142,19 @@ class Run:
         from surfcensus.sources.local import TEMPLATE_NAME, template_files_missing
 
         rows = self._catalog.query(
-            "SELECT dataset_id, root, fs_root, template_location FROM datasets "
-            "WHERE source = 'local' AND root IS NOT NULL ORDER BY pseudonym, source, pipeline"
+            "SELECT dataset_id, source, root, fs_root, template_location FROM datasets "
+            "WHERE root IS NOT NULL ORDER BY pseudonym, source, pipeline"
         )
         incomplete: tuple[Path | None, int | None] = (None, None)
         for row in rows:
+            if row["source"] != "local":
+                # a dataset of a bucket: its fsaverage, when its listing has every template
+                # file, downloaded into the retained cache (``template_dir``), whose files
+                # are those of a local copy of it, so the template id is the same
+                found = self._remote_template(row["dataset_id"])
+                if found is not None:
+                    return found, row["dataset_id"]
+                continue
             recorded = row["template_location"]
             location = recorded or (PurePosixPath(row["fs_root"]) / TEMPLATE_NAME).as_posix()
             directory = Path(row["root"]) / location
@@ -991,6 +1167,23 @@ class Run:
             if incomplete[0] is None and (recorded is not None or missing is not None):
                 incomplete = (directory, row["dataset_id"])
         return incomplete
+
+    def _remote_template(self, dataset_id: int) -> Path | None:
+        """The ``fsaverage`` next to the subjects of the remote dataset ``dataset_id`` as a
+        directory in the retained cache (``template_dir`` of its source), or None when its
+        listing lacks a template file or no source of the run holds the dataset."""
+        record = self._catalog.dataset_record(dataset_id)
+        if record.template_location is None:
+            return None
+        try:
+            source = self._source_of(record)
+        except SourceError:
+            return None
+        template_dir = getattr(source, "template_dir", None)
+        if template_dir is None:
+            return None
+        found = template_dir(record)
+        return found if isinstance(found, Path) else None
 
     def _no_template_message(self, exc: TemplateNotFound) -> str:
         names = {
@@ -1056,15 +1249,18 @@ class Run:
         )
         if pending:
             self._sources()  # a source that is gone is not a property of its subjects
-        return run_metrics(
-            context,
-            template=template,
-            datasets=pseudonyms,
-            stages=stages,
-            jobs=jobs,
-            force=force,
-            retry_failed=retry_failed,
-        )
+        with self._remote_batches(TIER_B if pending else (), "metrics"):
+            report = run_metrics(
+                self.context(),
+                template=template,
+                datasets=pseudonyms,
+                stages=stages,
+                jobs=jobs,
+                force=force,
+                retry_failed=retry_failed,
+            )
+        self.prune_cache()
+        return report
 
     def render(
         self,
@@ -1118,18 +1314,20 @@ class Run:
         )
         if pending:
             self._sources()  # a source that is gone is not a property of its subjects
-        report = run_render(
-            context,
-            template=template,
-            jobs=jobs,
-            datasets=pseudonyms,
-            subjects=uids,
-            all_subjects=all_subjects,
-            video=video,
-            force=force,
-            retry_failed=retry_failed,
-            stop=stop,
-        )
+        roles = RENDER_LEASED if pending else ()
+        with self._remote_batches(roles, "renders"):
+            report = run_render(
+                self.context(),
+                template=template,
+                jobs=jobs,
+                datasets=pseudonyms,
+                subjects=uids,
+                all_subjects=all_subjects,
+                video=video,
+                force=force,
+                retry_failed=retry_failed,
+                stop=stop,
+            )
         if not native or (stop is not None and stop()):
             return report
         # the cluster centroids of the subjects just rendered get their native position
@@ -1420,6 +1618,13 @@ class Run:
         return media_dir(self.run_dir, subject_uid)
 
     def close(self) -> None:
+        """Close the catalog, and give up the lease area of a remote source's cache when no
+        lease of it is open (``Cache.release``), so that a call that ended leaves nothing
+        under ``cache/leases/``."""
+        for source in self._built.values():
+            cache = getattr(source, "cache", None) if source.kind != "local" else None
+            if cache is not None:
+                cache.release()
         self._catalog.close()
 
     def __enter__(self) -> Run:
@@ -1427,6 +1632,32 @@ class Run:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+
+def free_bytes(path: Path) -> int | None:
+    """The free space of the file system that holds ``path`` (or its nearest existing
+    parent); None when it cannot be told."""
+    import shutil
+
+    place = Path(path)
+    while not place.exists() and place.parent != place:
+        place = place.parent
+    try:
+        return shutil.disk_usage(place).free
+    except OSError:
+        return None
+
+
+def size_text(n: int) -> str:
+    """A number of bytes as people read it: ``0 MB``, ``45 kB``, ``40.8 MB``, ``1.25 GB``
+    (powers of ten)."""
+    if n <= 0:
+        return "0 MB"
+    if n < 1_000_000:
+        return f"{max(1, round(n / 1e3))} kB"
+    if n < 1_000_000_000:
+        return f"{n / 1e6:.1f} MB"
+    return f"{n / 1e9:.2f} GB"
 
 
 def from_config(

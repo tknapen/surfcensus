@@ -32,6 +32,7 @@ import pandas as pd
 
 from surfcensus.app import APP_DB_FILE
 from surfcensus.config import (
+    CacheConfig,
     ConfigError,
     load_config,
     new_local_config,
@@ -39,8 +40,15 @@ from surfcensus.config import (
     write_config,
 )
 from surfcensus.log import get_logger
-from surfcensus.run import Run, other_root_hint
-from surfcensus.sources.base import RENDER_ROLES, DatasetRecord, SourceError
+from surfcensus.remote import RemoteRef, parse_remote_path
+from surfcensus.run import Run, other_root_hint, size_text
+from surfcensus.sources.base import (
+    RENDER_ROLES,
+    DatasetRecord,
+    FileRole,
+    SourceError,
+    SubjectRecord,
+)
 from surfcensus.sources.local import (
     LAYOUT_WORDS,
     LocalSource,
@@ -57,6 +65,8 @@ from surfcensus.stopping import StopFlag, StopRequest
 from surfcensus.store import queue_order, queue_scores
 
 if TYPE_CHECKING:
+    import httpx
+
     from surfcensus.app.server import ServerHandle
     from surfcensus.config import RunConfig, SourceConfig
     from surfcensus.records import PhaseReport
@@ -348,35 +358,49 @@ def _open_run(
         next(iter(source.subjects(source.dataset)), None)
     run = Run(run_dir, source, relocate=relocate)
     try:
-        config = run.config
-        app = config.app.model_dump()
-        if blind is not None and blind != config.app.blind:
-            rated = _n_submissions(run_dir)
-            if rated and not force:
-                was = "blind" if config.app.blind else "not blind"
-                raise ConfigError(
-                    "invalid",
-                    f"this run is {was} and has {_plural(rated, 'submission')}: the order "
-                    "of the queue and what a rater could see would change; pass --force "
-                    "to change it all the same (the change is recorded)",
-                )
-            app["blind"] = blind
-        if require_marks is not None:
-            app["require_marks"] = require_marks
-        changes: dict[str, object] = {"app": app}
-        if video is not None:
-            changes["render_video"] = video
-        changed = with_changes(config, **changes)
-        if changed != config:
-            write_config(run_dir, changed)
-            run.config = changed
-            if changed.app.blind != config.app.blind:
-                _record_blind(run, changed.app.blind)
+        _apply_options(run, blind=blind, require_marks=require_marks, video=video, force=force)
         run.set_epi(enabled=epi, runs=epi_runs, raw=raw)
     except BaseException:
         run.close()
         raise
     return run, False
+
+
+def _apply_options(
+    run: Run,
+    *,
+    blind: bool | None,
+    require_marks: bool | None,
+    video: bool | None,
+    force: bool,
+) -> None:
+    """Write the options of a call that were given into the configuration of an existing
+    run; None keeps what the run has. ``blind`` cannot change once the run has a submission
+    unless ``force``, and a change is recorded in the events of the app."""
+    config = run.config
+    app = config.app.model_dump()
+    if blind is not None and blind != config.app.blind:
+        rated = _n_submissions(run.run_dir)
+        if rated and not force:
+            was = "blind" if config.app.blind else "not blind"
+            raise ConfigError(
+                "invalid",
+                f"this run is {was} and has {_plural(rated, 'submission')}: the order "
+                "of the queue and what a rater could see would change; pass --force "
+                "to change it all the same (the change is recorded)",
+            )
+        app["blind"] = blind
+    if require_marks is not None:
+        app["require_marks"] = require_marks
+    changes: dict[str, object] = {"app": app}
+    if video is not None:
+        changes["render_video"] = video
+    changed = with_changes(config, **changes)
+    if changed != config:
+        write_config(run.run_dir, changed)
+        run.config = changed
+        if changed.app.blind != config.app.blind:
+            _record_blind(run, changed.app.blind)
 
 
 def _record_blind(run: Run, blind: bool) -> None:
@@ -399,6 +423,316 @@ def _record_blind(run: Run, blind: bool) -> None:
             session.commit()
     finally:
         engine.dispose()
+
+
+# --- a dataset of the OpenNeuroDerivatives bucket (docs/dev/remote_plan.md, section 4) ----------
+
+REMOTE_GUARD_BYTES = 2_000_000_000
+"""A new review of a remote dataset that names no subjects (``--subjects``) stops when the
+estimate of what it fetches before the first rating screen exceeds this, and asks for
+``--subjects`` (decision D47, item 3): about 135 subjects of 14 MB."""
+
+_RENDER_SPHERES = (FileRole.LH_SPHERE_REG, FileRole.RH_SPHERE_REG)
+
+
+def _refuse_for_remote(
+    *,
+    field_strength: float | None,
+    relocate: bool,
+    epi: bool | None,
+    epi_runs: Sequence[str] | None,
+    raw: Path | str | None,
+) -> None:
+    """The options that a review of a remote dataset does not take, each refused with one
+    line (decision D47, items 4 and 7)."""
+    if relocate:
+        raise ConfigError("invalid", "a remote dataset does not move; --relocate is for local data")
+    if raw is not None or epi is not None or epi_runs:
+        given = "--raw" if raw is not None else "--epi-runs" if epi_runs else "--epi/--no-epi"
+        raise ConfigError(
+            "invalid",
+            f"{given}: a review of a remote dataset has no EPI interface; the functional "
+            "files of a bucket dataset are not read",
+        )
+    if field_strength is not None:
+        raise ConfigError(
+            "invalid",
+            "--field-strength is not taken for a remote dataset; its field strength comes "
+            "from the raw dataset once enrichment is built",
+        )
+
+
+@dataclass(frozen=True)
+class RemoteEstimate:
+    """What a review of a remote dataset will fetch, from the sizes of the listing alone.
+
+    The figures are sums of listed sizes: the Tier A and Tier B files of every subject, the
+    ``fsaverage`` next to the subjects when the run will take its template from there, and
+    the render files (Tier C and, with a template, both ``sphere.reg`` files, which the
+    metrics fetched once already: decision D47, item 6) of the subjects rendered before the
+    app opens and of all. Files of this run's cache are left out."""
+
+    subjects: int
+    tier_a: int
+    tier_b: int
+    template: int
+    first: int
+    """Bytes of the renders before the first rating screen."""
+    n_first: int
+    renders: int
+    """Bytes of every render."""
+    peak: int
+    """The source files on disk at once at most: the kept Tier A files and template, and the
+    larger of one batch of the metrics and one of the renders."""
+
+    @property
+    def before_app(self) -> int:
+        return self.tier_a + self.tier_b + self.template + self.first
+
+    @property
+    def in_all(self) -> int:
+        return self.tier_a + self.tier_b + self.template + self.renders
+
+
+def _sum_roles(record: SubjectRecord, roles: Sequence[FileRole], skip: Callable[..., bool]) -> int:
+    return sum(
+        ref.size for role, ref in record.files.items() if role in roles and not skip(record, ref)
+    )
+
+
+def remote_estimate(
+    source: Any,
+    dataset: DatasetRecord,
+    records: Sequence[SubjectRecord],
+    *,
+    template_needed: bool,
+    n_first: int | None,
+    jobs: int,
+    batch_subjects: int,
+    max_bytes: int,
+) -> RemoteEstimate:
+    """:class:`RemoteEstimate` of ``records``, the listed subjects of ``dataset`` of the
+    remote ``source``. ``template_needed``: the run takes its template from the
+    ``fsaverage`` next to the subjects; ``n_first``: the renders the app waits for (None:
+    every one)."""
+    from surfcensus.sources.base import TIER_A, TIER_B, TIER_C
+
+    cache = getattr(source, "cache", None)
+
+    def kept(record: SubjectRecord, ref: Any) -> bool:
+        # a retained copy of this version is not fetched again
+        if cache is None:
+            return False
+        base = dataset.root.removeprefix(f"s3://{source.bucket}/")
+        key = f"{base}{record.fs_dir}/{ref.location}"
+        path = cache.path_for(source.bucket, key, ref.etag_or_mtime, retained=True)
+        try:
+            return path.is_file() and path.stat().st_size == ref.size
+        except OSError:
+            return False
+
+    def never(record: SubjectRecord, ref: Any) -> bool:
+        return False
+
+    template = 0
+    if template_needed:
+        template = int(source.template_size(dataset) or 0)
+    # a render leases both sphere.reg files whenever the run has a template: the one next
+    # to the subjects, or one that the run holds or finds elsewhere (not needed from here)
+    with_spheres = not template_needed or template > 0
+    render_roles = (*TIER_C, *_RENDER_SPHERES) if with_spheres else TIER_C
+    tier_a = sum(_sum_roles(r, TIER_A, kept) for r in records)
+    tier_bs = [_sum_roles(r, TIER_B, never) for r in records]
+    complete = [r for r in records if all(role in r.files for role in RENDER_ROLES)]
+    renders = sorted((_sum_roles(r, render_roles, never) for r in complete), reverse=True)
+    first_n = len(renders) if n_first is None else min(n_first, len(renders))
+    largest_b = max(tier_bs, default=0)
+    batch = min(batch_subjects, max(1, max_bytes // largest_b)) if largest_b else batch_subjects
+    peak_b = largest_b * min(batch, len(records))
+    # the renders leased at once: a call that renders everything before it ends takes
+    # batches of ``batch_subjects``; otherwise the renders before the app are one batch and
+    # those behind it come ``jobs`` at a time; each is lowered to fit ``max_bytes``, as
+    # ``Run`` lowers it
+    largest_c = renders[0] if renders else 0
+    fits = min(batch_subjects, max(1, max_bytes // largest_c)) if largest_c else batch_subjects
+    at_once = fits if n_first is None else max(min(first_n, fits), min(jobs, fits))
+    peak_c = largest_c * min(at_once, len(renders))
+    return RemoteEstimate(
+        subjects=len(records),
+        tier_a=tier_a,
+        tier_b=sum(tier_bs),
+        template=template,
+        first=sum(renders[:first_n]),
+        n_first=first_n,
+        renders=sum(renders),
+        peak=tier_a + template + max(peak_b, peak_c),
+    )
+
+
+def estimate_line(estimate: RemoteEstimate, *, new: bool) -> str:
+    """``To fetch: 108.2 MB before the first rating screen (...), 148.0 MB in all, ...``."""
+    what = [f"Tier A and B of {_plural(estimate.subjects, 'subject')}"]
+    if estimate.template:
+        what.append("the fsaverage template")
+    if estimate.n_first:
+        what.append(_plural(estimate.n_first, "render"))
+    if new:
+        return (
+            f"To fetch: {size_text(estimate.before_app)} before the first rating screen "
+            f"({', '.join(what)}), {size_text(estimate.in_all)} in all, an estimate from the "
+            "listed sizes; the files of each batch are removed after it, and at most "
+            f"{size_text(estimate.peak)} of source files are on disk at once."
+        )
+    return (
+        f"To fetch: at most {size_text(estimate.before_app)} before the first rating screen "
+        f"and {size_text(estimate.in_all)} in all, an estimate from the listed sizes; what this "
+        "run holds already is not fetched again."
+    )
+
+
+def _template_needed(run_dir: Path, stored: RunConfig | None, fsaverage: Path | str | None) -> bool:
+    """Whether a review will take its template from the ``fsaverage`` next to the subjects:
+    not when a directory is given, when ``$FREESURFER_HOME`` has one, or when the run holds
+    its pinned template (``Run._find_template``)."""
+    from surfcensus.sources.local import freesurfer_template_places
+    from surfcensus.templates import TEMPLATES_DIR
+
+    if fsaverage is not None:
+        return False
+    if any(place.is_dir() for _, place in freesurfer_template_places()):
+        return False
+    if stored is not None:
+        found = [p for p in (run_dir / TEMPLATES_DIR).glob("*/template.json")]
+        if found:
+            return False
+    return True
+
+
+def _cache_bytes(run_dir: Path) -> int:
+    """The bytes of the source files in the run's cache (its lock files left out)."""
+    from surfcensus.remote.cache import CACHE_DIR, LOCK_FILE
+
+    total = 0
+    for directory, _, files in os.walk(run_dir / CACHE_DIR):
+        for name in files:
+            if name == LOCK_FILE:
+                continue
+            with suppress(OSError):
+                total += os.lstat(os.path.join(directory, name)).st_size
+    return total
+
+
+def _fetched_since(start: Any) -> tuple[int, int]:
+    """Bytes and requests that this process sent to the buckets since ``start``
+    (``remote.stats()`` at the start of the call)."""
+    from surfcensus import remote
+
+    now = remote.stats()
+    return now.bytes - start.bytes, now.requests - start.requests
+
+
+def _say_fetched(run: Run, start: Any) -> None:
+    """The closing line of a review of a remote dataset."""
+    fetched, requests = _fetched_since(start)
+    _say(
+        f"Fetched {size_text(fetched)} in {_plural(requests, 'request')} in all; "
+        f"{size_text(_cache_bytes(run.run_dir))} of source files left in the cache."
+    )
+
+
+def _open_remote_run(
+    ref: RemoteRef,
+    run_dir: Path,
+    *,
+    subjects: Sequence[str] | None,
+    blind: bool | None,
+    require_marks: bool | None,
+    video: bool | None,
+    force: bool,
+    transport: httpx.BaseTransport | None,
+    serve: bool,
+    serve_after: int | None,
+    jobs: int,
+    fsaverage: Path | str | None,
+) -> tuple[Run, bool]:
+    """The run of a review of the remote dataset ``ref``, made or opened, with the options
+    given written into it, and whether it is new. The dataset and its subjects are listed
+    first, and what will be fetched is said from the listed sizes before any file is read;
+    a new run that names no subjects is refused when that exceeds
+    :data:`REMOTE_GUARD_BYTES` (decision D47, item 3), before anything is written."""
+    from surfcensus.config import RemoteConfig
+    from surfcensus.remote.s3 import S3Client
+    from surfcensus.run import remote_index
+    from surfcensus.sources.openneuro_derivatives import OpenNeuroDerivatives
+
+    stored = load_config(run_dir) if (run_dir / "config.yaml").is_file() else None
+    if stored is not None and stored.mode != "local":
+        raise ConfigError(
+            "invalid",
+            f"{run_dir} holds a census run; review works on a local run (surfcensus serve "
+            "opens the app of a census run)",
+        )
+    index = None if stored is None else remote_index(stored, ref.accession)
+    if subjects is not None:
+        globs = tuple(dict.fromkeys(subjects))
+    elif stored is not None and index is not None:
+        globs = stored.sources[index].subjects
+    else:
+        globs = ()
+    client = S3Client(
+        ref.bucket,
+        config=stored.remote if stored is not None else RemoteConfig(),
+        transport=transport,
+    )
+    source = OpenNeuroDerivatives(client=client, accession=ref.accession, subjects=globs)
+    run: Run | None = None
+    if stored is not None:
+        # another source's run is "other root" here, before anything is listed
+        run = Run(run_dir, source, transport=transport)
+    try:
+        if run is not None:
+            _apply_options(run, blind=blind, require_marks=require_marks, video=video, force=force)
+        _say(f"Listing {ref.text} in s3://{ref.bucket}, anonymously and read-only ...")
+        dataset = next(iter(source.datasets()))
+        records = list(source.subjects(dataset))
+        config = run.config if run is not None else None
+        settings = config.cache if config is not None else CacheConfig()
+        wanted = None if not serve or serve_after == 0 else serve_after or DEFAULT_SERVE_AFTER
+        estimate = remote_estimate(
+            source,
+            dataset,
+            records,
+            template_needed=_template_needed(run_dir, stored, fsaverage),
+            n_first=wanted,
+            jobs=jobs,
+            batch_subjects=settings.batch_subjects,
+            max_bytes=settings.max_bytes,
+        )
+        new = run is None
+        if new and subjects is None and estimate.before_app > REMOTE_GUARD_BYTES:
+            raise ConfigError(
+                "invalid",
+                f"this dataset lists {_plural(estimate.subjects, 'subject')}, about "
+                f"{size_text(estimate.before_app)} to fetch before the first rating screen, more "
+                f"than {size_text(REMOTE_GUARD_BYTES)}: name the subjects to review with "
+                "--subjects GLOB (for example --subjects 'sub-0[1-5]'), or --subjects '*' "
+                "for all of them",
+            )
+        if run is None:
+            app: dict[str, object] = {}
+            if blind is not None:
+                app["blind"] = blind
+            if require_marks is not None:
+                app["require_marks"] = require_marks
+            base = new_local_config(None, app=app, render_video=bool(video))
+            run = Run(run_dir, source, config=base, transport=transport)
+        _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
+        _say(estimate_line(estimate, new=new))
+        return run, new
+    except BaseException:
+        if run is not None:
+            run.close()
+        raise
 
 
 def _refuse_in_fsaverage(run_dir: Path, fsaverage: Path | str) -> None:
@@ -431,10 +765,11 @@ def _listed(names: Sequence[str]) -> str:
     return ", ".join(names[:_MAX_NAMES]) + more
 
 
-def _say_inventory(run: Run, path: Path | str | None = None) -> None:
+def _say_inventory(run: Run, path: Path | str | None = None, *, where: str | None = None) -> None:
     """``Found 48 subjects in sourcedata/freesurfer (fMRIPrep layout, FreeSurfer 7.3.2). 2
     cannot be rendered: ...``. Where the subjects lie is said relative to ``path``, the
-    folder that was named, and left out when they lie in that folder itself."""
+    folder that was named, and left out when they lie in that folder itself; ``where``
+    names it instead (``openneuro:ds000102``, as the user typed it)."""
     public = run.public()
     subjects = public.subjects()
     present = subjects[subjects["present"].to_numpy(dtype=bool)]
@@ -447,7 +782,8 @@ def _say_inventory(run: Run, path: Path | str | None = None) -> None:
     if globs:
         # a subject set that is narrower than the directory is said, since it is kept
         described.append("of the subjects matching " + ", ".join(globs))
-    where = where_subjects_lie(run.config, path)
+    if where is None:
+        where = where_subjects_lie(run.config, path)
     line = f"Found {_plural(len(present), 'subject')}{f' in {where}' if where else ''}"
     line += f" ({', '.join(described)})."
     lacking: list[tuple[str, str, bool]] = []  # label, what it lacks, whether not fetched
@@ -929,6 +1265,14 @@ class ReviewApp:
     epi: bool = False
     """Whether the run has functional runs that are packed or to pack: the app then offers
     the EPI index (``/epi``) beside the rating screen."""
+    fetched_from: Any = None
+    """For a remote dataset, ``remote.stats()`` at the start of the call, from which the
+    closing line counts what was fetched; None otherwise."""
+    fetched_at_app: tuple[int, int] | None = None
+    """For a remote dataset, the bytes and requests fetched before the app opened."""
+    transport: Any = None
+    """The transport that the worker behind the app reaches a remote dataset with (None: the
+    default of ``remote.default_transport``)."""
     _stop: threading.Event = field(default_factory=threading.Event, repr=False)
     _renderer: threading.Thread | None = field(default=None, repr=False)
     _problem: list[str] = field(default_factory=list, repr=False)
@@ -989,6 +1333,7 @@ def _render_rest(
     total: int,
     render: bool = True,
     pack: bool = False,
+    transport: httpx.BaseTransport | None = None,
 ) -> None:
     """The worker behind the app: a ``Run`` of its own renders what is pending, in queue
     order, a batch of ``jobs`` subjects at a time so that each is offered soon after it is
@@ -997,7 +1342,9 @@ def _render_rest(
     of step 2 of the EPI interface). The stop request of the app ends either between two
     batches. A failure of the run or the machine ends it and is said; the app goes on."""
     try:
-        with Run(run_dir) as run:
+        # a remote dataset is reached through a source and a cache of this Run's own, which
+        # share the lease area of this process and its budget with those of the caller
+        with Run(run_dir, transport=transport) as run:
             _with_fsaverage(run, fsaverage)
             cache = run.config.cache.model_dump() | {"batch_subjects": jobs}
             run.config = with_changes(run.config, cache=cache)
@@ -1074,6 +1421,7 @@ def open_review(
     epi: bool | None = None,
     epi_runs: Sequence[str] | None = None,
     raw: Path | str | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> tuple[Run, ReviewApp | None]:
     """Everything :func:`review` does up to the running app: the run, and the app with the
     worker behind it, which the caller stops (``ReviewApp.stop``) and whose run the caller
@@ -1081,8 +1429,18 @@ def open_review(
     subject can be rendered and no functional run packed (:func:`rateable` and
     :func:`viewable` are then 0). The options are those of :func:`review`.
     """
+    from surfcensus import remote
+
     started = time.perf_counter()
+    fetched_from = remote.stats()
     _check(rater, jobs, serve_after, port)
+    # openneuro:dsXXXXXX is read before any Path is made of the argument (decision D47,
+    # item 8); any other text that starts with openneuro: is refused here
+    ref = parse_remote_path(path)
+    if ref is not None:
+        _refuse_for_remote(
+            field_strength=field_strength, relocate=relocate, epi=epi, epi_runs=epi_runs, raw=raw
+        )
     if serve:
         # before the work, not after it: an installation that lacks a package of the app
         # (a stripped or broken one) has no rater app to open
@@ -1091,40 +1449,62 @@ def open_review(
         raise ConfigError(
             "invalid", f"field_strength is in tesla, positive and finite, not {field_strength}"
         )
-    path = Path(path)
     jobs = default_jobs() if jobs is None else jobs
-    if run_dir is None:
-        run_dir = default_run_dir(path)
-        if not relocate:
-            refuse_foreign_default(path, run_dir)  # before a run is opened there
+    named: Path | None = None  # the folder that was named, for where things lie under it
+    if ref is not None:
+        # the default run directory is in the current directory (decision D47, item 2)
+        run_dir = Path.cwd() / ref.run_dir_name if run_dir is None else Path(run_dir)
+        if fsaverage is not None:
+            _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
+        run, new = _open_remote_run(
+            ref,
+            run_dir,
+            subjects=subjects,
+            blind=blind,
+            require_marks=require_marks,
+            video=video,
+            force=force,
+            transport=transport,
+            serve=serve,
+            serve_after=serve_after,
+            jobs=jobs,
+            fsaverage=fsaverage,
+        )
     else:
-        run_dir = Path(run_dir)
-    if fsaverage is not None:
-        _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
-    run, new = _open_run(
-        path,
-        run_dir,
-        subjects=subjects,
-        field_strength=field_strength,
-        blind=blind,
-        require_marks=require_marks,
-        video=video,
-        relocate=relocate,
-        force=force,
-        epi=epi,
-        epi_runs=epi_runs,
-        raw=raw,
-    )
+        named = Path(path)
+        if run_dir is None:
+            run_dir = default_run_dir(named)
+            if not relocate:
+                refuse_foreign_default(named, run_dir)  # before a run is opened there
+        else:
+            run_dir = Path(run_dir)
+        if fsaverage is not None:
+            _refuse_in_fsaverage(run_dir, fsaverage)  # before a run is made there
+        run, new = _open_run(
+            named,
+            run_dir,
+            subjects=subjects,
+            field_strength=field_strength,
+            blind=blind,
+            require_marks=require_marks,
+            video=video,
+            relocate=relocate,
+            force=force,
+            epi=epi,
+            epi_runs=epi_runs,
+            raw=raw,
+        )
     try:
-        _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
+        if ref is None:
+            _say(f"Run directory: {run.run_dir} ({'new' if new else 'continued'})")
         report = run.inventory()
-        _say_inventory(run, path)
+        _say_inventory(run, named, where=None if ref is None else ref.text)
         if report.failed:
             _say_failures(run, report, "not read")
         # the functional inventory reads listings and small files only (D33: the time to the
         # rating screen does not grow with the functional data); the packs come behind the app
         run.func_inventory()
-        for line in functional_lines(run, path):
+        for line in functional_lines(run, named):
             _say(line)
 
         _with_fsaverage(run, fsaverage)
@@ -1156,7 +1536,7 @@ def open_review(
         shown = epi_done + epi_pending
         if done + pending == 0:
             line = "No subject of this run can be rendered, so there is nothing to rate."
-            if _fetch_said(run, path):
+            if _fetch_said(run, named):
                 # the fetch line above is the remedy: say what comes after it
                 line += " Fetch the files as said above, then run the same command again."
             if shown and serve:
@@ -1165,6 +1545,8 @@ def open_review(
                 line += " Its functional runs are packed for the EPI movies."
             _say(line)
             if shown == 0:
+                if ref is not None:
+                    _say_fetched(run, fetched_from)
                 return run, None
             # nothing to rate: the app opens at the first packed session (serve_after counts
             # sessions then), and the rest is packed behind it
@@ -1188,6 +1570,8 @@ def open_review(
         if said is not None:
             _say(said)
         if not serve:
+            if ref is not None:
+                _say_fetched(run, fetched_from)
             return run, None
 
         from surfcensus.app.server import start_server
@@ -1196,13 +1580,26 @@ def open_review(
         install_protocol(run.run_dir)
         handle = start_server(run.run_dir, port=port, rater=rater)
         app = ReviewApp(handle, run.run_dir, time.perf_counter() - started, epi=shown > 0)
+        if ref is not None:
+            app.fetched_from = fetched_from
+            app.fetched_at_app = _fetched_since(fetched_from)
+            app.transport = transport
         # a session can be pending with every pack current (its place in the stream moved,
         # D42): behind the app its session.json and stream.json are written again
         epi_behind = epi_pending > 0 or sessions_pending(run)
         if pending or epi_behind:
             thread = threading.Thread(
                 target=_render_rest,
-                args=(run.run_dir, jobs, fsaverage, app, len(uids), pending > 0, epi_behind),
+                args=(
+                    run.run_dir,
+                    jobs,
+                    fsaverage,
+                    app,
+                    len(uids),
+                    pending > 0,
+                    epi_behind,
+                    transport,
+                ),
                 name="surfcensus-renderer",
                 daemon=True,
             )
@@ -1275,9 +1672,20 @@ def review(
     epi: bool | None = None,
     epi_runs: Sequence[str] | None = None,
     raw: Path | str | None = None,
+    transport: httpx.BaseTransport | None = None,
 ) -> Run:
     """Inventory, score, select and render the subjects under ``path`` and open the rater
     app on them; returns the run.
+
+    ``path`` may name a dataset of the OpenNeuroDerivatives bucket, ``openneuro:dsXXXXXX``
+    (docs/dev/remote_plan.md, section 4): its subjects are listed anonymously and read-only,
+    what will be fetched is said from the listed sizes, and the files are fetched in batches
+    into the run's cache and removed after use. The run directory is then
+    ``./dsXXXXXX-surfcensus-run`` unless ``run_dir`` is given; ``relocate``, ``raw``, ``epi``,
+    ``epi_runs`` and ``field_strength`` are refused; a new run that names no ``subjects`` is
+    refused when the estimate before the first rating screen exceeds
+    :data:`REMOTE_GUARD_BYTES`. ``transport`` is that of the bucket requests (a test's fake);
+    None takes ``remote.default_transport``.
 
     The functional runs of the folder (an fMRIPrep derivative with its raw BIDS dataset,
     found by rule, docs/epi_interface.md) are listed after the surface inventory and packed
@@ -1322,6 +1730,7 @@ def review(
         epi=epi,
         epi_runs=epi_runs,
         raw=raw,
+        transport=transport,
     )
     if app is None:
         return run
@@ -1373,7 +1782,11 @@ def serve_review(
         _say(f"Rating app: {app.url} (Ctrl-C to stop)")
         if app.epi_url is not None:
             _say(f"EPI movies: {app.epi_url}")
-        _say(f"  {app.seconds_to_app:.1f} s from the start of the command to the app.")
+        took = f"  {app.seconds_to_app:.1f} s from the start of the command to the app"
+        if app.fetched_at_app is not None:
+            fetched, requests = app.fetched_at_app
+            took += f"; {size_text(fetched)} fetched in {_plural(requests, 'request')}"
+        _say(took + ".")
         # no subject to rate and EPI movies to view: the browser goes to the movies (review
         # of step 2)
         opened = app.url
@@ -1401,6 +1814,11 @@ def serve_review(
             f"{rated} rated, {left} to go. Run the same command to continue. "
             f"Export: surfcensus export --run-dir {run.run_dir}"
         )
+    if app.fetched_from is not None:
+        try:
+            _say_fetched(run, app.fetched_from)
+        except Exception:  # as above: the work is saved
+            logger.debug("no closing line of the fetches", exc_info=True)
     if app.epi:
         try:
             done, failed, pending = pack_counts(run)

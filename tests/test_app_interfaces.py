@@ -207,6 +207,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "epi",
             "epi_runs",
             "raw",
+            "transport",
         ),
         "open_review": (
             "path",
@@ -227,6 +228,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
             "epi",
             "epi_runs",
             "raw",
+            "transport",
         ),
         "serve_review": ("run", "app", "rater", "open_browser", "stop", "stopped"),
     },

@@ -977,25 +977,29 @@ def _checked_rater(name: str | None) -> str | None:
     short_help="Score, render and rate the FreeSurfer subjects under PATH, in one go.",
 )
 def review_command(
-    path: Path = typer.Argument(
+    path: str = typer.Argument(
         ...,
         metavar="PATH",
         help="A SUBJECTS_DIR, an fMRIPrep output, a BIDS derivatives folder, a BIDS dataset "
         "with FreeSurfer subjects below derivatives/, or one subject directory. It is read "
-        "and never changed.",
+        "and never changed. Or openneuro:dsXXXXXX, a dataset of the OpenNeuroDerivatives "
+        "bucket, read anonymously and fetched in batches into the run's cache.",
     ),
     run_dir: Path | None = typer.Option(
         None,
         "--run-dir",
         metavar="DIR",
         help="The run directory. Default: surfcensus-run next to PATH (next to the BIDS "
-        "dataset that holds the subjects, never in it), else in the current directory.",
+        "dataset that holds the subjects, never in it), else in the current directory; for "
+        "openneuro:dsXXXXXX, dsXXXXXX-surfcensus-run in the current directory.",
     ),
     subjects: list[str] | None = typer.Option(
         None,
         "--subjects",
         metavar="GLOB",
-        help="Only the subject directories that match. Repeatable; kept for later calls.",
+        help="Only the subject directories that match. Repeatable; kept for later calls. "
+        "A new review of openneuro:dsXXXXXX that would fetch more than 2 GB before the "
+        "first rating screen asks for it; '*' means all.",
     ),
     rater: str | None = _RATER,
     blind: bool | None = typer.Option(
@@ -1055,7 +1059,8 @@ def review_command(
 ) -> None:
     """Score, render and rate the FreeSurfer subjects under PATH: inventory, metrics,
     render and the rating app in the browser, in one go; with functional runs in the folder,
-    also the raw and preprocessed EPI movies, packed behind the app. Run it again to
+    also the raw and preprocessed EPI movies, packed behind the app. PATH may also be
+    openneuro:dsXXXXXX, a dataset of the OpenNeuroDerivatives bucket. Run it again to
     continue."""
     from surfcensus import review as reviewing
 

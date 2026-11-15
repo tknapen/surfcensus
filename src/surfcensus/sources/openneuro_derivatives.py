@@ -1,9 +1,8 @@
-"""The OpenNeuroDerivatives bucket as a source (work package RE).
+"""The OpenNeuroDerivatives bucket as a source (docs/dev/remote_plan.md).
 
-Laid down by work package R0 (docs/dev/remote_plan.md): the constructor, how a run binds the
-source to its cache and pseudonym, and ``config()``, which is what ``run.from_config`` reads
-back. The listing, ``read_bytes``, ``lease`` and ``template_dir`` are written by RE on top of
-``remote/s3.py`` and ``remote/cache.py``.
+The constructor, how a run binds the source to its cache and pseudonym, ``config()``, which
+is what ``run.from_config`` reads back, and the listing, ``read_bytes``, ``lease`` and
+``template_dir`` on top of ``remote/s3.py`` and ``remote/cache.py``.
 
 Two forms (decision D47, item 1):
 
@@ -163,7 +162,7 @@ class OpenNeuroDerivatives:
             subjects=self.globs,
         )
 
-    # --- work package RE ---------------------------------------------------------------------
+    # --- the listing and the files ----------------------------------------------------------
 
     def datasets(self, only: Collection[str] | None = None) -> Iterator[DatasetRecord]:
         """One dataset: its record (``source``, ``identity`` and ``accession`` the accession,
@@ -402,6 +401,21 @@ class OpenNeuroDerivatives:
             files[name] = path
         _build_tree(cache, target, files)
         return target
+
+    def template_size(self, dataset: DatasetRecord) -> int | None:
+        """The bytes that :meth:`template_dir` would fetch for ``dataset``, from the listing of
+        the template's prefix (kept, as :meth:`template_dir` keeps it); None when the dataset
+        has no complete template. Fetches nothing, so that a command can say what it will
+        fetch before it does."""
+        if dataset.template_location is None:
+            return None
+        listed = self._template_listing(f"{self._base_key(dataset)}{dataset.template_location}/")
+        required = [name.format(h=hemi) for name in TEMPLATE_FILES for hemi in HEMIS]
+        if any(name not in listed for name in required):
+            return None
+        optional = [name.format(h=hemi) for name in TEMPLATE_OPTIONAL_FILES for hemi in HEMIS]
+        names = [*required, *(name for name in (*optional, _BUILD_STAMP) if name in listed)]
+        return sum(listed[name].size for name in names)
 
     # --- helpers -------------------------------------------------------------------------------
 

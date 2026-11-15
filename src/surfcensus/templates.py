@@ -51,6 +51,7 @@ __all__ = [
     "REGION_NAMES",
     "TEMPLATES_DIR",
     "TEMPLATE_FILES",
+    "TEMPLATE_GONE",
     "TEMPLATE_JSON",
     "TEMPLATE_NPZ",
     "TEMPLATE_OPTIONAL_FILES",
@@ -117,6 +118,10 @@ _GONE = (
     "the template this run was scored with is no longer available; "
     "pass --fsaverage DIR or --retemplate"
 )
+TEMPLATE_GONE = _GONE
+"""The detail of the ``TemplateError`` of a pinned template that neither its cache nor any
+directory looked at gives: the one case in which a directory looked at later (the
+``fsaverage`` next to the subjects, which ``Run`` looks for last) can still give it."""
 
 
 def icosahedron_vertices(order: int) -> int:

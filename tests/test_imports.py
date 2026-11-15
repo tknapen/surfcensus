@@ -475,3 +475,49 @@ def test_the_boundary_check_knows_its_exemptions() -> None:
     assert private_names(opens, signatures_too=False, may_import_run=True) == [
         "2: reaches for _catalog"
     ]
+
+
+def remote_imports(source: str) -> list[str]:
+    """Where a module imports the remote layer (``surfcensus.remote`` or below it)."""
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            modules = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            modules = [node.module or ""]
+            if node.module == "surfcensus" and any(a.name == "remote" for a in node.names):
+                modules.append("surfcensus.remote")
+        else:
+            continue
+        for module in modules:
+            if module == "surfcensus.remote" or module.startswith("surfcensus.remote."):
+                found.append(f"{node.lineno}: imports {module}")
+    return found
+
+
+def test_code_downstream_of_the_inventory_does_not_import_the_remote_layer() -> None:
+    # the phases see local paths only (docs/architecture.md, Sources); what a bucket is,
+    # and what its keys and ETags are, stays with the source, the cache and the run
+    checked = 0
+    for name in DOWNSTREAM:
+        target = PACKAGE_DIR / name
+        paths = sorted(target.rglob("*.py")) if target.is_dir() else [target]
+        for path in paths:
+            if path.is_file():
+                checked += 1
+                found = remote_imports(path.read_text())
+                assert found == [], f"{path.relative_to(PACKAGE_DIR)}: {found}"
+    assert checked >= 20
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import surfcensus.remote",
+        "from surfcensus.remote.cache import Cache",
+        "from surfcensus import remote",
+        "def f():\n    from surfcensus.remote import stats\n",
+    ],
+)
+def test_the_remote_import_check_finds_what_it_is_for(source: str) -> None:
+    assert remote_imports(source) != []

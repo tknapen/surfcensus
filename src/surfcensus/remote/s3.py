@@ -1,8 +1,7 @@
-"""An anonymous, read-only S3 client: listing, HEAD, ranged GET, download (work package RA).
+"""An anonymous, read-only S3 client: listing, HEAD, ranged GET, download.
 
-Laid down by work package R0 (docs/dev/remote_plan.md): the records, the constructor, which
-puts the guard of ``remote/transport.py`` under every request, and the signatures with the
-behaviour each method must have. The methods are written by RA.
+The records, the constructor, which puts the guard of ``remote/transport.py`` under every
+request, and the methods (docs/dev/remote_plan.md, section 5).
 
 Behaviour that every method shares:
 
