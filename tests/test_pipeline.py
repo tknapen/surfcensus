@@ -110,6 +110,13 @@ def ledger(run: Run, stage: str) -> dict[str, str]:
     return dict(zip(frame["unit"], frame["finished_at"], strict=True))
 
 
+def stage_hashes_of(run_dir: Path, stage: str) -> dict[str, str]:
+    """Unit -> the config hash its row of the stage was recorded under, read from the
+    catalog file itself (the public side does not hand the hash out)."""
+    with contextlib.closing(sqlite3.connect(run_dir / "catalog.sqlite")) as conn:
+        return dict(conn.execute("SELECT unit, config_hash FROM work WHERE phase = ?", (stage,)))
+
+
 def little_cohort(
     root: Path, n: int, template: SyntheticTemplate, *, with_template: bool = True
 ) -> SyntheticCohort:
@@ -1555,7 +1562,7 @@ def test_maps_of_the_earlier_schema_are_made_again(
         with Run(run_dir, local(cohort.root), config=config) as run:
             run.inventory()
             assert counts(run.metrics()) == (3 + 3 + 2, 0, 0)
-            before = ledger(run, "fsaverage")
+            before = stage_hashes_of(run_dir, "fsaverage")
     # the tables as the version before wrote them: without the column n_widened
     written = [table_path(run_dir, "vertex_summary")]
     written += sorted((run_dir / "tables" / "_parts" / "vertex_summary").glob("*.parquet"))
@@ -1568,7 +1575,9 @@ def test_maps_of_the_earlier_schema_are_made_again(
         report = run.metrics(stages=("score",))
         assert report.failures == (("run", "score: reference not current"),)
         assert counts(run.metrics(stages=("fsaverage",))) == (3, 0, 0)
-        after = ledger(run, "fsaverage")
+        # every row was written again under the hash of the present schema (the times of
+        # the rows have a resolution of a second and can be equal)
+        after = stage_hashes_of(run_dir, "fsaverage")
         assert set(after) == set(before) and all(after[u] != before[u] for u in after)
         assert (table(run_dir, "vertex_summary")["n_widened"] == 0).all()
         assert counts(run.metrics(stages=("fsaverage",))) == (0, 3, 0)
