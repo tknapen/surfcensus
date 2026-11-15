@@ -235,34 +235,19 @@ def test_the_constants() -> None:
     assert CACHE_DIR == "cache"
 
 
-# --- the stubs and who writes them -----------------------------------------------------------
+# --- no stub is left ---------------------------------------------------------------------------
 
 
-def _stub_calls(tmp_path: Path) -> list[tuple[str, object]]:
-    client = S3Client(BUCKET, config=RemoteConfig(), transport=FakeS3({}).transport())
-    cache = Cache(tmp_path / "cache", max_bytes=10, secret=bytes(32))
-    source = OpenNeuroDerivatives(client=client, cache=cache, accession=ACCESSION)
-    record = DatasetRecord(
-        "openneuro-derivatives",
-        ACCESSION,
-        ACCESSION,
-        "s3://b/p/",
-        "freesurfer",
-        "fmriprep",
-        "fmriprep",
-    )
-    # the client (RA) and the cache (RB) are written; the source's listing (RE) is not yet
-    return [
-        ("RE: sources/openneuro_derivatives.py", lambda: list(source.datasets())),
-        ("RE: sources/openneuro_derivatives.py", lambda: list(source.subjects(record))),
-        ("RE: sources/openneuro_derivatives.py", lambda: source.template_dir(record)),
-    ]
+def test_no_stub_of_the_remote_stage_is_left() -> None:
+    """R0 laid the client, the cache and the source down as stubs that named their work
+    package; RA, RB and RE wrote them."""
+    import surfcensus.remote.cache as cache_module
+    import surfcensus.remote.s3 as s3_module
+    import surfcensus.sources.openneuro_derivatives as source_module
 
-
-def test_every_stub_names_the_package_that_writes_it(tmp_path: Path) -> None:
-    for owner, call in _stub_calls(tmp_path):
-        with pytest.raises(NotImplementedError, match=f"^work package {owner}$"):
-            call()  # pyrefly: ignore[not-callable]
+    for module in (s3_module, cache_module, source_module):
+        text = inspect.getsource(module)
+        assert "NotImplementedError" not in text, module
 
 
 # --- openneuro:dsXXXXXX ----------------------------------------------------------------------

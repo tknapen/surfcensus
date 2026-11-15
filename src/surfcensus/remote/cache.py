@@ -484,6 +484,14 @@ class Cache:
             get_logger().info("removed %d files that ended processes left in the cache", removed)
         return removed
 
+    def hold_area(self) -> Path:
+        """This process's lease area with its lock held, for a caller that writes a directory
+        of its own there (the staging tree of a template) and renames it into ``retained/``:
+        an area without its lock could be pruned by another process or cleared by the first
+        lease of this one. The lock is held for the life of the process."""
+        self._area()
+        return self.area
+
     def _area(self) -> _Area:
         """This process's area, its lock taken on first use: what a dead process with the same
         pid left there is removed then, since no lease of this process exists yet."""
