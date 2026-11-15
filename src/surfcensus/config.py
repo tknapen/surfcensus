@@ -2,7 +2,9 @@
 
 Every model is frozen and refuses unknown keys. ``config.yaml`` holds the salt of a local
 run and the root of its source; it never holds the dataset key, the run secret or an
-accession, and in a census run it holds no path either.
+accession, and in a census run it holds no path either. A local run on a dataset of a bucket
+(``review openneuro:dsXXXXXX``) stores the dataset by its pseudonym, and its accession is in
+``catalog.sqlite`` only (decision D47).
 
 A value is hashed into the identity of the stage it changes (:func:`stage_hashes`), so a
 changed option redoes that stage and what follows it, and nothing else.
@@ -12,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import secrets
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -21,7 +24,8 @@ import yaml
 from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from surfcensus._io import atomic_path, canonical_json
-from surfcensus.privacy import HashKey, local_salt_from_hex, new_local_salt
+from surfcensus.privacy import HashKey, dataset_pseudonym, local_salt_from_hex, new_local_salt
+from surfcensus.remote import DERIVATIVES_BUCKET, FMRIPREP_PREFIX, MAX_CONCURRENCY
 from surfcensus.render.model import RenderConfig, _Frozen
 from surfcensus.sources.base import FileRole, SourceKind
 
@@ -56,13 +60,15 @@ class SourceConfig(_Frozen):
     """Local source in a local run: set at first inventory, then fixed (see
     ``DatasetRecord.identity``)."""
     dataset: str | None = None
-    """Local source in a census run: its pseudonym, the link to the catalog row."""
+    """Local source in a census run, and the remote dataset of a local run: its pseudonym,
+    the link to the catalog row, which holds the root or the accession."""
     subjects: tuple[str, ...] = ()
-    """Local only: globs on directory names; empty means all."""
+    """Globs on subject labels; empty means all. A local source, and the remote dataset of a
+    local run (stored with its ``dataset``)."""
     field_strength: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     """Local only: tesla, copied to the subjects of the source."""
     bucket: str | None = None
-    """Remote only; likewise ``prefix``."""
+    """Remote only; likewise ``prefix``, which names no dataset (``fmriprep/``)."""
     prefix: str | None = None
 
     @model_validator(mode="after")
@@ -73,15 +79,18 @@ class SourceConfig(_Frozen):
             given = {
                 "root": self.root,
                 "identity": self.identity,
-                "dataset": self.dataset,
-                "subjects": self.subjects or None,
                 "field_strength": self.field_strength,
+                # the globs of a remote dataset belong to its stored form in a local run
+                "subjects": None if self.dataset is not None else self.subjects or None,
             }
             if self.bucket is None:
                 raise ValueError(f"a {self.kind} source needs a bucket")
         extra = sorted(name for name, value in given.items() if value is not None)
         if extra:
             raise ValueError(f"a {self.kind} source has no {', '.join(extra)}")
+        if self.prefix is not None and re.search(r"ds[0-9]{6}", self.prefix):
+            # accessions live in catalog.sqlite only (decision D47, item 1)
+            raise ValueError(f"the prefix of a {self.kind} source names no dataset")
         return self
 
 
@@ -296,7 +305,9 @@ hash and of the shape the page receives, not of a pack's."""
 class RemoteConfig(_Frozen):
     """Not hashed into any stage."""
 
-    max_concurrency: int = Field(default=8, ge=1)
+    max_concurrency: int = Field(default=MAX_CONCURRENCY, ge=1, le=MAX_CONCURRENCY)
+    """Requests of one client at once; the process never has more than
+    ``remote.MAX_CONCURRENCY`` open, whatever this says."""
     max_retries: int = Field(default=6, ge=0)
     timeout_s: float = Field(default=120.0, gt=0)
 
@@ -342,8 +353,18 @@ class RunConfig(_Frozen):
             raise ValueError(f"a {self.mode} run does not use identity kind {self.identity.kind!r}")
         for source in self.sources:
             if source.kind != "local":
-                if local:
-                    raise ValueError(f"a local run has no {source.kind} source")
+                if local and (source.kind != "openneuro-derivatives" or source.dataset is None):
+                    raise ValueError(
+                        f"a local run has no {source.kind} source but one dataset stored by "
+                        "its pseudonym"
+                    )
+                if local and len(self.sources) != 1:
+                    raise ValueError("a local run on a remote dataset has no other source")
+                if not local and source.dataset is not None:
+                    # a census run lists the datasets of the prefix; they are in the catalog
+                    raise ValueError(
+                        f"a {source.kind} source of a census run is stored by bucket and prefix"
+                    )
             elif local and (source.root is None or source.dataset is not None):
                 raise ValueError("a local source in a local run is stored by its root")
             elif not local and (
@@ -371,19 +392,31 @@ def _build(defaults: dict[str, object], overrides: Mapping[str, object]) -> RunC
 
 
 def new_local_config(
-    root: Path | str, *, subjects: Sequence[str] = (), **overrides: object
+    root: Path | str | None, *, subjects: Sequence[str] = (), **overrides: object
 ) -> RunConfig:
     """The configuration of a new local run on ``root``: a fresh salt and queue seed, no
     video, marks not required.
+
+    ``root`` None gives a configuration without a source, for a run on a remote dataset:
+    its source is stored by a pseudonym keyed with the salt drawn here
+    (:func:`remote_dataset_config`), so it can only be added afterwards
+    (``with_changes(config, sources=...)``, which ``Run`` does).
 
     ``overrides`` are fields of :class:`RunConfig`, as models or as mappings, for example
     ``render=RenderConfig(panel_px=64)``.
     """
     salt = new_local_salt()
-    source = SourceConfig(kind="local", root=str(Path(root).resolve()), subjects=tuple(subjects))
+    if root is None:
+        if subjects:
+            raise ConfigError("invalid", "subject globs belong to a source")
+        sources: tuple[SourceConfig, ...] = ()
+    else:
+        sources = (
+            SourceConfig(kind="local", root=str(Path(root).resolve()), subjects=tuple(subjects)),
+        )
     defaults: dict[str, object] = {
         "mode": "local",
-        "sources": (source,),
+        "sources": sources,
         "identity": IdentityConfig(
             kind="local-salt", local_salt=salt.secret.hex(), key_fingerprint=salt.fingerprint
         ),
@@ -392,6 +425,34 @@ def new_local_config(
         "app": AppConfig(queue_seed=_queue_seed(), require_marks=False),
     }
     return _build(defaults, overrides)
+
+
+def remote_dataset_config(
+    config: RunConfig,
+    accession: str,
+    *,
+    subjects: Sequence[str] = (),
+    bucket: str = DERIVATIVES_BUCKET,
+) -> SourceConfig:
+    """How the local run ``config`` stores the dataset ``accession`` of the
+    OpenNeuroDerivatives bucket (decision D47, item 1): kind, bucket, the prefix
+    ``fmriprep/``, the dataset's pseudonym (``HMAC(salt, "openneuro-derivatives:<accession>")``)
+    and the subject globs. The accession is not in it: it is in ``catalog.sqlite``. The same
+    accession and salt give the same pseudonym, which is how a second ``review
+    openneuro:dsXXXXXX`` finds its run. Raises ``ConfigError("invalid", ...)`` for a census
+    run."""
+    if config.mode != "local":
+        raise ConfigError("invalid", "a census run lists the datasets of its prefix")
+    if not re.fullmatch(r"ds[0-9]{6}", accession):
+        raise ConfigError("invalid", f"{accession!r} is no accession")
+    kind = "openneuro-derivatives"
+    return SourceConfig(
+        kind=kind,
+        bucket=bucket,
+        prefix=FMRIPREP_PREFIX,
+        dataset=dataset_pseudonym(run_key(config), kind, accession),
+        subjects=tuple(dict.fromkeys(subjects)),
+    )
 
 
 def new_census_config(key: HashKey, **overrides: object) -> RunConfig:

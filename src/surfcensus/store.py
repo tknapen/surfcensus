@@ -1703,8 +1703,9 @@ class Catalog:
 
     def scrub_terms(self) -> tuple[dict[str, str], tuple[str, ...]]:
         """What ``privacy.scrub`` needs for this run: accession -> pseudonym, and every
-        dataset root and identity, sorted. A local run has no accessions; its caller passes
-        ``pseudonyms=None`` to ``scrub``, which then keeps subject labels."""
+        dataset root and identity, sorted. A local run has accessions only for a remote
+        dataset (``review openneuro:dsXXXXXX``); ``privacy.scrub_with`` keeps the subject
+        labels of a local run."""
         rows = self._db.rows("SELECT pseudonym, accession, root, identity FROM datasets")
         pseudonyms = {r["accession"]: r["pseudonym"] for r in rows if r["accession"] is not None}
         roots = sorted({text for r in rows for text in (r["root"], r["identity"])})

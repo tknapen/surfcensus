@@ -28,7 +28,6 @@ from stat import S_ISDIR
 from typing import Literal
 
 from surfcensus.config import ConfigError, RunConfig, SourceConfig
-from surfcensus.inventory.provenance import parse_dataset_description
 from surfcensus.log import get_logger
 from surfcensus.sources.base import (
     HEMIS,
@@ -54,6 +53,7 @@ from surfcensus.sources.patterns import (
     is_file,
     is_subject_candidate,
     is_template_name,
+    parse_pipeline_version,
     resolve_subject_files,
     size_words,
     unfetched_files,
@@ -672,7 +672,7 @@ def _pipeline_version(directory: Path) -> str | None:
         raw = (directory / _DESCRIPTION).read_bytes()
     except OSError:
         return None
-    return parse_dataset_description(raw.decode("utf-8", errors="replace"))
+    return parse_pipeline_version(raw)
 
 
 def _record(root: Path, fs_root: str, layout: Layout) -> DatasetRecord:

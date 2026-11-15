@@ -27,6 +27,7 @@ from surfcensus.config import (
     load_config,
     new_census_config,
     new_local_config,
+    remote_dataset_config,
     run_key,
     with_changes,
     write_config,
@@ -34,7 +35,15 @@ from surfcensus.config import (
 from surfcensus.log import get_logger
 from surfcensus.privacy import HashKey
 from surfcensus.records import FUNC_INVENTORY_PHASE, METRIC_STAGES, PhaseReport, RunContext
-from surfcensus.sources.base import HEMIS, DatasetRecord, FileRole, Hemi, Source, SourceError
+from surfcensus.sources.base import (
+    HEMIS,
+    DatasetRecord,
+    FileRole,
+    Hemi,
+    RemoteSource,
+    Source,
+    SourceError,
+)
 from surfcensus.store import (
     CATALOG_FILE,
     Catalog,
@@ -49,6 +58,7 @@ if TYPE_CHECKING:
     import pandas as pd
 
     from surfcensus.records import SessionWork
+    from surfcensus.remote.cache import Cache
     from surfcensus.templates import Template, TemplateNotFound
 
 
@@ -88,6 +98,23 @@ def other_root_hint(
         "which still holds its subjects, so this path is another dataset: give it a run "
         f"directory of its own with {new_run}"
     )
+
+
+def remote_index(config: RunConfig, accession: str) -> int | None:
+    """The place in ``config.sources`` of the dataset ``accession`` of the OpenNeuroDerivatives
+    bucket, in a local run that stores it; None otherwise.
+
+    ``config.yaml`` holds the dataset's pseudonym and not its accession (decision D47, item
+    1). The pseudonym is ``HMAC(salt, "openneuro-derivatives:<accession>")`` with the salt of
+    ``config.yaml``, so the accession that a user types again gives it again: that is how a
+    second ``review openneuro:dsXXXXXX`` recognises its run, without the catalog."""
+    if config.mode != "local":
+        return None
+    expected = privacy.dataset_pseudonym(run_key(config), "openneuro-derivatives", accession)
+    for index, stored in enumerate(config.sources):
+        if stored.kind == "openneuro-derivatives" and stored.dataset == expected:
+            return index
+    return None
 
 
 def epi_with(
@@ -298,16 +325,41 @@ class Run:
         else:
             if not given:
                 assert config is not None  # checked above
+                if any(stored.kind != "local" for stored in config.sources):
+                    # its accession would be in the catalog, which a new run does not have
+                    raise ConfigError(
+                        "invalid", "a new run on a remote dataset is created from its source"
+                    )
                 given = tuple(
                     from_config(stored, config, self.run_dir, transport=self._transport)
                     for stored in config.sources
                 )
-            base = config if config is not None else new_local_config(given[0].config().root or ".")
+            if config is not None:
+                base = config
+            elif _one_dataset(given[0]):
+                base = new_local_config(None)  # the source is stored once the salt is drawn
+            else:
+                base = new_local_config(given[0].config().root or ".")
             hash_key = run_key(base)
         stored = []
         self.config = base  # what the refusal below reads; the sources follow
         for source in given:
             self._refuse_inside(source)
+            if _one_dataset(source):
+                assert isinstance(source, RemoteSource) and source.accession is not None
+                if census:
+                    raise ConfigError(
+                        "invalid",
+                        "a census run lists every dataset of its prefix; a source of one "
+                        "dataset is for a local run",
+                    )
+                # decision D47, item 1: stored by its pseudonym, the accession in the catalog
+                stored.append(
+                    remote_dataset_config(
+                        base, source.accession, subjects=source.globs, bucket=source.bucket
+                    )
+                )
+                continue
             described = source.config()
             if census and described.kind == "local":
                 assert described.identity is not None  # a source knows its identity
@@ -338,11 +390,48 @@ class Run:
             ) from exc
         for index, (source, described) in enumerate(zip(given, stored, strict=True)):
             self._built[index] = source
+            if isinstance(source, RemoteSource):
+                self._bind(source, described)
             if census and described.kind == "local":
                 # the root of a local source of a census run is in the catalog only
                 assert described.dataset is not None
                 for dataset in source.datasets():
                     self._catalog.upsert_dataset(dataset, described.dataset, None)
+            elif described.kind != "local" and described.dataset is not None:
+                # and so is the accession of the remote dataset of a local run
+                self._remote_row(source, described.dataset)
+
+    def _bind(self, source: RemoteSource, stored: SourceConfig) -> None:
+        """Give a remote source the cache of this run and, in a local run, its pseudonym."""
+        source.bind(cache=self._remote_cache(), pseudonym=stored.dataset)
+
+    def _remote_cache(self) -> Cache:
+        """The cache of this run's downloads, keyed with the run secret."""
+        from surfcensus.remote.cache import CACHE_DIR, Cache
+
+        return Cache(
+            self.run_dir / CACHE_DIR,
+            max_bytes=self.config.cache.max_bytes,
+            secret=self._catalog.run_secret(),
+            retain_roles=self.config.cache.retain_roles,
+        )
+
+    def _remote_row(self, source: Source, pseudonym: str) -> None:
+        """Write the dataset row of the remote dataset of a local run when the catalog has
+        none: the one place its accession is kept (decision D47, item 1). A run whose
+        creation stopped before the row was written gets it from the next call that names
+        the dataset. Lists the dataset (a few requests) only when the row is missing."""
+        found = self._catalog.query(
+            "SELECT 1 FROM datasets WHERE source = ? AND pseudonym = ?",
+            (source.kind, pseudonym),
+        )
+        if found:
+            return
+        accession = getattr(source, "accession", None)
+        for dataset in source.datasets():
+            if dataset.identity != accession:
+                raise SourceError("invalid", "the source listed a dataset it was not given")
+            self._catalog.upsert_dataset(dataset, pseudonym, None)
 
     def _open(
         self, given: tuple[Source, ...], config: RunConfig | None, relocate: bool | str
@@ -421,13 +510,10 @@ class Run:
 
     def _adopt(self, source: Source, relocate: bool | str) -> None:
         """Match a source given on opening to a stored one and take over what it says."""
-        described = source.config()
-        if described.kind != "local":
-            matches = [i for i, s in enumerate(self.config.sources) if s == described]
-            if not matches:
-                raise ConfigError("invalid", f"this run has no such {described.kind} source")
-            self._built[matches[0]] = source
+        if source.kind != "local":
+            self._adopt_remote(source, relocate)
             return
+        described = source.config()
         locals_ = self._stored_locals()
         match = next((s for s in locals_ if s.root == described.root), None)
         moved = match is None
@@ -489,6 +575,66 @@ class Run:
                             [(dataset.root, dataset_id) for dataset_id in earlier],
                         )
 
+    def _adopt_remote(self, source: Source, relocate: bool | str) -> None:
+        """Match a remote source given on opening to a stored one. In a local run the source
+        names its dataset by accession, and the stored source by pseudonym
+        (:func:`remote_index`); the globs of the source given replace the stored ones, as
+        for a local source. A dataset of another accession is ``other root``."""
+        if relocate:
+            raise ConfigError(
+                "invalid", "a remote dataset does not move; --relocate is for local data"
+            )
+        if self.config.mode == "local" and _one_dataset(source):
+            assert isinstance(source, RemoteSource) and source.accession is not None
+            index = remote_index(self.config, source.accession)
+            if index is None:
+                raise ConfigError(
+                    "other root",
+                    f"this run directory belongs to {self._named_sources()}, not to the "
+                    "dataset given: give it a run directory of its own with --run-dir DIR",
+                )
+            updated = remote_dataset_config(
+                self.config, source.accession, subjects=source.globs, bucket=source.bucket
+            )
+            if updated != self.config.sources[index]:
+                sources = list(self.config.sources)
+                sources[index] = updated
+                self.config = with_changes(self.config, sources=tuple(sources))
+            self._refuse_inside(source)
+            self._built[index] = source
+            self._bind(source, updated)
+            assert updated.dataset is not None
+            self._remote_row(source, updated.dataset)
+            return
+        described = source.config()
+        matches = [i for i, s in enumerate(self.config.sources) if s == described]
+        if not matches:
+            if self.config.mode == "local":
+                raise ConfigError(
+                    "other root",
+                    f"this run directory belongs to {self._named_sources()}: give the "
+                    "source a run directory of its own with --run-dir DIR",
+                )
+            raise ConfigError("invalid", f"this run has no such {described.kind} source")
+        self._built[matches[0]] = source
+        if isinstance(source, RemoteSource):
+            self._bind(source, described)
+
+    def _named_sources(self) -> str:
+        """The stored sources as a message names them: a local root in a local run, else the
+        pseudonym; a remote dataset by its pseudonym, never by its accession."""
+        names = []
+        for stored in self.config.sources:
+            if stored.kind == "local" and self.config.mode == "local":
+                names.append(str(stored.root))
+            elif stored.kind == "local":
+                names.append(str(stored.dataset))
+            elif stored.dataset is not None:
+                names.append(f"{stored.dataset}, a dataset of the {stored.bucket} bucket")
+            else:
+                names.append(f"the {stored.bucket} bucket")
+        return ", ".join(names) or "no source"
+
     def _relocation_target(
         self, locals_: Sequence[_StoredLocal], relocate: bool | str, source: Source
     ) -> _StoredLocal:
@@ -503,6 +649,13 @@ class Run:
         from surfcensus.sources.local import subjects_held
 
         if not locals_:
+            if self.config.mode == "local" and self.config.sources:
+                # a run on a remote dataset, given a path
+                raise ConfigError(
+                    "other root",
+                    f"this run directory belongs to {self._named_sources()}, not to this "
+                    "path: give it a run directory of its own with --run-dir DIR",
+                )
             raise ConfigError("invalid", "this run has no local source")
         local = self.config.mode == "local"
 
@@ -647,9 +800,14 @@ class Run:
         if index not in self._built:
             stored = self.config.sources[index]
             identity = None
+            secret = None
             if stored.kind == "local":
                 local = next(s for s in self._stored_locals() if s.index == index)
                 root, identity = root or local.root, local.identity
+            else:
+                secret = self._catalog.run_secret()
+                if stored.dataset is not None:
+                    identity = self._remote_accession(stored)
             source = from_config(
                 stored,
                 self.config,
@@ -657,10 +815,26 @@ class Run:
                 root=root,
                 identity=identity,
                 transport=self._transport,
+                secret=secret,
             )
             self._refuse_inside(source)
             self._built[index] = source
         return self._built[index]
+
+    def _remote_accession(self, stored: SourceConfig) -> str:
+        """The accession of the remote dataset that ``stored`` names by pseudonym, from the
+        catalog, the one place it is kept (decision D47, item 1)."""
+        rows = self._catalog.query(
+            "SELECT accession FROM datasets WHERE source = ? AND pseudonym = ?",
+            (stored.kind, stored.dataset),
+        )
+        if not rows or rows[0]["accession"] is None:
+            raise ConfigError(
+                "invalid",
+                f"the catalog has no dataset {stored.dataset} of {CONFIG_FILE}: run the "
+                "command again with the dataset named (openneuro:dsXXXXXX), which records it",
+            )
+        return rows[0]["accession"]
 
     def _sources(self) -> list[Source]:
         """Every source of the run. Raises ``SourceError`` when one cannot be built, for
@@ -1263,16 +1437,24 @@ def from_config(
     root: str | None = None,
     identity: str | None = None,
     transport: httpx.BaseTransport | None = None,
+    secret: bytes | None = None,
 ) -> Source:
     """The source that ``config`` describes.
 
     ``root`` and ``identity`` override those of ``config``: a local source in a census run
-    is stored without either, and both come from the catalog. The remote kinds arrive in
-    milestone 5; they take their client and cache from ``run_config``, ``run_dir`` and
-    ``transport``.
+    is stored without either, and both come from the catalog.
+
+    A remote source (``openneuro-derivatives``) takes its client from ``run_config.remote``
+    and ``transport`` and its cache from ``run_dir`` and ``secret``, the run secret, which
+    it needs (``ConfigError("invalid", ...)`` without). Stored with a ``dataset`` (the local
+    run on one dataset, decision D47, item 1), ``identity`` is the dataset's accession from
+    the catalog: it must be given and must give the stored pseudonym with the run's salt
+    (``ConfigError("invalid", ...)`` or ``ConfigError("key", ...)`` otherwise). Stored
+    without one (a census run), the source lists every dataset of its prefix. The source
+    is built without a request. ``openneuro-embedded`` is not built (O9).
     """
     if config.kind != "local":
-        raise NotImplementedError(f"the {config.kind} source arrives in milestone 5")
+        return _remote_from_config(config, run_config, run_dir, identity, transport, secret)
     from surfcensus.sources.local import LocalSource
 
     path = root if root is not None else config.root
@@ -1285,4 +1467,53 @@ def from_config(
         field_strength=config.field_strength,
         # a stored root is the folder that was found: it is not searched below derivatives/
         nested=False,
+    )
+
+
+def _one_dataset(source: Source) -> bool:
+    """Whether ``source`` is a remote source of one dataset: what a local run on a remote
+    dataset is made of."""
+    return isinstance(source, RemoteSource) and source.accession is not None
+
+
+def _remote_from_config(
+    config: SourceConfig,
+    run_config: RunConfig,
+    run_dir: Path,
+    accession: str | None,
+    transport: httpx.BaseTransport | None,
+    secret: bytes | None,
+) -> Source:
+    if config.kind != "openneuro-derivatives":
+        raise NotImplementedError(f"the {config.kind} source is not built (decision O9)")
+    if secret is None:
+        raise ConfigError("invalid", "a remote source needs the run secret for its cache")
+    if config.dataset is not None:
+        if accession is None:
+            raise ConfigError(
+                "invalid", f"the accession of {config.dataset} is in {CATALOG_FILE} only"
+            )
+        expected = privacy.dataset_pseudonym(run_key(run_config), config.kind, accession)
+        if expected != config.dataset:
+            raise ConfigError("key", f"the dataset given is not {config.dataset} of {CONFIG_FILE}")
+    from surfcensus.remote import FMRIPREP_PREFIX
+    from surfcensus.remote.cache import CACHE_DIR, Cache
+    from surfcensus.remote.s3 import S3Client
+    from surfcensus.sources.openneuro_derivatives import OpenNeuroDerivatives
+
+    assert config.bucket is not None  # SourceConfig checks it
+    client = S3Client(config.bucket, config=run_config.remote, transport=transport)
+    cache = Cache(
+        run_dir / CACHE_DIR,
+        max_bytes=run_config.cache.max_bytes,
+        secret=secret,
+        retain_roles=run_config.cache.retain_roles,
+    )
+    return OpenNeuroDerivatives(
+        client=client,
+        cache=cache,
+        prefix=config.prefix or FMRIPREP_PREFIX,
+        accession=accession if config.dataset is not None else None,
+        subjects=config.subjects,
+        pseudonym=config.dataset,
     )

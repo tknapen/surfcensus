@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from surfcensus.config import SourceConfig
+    from surfcensus.remote.cache import Cache
 
 Hemi = Literal["lh", "rh"]
 HEMIS: tuple[Hemi, Hemi] = ("lh", "rh")
@@ -301,6 +302,28 @@ class Source(Protocol):
 
     def config(self) -> SourceConfig:
         """The stored description from which ``run.from_config`` builds an equal source."""
+        ...
+
+
+@runtime_checkable
+class RemoteSource(Source, Protocol):
+    """A source on a bucket, which a run binds to its cache (docs/dev/remote_plan.md).
+
+    ``accession`` is the one dataset of a local run on a remote dataset
+    (``review openneuro:dsXXXXXX``), None for a source that lists every dataset of its
+    prefix (a census run). ``globs`` are the subject globs of the one dataset. A run binds
+    every remote source it takes, before any phase: the cache of the run directory, keyed
+    with the run secret, and in a local run the dataset's pseudonym, which ``config()``
+    then stores in place of the accession (decision D47, item 1).
+    """
+
+    accession: str | None
+    globs: tuple[str, ...]
+    bucket: str
+    prefix: str
+
+    def bind(self, *, cache: Cache, pseudonym: str | None = None) -> None:
+        """Give the source the run's cache and, for one dataset, its pseudonym."""
         ...
 
 

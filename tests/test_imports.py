@@ -75,6 +75,11 @@ def test_the_modules_of_this_milestone_are_found() -> None:
         "surfcensus.sources.base",
         "surfcensus.sources.patterns",
         "surfcensus.sources.local",
+        "surfcensus.sources.openneuro_derivatives",
+        "surfcensus.remote",
+        "surfcensus.remote.transport",
+        "surfcensus.remote.s3",
+        "surfcensus.remote.cache",
         "surfcensus.inventory",
         "surfcensus.inventory.subjects",
         "surfcensus.inventory.provenance",
@@ -179,9 +184,11 @@ print("\\n" + json.dumps({{"code": code, "loaded": loaded}}))
 
 
 def run_command(*args: object, cwd: Path) -> tuple[int, list[str], str]:
-    """Exit code of ``surfcensus ARGS`` in a fresh interpreter, the packages of the app that
-    it had loaded when it ended, and what it wrote to stderr."""
-    code = COMMAND_PROBE.format(args=[str(arg) for arg in args], packages=APP_PACKAGES)
+    """Exit code of ``surfcensus ARGS`` in a fresh interpreter, the packages of the app (and
+    ``httpx``) that it had loaded when it ended, and what it wrote to stderr."""
+    # httpx as well: a command that reads no bucket does not load the remote layer
+    # (docs/dev/remote_plan.md), so the packages it reports are also those of a remote source
+    code = COMMAND_PROBE.format(args=[str(arg) for arg in args], packages=(*APP_PACKAGES, "httpx"))
     environment = {k: v for k, v in os.environ.items() if k != "FREESURFER_HOME"}
     result = subprocess.run(
         [sys.executable, "-c", code], capture_output=True, text=True, cwd=cwd, env=environment
@@ -270,6 +277,19 @@ def test_the_app_package_names_its_database_without_importing_anything() -> None
 
 def test_import_surfcensus_loads_the_standard_library_only() -> None:
     assert loaded_beyond("import surfcensus", "surfcensus") == []
+
+
+def test_the_remote_layer_loads_httpx_only_where_it_sends_requests() -> None:
+    # a command parses openneuro:dsXXXXXX with remote/__init__.py; the configuration and the
+    # cache name the remote constants; only the transport and the client need httpx
+    assert loaded_beyond("import surfcensus.remote", "surfcensus") == []
+    out = run_python(
+        "import sys, surfcensus.config, surfcensus.remote.cache, surfcensus.run\n"
+        "print('httpx' in sys.modules)\n"
+        "import surfcensus.remote.s3, surfcensus.sources.openneuro_derivatives\n"
+        "print('httpx' in sys.modules)\n"
+    )
+    assert out.split() == ["False", "True"]
 
 
 def test_the_top_level_names_are_imported_on_first_use() -> None:

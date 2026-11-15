@@ -9,9 +9,9 @@ import errno
 import os
 import re
 import stat
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from fnmatch import fnmatchcase
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from surfcensus.sources.base import RENDER_ROLES, UNFETCHED, FileRole, Unfetched
 
@@ -321,6 +321,19 @@ def is_subject_candidate(path: Path | str) -> bool:
     return True
 
 
+def _first_candidates(exists: Callable[[str], bool]) -> dict[FileRole, str]:
+    """The rule by which a file is chosen for a role, whatever the listing: for each role the
+    first of its :data:`ROLE_CANDIDATES` for which ``exists`` holds, in definition order of
+    the roles; roles with none are absent."""
+    found: dict[FileRole, str] = {}
+    for role, candidates in ROLE_CANDIDATES.items():
+        for candidate in candidates:
+            if exists(candidate):
+                found[role] = candidate
+                break
+    return found
+
+
 def resolve_subject_files(subject_dir: Path | str) -> dict[FileRole, Path]:
     """The first existing candidate of each role; roles with none are absent.
 
@@ -329,14 +342,48 @@ def resolve_subject_files(subject_dir: Path | str) -> dict[FileRole, Path]:
     Raises OSError if a candidate cannot be examined (see :func:`is_file`).
     """
     root = Path(subject_dir)
-    files: dict[FileRole, Path] = {}
-    for role, candidates in ROLE_CANDIDATES.items():
-        for candidate in candidates:
-            path = root / candidate
-            if is_file(path):
-                files[role] = path
-                break
-    return files
+    found = _first_candidates(lambda candidate: is_file(root / candidate))
+    return {role: root / candidate for role, candidate in found.items()}
+
+
+def roles_from_keys(names: Iterable[str]) -> dict[FileRole, str]:
+    """The file of each role in a listing of a subject: ``names`` are the keys relative to
+    the subject's prefix (``surf/lh.pial.T1``), and each role gets the first of its
+    candidates that is among them, by the rule of :func:`resolve_subject_files`. The
+    OpenNeuroDerivatives source decides roles with this, so a bucket and a directory with
+    the same files give the same roles (FreeSurfer 7 on S3 has ``lh.pial.T1`` and no
+    ``lh.pial``)."""
+    present = set(names)
+    return _first_candidates(present.__contains__)
+
+
+def key_variant(role: FileRole, location: str) -> str | None:
+    """``FileRef.variant`` of a file listed under ``location`` (relative to the subject):
+    its file name for a role with several candidates, None otherwise. A bucket has no
+    links, so the name listed is the name read."""
+    if len(ROLE_CANDIDATES[role]) == 1:
+        return None
+    return PurePosixPath(location).name
+
+
+def is_subject_candidate_keys(names: Iterable[str], label: str) -> bool:
+    """:func:`is_subject_candidate` for a listing: some key lies below ``mri/`` and some
+    below ``surf/`` (relative to the subject's prefix), and ``label`` is not the name of a
+    template. A bucket has no empty folders, so a prefix with an empty ``mri/`` is no
+    candidate where a directory would be one."""
+    if is_template_name(label):
+        return False
+    tops = {name.split("/", 1)[0] for name in names if "/" in name}
+    return {"mri", "surf"} <= tops
+
+
+def parse_pipeline_version(raw: bytes) -> str | None:
+    """The fMRIPrep version in the bytes of a ``dataset_description.json``
+    (``inventory.provenance.parse_dataset_description``), decoded as UTF-8 with
+    replacement; None when it says nothing usable. Never raises."""
+    from surfcensus.inventory.provenance import parse_dataset_description
+
+    return parse_dataset_description(raw.decode("utf-8", errors="replace"))
 
 
 def variant_name(role: FileRole, path: Path | str) -> str:

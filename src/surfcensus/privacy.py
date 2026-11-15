@@ -11,7 +11,8 @@ dataset key of a census run) is hashed into pseudonyms and subject identifiers. 
 secret, 32 random bytes kept in ``catalog.sqlite``, is hashed into render keys and cache
 names, so that neither can be recomputed from a bucket listing.
 
-The key file, pseudonym collisions and the reveal path of a census run follow in milestone 5.
+The key file, pseudonym collisions and the reveal path of a census run follow later in
+milestone 5 (docs/dev/remote_plan.md, what is not in this stage).
 """
 
 from __future__ import annotations
@@ -211,7 +212,11 @@ def _last_component(match: re.Match[str]) -> str:
 
 
 def scrub(
-    text: str, *, pseudonyms: Mapping[str, str] | None = None, roots: Collection[str] = ()
+    text: str,
+    *,
+    pseudonyms: Mapping[str, str] | None = None,
+    roots: Collection[str] = (),
+    mask_subjects: bool | None = None,
 ) -> str:
     """Text of an exception or a log line with what could name a dataset taken out.
 
@@ -222,8 +227,10 @@ def scrub(
        last component.
     3. Every ``ds`` accession becomes its pseudonym from ``pseudonyms``, or ``D-?`` when it
        has none.
-    4. Every ``sub-<label>`` token becomes ``sub-?`` when ``pseudonyms`` is given, that is,
-       in a census run. A local run keeps subject labels.
+    4. Every ``sub-<label>`` token becomes ``sub-?`` when ``mask_subjects`` is true, which
+       it is by default when ``pseudonyms`` is given, that is, in a census run. A local run
+       keeps subject labels: :func:`scrub_with` passes the pseudonyms of a local run (a run
+       on a remote dataset has one) with ``mask_subjects=False``.
 
     White space is collapsed to single spaces. Pure; never raises for a string.
     """
@@ -233,15 +240,17 @@ def scrub(
     text = _PATH.sub(_last_component, text)
     known = pseudonyms or {}
     text = _ACCESSION.sub(lambda match: known.get(match.group(0), "D-?"), text)
-    if pseudonyms is not None:
+    mask = pseudonyms is not None if mask_subjects is None else mask_subjects
+    if mask:
         text = _SUBJECT.sub("sub-?", text)
     return " ".join(text.split())
 
 
 def scrub_with(catalog: Catalog, text: str) -> str:
     """:func:`scrub` with what ``catalog`` holds when this is called: the roots and
-    identities of its datasets and, in a census run, their pseudonyms. A local run keeps
-    subject labels: they are the user's own."""
+    identities of its datasets and their pseudonyms, so that an accession becomes its
+    pseudonym in a local run on a remote dataset as in a census run (decision D47). A
+    local run keeps subject labels: they are the user's own."""
     pseudonyms, roots = catalog.scrub_terms()
     census = catalog.meta("mode") == "census"
-    return scrub(text, pseudonyms=pseudonyms if census else None, roots=roots)
+    return scrub(text, pseudonyms=pseudonyms, roots=roots, mask_subjects=census)
