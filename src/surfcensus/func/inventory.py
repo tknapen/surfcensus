@@ -36,7 +36,7 @@ import fnmatch
 import os
 import re
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -1032,6 +1032,7 @@ def run_func_inventory(
     key: HashKey,
     *,
     force: bool = False,
+    skip: Collection[tuple[str, str]] = (),
 ) -> PhaseReport:
     """Phase 2f for the local sources of a run (module docstring). Returns a report of phase
     ``func_inventory`` whose units are sessions: done (stored now), skipped (hash unchanged),
@@ -1043,7 +1044,11 @@ def run_func_inventory(
     Datasets are those the surface inventory stored (a dataset of a source that the catalog
     does not hold is passed over). Everything is listed first, so that a listing that fails
     records nothing; then each session is skipped or planned and stored, one transaction per
-    session; then what is no longer listed is marked absent, per functional source."""
+    session; then what is no longer listed is marked absent, per functional source.
+
+    ``skip`` names datasets (``(source, identity)``) that are passed over in this call: none of
+    their functional rows is added, changed or marked absent (``Run.func_inventory`` passes the
+    datasets of a bucket whose functional files could not all be fetched, decision D50)."""
     from surfcensus.config import epi_settings
 
     start = time.perf_counter()
@@ -1060,6 +1065,8 @@ def run_func_inventory(
         if source.kind != "local" and tree_of is None:
             continue
         for record in source.datasets():
+            if (record.source, record.identity) in skip:
+                continue
             dataset_id = _dataset_id(catalog, record)
             if dataset_id is None:
                 continue

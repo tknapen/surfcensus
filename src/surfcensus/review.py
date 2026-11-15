@@ -496,6 +496,8 @@ class RemoteEstimate:
     and kept in the retained cache."""
     func_subjects: int = 0
     """The participants those files are of."""
+    func_unlisted: str | None = None
+    """Why the functional files could not be listed (a refused listing); they count as 0."""
 
     @property
     def before_app(self) -> int:
@@ -552,9 +554,17 @@ def remote_estimate(
     # with the EPI interface on, the FreeSurfer files of the contours are retained with the
     # functional files, and the render leases those copies without a request (decision D50)
     shared: set[str] = set()
+    unlisted: str | None = None
     listing = getattr(source, "func_listing", None) if epi else None
     if listing is not None:
-        found = listing(dataset)
+        try:
+            found = listing(dataset)
+        except SourceError as exc:
+            # a listing that is refused: the functional part of this call is skipped and said
+            # (decision D50, review); the surfaces go on
+            if exc.reason == "unreachable":
+                raise
+            found, unlisted = None, exc.detail
         if found is not None:
             shared = {obj.key for kind, obj in found.files.values() if kind == "deriv"}
 
@@ -586,7 +596,7 @@ def remote_estimate(
     at_once = fits if n_first is None else max(min(first_n, fits), min(jobs, fits))
     peak_c = largest_c * min(at_once, len(renders))
     func = func_subjects = 0
-    if epi and getattr(source, "func_size", None) is not None:
+    if epi and unlisted is None and getattr(source, "func_size", None) is not None:
         func, func_subjects = source.func_size(dataset)
     return RemoteEstimate(
         subjects=len(records),
@@ -600,6 +610,7 @@ def remote_estimate(
         everything=n_first is None,
         func=func,
         func_subjects=func_subjects,
+        func_unlisted=unlisted,
     )
 
 
@@ -621,6 +632,11 @@ def estimate_line(estimate: RemoteEstimate, *, app: bool = True) -> str:
     else:
         head = f"To fetch: {size_text(estimate.in_all)} in all ({', '.join(what)})"
     head += func_words(estimate.func, estimate.func_subjects, app=app)
+    if estimate.func_unlisted is not None:
+        head += (
+            f"; the functional files could not be listed ({estimate.func_unlisted}) and are "
+            "not counted"
+        )
     return (
         f"{head}, an estimate from the listed sizes; the files of each batch are removed after "
         f"it, and at most {size_text(estimate.peak)} of source files are on disk at once."
@@ -834,10 +850,28 @@ def _open_remote_run(
             epi=epi_on and new_run,
         )
         new = run is None
-        if epi_on and epi_runs:
+        if epi_on and epi_runs and estimate.func_unlisted is None:
             from surfcensus.run import refuse_unmatched_epi_runs
 
             refuse_unmatched_epi_runs(source.func_stems(dataset), epi_runs)
+        if not new and epi_on and subjects is None:
+            # the guard of a new run also holds for the EPI interface turned on for a run that
+            # has subjects, or for its functional files pending (decision D50, review)
+            try:
+                pending_func = source.func_size(dataset)[0]
+            except SourceError as exc:
+                if exc.reason == "unreachable":
+                    raise
+                pending_func = 0  # said by the functional inventory
+            if pending_func > REMOTE_GUARD_BYTES:
+                raise ConfigError(
+                    "invalid",
+                    f"the EPI interface of this run would fetch about "
+                    f"{size_text(pending_func)} of functional files, more than "
+                    f"{size_text(REMOTE_GUARD_BYTES)}: name the subjects whose EPI movies to "
+                    "make with --subjects GLOB (for example --subjects 'sub-0[1-5]'), or "
+                    "--subjects '*' for all of them",
+                )
         if new and subjects is None and estimate.before_app > REMOTE_GUARD_BYTES:
             before = " before the first rating screen" if serve else ""
             raise ConfigError(
@@ -1718,8 +1752,8 @@ def open_review(
         run.func_inventory()
         for line in functional_lines(run, named):
             _say(line)
-        if run.func_left_out_note is not None:
-            _say(f"  {run.func_left_out_note}.")
+        for note in run.func_notes:
+            _say(f"Functional: {note}.")
 
         _with_fsaverage(run, fsaverage)
         report = run.metrics(jobs=jobs)

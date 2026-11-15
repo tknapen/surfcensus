@@ -188,7 +188,14 @@ def epi_run_stems(sources: Sequence[Source], raw: Path | str | None) -> list[str
             if remote_stems is None:
                 continue
             for record in source.datasets():
-                found = remote_stems(record)
+                try:
+                    found = remote_stems(record)
+                except SourceError as exc:
+                    if exc.reason == "unreachable":
+                        raise
+                    # a refused listing: the glob cannot be checked now, and the functional
+                    # inventory says that the files could not be listed (decision D50, review)
+                    return ANY_STEMS
                 if found is not None:
                     stems = [*(stems or []), *found]
             continue
@@ -205,12 +212,17 @@ def epi_run_stems(sources: Sequence[Source], raw: Path | str | None) -> list[str
     return stems
 
 
+ANY_STEMS: list[str] = ["\0every run"]
+"""What :func:`epi_run_stems` gives when a listing of a dataset of a bucket was refused: no
+glob can be checked, and every one is taken (:func:`refuse_unmatched_epi_runs`)."""
+
+
 def refuse_unmatched_epi_runs(stems: Sequence[str] | None, globs: Sequence[str]) -> None:
     """``ConfigError("invalid", ...)`` when a glob of ``--epi-runs`` matches no run of
     ``stems`` (:func:`epi_run_stems`), before it is stored, as for ``--subjects``."""
     import fnmatch
 
-    if not globs:
+    if not globs or stems is ANY_STEMS:
         return
     if stems is None:
         raise ConfigError(
@@ -292,9 +304,12 @@ class Run:
         self._template: Template | None = None
         self._template_looked_for = False
         self._no_template: tuple[str, int] | None = None  # the message, the level it was logged at
-        self.func_left_out_note: str | None = None
-        """What the last :meth:`func_inventory` left out of the functional tree of a dataset of
-        a bucket, as one sentence; None when nothing was."""
+        self.func_notes: list[str] = []
+        """What the last :meth:`func_inventory` says of a dataset of a bucket whose functional
+        files could not all be listed or fetched (:func:`func_fault_note`); empty otherwise."""
+        self._func_unfinished: set[str] = set()
+        """The cache names of the functional listing of a dataset whose tree could not be built
+        in this call, which :meth:`prune_cache` keeps."""
         if source is None:
             given: tuple[Source, ...] = ()
         elif isinstance(source, Sequence):
@@ -899,22 +914,61 @@ class Run:
         record = self._catalog.subject_record(subject_uid)
         return self._source_of(record.dataset).lease(record, roles)
 
-    def remote_bytes(self, roles: Collection[FileRole]) -> dict[str, int]:
+    def remote_bytes(
+        self, roles: Collection[FileRole], *, exclude: Collection[str] = ()
+    ) -> dict[str, int]:
         """``subject_uid`` -> the bytes of the listed files of ``roles``, for every present
         subject of a remote dataset that has one of them, from the private catalog: what one
-        lease of the subject downloads at most. Empty for a run without a remote dataset."""
+        lease of the subject downloads at most. ``exclude`` are bucket keys that are not
+        counted (the FreeSurfer files that the functional tree retains, which a lease uses
+        without a request). Empty for a run without a remote dataset."""
         if not roles or all(stored.kind == "local" for stored in self.config.sources):
             return {}
         marks = ", ".join("?" for _ in roles)
         rows = self._catalog.query(
-            "SELECT f.subject_uid AS uid, SUM(f.size) AS total FROM files f "
+            "SELECT f.subject_uid AS uid, f.size, f.location, s.fs_dir, d.root FROM files f "
             "JOIN subjects s ON s.subject_uid = f.subject_uid "
             "JOIN datasets d ON d.dataset_id = s.dataset_id "
             f"WHERE d.source != 'local' AND s.present = 1 AND f.role IN ({marks}) "
-            "GROUP BY f.subject_uid ORDER BY f.subject_uid",
+            "ORDER BY f.subject_uid",
             tuple(FileRole(role).value for role in roles),
         )
-        return {str(row["uid"]): int(row["total"] or 0) for row in rows}
+        skipped = set(exclude)
+        found: dict[str, int] = {}
+        for row in rows:
+            uid = str(row["uid"])
+            found.setdefault(uid, 0)
+            if skipped:
+                _, _, base = str(row["root"]).removeprefix("s3://").partition("/")
+                if f"{base}{row['fs_dir']}/{row['location']}" in skipped:
+                    continue
+            found[uid] += int(row["size"] or 0)
+        return found
+
+    def _func_listed_keys(self) -> set[str]:
+        """The derivative bucket's keys of the functional listing of every dataset of a bucket
+        with the EPI interface on: among them the FreeSurfer files of the contours, which the
+        functional tree retains and a render then leases without a request. Empty with the
+        interface off, and for a listing that cannot be had (a fault is said elsewhere)."""
+        from surfcensus.config import epi_settings
+
+        if self.config.mode != "local" or not epi_settings(self.config).enabled:
+            return set()
+        keys: set[str] = set()
+        for source in self._sources():
+            listing = getattr(source, "func_listing", None) if source.kind != "local" else None
+            if listing is None:
+                continue
+            for record in source.datasets():
+                try:
+                    found = listing(record)
+                except SourceError as exc:
+                    if exc.reason == "unreachable":
+                        raise
+                    continue
+                if found is not None:
+                    keys |= {obj.key for kind, obj in found.files.values() if kind == "deriv"}
+        return keys
 
     def remote_pending(self) -> tuple[dict[str, int], dict[str, int], bool]:
         """What a plain ``metrics`` and ``render`` would lease now from the remote datasets
@@ -930,7 +984,8 @@ class Run:
         from surfcensus.render.batch import pending_renders
         from surfcensus.templates import TEMPLATES_DIR, read_template
 
-        tier_b, render = self.remote_bytes(TIER_B), self.remote_bytes(RENDER_LEASED)
+        tier_b = self.remote_bytes(TIER_B)
+        render = self.remote_bytes(RENDER_LEASED, exclude=self._func_listed_keys())
         template = None
         pinned = self._catalog.meta("template_id")
         if pinned is not None:
@@ -1063,6 +1118,9 @@ class Run:
             key = f"{base}{row['fs_dir']}/{row['location']}"
             keep.add(cache.name(bucket, key, row["etag_or_mtime"]))
         keep |= self._func_tree_names()
+        # a dataset whose tree could not be built in this call keeps what it fetched, so that
+        # the next call fetches only what is missing (decision D50, review)
+        keep |= self._func_unfinished
         removed = cache.prune_retained(keep)
         if removed:
             get_logger().info(
@@ -1093,8 +1151,9 @@ class Run:
 
     def _follow_func_trees(self) -> None:
         """Point the stored roots of the functional sources of datasets of a bucket at their
-        trees in this run's cache when the run directory was moved or copied (the stored roots
-        are absolute): ``Catalog.relocate_func``, which keeps every identifier."""
+        trees in this run's own cache (the stored roots are absolute, and a run directory that
+        was moved or copied would otherwise read another run's cache), whether or not the tree
+        is there: ``Catalog.relocate_func``, which keeps every identifier."""
         from surfcensus.sources.openneuro_derivatives import FUNC_TREE_DERIV, FUNC_TREE_RAW
 
         rows = {
@@ -1103,7 +1162,7 @@ class Run:
         }
         for func_id, raw_found, tree in self._remote_func_trees():
             deriv = tree / FUNC_TREE_DERIV
-            if rows.get(func_id) != str(deriv) and deriv.is_dir():
+            if rows.get(func_id) != str(deriv):
                 self._catalog.relocate_func(
                     func_id, str(deriv), str(tree / FUNC_TREE_RAW), raw_found
                 )
@@ -1521,47 +1580,57 @@ class Run:
 
         if self.config.mode != "local" or not epi_settings(self.config).enabled:
             return PhaseReport(phase=FUNC_INVENTORY_PHASE, done=0, skipped=0, failed=0, failures=())
+        self._follow_func_trees()
         sources = self._sources()
-        left_out = self._func_trees(sources)
+        skipped, notes = self._func_trees(sources)
         report = run_func_inventory(
-            self._catalog, sources, self.config, run_key(self.config), force=force
+            self._catalog,
+            sources,
+            self.config,
+            run_key(self.config),
+            force=force,
+            skip=skipped,
         )
-        if left_out:
-            listed = ", ".join(left_out[:_MAX_LEFT_OUT])
-            more = (
-                f" and {len(left_out) - _MAX_LEFT_OUT} more"
-                if len(left_out) > _MAX_LEFT_OUT
-                else ""
-            )
-            note = (
-                f"{len(left_out)} functional file(s) of the bucket could not be fetched (changed "
-                f"since they were listed, or refused) and are left out: {listed}{more}; their "
-                "runs get the planner's reason, and the next call tries a new listing"
-            )
-            report = dataclasses.replace(report, notes=(*report.notes, note))
-        self.func_left_out_note = note if left_out else None
+        self.func_notes = notes
+        if notes:
+            report = dataclasses.replace(report, notes=(*report.notes, *notes))
         return report
 
-    def _func_trees(self, sources: Sequence[Source]) -> list[str]:
+    def _func_trees(self, sources: Sequence[Source]) -> tuple[set[tuple[str, str]], list[str]]:
         """Fetch the functional files of every dataset of a bucket into the retained cache, as
         a tree of links that the functional inventory reads (``OpenNeuroDerivatives.func_tree``,
-        decision D50), before anything of the inventory is recorded; returns the places that
-        could not be fetched (relative to the tree). A disk that does not hold what is to be
-        fetched is refused before anything of it is fetched; a bucket that cannot be reached
-        raises ``SourceError("unreachable", ...)`` and a full disk ``ConfigError``, and nothing
-        is recorded."""
-        left: list[str] = []
+        decision D50), before anything of the inventory is recorded. Returns the datasets
+        (``(source, identity)``) whose functional inventory is not run in this call, and one
+        note for each.
+
+        A dataset whose functional files cannot all be listed or fetched for a reason that
+        lies in an object (403, 404, 412, a changed ETag or body) is skipped: none of its
+        functional rows is added, changed or marked absent, an earlier tree with its rows and
+        packs stays as it was, the surfaces go on, and the files that were fetched stay
+        retained (:meth:`prune_cache` keeps them for this call), so the same command tries again
+        at the cost of what is missing. A disk that does not hold what is to be fetched is
+        refused before anything of it is fetched; a bucket that cannot be reached raises
+        ``SourceError("unreachable", ...)`` and a full disk ``ConfigError``, and nothing is
+        recorded."""
+        skipped: set[tuple[str, str]] = set()
+        notes: list[str] = []
+        self._func_unfinished: set[str] = set()
         for source in sources:
             tree_of = getattr(source, "func_tree", None) if source.kind != "local" else None
             if tree_of is None:
                 continue
             for record in source.datasets():
-                self._room_for_func(source, record)
                 try:
-                    tree = tree_of(record)
+                    self._room_for_func(source, record)
+                    tree_of(record)
                 except SourceError as exc:
                     if exc.reason != "unreachable":
-                        raise
+                        skipped.add((record.source, record.identity))
+                        names = getattr(source, "func_object_names", None)
+                        if names is not None:
+                            self._func_unfinished.update(names(record))
+                        notes.append(func_fault_note(record, exc))
+                        continue
                     raise SourceError(
                         "unreachable",
                         "the bucket could not be reached while the functional files of the "
@@ -1577,14 +1646,13 @@ class Run:
                         "dataset could not be fetched; make room and run the same command "
                         "again, or turn the EPI interface off with --no-epi",
                     ) from exc
-                if tree is not None:
-                    left += list(tree.left_out)
-        return left
+        return skipped, notes
 
     def _room_for_func(self, source: object, record: DatasetRecord) -> None:
         """Refuse, before anything of them is fetched, the functional files of a dataset of a
-        bucket when the free space of the cache's disk does not hold them (what the retained
-        cache holds already is not fetched again and not counted)."""
+        bucket when the free space of the cache's disk, less the margin that a phase on remote
+        data keeps (:func:`disk_margin`), does not hold them; what the retained cache holds
+        already is not fetched again and not counted."""
         from surfcensus.remote.cache import CACHE_DIR
 
         func_size = getattr(source, "func_size", None)
@@ -1592,12 +1660,13 @@ class Run:
         free = free_bytes(self.run_dir / CACHE_DIR)
         if not need or free is None:
             return
-        if free < need:
+        if free - disk_margin(free) < need:
             raise ConfigError(
                 "invalid",
                 f"the disk of {self.run_dir} has {size_text(free)} free, and the functional "
-                f"files of the EPI interface take {size_text(need)}: make room, name fewer "
-                "subjects with --subjects, or turn the EPI interface off with --no-epi",
+                f"files of the EPI interface take {size_text(need)} beside room for what the "
+                "phases write: make room, name fewer subjects with --subjects, or turn the EPI "
+                "interface off with --no-epi",
             )
 
     def remote_func_pending(self) -> tuple[int, int]:
@@ -1615,7 +1684,12 @@ class Run:
             if func_size is None:
                 continue
             for record in source.datasets():
-                size, n = func_size(record)
+                try:
+                    size, n = func_size(record)
+                except SourceError as exc:
+                    if exc.reason == "unreachable":
+                        raise
+                    continue  # said by the functional inventory (func_fault_note)
                 total += size
                 participants += n
         return total, participants
@@ -1655,12 +1729,22 @@ class Run:
         pending = pack_pending(context, sessions=sessions, force=force, retry_failed=retry_failed)
         if pending:
             self._sources()  # a source that is gone is not a property of its sessions
+            remote = {str(tree / "deriv") for _, _, tree in self._remote_func_trees()}
             for root in self._func_roots():
-                if not Path(root).is_dir():
+                if Path(root).is_dir():
+                    continue
+                if root in remote:
                     raise SourceError(
                         "not found",
-                        f"the derivative {root} of this run's functional sessions is not there",
+                        "the functional files of this run are not in its cache (cache/retained "
+                        "was removed, or the run directory was copied without it); fetch them "
+                        f"again with {self._remote_review_command()} or surfcensus inventory "
+                        f"--run-dir {self.run_dir}, then pack",
                     )
+                raise SourceError(
+                    "not found",
+                    f"the derivative {root} of this run's functional sessions is not there",
+                )
         return run_pack(
             context,
             jobs=jobs,
@@ -1670,6 +1754,18 @@ class Run:
             stop=stop,
             waiting=waiting,
         )
+
+    def _remote_review_command(self) -> str:
+        """``surfcensus review openneuro:dsXXXXXX --epi --run-dir DIR`` for this run's dataset
+        of a bucket, said on the terminal of whoever runs it; a generic form without one."""
+        from surfcensus.remote import REMOTE_SCHEME
+
+        rows = self._catalog.query(
+            "SELECT accession FROM datasets WHERE source != 'local' AND accession IS NOT NULL "
+            "ORDER BY dataset_id LIMIT 1"
+        )
+        name = f"{REMOTE_SCHEME}:{rows[0]['accession']}" if rows else f"{REMOTE_SCHEME}:dsXXXXXX"
+        return f"surfcensus review {name} --epi --run-dir {self.run_dir}"
 
     def _func_roots(self) -> list[str]:
         """The derivative roots of the run's present functional sources, from the catalog."""
@@ -1906,8 +2002,18 @@ class Run:
         self.close()
 
 
-_MAX_LEFT_OUT = 5
-"""Functional files left out of a tree that a note names; the rest are counted."""
+def func_fault_note(record: DatasetRecord, exc: SourceError) -> str:
+    """The line said when the functional files of a dataset of a bucket could not all be
+    listed or fetched (decision D50, review): what went wrong, that the EPI movies of this call
+    are those of before, and that the same command tries again. It names the dataset as the
+    other lines of a review do (``openneuro:dsXXXXXX``), on the terminal of whoever runs it."""
+    from surfcensus.remote import REMOTE_SCHEME
+
+    return (
+        f"the functional files of {REMOTE_SCHEME}:{record.identity} could not all be fetched "
+        f"({exc.detail}); the EPI movies of this call are left as they were, and the same "
+        "command tries again"
+    )
 
 
 def free_bytes(path: Path) -> int | None:

@@ -555,17 +555,24 @@ class OpenNeuroDerivatives:
         hard link). ``h`` is ``Cache.name`` of the bucket, the dataset's prefix and a digest
         over the place, bucket, size and ETag of every file listed, as the template's tree is
         named. The tree is built in this process's lease area and renamed into place in one
-        step, with :data:`FUNC_TREE_OBJECTS` (the cache names of the objects it links, and the
-        places left out) in it, so that no partial tree ever has that name. A tree that is
-        whole is returned without a download. None without a listing.
+        step, with :data:`FUNC_TREE_OBJECTS` (the cache names of the objects it links) in it,
+        so that no partial tree ever has that name. A tree that is whole is returned without a
+        download. None without a listing.
 
-        A file whose object changed or went since it was listed (404, 412, another ETag, a
-        body that is not the listed one) or that may not be read (403) is left out of the
-        tree and named in ``left_out``: the run it belongs to then gets the planner's own
-        reason. A bucket that cannot be reached raises ``SourceError("unreachable", ...)`` and
-        leaves no tree. A stop (Ctrl-C, SIGTERM) stops both clients and leaves nothing partial
-        under ``retained/`` (``Cache.retained``). Kept for the life of the source.
-        ``ConfigError`` before the source was bound to a cache."""
+        The times of every retained functional file are set to the object's ``LastModified``
+        of the listing, so the listing facts that the planner hashes (size and modification
+        time) are those of the bucket, and a cache that is fetched again changes no hash.
+
+        A tree is built only when every listed file was fetched. A file whose object changed
+        or went since it was listed (404, 412, another ETag, a body that is not the listed
+        one) or that may not be read (403) raises one ``SourceError`` (the first fault's
+        reason; the detail names up to five places in the tree and the count) once the other
+        downloads ended, and no tree is built: the files that were fetched stay retained, so
+        the next call fetches only the rest. A bucket that cannot be reached raises
+        ``SourceError("unreachable", ...)``. A stop (Ctrl-C, SIGTERM) stops both clients and
+        leaves nothing partial under ``retained/`` (``Cache.retained``). A tree that was built
+        is kept for the life of the source. ``ConfigError`` before the source was bound to a
+        cache."""
         memo = self._memo()
         with memo.lock:
             if dataset.identity in memo.func_trees:
@@ -588,33 +595,39 @@ class OpenNeuroDerivatives:
         target = cache.path_for(
             self.bucket, f"{self._base_key(dataset)}{FUNC_TREE}", digest, retained=True
         )
-        whole = _func_tree_whole(target, listing)
-        if whole is None:
+        if not _func_tree_whole(target, listing):
             places = list(listing.files)
 
             def kept(place: str) -> Path | SourceError:
                 kind, obj = listing.files[place]
                 try:
-                    return cache.retained(self._client_of(kind), obj)
+                    path = cache.retained(self._client_of(kind), obj)
                 except SourceError as exc:
                     if exc.reason == UNREACHABLE:
                         raise
                     return _placed(exc, (place,))
+                _bucket_time(path, obj)
+                return path
 
             found = self._parallel(kept, places)
-            links: dict[str, Path] = {}
-            left: list[str] = []
-            for place, path in zip(places, found, strict=True):
-                if isinstance(path, SourceError):
-                    left.append(place)
-                else:
-                    links[place] = path
+            faults = [
+                (place, path)
+                for place, path in zip(places, found, strict=True)
+                if isinstance(path, SourceError)
+            ]
+            if faults:
+                raise _fetch_fault(faults)
+            links = {
+                place: path
+                for place, path in zip(places, found, strict=True)
+                if isinstance(path, Path)
+            }
             names = sorted(
                 cache.name(self._client_of(kind).bucket, obj.key, obj.etag)
-                for place, (kind, obj) in listing.files.items()
-                if place in links
+                for kind, obj in listing.files.values()
             )
-            record = json.dumps({"objects": names, "left_out": left}, indent=1) + "\n"
+            record = json.dumps({"objects": names}, indent=1) + "\n"
+            _clear_stale_tree(cache, target)
             _build_tree(
                 cache,
                 target,
@@ -623,17 +636,34 @@ class OpenNeuroDerivatives:
                 dirs=(FUNC_TREE_RAW, FUNC_TREE_DERIV),
                 what="functional",
             )
-            whole = tuple(left)
+        else:
+            for place, (_, obj) in listing.files.items():
+                _bucket_time(target / place, obj)
         tree = FuncTree(
             root=target,
             raw=target / FUNC_TREE_RAW,
             deriv=target / FUNC_TREE_DERIV,
             fs_subjects=target / FUNC_TREE_FS,
-            left_out=whole,
         )
         with memo.lock:
             memo.func_trees[dataset.identity] = tree
         return tree
+
+    def func_object_names(self, dataset: DatasetRecord) -> list[str]:
+        """The cache names of the objects of :meth:`func_listing` (``Cache.name``, keyed with
+        the run secret), for ``Run.prune_cache`` to keep while a tree of the dataset could not
+        be built: what was fetched is then not fetched again. Empty without a listing or
+        before the source was bound to a cache; lists nothing that is not listed yet."""
+        memo = self._memo()
+        with memo.lock:
+            listing = memo.func_listings.get(dataset.identity)
+        cache = self.cache
+        if listing is None or cache is None:
+            return []
+        return sorted(
+            cache.name(self._client_of(kind).bucket, obj.key, obj.etag)
+            for kind, obj in listing.files.values()
+        )
 
     def func_stems(self, dataset: DatasetRecord) -> list[str] | None:
         """The derivative stems of the preprocessed series of the selected participants
@@ -972,8 +1002,8 @@ FUNC_TREE_FS = f"{FUNC_TREE_DERIV}/sourcedata/freesurfer"
 dataset has: the place ``func.discover`` finds them in a local fMRIPrep output."""
 FUNC_TREE_OBJECTS = ".objects.json"
 """The file of a tree that names the cache names of the objects it links (keyed with the run
-secret) and the places left out; written last, inside the tree, so that ``Run.prune_cache``
-keeps those objects and a tree without it is not whole."""
+secret), inside the tree, so that ``Run.prune_cache`` keeps those objects; a tree without it is
+not whole."""
 FuncBucket = Literal["raw", "deriv"]
 _PARTICIPANT = re.compile(r"sub-[A-Za-z0-9]+")
 """The participant of a FreeSurfer subject directory, as the inventory reads it."""
@@ -997,14 +1027,12 @@ class FuncListing:
 
 @dataclass(frozen=True)
 class FuncTree:
-    """The functional tree of a dataset in the retained cache: its folders, and the places
-    (relative to ``root``) that were listed and could not be fetched."""
+    """The functional tree of a dataset in the retained cache: its folders."""
 
     root: Path
     raw: Path
     deriv: Path
     fs_subjects: Path
-    left_out: tuple[str, ...] = ()
 
 
 def _deriv_wanted(
@@ -1056,20 +1084,83 @@ def _raw_wanted(parts: Sequence[str], participant: str) -> bool:
     return False
 
 
-def _func_tree_whole(target: Path, listing: FuncListing) -> tuple[str, ...] | None:
-    """The places left out of a whole tree at ``target`` (from its :data:`FUNC_TREE_OBJECTS`),
-    or None when there is no whole tree: the file is missing or cannot be read, or a place
-    that it does not name as left out is missing or not at its listed size."""
+def _func_tree_whole(target: Path, listing: FuncListing) -> bool:
+    """Whether ``target`` holds a whole tree: its :data:`FUNC_TREE_OBJECTS` reads and names no
+    place left out (a tree of the first build of D50 with a non-empty ``left_out`` is not
+    whole), and every listed place is there at its listed size."""
     try:
         record = json.loads((target / FUNC_TREE_OBJECTS).read_text(encoding="utf-8"))
-        left = tuple(str(place) for place in record["left_out"])
-    except (OSError, ValueError, KeyError, TypeError):
+        if record.get("left_out"):
+            return False
+        if not isinstance(record["objects"], list):
+            return False
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return False
+    return all(_is_whole(target / place, obj.size) for place, (_, obj) in listing.files.items())
+
+
+MAX_FAULT_PLACES = 5
+"""Places that the fault of a functional fetch names; the rest are counted."""
+
+
+def _fetch_fault(faults: Sequence[tuple[str, SourceError]]) -> SourceError:
+    """One ``SourceError`` for the files of a tree that could not be fetched: the reason of the
+    first, and a detail that names up to :data:`MAX_FAULT_PLACES` places and the count."""
+    places = [place for place, _ in faults]
+    shown = ", ".join(places[:MAX_FAULT_PLACES])
+    more = f" and {len(places) - MAX_FAULT_PLACES} more" if len(places) > MAX_FAULT_PLACES else ""
+    noun = "file was" if len(places) == 1 else "files were"
+    return SourceError(
+        faults[0][1].reason,
+        f"{len(places)} {noun} refused or changed since they were listed: {shown}{more}",
+    )
+
+
+def _listed_ns(obj: S3Object) -> int | None:
+    """``LastModified`` of a listing in nanoseconds since the epoch; None when it is missing
+    or does not parse."""
+    from datetime import datetime
+
+    text = obj.last_modified
+    if not text:
         return None
-    out = set(left)
-    for place, (_, obj) in listing.files.items():
-        if place not in out and not _is_whole(target / place, obj.size):
-            return None
-    return left
+    try:
+        stamp = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if stamp.tzinfo is None:
+        return None
+    seconds = int(stamp.timestamp())
+    return seconds * 1_000_000_000 + stamp.microsecond * 1_000
+
+
+def _bucket_time(path: Path, obj: S3Object) -> None:
+    """Set the access and modification time of a retained functional file to the object's
+    ``LastModified`` of the listing, unless it has it already (decision D50, review: a cache
+    that is fetched again keeps every inventory hash and pack signature). Nothing in the cache
+    or the leases reads the time of a retained file."""
+    ns = _listed_ns(obj)
+    if ns is None:
+        return
+    try:
+        if os.stat(path).st_mtime_ns != ns:
+            os.utime(path, ns=(ns, ns))
+    except OSError:
+        pass
+
+
+def _clear_stale_tree(cache: Cache, target: Path) -> None:
+    """Move a tree at ``target`` that is not whole (one of the first build of D50 that named
+    places left out, or one that lost a file) out of the way before a whole one is renamed
+    there; it is removed from this process's lease area."""
+    if not target.exists():
+        return
+    aside = cache.hold_area() / f".stale.{secrets.token_hex(8)}"
+    try:
+        os.rename(target, aside)
+    except OSError:
+        return
+    shutil.rmtree(aside, ignore_errors=True)
 
 
 def tree_objects(tree_root: Path) -> list[str] | None:

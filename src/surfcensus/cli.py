@@ -618,7 +618,7 @@ def _print_functional(run: Run, source: Path | None, report: PhaseReport) -> Non
     lines = functional_lines(run, source if source is not None else _stored_root(run))
     for line in lines:
         typer.echo(line)
-    if lines or report.done or report.failed:
+    if lines or report.done or report.failed or report.notes:
         _print_report(run, report)
 
 
@@ -808,6 +808,8 @@ def pack(
                 # listed as such, and the pack phase removes its pack
                 with _stops_at_signals():
                     run.func_inventory()
+                for note in run.func_notes:
+                    typer.echo(f"Functional: {note}.")
             with _stops_at_signals():
                 report = run.pack(
                     jobs=jobs, force=force, retry_failed=retry_failed, waiting=_waiting_for_packs

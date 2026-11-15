@@ -13,7 +13,9 @@ of the same folder. Nothing here touches the network.
 from __future__ import annotations
 
 import _thread
+import fnmatch
 import json
+import os
 import shutil
 import signal
 import threading
@@ -118,12 +120,19 @@ def runs_by_name(run_dir: Path) -> dict[tuple[str, str], dict[str, Any]]:
     """Every present run of a run directory by (participant, BIDS name), with its pack."""
     with Run(run_dir) as run:
         rows = run._catalog.query(
-            "SELECT p.participant, r.*, k.status AS pack_status, k.content_digest "
+            "SELECT p.participant, r.*, k.status AS pack_status, k.content_digest, k.packed_at "
             "FROM func_runs r JOIN func_sessions s USING (session_uid) "
             "JOIN func_participants p USING (participant_uid) "
             "LEFT JOIN packs k USING (run_uid) WHERE r.present = 1"
         )
     return {(row["participant"], row["name"]): dict(row) for row in rows}
+
+
+def own_tree(run_dir: Path) -> Path:
+    """The functional tree in the cache of ``run_dir`` itself: a copy of a run directory keeps
+    the stored roots of the original until a call of its own follows them."""
+    (tree,) = (run_dir / CACHE_DIR / RETAINED).glob("*/*/func")
+    return tree
 
 
 def gets(fake: FakeS3, bucket: str | None = None) -> list[str]:
@@ -179,7 +188,7 @@ def test_the_tree_is_in_the_retained_cache_and_named_by_keyed_names(prepared: Pa
     # the identity names the dataset in the bucket, no path of this machine
     assert row["deriv_identity"].startswith(f"s3://{DERIV_BUCKET}/fmriprep/{FAKE_ACCESSION}")
     record = json.loads((tree / FUNC_TREE_OBJECTS).read_text())
-    assert record["left_out"] == [] and len(record["objects"]) > 20
+    assert set(record) == {"objects"} and len(record["objects"]) > 20
     # the tree's files are hard links of retained objects
     series = next(deriv.rglob("*_space-T1w_desc-preproc_bold.nii.gz"))
     assert series.stat().st_nlink == 2
@@ -351,17 +360,99 @@ def test_an_unreachable_raw_bucket_records_nothing_and_the_next_call_goes_on(
         assert run._catalog.query("SELECT count(*) AS n FROM packs")[0]["n"] == 11
 
 
-def test_a_file_refused_by_the_bucket_is_left_out_and_its_run_says_why(
+FAULTS = {
+    "raw series": ("*/sub-01/ses-1/func/*task-rest_run-1_bold.nii.gz", RAW_BUCKET),
+    "derivative file": ("fmriprep/*/sub-01/ses-1/func/*task-rest_run-2*confounds*", DERIV_BUCKET),
+    "contour file": ("fmriprep/*/sourcedata/freesurfer/sub-01/surf/lh.white", DERIV_BUCKET),
+}
+
+
+def functional_rows(run_dir: Path) -> int:
+    with Run(run_dir) as run:
+        return sum(
+            run._catalog.query(f"SELECT count(*) AS n FROM {table}")[0]["n"]
+            for table in ("func_sources", "func_sessions", "func_runs", "packs")
+        )
+
+
+@pytest.mark.parametrize("what", sorted(FAULTS))
+def test_a_file_refused_once_records_nothing_and_the_next_call_fetches_only_it(
+    tmp_path: Path, buckets: dict, capsys: pytest.CaptureFixture[str], what: str
+) -> None:
+    """A 403 on one functional file (decision D50, review): no tree is built, nothing
+    functional is recorded in that call, the surfaces are rendered, one line says so; the next
+    clean call fetches that file alone (and the listings) and packs every run with contours."""
+    pattern, bucket = FAULTS[what]
+    run_dir = tmp_path / "run"
+    fake = FakeS3(buckets)
+    fake.fault(pattern, "403", times=1, methods=("GET",))
+    with remote_review(fake, run_dir, epi=True) as run:
+        assert reviewing.render_counts(run)[0] == 2  # the surfaces went on
+    err = capsys.readouterr().err
+    assert f"Functional: the functional files of {TEXT} could not all be fetched" in err
+    assert "1 file was refused or changed since they were listed" in err
+    assert "the same command tries again" in err
+    assert functional_rows(run_dir) == 0
+    assert not any((run_dir / CACHE_DIR / RETAINED).rglob(FUNC_TREE_OBJECTS))
+    clean = FakeS3(buckets)
+    with remote_review(clean, run_dir) as run:
+        sessions = run._catalog.query(
+            "SELECT count(*) AS n FROM func_sessions WHERE fs_subject IS NOT NULL"
+        )
+        assert sessions[0]["n"] == 3
+    fetched = [k for k in gets(clean) if not k.endswith("dataset_description.json")]
+    assert len(fetched) == 1 and fnmatch.fnmatchcase(fetched[0], pattern)
+    assert fetched[0] in gets(clean, bucket)
+    rows = runs_by_name(run_dir)
+    assert sum(1 for row in rows.values() if row["pack_status"] == "done") == 11
+    session_files = list((run_dir / "epi").glob("*/*/session.json"))
+    assert len(session_files) == 3
+    for session_json in session_files:  # every session with its contours
+        assert json.loads(session_json.read_text())["contours_from"] is not None, session_json
+
+
+def test_a_file_refused_always_changes_nothing_of_an_earlier_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A file whose new version is refused at every call: the earlier tree, its rows and its
+    packs stay as they were at every call, and no false reason is recorded."""
+    dataset = write_review_folder(tmp_path / "data")
+    buckets = lay_out(dataset, tmp_path / "buckets")
+    run_dir = tmp_path / "run"
+    remote_review(FakeS3(buckets), run_dir, epi=True).close()
+    before = runs_by_name(run_dir)
+    with Run(run_dir) as run:
+        (tree,) = run._catalog.query("SELECT deriv_root FROM func_sources")
+    confounds = next(
+        (dataset.deriv_root / "sub-01" / "ses-1" / "func").glob("*run-1_desc-confounds*")
+    )
+    confounds.write_text(confounds.read_text() + "\n")  # a new version, which is refused
+    for _ in range(2):
+        fake = FakeS3(buckets)
+        fake.fault("*/sub-01/ses-1/func/*run-1_desc-confounds*", "403", times=None)
+        remote_review(fake, run_dir).close()
+        after = runs_by_name(run_dir)
+        assert after == before
+        with Run(run_dir) as run:
+            assert run._catalog.query("SELECT deriv_root FROM func_sources") == [tree]
+        assert Path(tree["deriv_root"]).is_dir()
+
+
+def test_a_refused_listing_of_a_participant_leaves_the_surfaces_going(
     tmp_path: Path, buckets: dict, capsys: pytest.CaptureFixture[str]
 ) -> None:
     fake = FakeS3(buckets)
-    fake.fault("*/sub-01/ses-1/func/*task-rest_run-1_bold.nii.gz", "403", times=None)
+    fake.fault(f"{FAKE_ACCESSION}/sub-01/", "403", times=None, methods=("LIST",))
     run_dir = tmp_path / "run"
-    remote_review(fake, run_dir, epi=True).close()
-    assert "1 functional file(s) of the bucket could not be fetched" in capsys.readouterr().err
-    rows = runs_by_name(run_dir)
-    assert rows[("sub-01", "ses-1_task-rest_run-1")]["reason"] == "no raw series"
-    assert sum(1 for row in rows.values() if row["pack_status"] == "done") == 10
+    with remote_review(fake, run_dir, epi=True) as run:
+        assert reviewing.render_counts(run)[0] == 2
+    err = capsys.readouterr().err
+    line = next(line for line in err.splitlines() if line.startswith("To fetch:"))
+    assert "the functional files could not be listed" in line
+    assert "could not all be fetched (listing: HTTP 403" in err
+    assert functional_rows(run_dir) == 0
+    with remote_review(FakeS3(buckets), run_dir) as run:
+        assert run._catalog.query("SELECT count(*) AS n FROM packs")[0]["n"] == 11
 
 
 def test_an_interrupt_during_the_functional_downloads_leaves_nothing_partial(
@@ -460,8 +551,7 @@ def test_prune_cache_keeps_the_tree_and_its_objects_and_removes_an_old_tree(
 
     retained = run_dir / CACHE_DIR / RETAINED
     with Run(run_dir) as run:
-        (row,) = run._catalog.query("SELECT deriv_root FROM func_sources")
-        tree = Path(row["deriv_root"]).parent
+        tree = own_tree(run_dir)
         old = retained / "ab" / ("ab" + "0" * 30) / "func"  # an earlier tree of the run
         shutil.copytree(tree, old)
         stray = retained / "cd" / ("cd" + "1" * 30)
@@ -504,19 +594,34 @@ def test_the_raw_client_is_behind_the_read_only_guard(buckets: dict) -> None:
     assert fake.signed == [] and fake.log == []
 
 
-def test_the_accession_is_only_where_it_is_allowed(prepared: Path) -> None:
-    """Outside ``catalog.sqlite`` and the bucket's files kept under ``cache/`` (whose names
-    alone are searched), no file of the run names the accession or a bucket key."""
+def test_the_accession_is_only_where_it_is_allowed(prepared: Path, buckets: dict) -> None:
+    """Outside ``catalog.sqlite`` and the bucket's files kept under ``cache/`` as they are,
+    no file of the run names the accession or a bucket key: the files of ``cache/`` that are
+    not a bucket file byte for byte (``.objects.json`` among them) are searched as well."""
+    import hashlib
+
+    fake = FakeS3(buckets)
+    as_is = {
+        hashlib.md5(fake.buckets[bucket].joinpath(*key.split("/")).read_bytes()).hexdigest()
+        for bucket in buckets
+        for key in fake.keys(bucket)
+    }
+    searched_in_cache = 0
     for path in sorted(prepared.rglob("*")):
         relative = path.relative_to(prepared)
         if path.name.startswith("catalog.sqlite"):
             continue
         assert FAKE_ACCESSION not in relative.as_posix(), relative
-        if relative.parts[0] == CACHE_DIR or not path.is_file():
+        if not path.is_file():
             continue
         content = path.read_bytes()
+        if relative.parts[0] == CACHE_DIR:
+            if hashlib.md5(content).hexdigest() in as_is:
+                continue  # a file of the bucket as it is
+            searched_in_cache += 1
         for word in (FAKE_ACCESSION, "s3://", "fmriprep/ds"):
             assert word.encode() not in content, (relative, word)
+    assert searched_in_cache >= 1  # the tree's .objects.json at least
     assert "epi" in load_config(prepared).model_dump()
 
 
@@ -556,3 +661,182 @@ def test_the_commands_on_a_remote_run_with_the_epi_interface(
         assert "not selected (--epi-runs)" in result.output
         result = cli("inventory", "--run-dir", run_dir, "--epi-runs", "*no-such*")
         assert result.exit_code == 2 and "--epi-runs" in result.output
+
+
+# --- the review of D50: guard, times, copies, and what the earlier tests let pass ------------
+
+
+def test_the_guard_holds_for_the_epi_interface_turned_on_for_an_existing_run(
+    tmp_path: Path, buckets: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    remote_review(FakeS3(buckets), run_dir).close()
+    text = (run_dir / CONFIG_FILE).read_text()
+    monkeypatch.setattr(reviewing, "REMOTE_GUARD_BYTES", 1_000_000)  # the functions: 7.5 MB
+    fake = FakeS3(buckets)
+    with pytest.raises(ConfigError, match=r"functional files.*--subjects"):
+        remote_review(fake, run_dir, epi=True)
+    assert gets(fake, RAW_BUCKET) == []
+    assert (run_dir / CONFIG_FILE).read_text() == text  # nothing stored
+    with remote_review(FakeS3(buckets), run_dir, epi=True, subjects=["*"]) as run:
+        assert run._catalog.query("SELECT count(*) AS n FROM packs")[0]["n"] == 11
+
+
+def test_the_times_of_the_tree_are_those_of_the_bucket(prepared: Path, buckets: dict) -> None:
+    """The planner hashes size and modification time; the tree's are the listing's
+    ``LastModified`` (the fake's file time, to the millisecond), not the download time."""
+    with Run(prepared) as run:
+        (row,) = run._catalog.query("SELECT raw_root FROM func_sources")
+    raw = Path(row["raw_root"])
+    series = next(raw.rglob("*_bold.nii.gz"))
+    origin = buckets[RAW_BUCKET] / FAKE_ACCESSION / series.relative_to(raw)
+    listed = origin.stat().st_mtime_ns // 1_000_000 * 1_000_000
+    assert series.stat().st_mtime_ns == listed
+
+
+def test_a_cache_fetched_again_packs_nothing_again(run_dir: Path, buckets: dict) -> None:
+    before = runs_by_name(run_dir)
+    shutil.rmtree(run_dir / CACHE_DIR / RETAINED)
+    fake = FakeS3(buckets)
+    with Run(run_dir, transport=fake.transport()) as run:
+        run.inventory()
+        report = run.func_inventory()
+        assert (report.done, report.skipped) == (0, 3)
+        assert run.pack().done == 0
+    assert len(gets(fake)) > 100  # every file fetched again
+    after = runs_by_name(run_dir)
+    for key, row in after.items():
+        assert row["content_digest"] == before[key]["content_digest"], key
+        assert row["packed_at"] == before[key]["packed_at"], key
+
+
+def test_a_copied_run_without_its_tree_reads_no_other_run_and_names_the_remedy(
+    run_dir: Path, tmp_path: Path
+) -> None:
+    from typer.testing import CliRunner
+
+    from surfcensus.cli import app
+
+    copy = Path(shutil.copytree(run_dir, tmp_path / "copy"))
+    shutil.rmtree(copy / CACHE_DIR / RETAINED)
+    next((copy / "epi").glob("*/*/session.json")).unlink()  # a session of the copy pending
+    shutil.move(run_dir, tmp_path / "elsewhere")
+    result = CliRunner().invoke(app, ["pack", "--run-dir", str(copy)])
+    assert result.exit_code == 2, result.output
+    assert "not in its cache" in result.output
+    assert f"surfcensus review {TEXT} --epi" in result.output
+    with Run(copy) as run:
+        (row,) = run._catalog.query("SELECT deriv_root FROM func_sources")
+    assert Path(row["deriv_root"]).is_relative_to(copy)
+
+
+def test_a_tree_file_that_lost_bytes_is_built_again(run_dir: Path, buckets: dict) -> None:
+    raw = own_tree(run_dir) / "raw"
+    series = next(raw.rglob("*_bold.nii.gz"))
+    place, size = series.relative_to(raw), series.stat().st_size
+    with series.open("r+b") as stream:  # a copy of a run: the tree holds copies, not links
+        stream.truncate(size // 2)
+    fake = FakeS3(buckets)
+    with Run(run_dir, transport=fake.transport()) as run:
+        run.inventory()
+        run.func_inventory()
+        (row,) = run._catalog.query("SELECT raw_root FROM func_sources")
+    # the tree is not whole and is built again from the retained object, which is
+    assert [key for key in gets(fake) if "/func/" in key] == []
+    assert (Path(row["raw_root"]) / place).stat().st_size == size
+
+
+def test_the_estimate_does_not_count_the_contour_files_twice(
+    tmp_path: Path, buckets: dict, folder: SyntheticFuncDataset, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    found: dict[str, Any] = {}
+    surface = reviewing.remote_estimate
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        estimate = surface(*args, **kwargs)
+        found["func" if kwargs.get("epi") else "plain"] = estimate
+        return estimate
+
+    monkeypatch.setattr(reviewing, "remote_estimate", spy)
+    remote_review(FakeS3(buckets), tmp_path / "plain").close()
+    remote_review(FakeS3(buckets), tmp_path / "func", epi=True).close()
+    places = ("mri/T1.mgz", "surf/lh.white", "surf/rh.white", "surf/lh.pial", "surf/rh.pial")
+    shared = sum(
+        (folder.fs_subjects_dir / subject / place).stat().st_size
+        for subject in ("sub-01", "sub-02")
+        for place in places
+    )
+    assert found["plain"].renders - found["func"].renders == shared
+
+
+def test_a_continued_run_counts_the_functional_files_and_not_the_contours_twice(
+    tmp_path: Path,
+    buckets: dict,
+    folder: SyntheticFuncDataset,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_dir = tmp_path / "run"
+    remote_review(FakeS3(buckets), run_dir, subjects=["sub-01"]).close()
+    capsys.readouterr()
+    seen: dict[str, int] = {}
+    line_of = reviewing.continued_line
+
+    def spy(run: Run, **kwargs: Any) -> str:
+        seen["renders"] = sum(run.remote_pending()[1].values())
+        return line_of(run, **kwargs)
+
+    monkeypatch.setattr(reviewing, "continued_line", spy)
+    remote_review(FakeS3(buckets), run_dir, subjects=["*"], epi=True).close()
+    line = next(line for line in capsys.readouterr().err.splitlines() if "To fetch" in line)
+    assert "of it the functional files of 2 subjects" in line
+    # a render leases the brainmask alone: the tree holds the T1 and the surfaces
+    # without a pinned template the plan is an upper bound over every complete subject
+    masks = sum(
+        (folder.fs_subjects_dir / subject / "mri" / "brainmask.mgz").stat().st_size
+        for subject in ("sub-01", "sub-02")
+    )
+    assert seen["renders"] == masks
+
+
+def test_without_hard_links_a_tree_built_again_keeps_every_hash(
+    run_dir: Path, buckets: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def no_link(*args: Any, **kwargs: Any) -> None:
+        raise OSError(1, "no hard links here")
+
+    shutil.rmtree(own_tree(run_dir))  # the tree alone; its objects stay
+    monkeypatch.setattr(os, "link", no_link)
+    fake = FakeS3(buckets)
+    with Run(run_dir, transport=fake.transport()) as run:
+        run.inventory()
+        report = run.func_inventory()
+        assert (report.done, report.skipped) == (0, 3)
+    assert [k for k in gets(fake) if "/func/" in k] == []
+
+
+def test_the_sessions_table_is_fetched_and_orders_the_stream(tmp_path: Path) -> None:
+    from synth_func import write_session_dates  # pyrefly: ignore[missing-import]
+
+    dataset = write_review_folder(tmp_path / "data")
+    dates = {"1": "1900-01-03T10:00:00", "2": "1900-01-02T10:00:00"}
+    write_session_dates(dataset.raw_root, "sub-01", sessions=dates)
+    buckets = lay_out(dataset, tmp_path / "buckets")
+    with remote_review(FakeS3(buckets), tmp_path / "run", epi=True) as run:
+        (row,) = run._catalog.query(
+            "SELECT session_order FROM func_participants WHERE participant = 'sub-01'"
+        )
+        (root,) = run._catalog.query("SELECT raw_root FROM func_sources")
+    assert row["session_order"] == "acquisition time"
+    assert (Path(root["raw_root"]) / "sub-01" / "sub-01_sessions.tsv").is_file()
+
+
+def test_the_disk_keeps_a_margin_beside_the_functional_files(
+    tmp_path: Path, buckets: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_dir = tmp_path / "run"
+    remote_review(FakeS3(buckets), run_dir).close()
+    need = 7_600_000  # a little more than the functional files of the folder (7.5 MB)
+    monkeypatch.setattr(run_module, "free_bytes", lambda path: need + 100_000)
+    with pytest.raises(ConfigError, match="beside room for what the phases write"):
+        remote_review(FakeS3(buckets), run_dir, epi=True)

@@ -78,7 +78,8 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
         "stored_read_places": ("config",),
     },
     "surfcensus.func.inventory": {
-        "run_func_inventory": ("catalog", "sources", "config", "key", "force"),
+        # skip: datasets of a bucket whose functional files could not all be fetched (D50)
+        "run_func_inventory": ("catalog", "sources", "config", "key", "force", "skip"),
         "session_work": ("facts", "config"),
         "func_fetch_lines": ("catalog",),
     },

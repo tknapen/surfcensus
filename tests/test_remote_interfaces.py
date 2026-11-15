@@ -160,6 +160,7 @@ INTERFACE: dict[str, dict[str, tuple[str, ...] | None]] = {
     },
     "surfcensus.run": {
         "remote_index": ("config", "accession"),
+        "func_fault_note": ("record", "exc"),
         "from_config": (
             "config",
             "run_config",
@@ -212,6 +213,7 @@ METHODS: dict[type, dict[str, tuple[str, ...]]] = {
         "func_size": ("dataset",),
         "func_tree": ("dataset",),
         "func_stems": ("dataset",),
+        "func_object_names": ("dataset",),
         "stop": (),
         "close": (),
     },
