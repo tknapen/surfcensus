@@ -84,6 +84,7 @@ surfcensus/
     privacy.py             # keyed pseudonyms, subject_uid, render keys, scrubbing; dataset key, reveal mapping
     protocol.py            # the rating protocol of a run (protocol.yaml): scale, criteria, keys, unratable reasons
     calibration.py         # the calibration set of a run (calibration.yaml)
+    inputs.py              # the input set (inputs.yaml): files named by patterns per data type (O31; not yet used by a command)
     review.py              # `surfcensus review`: inventory, metrics, selection, render, app (milestone 4)
     stopping.py            # SIGTERM and Ctrl-C of the commands: a stop flag without a lock, SIG_IGN at the end
     store.py               # SQLite catalog (private Catalog, PublicCatalog) + parquet tables; schema migrations
