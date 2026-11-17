@@ -116,16 +116,30 @@ I1 and I2 on `epi-session` are the first useful slice, as step 1 of the EPI inte
 
 ## Decisions for Tomas
 
-Each with the proposed default.
+Each with the proposed default, and his answer where he gave one (2026-11-17).
 
-1. Which data prompt this: fMRIPrep output that lies somewhere unusual, or the output of another pipeline, or data without BIDS names. The first needs I1 and I3 only; the others need I2. Default: plan for all three, build in the order above.
-2. Pairing. Default: BIDS entities, else named fields in the patterns, else stop; sorted order only on request.
-3. A run without a stored transform. Default: not packed, unless the user states that raw and preprocessed share a frame; the tool never estimates a registration.
-4. A run without a mask, a confounds table or a report. Default: packed, with what is missing said on the page.
-5. Transform formats beyond ITK text. Default: none until a pipeline is named.
+1. Which data prompt this: fMRIPrep output that lies somewhere unusual, or the output of another pipeline, or data without BIDS names. The first needs I1 and I3 only; the others need I2. Default: plan for all three, build in the order above. His answer: "our own, non-fmriprep data with bids-like but idiosyncratic filename formatting". So I1 and I2 are the steps that matter, and the named fields of the patterns carry the pairing.
+2. Pairing. Default: BIDS entities, else named fields in the patterns, else stop; sorted order only on request. His answer: "fair enough - good proposal". In force.
+3. A run without a stored transform. Default: not packed, unless the user states that raw and preprocessed share a frame; the tool never estimates a registration. His question in reply: "should we point to this transform separately then? i thought you were doing a rigid-body coregistration to the freesurfer anatomy on a per-session basis." Open; see "The registration of a session" below.
+4. A run without a mask, a confounds table or a report. Default: packed, with what is missing said on the page. His answer: "sounds good". In force.
+5. Transform formats beyond ITK text. Default: none until a pipeline is named. His answer: "yeah let's defer building that for now". In force, with a consequence that follows from answer 1: if the transforms of his own pipeline are not ITK text, the way (a) below needs a reader for their format after all, or a conversion of them to ITK text outside the tool.
 6. The setup page as a directory browser served by the local app, with a token. Default: yes; no uploads, no native dialog.
 7. Whether a bare `surfcensus review` opens the setup page, or a command of its own does. Default: both `review` without a path and `surfcensus open`.
 8. Surface files by role (I5). Default: last, since a FreeSurfer subject directory covers the usual case.
+
+Decisions 6 to 8 were not answered and keep their defaults.
+
+## The registration of a session
+
+What the tool does today, read in the code (`func/connectors/fmriprep.py`, `Connector.raw_to_anat` and `anat_to_fsnative`; `func/session.py`): it estimates no registration. The one rigid placement per session of D36 is the transform fMRIPrep stored for the session's anchor run (`from-scanner_to-T1w`, an ITK text file, written by fMRIPrep's boundary-based registration of that run's reference volume to the T1w), applied unchanged to the raw series of every run of the session; the contours come through fMRIPrep's `from-T1w_to-fsnative`. Nothing in `func/` registers, optimises or resamples to find a placement. That is how the building session read his decision of 2026-11-13 ("single per session registration to the anatomy"), and D36 records it so. With fMRIPrep output the viewer therefore shows the quality of fMRIPrep's registration of the anchor run, which is part of the quality control of the preprocessing.
+
+For data of another pipeline there are two ways to get that placement.
+
+(a) The user points to it. A pattern per data type, as for the other companions (`--xfm-files '/data/prep/{sub}/{ses}/{run}_to_anat.txt'`), per run or per session; the anchor rule picks the transform of the session's first run, as now. The placement is then the pipeline's own, as with fMRIPrep, and the viewer says where it was read. Cost: little in the planner (one more role from the input set). With answer 5 only ITK text is read, so this works today only if his pipeline writes ITK text, or if he converts its transforms (with ANTs, nitransforms or FreeSurfer's `lta_convert`) before pointing at them. A reader of the pipeline's own format (FSL `.mat`, FreeSurfer `.lta`, AFNI `.1D`) is one module with a convention check on real files of that pipeline; an FSL matrix also needs the geometry of both images it was estimated between.
+
+(b) The tool estimates it: a rigid registration, per session, of a reference volume of the anchor run's raw series to the anatomy, or to the mean of the preprocessed anchor run when that series already lies in the anatomy's space (then an EPI-to-EPI fit of one contrast, which is easier than EPI to T1). Cost: a new algorithm in the package, with an optimiser, a cost function, a deterministic start and a check that it converged, and its own failure cases (dropout, a field of view that cuts the occipital lobe, a very short run). And a question of meaning that D36 raises: the placement would then be the tool's and not the pipeline's, so what the viewer shows as the raw stream's misfit to the contours would be in part the error of our fit; and because a fit minimises misfit, it would absorb some of the very difference between the streams that the viewer exists to show (distortion that the pipeline corrected, most of all). The raw stream would still be resampled once and nothing else would be done to it.
+
+Proposed: (a), with a reader of the format his pipeline writes as the first exception to answer 5 once he names the pipeline; (b) only if he wants it, as an option that is off by default and that the page names wherever it names the registration ("placement estimated by surfcensus, not stored by the pipeline"). Neither is built until he answers.
 
 ## What is not known
 
