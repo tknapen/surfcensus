@@ -8,57 +8,115 @@ Near the occipital pole, FreeSurfer's pial and white surfaces often absorb the s
 
 Milestones 1 to 4 of 6 are built: rendering one subject; inventorying, scoring and rendering a directory of subjects into a run directory; and the rating app for one researcher's own data, with `surfcensus review` and `surfcensus export`, which since the quick-start follow-up installs in one line and finds the subjects of a downloaded or DataLad-cloned dataset by itself. `surfcensus review openneuro:dsXXXXXX` does the same for a dataset of the public OpenNeuroDerivatives bucket that is not on disk. The census over OpenNeuro, several raters at once and the normative reference are planned and do not exist yet. Nobody has rated a brain with the app so far: it was tested by scripts that drive a browser, on synthetic subjects and on two real ones. The scores have been run on real subjects but not yet compared with anyone's judgment of the surfaces, so they say which subjects stand out on the numbers, not which have an error. The package is not on PyPI. The specification is in `docs/`; the build order and what has been checked are in `CLAUDE.md`.
 
-## Quick start
+## Getting started
 
-One line, with [uv](https://docs.astral.sh/uv/), and nothing to install first:
+The app has two interfaces. The surface interface shows FreeSurfer's white and pial surfaces over the T1 around the occipital pole, and you rate them. The EPI movies show the raw and the preprocessed EPI series of every functional run, one stream over all runs and sessions of a subject, with the surfaces as contours, for quality control of the raw data and of the preprocessing. `surfcensus review` prepares both and opens them in your browser.
 
-```
-uvx --from git+https://github.com/tknapen/surfcensus surfcensus review /path/to/your/data
-```
+### 1. Get the code
 
-Or install the package into an environment of yours (Python 3.11 or later) and run the command:
+You need Python 3.11 or later, `git` and [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh` installs it). No FreeSurfer installation or licence is needed.
 
-```
-pip install git+https://github.com/tknapen/surfcensus
-surfcensus review /path/to/your/data
+```bash
+git clone https://github.com/tknapen/surfcensus.git
 ```
 
-The package is not on PyPI yet, so both lines name the repository and need `git`. Once it is, they are `uvx surfcensus review PATH` and `pip install surfcensus`. That is the whole install: the rating app is part of the package and needs no extra (`"surfcensus[app]"`, the form these docs gave earlier, installs the same). No FreeSurfer installation or licence is needed.
-
-What the folder may be. `review` finds the FreeSurfer subjects itself in any of these:
-
-- a FreeSurfer `SUBJECTS_DIR` (folders with `mri/` and `surf/`), or one subject directory;
-- an fMRIPrep output folder (`sourcedata/freesurfer/`, or the older `freesurfer/` beside `fmriprep/`);
-- a BIDS dataset as OpenNeuro hands it out, with the FreeSurfer subjects below `derivatives/`: `derivatives/freesurfer/`, `derivatives/fmriprep/sourcedata/freesurfer/`, `derivatives/fmriprep/freesurfer/`, and the same under other folder names (`derivatives/fmriprep-21.0.2/...`). The first line it prints says where it found them, for example `Found 2 subjects in derivatives/fmriprep/sourcedata/freesurfer (fMRIPrep layout, FreeSurfer 6.0.1, 7.3.2).` When subjects lie in more than one place, it takes the first and names the others with the folder to give for each.
-
-What happens. The command lists and scores the subjects, renders the first one and opens the rating app in your browser at `http://127.0.0.1:8765/`; the other subjects are rendered while you rate. Measured on 2026-11-14 on one 4-core Linux machine, in an environment just made from the wheel: 17 s from the command to the app for a BIDS dataset root over two real subjects, of which the first imports of a fresh environment take part; 1 s when you come back to the same run.
-
-Files that are not fetched. A dataset cloned with DataLad (or `git clone` of a git-annex repository) holds its files by name before their content is fetched. `review` fetches nothing and changes nothing in the dataset: it names the subjects whose files have no content, the size, and one command that fetches them, for example `Fetch them (28.5 MB) with: datalad -C /data/ds000102 get derivatives/fmriprep/sourcedata/freesurfer/sub-01/mri/T1.mgz ...`. A subdataset that is not installed (an empty `derivatives/`) gets the command that installs it (`datalad -C /data/ds000102 get -n derivatives`). Run the command, then the same `review` again: the subjects are picked up without further options. A subject that cannot be rendered is shown to nobody and is listed as unratable with its reason.
-
-Where your work goes. Your data is only read: nothing is written into the dataset, a subject directory or the directory that holds your subjects. Everything goes into a run directory, `surfcensus-run` beside the folder you named, or beside the dataset that holds it, never inside it: a BIDS dataset with the subjects below its `derivatives/`, an fMRIPrep output with a `dataset_description.json`, or a DataLad dataset (`--run-dir DIR` puts it elsewhere). A plain git repository is not recognised, so in one the run can land inside its work tree; give `--run-dir` there. Two datasets in one folder would share that `surfcensus-run`: the second is told which `--run-dir` to give (`surfcensus-run` with the dataset's name in front), and is found there the next time. Ratings and marks are in `app.sqlite` there; `surfcensus export --run-dir /path/to/surfcensus-run` writes them as tables (below). Ctrl-C stops the app, and the same command again continues where you were.
-
-A dataset that is not on your disk. For a dataset of the OpenNeuroDerivatives bucket (fMRIPrep output of OpenNeuro datasets, with its FreeSurfer subjects), name it instead of a folder:
-
-```
-surfcensus review openneuro:ds000102 --subjects 'sub-0[12]'
+```bash
+cd surfcensus
 ```
 
-The dataset is read anonymously and read-only (GET requests alone, at most 8 at once, no credential). The command lists it, says how much it will fetch from the listed sizes, fetches the files of a few subjects at a time into the run directory and removes them once they are scored and rendered. What it keeps is the renders, the scores and the small log and stats files. Measured on 2026-11-15 on one 4-core Linux machine: the rating screen of the two subjects above was up 20 s after the command, after 109 MB of downloads (148 MB in all, about 40 MB of it the `fsaverage` template that comes with the dataset), with at most 40 MB of subject files on disk at once; the renders and maps are byte for byte those of the same files on disk.
+```bash
+uv sync
+```
 
-- The run goes to `./ds000102-surfcensus-run` in the directory you are in (`--run-dir DIR` otherwise). The dataset's accession is in that name, in `catalog.sqlite` and in the text of the kept log files, and nowhere else in the run; the rating screen names no dataset.
-- `--subjects` takes shell patterns and is kept for later calls. Without it every subject of the dataset is reviewed: for `ds000102` (26 subjects) that is 460 MB before the rating screen and 1.4 GB in all. A new review that would fetch more than 2 GB before the rating screen stops and asks for `--subjects`; `--subjects '*'` means all of them.
-- Every call lists the dataset, so `review` needs the network also when everything is rendered. Without it, `surfcensus serve --run-dir ./ds000102-surfcensus-run` opens the rating app on what is rendered, with no request to the bucket. If the network fails while subjects are still being rendered behind the app, the rendering pauses, says so, and tries again every 30 s.
-- Ctrl-C stops it; the same command again goes on and fetches nothing twice that the run holds. On a small disk fewer subjects are fetched at a time; a disk that does not hold the files of one subject (about 40 MB) or the template is refused before anything is fetched for them.
-- Both interfaces in one command: `--epi` also fetches the raw and the preprocessed EPI series of the chosen subjects (from `s3://openneuro.org` and the derivative, read the same way) and packs them for the EPI movies, which the app offers at `/epi`:
+`uv run surfcensus --help` lists the commands. Every command below is run from the clone with `uv run` in front.
 
-  ```
-  uvx --from git+https://github.com/tknapen/surfcensus surfcensus review openneuro:ds000102 --subjects sub-01 --epi
-  ```
+Without a clone, `uvx --from git+https://github.com/tknapen/surfcensus surfcensus ...` runs the same commands in an environment that uv makes for the purpose. `pip install git+https://github.com/tknapen/surfcensus` installs the package into an environment of yours; leave `uv run` off then. The package is not on PyPI yet.
 
-  The functional files are fetched before the rating screen opens, so they delay it; the line `To fetch:` says by how much (`To fetch: 209.9 MB before the first rating screen (...), 143.1 MB of it the functional files of 1 subject for the EPI movies, ...`). Measured on 2026-11-15 for `ds000102` sub-01 on one 4-core Linux machine: the rating screen 20 s after the command (25 s in a second run on a busier machine), after 210 MB of downloads, both EPI movies ready 52 s (62 s) after the command; the same command again was at the app in under 3 s. When a functional file cannot be fetched, one line says so, the rating screen opens all the same, and the same command tries again. The functional files and the subject's T1 and surfaces stay in the run's cache (about 144 MB for this subject), as the bucket has them; nothing writes an image volume of its own. `--epi` is kept for later calls, `--no-epi` turns it off (and frees nothing: the files stay in the cache until you remove its folder), `--epi-runs GLOB` chooses the runs that are packed. Without `--epi` nothing is asked of the raw bucket.
-- Not for a remote dataset: `--raw`, `--field-strength` and `--relocate` are refused. `render-subject`, `epi-session` and `inventory --source` read folders only.
+### 2. An OpenNeuro dataset, without downloading it
 
-What the install costs, measured on 2026-11-14 on the same machine with a fast connection: `pip` on Python 3.13 installs 50 packages, 227 MB of downloads and about 0.8 GB on disk, in 28 s. With the packages already in uv's cache, the `uvx` form had the rating app of two synthetic subjects running 9 s after the command was given, and 2 s the second time.
+```bash
+uv run surfcensus review openneuro:ds000102 --subjects sub-01 --epi
+```
+
+This reviews `sub-01` of `ds000102` straight from the public buckets: the FreeSurfer subject and fMRIPrep files from the OpenNeuroDerivatives bucket, the raw series from `s3://openneuro.org`. Access is anonymous and read-only (GET requests only, at most 8 at a time, no credential). Before fetching anything, the command says how much it will fetch, estimated from the listed sizes. Then it fetches, scores and renders, and opens the rating screen at `http://127.0.0.1:8765/`. The EPI movies are at `http://127.0.0.1:8765/epi` (printed as `EPI movies:`) and are packed behind the rating screen.
+
+- Measured on 2026-11-15 for this command on one 4-core Linux machine: the rating screen 20 to 25 s after the command, after 210 MB of downloads, and both EPI movies ready after 52 to 62 s.
+- Leave out `--epi` for the surfaces alone: nothing is then asked of the raw bucket, and the download is much smaller (about 110 MB before the rating screen for two subjects).
+- `--subjects` takes shell patterns (`'sub-0[1-5]'`; `'*'` for all) and is kept for later calls. A new review that would fetch more than 2 GB before the rating screen stops and asks for `--subjects`.
+- The EPI movies need an fMRIPrep derivative with T1w-space series. In OpenNeuroDerivatives those are the derivatives made with fMRIPrep below 23.2; for other datasets the surfaces are reviewed and the functional runs are listed with the reason they cannot be shown.
+- The work goes into `./ds000102-surfcensus-run`, or `--run-dir DIR`. The files of each batch of subjects are removed once they are scored and rendered. Kept: the renders, the scores, the small log and stats files, and with `--epi` the functional files and the surfaces of the contours.
+- Ctrl-C stops it. The same command again goes on and fetches nothing twice; it needs the network to list the dataset. Without a network, `uv run surfcensus serve --run-dir ./ds000102-surfcensus-run` opens the app on what is there.
+
+### 3. An OpenNeuro subject, downloaded
+
+```bash
+uv run python scripts/fetch_example.py data
+```
+
+This fetches `ds000102` sub-01 (about 160 MB, the same public buckets, anonymous) into `data/ds000102`, laid out as a BIDS dataset: the raw functional series and their sidecars, and below `derivatives/fmriprep/` what surfcensus reads of the fMRIPrep derivative, the FreeSurfer subject in `sourcedata/freesurfer/` included. `--dataset dsNNNNNN --subject LABEL` fetches one subject of another dataset that OpenNeuroDerivatives has an fMRIPrep derivative of. A file that is already there is not fetched again. Then:
+
+```bash
+uv run surfcensus review data/ds000102
+```
+
+This is the same review as in step 2, read from disk, with the run directory at `data/surfcensus-run`. The `fsaverage` template is not part of the download, so the subject is ranked without per-location scores (see `metrics` below); `--fsaverage DIR` names one.
+
+### 4. A BIDS dataset with fMRIPrep derivatives of your own
+
+```bash
+uv run surfcensus review /path/to/mystudy
+```
+
+`review` finds everything below the dataset root by itself. For both interfaces the dataset looks like this:
+
+```
+mystudy/
+  dataset_description.json
+  sub-01/ses-1/func/sub-01_ses-1_task-rest_run-1_bold.nii.gz   (and its .json)
+  derivatives/fmriprep/
+    dataset_description.json
+    sub-01/anat/sub-01_from-T1w_to-fsnative_mode-image_xfm.txt
+    sub-01/ses-1/func/sub-01_ses-1_task-rest_run-1_space-T1w_desc-preproc_bold.nii.gz
+                      ..._space-T1w_desc-brain_mask.nii.gz
+                      ..._desc-confounds_timeseries.tsv
+                      ..._from-scanner_to-T1w_mode-image_xfm.txt
+    sub-01/figures/..._desc-summary_bold.html
+    sourcedata/freesurfer/sub-01/   (mri/, surf/, label/, stats/, scripts/)
+    sourcedata/freesurfer/fsaverage/
+```
+
+That is the output of fMRIPrep run with FreeSurfer and with `T1w` among its `--output-spaces`. It has been tried on real output of fMRIPrep versions from 20.2 to 23.0; the file names of 23.2 and later are recognised, but no real derivative of those versions has been tried.
+
+- The raw dataset is found as the dataset root above `derivatives/`, or inside the derivative at `sourcedata/raw/`; when it lies elsewhere, name it with `--raw /path/to/raw_bids`.
+- The surfaces alone need only the FreeSurfer subjects. `review` takes a FreeSurfer `SUBJECTS_DIR`, one subject directory, an fMRIPrep output folder (`sourcedata/freesurfer/`, or the older `freesurfer/` beside `fmriprep/`), or a dataset root like the one above, and the folders below `derivatives/` may have other names (`derivatives/fmriprep-21.0.2/...`). The first line it prints says where it found the subjects. With fewer than 30 subjects, or without an `fsaverage` (next to the subjects, in `$FREESURFER_HOME`, or `--fsaverage DIR`), subjects are ranked on two raw numbers only, and the command says so.
+- A DataLad clone whose files are not fetched: `review` fetches nothing and changes nothing in it. It names the files that have no content and prints one `datalad ... get` command that fetches them; run that, then the same `review` again.
+- The work goes into `surfcensus-run` beside the dataset, never inside it, or `--run-dir DIR`. Nothing is written into your data.
+- The EPI movies of one subject without a run directory: `uv run surfcensus epi-session /path/to/mystudy --subject 01 --out epi-sub-01 --serve`.
+
+### 5. On a server
+
+The app listens on `127.0.0.1` of the machine it runs on, and loads nothing from the internet. On a server, start it without a browser:
+
+```bash
+uv run surfcensus review /path/to/mystudy --no-browser --port 8790
+```
+
+and forward the port from your own machine:
+
+```bash
+ssh -N -L 8790:127.0.0.1:8790 you@yourserver
+```
+
+Then open `http://127.0.0.1:8790/` on your machine. When the port is taken on the server, `review` takes the next free one and prints it on the line `Rating app: http://127.0.0.1:NNNN/`; forward that port instead. When it is taken on your own machine, `ssh` says `bind: Address already in use`; use another local number (`-L 9000:127.0.0.1:8790`, then `http://127.0.0.1:9000/`).
+
+### 6. Afterwards
+
+- Ctrl-C stops the app. The same command again continues where you were; `uv run surfcensus serve --run-dir DIR` opens a run that is ready without preparing anything.
+- `uv run surfcensus status --run-dir DIR` says what is rendered, packed, failed or waiting; `--failures` names the failures and their reasons.
+- `uv run surfcensus export --run-dir DIR` writes the ratings, marks, scores and, with functional data, `func_sessions` and `func_runs` as tables into `DIR/export/` (below).
+- Two people can rate one run one after the other (`--rater NAME`); `uv run surfcensus finalize --run-dir DIR` then writes the labels they agree on.
+
+What the install costs, measured on 2026-11-14 on one 4-core Linux machine with a fast connection: 50 packages, 227 MB of downloads and about 0.8 GB on disk.
 
 ## What works today
 
