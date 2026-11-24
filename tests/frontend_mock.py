@@ -509,8 +509,12 @@ def create_mock_app(state: MockState) -> FastAPI:
         return HTMLResponse(text, headers={"Cache-Control": "no-cache"})
 
     @app.get("/")
-    def rate_page() -> Response:
+    def home_page() -> Response:
         return page("/")
+
+    @app.get("/rate")
+    def rate_page() -> Response:
+        return page("/rate")
 
     @app.get("/review")
     def review_page() -> Response:

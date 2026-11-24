@@ -614,6 +614,58 @@ class HealthOut(_Shape):
     version: str
 
 
+# --- the start page -------------------------------------------------------------------------
+
+
+class HomeSurfacesOut(_Shape):
+    """The surface interface on the start page: where the rating screen is and how far the
+    rater is. The counts are those of the progress line of the rating screen
+    (:class:`ProgressOut`), so the start page shows nothing a rater does not see there."""
+
+    url: str
+    """``/rate``, the rating screen."""
+    n_subjects: int = Field(ge=0)
+    rendered: int = Field(ge=0)
+    done_total: int = Field(ge=0)
+    remaining: int = Field(ge=0)
+    skipped: int = Field(ge=0)
+    review_url: str | None = None
+    """``/review`` when the review screen is open to the rater now; None otherwise."""
+
+
+class HomeFunctionalOut(_Shape):
+    """The EPI interface on the start page. ``offered`` is false in a run without functional
+    data, with the EPI interface off, and in a census run. While the EPI pages are closed to
+    the rater (a blind run, or a second rater, with subjects left to rate) ``closed`` says so
+    and the counts are 0, since the EPI pages are unblinded."""
+
+    offered: bool
+    url: str | None = None
+    """``/epi``, the index of the EPI movies, when it is open to the rater now."""
+    subjects_url: str | None = None
+    """``/subjects``, the subject pages, when they are open to the rater now."""
+    closed: str | None = None
+    n_participants: int = Field(default=0, ge=0)
+    n_runs: int = Field(default=0, ge=0)
+    n_packable: int = Field(default=0, ge=0)
+    n_packed: int = Field(default=0, ge=0)
+    n_pending: int = Field(default=0, ge=0)
+    n_failed: int = Field(default=0, ge=0)
+
+
+class HomeOut(_Shape):
+    """``GET /api/home``: the start page of the app, from which both interfaces are reached.
+    It names no subject, dataset or score."""
+
+    rater: str
+    blind: bool
+    surfaces: HomeSurfacesOut
+    functional: HomeFunctionalOut
+    poll_s: float | None = None
+    """How long the page waits before it asks again, while subjects are still rendered or
+    runs still packed behind the app; None when nothing is."""
+
+
 # --- routes ---------------------------------------------------------------------------------
 
 
@@ -635,15 +687,16 @@ class Route(NamedTuple):
 
 
 NAV_LABELS: dict[str, str] = {
+    "home": "start",
     "rate": "rating screen",
     "subjects": "subjects",
     "review": "review",
     "epi": "EPI movies",
 }
-"""The one name of each page that the pages link to one another by: the rating screen, the
-subjects page, the review screen and the index of the EPI movies. Every template gets it as
-``nav`` (a global of the template environment), so that a page is called the same on every
-page (review of step 3, F5)."""
+"""The one name of each page that the pages link to one another by: the start page, the rating
+screen, the subjects page, the review screen and the index of the EPI movies. Every template
+gets it as ``nav`` (a global of the template environment), so that a page is called the same
+on every page (review of step 3, F5)."""
 
 
 SUBJECT_ROUTES: tuple[Route, ...] = (
@@ -663,6 +716,8 @@ that the routes of the EPI pages stay those whose path starts with ``/epi`` or `
 
 ROUTES: tuple[Route, ...] = (
     Route("GET", "/"),
+    Route("GET", "/rate"),
+    Route("GET", "/api/home", HomeOut),
     Route("GET", "/review", unblinded=True),
     Route("GET", "/static/{path}"),
     Route("GET", "/media/{subject_uid}/{path}"),
@@ -685,7 +740,8 @@ ROUTES: tuple[Route, ...] = (
     *SUBJECT_ROUTES,
 )
 """Every route of the app (local mode). The server serves these and no other, and the
-frontend calls none that is not here: ``/`` and ``/review`` are the pages, ``/static`` the
+frontend calls none that is not here: ``/`` (the start page, which leads to both interfaces),
+``/rate`` (the rating screen) and ``/review`` are the pages, ``/static`` the
 frontend files, ``/media`` the files of a render that :data:`MEDIA_FILE` names,
 ``/api/export`` the ratings as CSV.
 

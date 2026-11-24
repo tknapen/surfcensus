@@ -140,8 +140,11 @@ modules that make no request outside the server."""
 STATIC_URL = "/static"
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 """The pages: ``base.html``, and :data:`PAGES` that extend it."""
-PAGES: dict[str, str] = {"/": "rate.html", "/review": "review.html"}
-"""Route -> template. A page is rendered with ``static`` (:data:`STATIC_URL`, the prefix of
+PAGES: dict[str, str] = {"/": "home.html", "/rate": "rate.html", "/review": "review.html"}
+RATE_URL = "/rate"
+"""The rating screen. ``/`` is the start page, which leads to it and to the EPI movies."""
+HOME_API = "/api/home"
+"""Route -> template, above. A page is rendered with ``static`` (:data:`STATIC_URL`, the prefix of
 every script and stylesheet it loads), ``version`` (the package version, which a page
 appends to those URLs as ``?v=``) and ``mode``, and with nothing about a subject:
 everything else arrives through the API. The EPI pages are not among them:
@@ -174,7 +177,8 @@ _CLOSED_PAGE = (
     "<title>surfcensus: {title}</title>\n"
     '<link rel="icon" href="data:,">\n<link rel="stylesheet" href="{static}/app.css">\n'
     '</head>\n<body>\n<main class="review">\n<p class="message" role="status">{message}</p>\n'
-    '<p><a href="/">Back to the rating screen</a></p>\n</main>\n</body>\n</html>\n'
+    '<p><a href="/rate">Back to the rating screen</a> · <a href="/">start</a></p>\n'
+    "</main>\n</body>\n</html>\n"
 )
 _INT64 = 2**63
 _NO_ROUTE = "there is no such route"
@@ -932,6 +936,53 @@ class _App:
             )
         return _json(body)
 
+    def get_home(self) -> Response:
+        """``HomeOut``: the start page. What it says of the surfaces is the progress line of
+        the rating screen; of the functional data only that there is some, until the EPI
+        pages are open to the rater, and then the counts of their index."""
+        plan = self.plan()
+        with self.session() as (session, rater):
+            progress = self.progress(session, rater, plan, None)
+            closed = self.closed_to(session, rater, plan)
+            rater_name = rater.name
+        surfaces = schemas.HomeSurfacesOut(
+            url=RATE_URL,
+            n_subjects=progress.n_subjects,
+            rendered=progress.rendered,
+            done_total=progress.done_total,
+            remaining=progress.remaining,
+            skipped=progress.skipped,
+            review_url=None if closed else "/review",
+        )
+        offered = self.epi_offered()
+        waiting = plan.pending > 0
+        if not offered:
+            functional = schemas.HomeFunctionalOut(offered=False)
+        elif closed:
+            functional = schemas.HomeFunctionalOut(offered=True, closed=_CLOSED["epi"])
+        else:
+            index = self.epi_index()
+            totals = {
+                name: sum(getattr(p, name) for p in index.participants)
+                for name in ("n_runs", "n_packable", "n_packed", "n_pending", "n_failed")
+            }
+            waiting = waiting or index.n_pending > 0
+            functional = schemas.HomeFunctionalOut(
+                offered=True,
+                url=EPI_INDEX_URL,
+                subjects_url=SUBJECTS_URL,
+                n_participants=len(index.participants),
+                **totals,
+            )
+        body = schemas.HomeOut(
+            rater=rater_name,
+            blind=self.config.app.blind,
+            surfaces=surfaces,
+            functional=functional,
+            poll_s=float(EPI_POLL_S) if waiting else None,
+        )
+        return _json(body)
+
     def examples(self, session: Session, plan: QueuePlan) -> tuple[schemas.ExampleOut, ...]:
         """The reference slices of the calibration set, for a rater who has rated every
         subject of the set that the queue will give: nobody is shown the consensus of a
@@ -1626,7 +1677,7 @@ class _App:
                 version=self.version,
                 mode=self.mode,
                 api=EPI_API,
-                rate_url="/",
+                rate_url=RATE_URL,
                 subjects_url=SUBJECTS_URL,
             )
             return HTMLResponse(text, headers={"Cache-Control": NO_CACHE})
@@ -1638,7 +1689,7 @@ class _App:
             mode=self.mode,
             api=f"{EPI_API}/{participant_uid}",
             index_url=EPI_INDEX_URL,
-            rate_url="/",
+            rate_url=RATE_URL,
             subjects_url=SUBJECTS_URL,
             # the page asks every EPI_POLL_S while packs of the participant wait and every
             # EPI_POLL_IDLE_S when none do; poll_s is the interval of now, and after each answer
@@ -1850,7 +1901,7 @@ class _App:
         return SubjectPageOut(
             subject=row,
             review_url=None if row.subject_uid is None else f"/review#subject={row.subject_uid}",
-            rate_url="/",
+            rate_url=RATE_URL,
             index_url=SUBJECTS_URL,
             epi_index_url=EPI_INDEX_URL,
             sessions=tuple(sessions),
@@ -1964,7 +2015,7 @@ class _App:
             "version": self.version,
             "mode": self.mode,
             "poll_s": EPI_POLL_S,
-            "rate_url": "/",
+            "rate_url": RATE_URL,
             "review_url": "/review",
             "epi_index_url": EPI_INDEX_URL,
             "subjects_url": SUBJECTS_URL,
@@ -2278,8 +2329,16 @@ def create_app(
         return await run_in_threadpool(state.answer, work, body)
 
     @app.get("/")
-    def rate_page() -> Response:
+    def home_page() -> Response:
         return state.answer(state.page, "/")
+
+    @app.get(RATE_URL)
+    def rate_page() -> Response:
+        return state.answer(state.page, RATE_URL)
+
+    @app.get(HOME_API)
+    def home() -> Response:
+        return state.answer(state.get_home)
 
     @app.get("/review")
     def review_page(request: Request) -> Response:

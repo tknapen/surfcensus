@@ -256,7 +256,7 @@ def closed(client: TestClient, epi: EpiRun) -> None:
             assert page.headers["content-type"].startswith("text/html")
             assert page.headers["cache-control"] == "no-store"
             assert "the EPI movies open when none is left" in page.text
-            assert '<a href="/">Back to the rating screen</a>' in page.text
+            assert '<a href="/rate">Back to the rating screen</a>' in page.text
             assert (
                 "<script" not in page.text and "<title>surfcensus: EPI movies</title>" in page.text
             )
@@ -280,7 +280,7 @@ def test_a_blind_run_opens_the_epi_pages_only_when_nothing_is_left_to_rate(
     with serving(epi_run.run_dir) as client:
         closed(client, epi_run)
         # the rating routes are open all along, and the review is closed as before
-        assert client.get("/").status_code == 200
+        assert client.get("/rate").status_code == 200
         assert client.get("/api/review").status_code == 403
         assert rate_everything(client) == 3
         opened(client, epi_run)
@@ -357,7 +357,7 @@ def test_the_index_page_is_its_template_with_the_address_of_its_api(client: Test
     page = ok(client.get("/epi", headers=PAGE)).text
     assert 'data-api="/api/epi"' in page
     assert '<script type="module" src="/static/js/epi/index.js?v=' in page
-    assert '<a id="rate-link" href="/">rating screen</a>' in page
+    assert '<a id="rate-link" href="/rate">rating screen</a>' in page
     assert "raw data" in page and "preprocessing" in page
     # nothing about a participant: everything arrives through the API
     for uid in (FULL, HALF, *LABELS.values()):
@@ -379,7 +379,7 @@ def test_the_page_of_a_participant_plays_its_stream_from_the_run(
     assert 'data-poll-waiting="5" data-poll-idle="30"' in page
     assert f'data-index-api="/api/epi" data-participant="{FULL}"' in page
     assert '<a id="index-link" href="/epi">EPI movies</a>' in page
-    assert '<a id="rate-link" href="/">rating screen</a>' in page
+    assert '<a id="rate-link" href="/rate">rating screen</a>' in page
     assert '<span id="packing" class="epi-packing" data-waiting="false">' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
     # the answer of step 1's server on the same directory, with only the media URLs changed
@@ -621,7 +621,7 @@ def test_nothing_the_rating_routes_answer_holds_anything_of_the_epi_interface(
     rated = client.post("/api/rating", json=rating_body(client, second["assignment_id"], 1))
     answers.append(ok(rated).text)
     answers.append(ok(client.get("/api/back")).text)
-    answers.append(ok(client.get("/")).text)
+    answers.append(ok(client.get("/rate")).text)
     text = "\n".join(answers)
     for word in sorted(secret):
         assert word not in text, word
@@ -630,7 +630,7 @@ def test_nothing_the_rating_routes_answer_holds_anything_of_the_epi_interface(
     for word in ("participant", "session_uid", "run_uid", "stream", "trace", "framewise"):
         assert word not in text, word
     # the one link of the rating page, which names no subject
-    page = ok(client.get("/")).text
+    page = ok(client.get("/rate")).text
     assert '<a id="epi-link" class="epi-link" href="/epi" hidden>EPI movies</a>' in page
 
 

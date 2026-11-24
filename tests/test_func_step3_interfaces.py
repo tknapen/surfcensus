@@ -243,7 +243,7 @@ def test_a_subject_page_body_validates_and_a_wrong_one_does_not() -> None:
     page = {
         "subject": _row(),
         "review_url": "/review#subject=" + "0" * 16,
-        "rate_url": "/",
+        "rate_url": "/rate",
         "index_url": "/subjects",
         "epi_index_url": "/epi",
         "sessions": [session],

@@ -361,7 +361,11 @@ def test_health_says_the_version(client: TestClient) -> None:
 def test_the_pages_are_the_templates_with_three_variables_and_no_subject(
     client: TestClient, app_run: Path, small_run_uids: dict[str, str]
 ) -> None:
-    for route, script in (("/", "js/rate.js"), ("/review", "js/review.js")):
+    for route, script in (
+        ("/", "js/home.js"),
+        ("/rate", "js/rate.js"),
+        ("/review", "js/review.js"),
+    ):
         response = client.get(route)
         assert response.status_code == 200 and response.headers["cache-control"] == "no-cache"
         assert response.headers["content-type"].startswith("text/html")
@@ -1884,7 +1888,7 @@ def test_a_blind_run_opens_the_unblinded_routes_only_when_nothing_is_left(app_ru
         for path in paths:
             assert client.get(path).status_code == 200, path
         # the rating routes were open all along
-        assert client.get("/").status_code == 200
+        assert client.get("/rate").status_code == 200
 
 
 def test_a_browser_that_opens_a_closed_review_gets_a_page_that_says_why(app_run: Path) -> None:
@@ -1897,7 +1901,7 @@ def test_a_browser_that_opens_a_closed_review_gets_a_page_that_says_why(app_run:
         assert page.headers["content-type"].startswith("text/html")
         assert page.headers["cache-control"] == "no-store"
         assert "you still have subjects to rate; the review opens when none is left" in page.text
-        assert '<a href="/">Back to the rating screen</a>' in page.text
+        assert '<a href="/rate">Back to the rating screen</a>' in page.text
         # the page of the review itself, its scripts and anything of a subject are not in it
         assert "<script" not in page.text and "review.js" not in page.text
         for uid in queue(app_run):
@@ -3119,7 +3123,7 @@ def test_the_pages_work_on_the_server_in_a_browser(app_run: Path) -> None:
                 if page.evaluate("document.getElementById('viewer').dataset.playing") == "true":
                     page.keyboard.press(" ")
 
-            page.goto(handle.url)
+            page.goto(handle.url + "rate")
             first = ready()
             pause()
             # rate with a mark, submit

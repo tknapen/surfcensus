@@ -55,6 +55,7 @@ JS_FILES = (
     "coords.js",
     "events.js",
     "help.js",
+    "home.js",
     "keys.js",
     "marks.js",
     "rate.js",
@@ -64,11 +65,13 @@ JS_FILES = (
     "tour.js",
     "viewer.js",
 )
-"""The modules of docs/dev/contract.md, section 7.9, and ``subjects.js``, the subject pages of
-a run with functional data (step 3 of docs/epi_interface.md)."""
+"""The modules of docs/dev/contract.md, section 7.9, ``subjects.js``, the subject pages of a
+run with functional data (step 3 of docs/epi_interface.md), and ``home.js``, the start page."""
 
 USED_ROUTES = {
     ("GET", "/"),
+    ("GET", "/rate"),
+    ("GET", "/api/home"),
     ("GET", "/review"),
     ("GET", "/api/session"),
     ("GET", "/api/next"),
@@ -129,6 +132,10 @@ NAMES: dict[str, type[BaseModel] | tuple[type[BaseModel], ...] | frozenset[str]]
     "funcFrame": epi_schemas.FuncFrameOut,
     "corrections": CorrectionsInfo,
     "statement": StatementInfo,
+    # the start page (home.js)
+    "home": schemas.HomeOut,
+    "surfaces": schemas.HomeSurfacesOut,
+    "functional": schemas.HomeFunctionalOut,
 }
 
 SHAPES: dict[str, type[BaseModel]] = {
@@ -387,12 +394,13 @@ def test_the_frontend_files_are_those_of_the_contract() -> None:
         "base.html",
         "epi.html",
         "epi_index.html",
+        "home.html",
         "rate.html",
         "review.html",
         "subject.html",
         "subjects.html",
     }
-    # nothing to build and nothing else to ship: scripts, one stylesheet, seven pages (the
+    # nothing to build and nothing else to ship: scripts, one stylesheet, eight pages (the
     # EPI page's modules are in js/epi/ and tested in test_epi_frontend.py)
     others = [
         str(path.relative_to(STATIC_DIR))
@@ -679,8 +687,8 @@ def pages() -> dict[str, str]:
 
 
 def test_the_pages_render_with_static_version_and_mode_alone(pages: dict[str, str]) -> None:
-    assert set(pages) == {"/", "/review"}
-    for route, script in (("/", "rate.js"), ("/review", "review.js")):
+    assert set(pages) == {"/", "/rate", "/review"}
+    for route, script in (("/", "home.js"), ("/rate", "rate.js"), ("/review", "review.js")):
         text = pages[route]
         assert f'<script type="module" src="/static/js/{script}?v=1.2.3"></script>' in text
         assert '<link rel="stylesheet" href="/static/app.css?v=1.2.3">' in text
@@ -706,7 +714,9 @@ def test_the_pages_hold_nothing_about_a_subject(pages: dict[str, str]) -> None:
         assert "/media/" not in text and "sub-" not in text
 
 
-@pytest.mark.parametrize(("route", "script"), [("/", "rate.js"), ("/review", "review.js")])
+@pytest.mark.parametrize(
+    ("route", "script"), [("/", "home.js"), ("/rate", "rate.js"), ("/review", "review.js")]
+)
 def test_every_element_a_page_script_looks_up_is_in_its_page(
     pages: dict[str, str], route: str, script: str
 ) -> None:
@@ -733,7 +743,7 @@ def subject_pages() -> dict[str, str]:
         "version": "1.2.3",
         "mode": "local",
         "poll_s": 5,
-        "rate_url": "/",
+        "rate_url": "/rate",
         "review_url": "/review",
         "epi_index_url": "/epi",
         "subjects_url": "/subjects",
@@ -842,7 +852,7 @@ def test_the_subjects_script_reads_the_fields_of_the_subject_shapes() -> None:
 def test_the_keys_named_on_the_rating_page_are_keys_of_the_keyboard_map(
     pages: dict[str, str],
 ) -> None:
-    named = set(re.findall(r"<kbd>([^<]+)</kbd>", pages["/"]))
+    named = set(re.findall(r"<kbd>([^<]+)</kbd>", pages["/rate"]))
     aliases = {"Esc": "Escape", "Ctrl": None, "Z": None}
     fixed = set(protocol_module.FIXED_KEYS) | {"Escape"}
     for key in named:
@@ -1957,7 +1967,7 @@ def test_the_tour_has_five_short_steps_each_about_a_part_of_the_rating_page(
     steps = tour_of(js_copy, shipped_protocol)
     assert tuple(step["id"] for step in steps) == TOUR_STEPS
     assert len(steps) <= 5
-    present = set(re.findall(r'\bid="([\w-]+)"', pages["/"]))
+    present = set(re.findall(r'\bid="([\w-]+)"', pages["/rate"]))
     for step in steps:
         assert step["title"] and step["targets"] and 1 <= len(step["text"]) <= 3
         for selector in step["targets"]:
@@ -2265,6 +2275,7 @@ def test_the_subject_page_says_an_anchor_waits_for_its_pack_while_it_is_pending(
 
 
 NAV_IDS = {
+    "home-link": "home",
     "rate-link": "rate",
     "subjects-link": "subjects",
     "review-link": "review",
@@ -2279,7 +2290,7 @@ def test_every_page_names_the_other_pages_from_one_list() -> None:
     """The review of step 3 (F5) found the rating screen called "rating" on one page and
     "rating screen" on the others, and the subjects page "all subjects", "subjects" and
     "Subjects". Every link between pages takes its words from ``schemas.NAV_LABELS``."""
-    assert set(schemas.NAV_LABELS) == {"rate", "subjects", "review", "epi"}
+    assert set(schemas.NAV_LABELS) == {"home", "rate", "subjects", "review", "epi"}
     assert len(set(schemas.NAV_LABELS.values())) == len(schemas.NAV_LABELS)
     seen = set()
     for template in sorted(TEMPLATES_DIR.glob("*.html")):

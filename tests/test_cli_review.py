@@ -342,7 +342,7 @@ def test_the_app_of_a_review_stops_at_ctrl_c_and_at_sigterm(
     assert "Rendered: 1 of 3 subjects, 1 to render while the app runs, 1 cannot be rated." in lines
     with httpx.Client(base_url=url, trust_env=False) as client:
         assert client.get("/healthz").status_code == 200
-        page = client.get("/")
+        page = client.get("/rate")
         assert page.status_code == 200 and "<title>" in page.text
         deadline = time.monotonic() + 60
         while client.get("/api/next").json()["progress"]["rendered"] < 2:

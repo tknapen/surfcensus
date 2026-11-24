@@ -57,6 +57,8 @@ EXAMPLE_SHAPES: dict[str, type[BaseModel]] = {
     "epi_stream": EpiStreamOut,
     "subjects": SubjectsOut,
     "subject_page": SubjectPageOut,
+    "home": schemas.HomeOut,
+    "home_blind": schemas.HomeOut,
 }
 """Key of ``api_examples.json`` -> the shape its value has."""
 
@@ -85,6 +87,8 @@ EXAMPLE_ROUTES: dict[str, str] = {
     "epi_stream": "GET /api/epi/{participant_uid}",
     "subjects": "GET /api/subjects",
     "subject_page": "GET /api/subjects/{key}",
+    "home": "GET /api/home",
+    "home_blind": "GET /api/home",
 }
 """Key of ``api_examples.json`` -> the route that receives or answers it, as method and path
 of ``schemas.ROUTES``."""

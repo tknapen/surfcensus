@@ -219,7 +219,7 @@ def test_a_rater_rates_marks_goes_back_and_reviews_on_the_real_pages(
     handle, run_dir, data = served
     rater = Rater(browser, handle.url, width=width)
     page = rater.page
-    page.goto(handle.url)
+    page.goto(handle.url + "rate")
     first = rater.subject()
     label = labels_by_uid(run_dir)[first]
 
@@ -383,7 +383,7 @@ def test_a_first_time_rater_learns_from_the_screen_how_to_get_to_the_next_subjec
     handle, run_dir, _ = served
     rater = Rater(browser, handle.url, width=1280, seen_tour=False)
     page = rater.page
-    page.goto(handle.url)
+    page.goto(handle.url + "rate")
     page.wait_for_selector("#tour:not([hidden])")
     said = []
     for _ in range(6):

@@ -124,7 +124,7 @@ class Rater:
         page.on("requestfailed", lambda request: self.failed.append(request.url))
         page.on("request", lambda request: self.requested.append(request.url))
 
-    def open(self, path: str = "") -> Rater:
+    def open(self, path: str = "rate") -> Rater:
         self.page.goto(self.server.url + path)
         return self
 
@@ -1802,7 +1802,7 @@ def test_the_review_page_says_in_words_that_it_is_closed(rater: Rater, state: Mo
     assert message.startswith("The review is closed while you still have subjects to rate")
     assert "you still have subjects to rate" in message
     assert rater.page.is_hidden("#review-body")
-    assert rater.page.get_attribute("#rate-link", "href") == "/"
+    assert rater.page.get_attribute("#rate-link", "href") == "/rate"
 
 
 # --- skip ------------------------------------------------------------------------------------
@@ -2124,7 +2124,7 @@ def test_the_tour_opens_on_a_first_visit_and_not_on_the_second(
     rater.ready(1)
     assert rater.tour_step is None
     second = rater.page.context.new_page()
-    second.goto(rater.server.url)
+    second.goto(rater.server.url + "rate")
     second.wait_for_selector("#viewer[data-ready='true']")
     second.wait_for_function("document.getElementById('viewer').dataset.playing === 'true'")
     assert second.is_hidden("#tour")

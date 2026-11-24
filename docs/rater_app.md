@@ -14,6 +14,10 @@ Offline export (optional, later): `surfcensus static-export` writes a self-conta
 
 The frontend is plain HTML, CSS and JavaScript with no build step, shipped inside the wheel, and the packages the server needs (`fastapi`, `uvicorn`, `sqlmodel`, `jinja2`) are dependencies of the package, so `pip install surfcensus` is all a user needs: no extra, no second step (decision O20; `architecture.md`, Dependencies).
 
+## The start page
+
+`/` is the start page of a local run (2026-11-24, decision D51): the two interfaces of the app side by side, the surfaces and the EPI movies, each with a sentence on what it shows, how far it is and a link into it. The rating screen is at `/rate`, and every page links back to the start page ("start"). What it says of the surfaces is what the progress line of the rating screen says (subjects rated, left, skipped, rendered); of the functional data, while the EPI pages are closed to the rater (a blind run, or a second rater, with subjects left), only that there is some and why it is closed, and the counts of the EPI index once they are open. It names no subject, dataset or score, asks `GET /api/home` (`HomeOut`) every 5 s while subjects are rendered or runs packed behind the app, and opens no assignment. The address that `review` and `serve` print and open is the start page, but for a run in which nothing can be rated and EPI movies can be viewed, where the browser opens at `/epi` as before.
+
 ## Rating screen
 
 Layout, top to bottom:
@@ -169,6 +173,7 @@ The tables are the SQLModel classes of `app/models.py`. Timestamps that the serv
 
 ## API
 
+- `GET /` → the start page; `GET /rate` → the rating screen; `GET /api/home` → `HomeOut`, what the start page shows (above).
 - `GET /api/next` → next assignment for the authenticated rater: `subject_uid`, frame URLs, protocol version.
 - `POST /api/rating` → criterion values, marks (class, panel, slice, px, py, and the frame and playback mode as context), note, timing; returns the next assignment. The server validates marks against `render.json` and resolves coordinates and vertices. A rating that arrives twice is one submission when it carries the client's time of the press (`client_ts`), which the page always sends, and the same content: the values, the unratable reason, the other flag, the note, the time on the subject and, of each mark, its class, panel, slice, pixel, frame, mode and its own time when the body gives one. A body that differs in any of these under the same client time is a revision. The field is optional in the shape: a client that leaves it out and sends a body again stores a revision each time, since nothing tells a second send from a deliberate identical revision.
 - `POST /api/skip` → the assignment id, the client's time and the time on the subject; nothing of the rating. Returns the next assignment, in the shape of `GET /api/next`. Sent twice with the same client time it is one skip. 409, as for a stale rating, when the assignment is not open for the rater: it has a submission, or its render is no longer the subject's.

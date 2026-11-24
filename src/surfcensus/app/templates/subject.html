@@ -3,7 +3,7 @@
 {% block body %}
 <main id="subjects-page" class="subjects-page" data-page="one" data-key="{{ key }}" data-api="{{ api }}" data-poll="{{ poll_s }}" data-state="loading">
   <header class="review-head">
-    <nav class="subjects-nav" aria-label="other pages"><a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a><a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a><a id="review-link" href="{{ review_url }}">{{ nav.review }}</a><a id="epi-index-link" href="{{ epi_index_url }}">{{ nav.epi }}</a></nav>
+    <nav class="subjects-nav" aria-label="other pages"><a id="home-link" href="/">{{ nav.home }}</a><a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a><a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a><a id="review-link" href="{{ review_url }}">{{ nav.review }}</a><a id="epi-index-link" href="{{ epi_index_url }}">{{ nav.epi }}</a></nav>
     <h1 id="subject-name">Subject</h1>
     <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b>, session by session</span>
   </header>

@@ -162,7 +162,7 @@ def closed(client: TestClient, key: str, secrets: tuple[str, ...]) -> None:
             assert page.headers["content-type"].startswith("text/html")
             assert page.headers["cache-control"] == "no-store"
             assert CLOSED in page.text
-            assert '<a href="/">Back to the rating screen</a>' in page.text
+            assert '<a href="/rate">Back to the rating screen</a>' in page.text
             assert "<script" not in page.text
             assert "<title>surfcensus: subjects</title>" in page.text
             for uid in (key, *secrets):
@@ -178,7 +178,7 @@ def test_local_not_blind_one_rater_opens_the_subject_pages(
 ) -> None:
     opened(client, small_run_uids["sub-001"])
     # the link is in the page, hidden until an assignment is open; rate.js shows it
-    assert SUBJECT_LINK in ok(client.get("/")).text
+    assert SUBJECT_LINK in ok(client.get("/rate")).text
 
 
 def test_blind_with_work_left_closes_them_and_everything_rated_opens_them(
@@ -403,7 +403,7 @@ def test_the_page_of_a_subject_has_every_session_and_run_with_what_the_catalog_s
     page = ok(client.get(f"/api/subjects/{key}"), shapes.SubjectPageOut)
     assert page["review_url"] == f"/review#subject={key}"
     assert (page["rate_url"], page["index_url"], page["epi_index_url"]) == (
-        "/",
+        "/rate",
         "/subjects",
         "/epi",
     )
@@ -597,7 +597,7 @@ def test_the_rating_routes_answer_nothing_of_the_subject_pages(
         assert word not in text, word
     # the rating page holds the link and nothing of a subject: the href is a path of the
     # route table, which rate.js replaces with the subject's page while one is open
-    page = ok(client.get("/")).text
+    page = ok(client.get("/rate")).text
     assert SUBJECT_LINK in page
     assert not re.search(r"\b[0-9a-f]{16}\b", page)
     for word in ("/subject/", "func_sessions", *LABELS.values()):

@@ -1855,7 +1855,8 @@ body.no-traces .epi #traces {
   white-space: nowrap;
 }
 
-.progress .epi-link {
+.progress .epi-link,
+.progress .links a + a {
   margin-left: 12px;
 }
 
@@ -2018,4 +2019,101 @@ body.no-traces .epi #traces {
   .progress .links a {
     white-space: nowrap;
   }
+}
+
+/* The start page (templates/home.html): the two interfaces side by side, one above the other
+   in a narrow window. */
+
+.home {
+  height: 100%;
+  overflow: auto;
+  padding: 24px max(16px, env(safe-area-inset-right, 0px)) 24px max(16px, env(safe-area-inset-left, 0px));
+}
+
+.home-head,
+.home-cards,
+.home > .message {
+  max-width: 1040px;
+  margin: 0 auto;
+}
+
+.home-head h1 {
+  margin: 0 0 6px;
+  font-size: 22px;
+}
+
+.home-head .tagline {
+  margin: 0;
+  max-width: 70ch;
+  color: var(--muted);
+}
+
+.home-rater {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+.home-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: 16px;
+  margin-top: 20px;
+}
+
+.home-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  min-width: 0;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.home-card h2 {
+  margin: 0;
+  font-size: 17px;
+}
+
+.home-what {
+  margin: 0;
+  color: var(--muted);
+}
+
+.home-what b {
+  color: var(--text);
+}
+
+.home-state {
+  margin: 0;
+  min-height: 1.35em;
+}
+
+.home-card[data-offered="false"] .home-state {
+  color: var(--muted);
+}
+
+.home-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px;
+  margin: auto 0 0;
+}
+
+.home-button {
+  display: inline-block;
+  padding: 6px 14px;
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  background: var(--raised);
+  color: var(--text);
+  text-decoration: none;
+}
+
+.home-button:hover,
+.home-button:focus-visible {
+  background: var(--accent);
+  color: #0c0f13;
 }

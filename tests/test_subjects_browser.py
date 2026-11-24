@@ -142,7 +142,7 @@ def test_from_the_rating_screen_to_a_run_of_the_subject_and_back_with_the_draft_
 ) -> None:
     tab = Tab(browser, server.url, width=width, height=height)
     page = tab.page
-    page.goto(server.url)
+    page.goto(server.url + "rate")
     uid = rating_screen(tab)
     assert uid == small_run_uids["sub-001"]  # the first of the queue, which has a session
     page.keyboard.press("2")
@@ -223,7 +223,7 @@ def test_from_the_rating_screen_to_a_run_of_the_subject_and_back_with_the_draft_
     tab.shot("subjects")
 
     page.click("#rate-link")
-    page.wait_for_url(server.url)
+    page.wait_for_url(server.url + "rate")
     assert rating_screen(tab) == uid
     assert pressed(tab) == [["A", "1"]]
     assert page.input_value("#note") == "seen before the subject page"

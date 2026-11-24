@@ -35,7 +35,7 @@ uv sync
 uv run surfcensus review openneuro:ds000102 --subjects sub-01 --epi
 ```
 
-This reviews `sub-01` of `ds000102` straight from the public buckets: the FreeSurfer subject and the fMRIPrep files from the OpenNeuroDerivatives bucket, the raw series from `s3://openneuro.org`. Access is anonymous and read-only. The command first says how much it will fetch, then fetches, scores and renders, and opens the rating screen at `http://127.0.0.1:8765/`. The EPI movies are packed behind it and appear at `http://127.0.0.1:8765/epi` (the address is printed as `EPI movies:`). For this subject, on one 4-core machine, the rating screen was up 20 to 25 s after the command, after 210 MB of downloads, and both EPI movies 30 to 40 s after that.
+This reviews `sub-01` of `ds000102` straight from the public buckets: the FreeSurfer subject and the fMRIPrep files from the OpenNeuroDerivatives bucket, the raw series from `s3://openneuro.org`. Access is anonymous and read-only. The command first says how much it will fetch, then fetches, scores and renders, and opens the app at `http://127.0.0.1:8765/`. That start page leads to both interfaces: the rating screen of the surfaces (`/rate`) and the EPI movies (`/epi`), which are packed behind it and appear there as they are made. For this subject, on one 4-core machine, the rating screen was up 20 to 25 s after the command, after 210 MB of downloads, and both EPI movies 30 to 40 s after that.
 
 - Without `--epi` only the surfaces are reviewed, and nothing is asked of the raw bucket.
 - `--subjects` takes shell patterns (`'sub-0[1-5]'`, or `'*'` for all) and is kept for later calls. A new review that would fetch more than 2 GB before the rating screen stops and asks for `--subjects`.
@@ -102,6 +102,8 @@ ssh -N -L 8790:127.0.0.1:8790 you@yourserver
 Then open `http://127.0.0.1:8790/` on your own machine. When the port is taken on the server, `review` takes the next free one and prints it on the line `Rating app: http://127.0.0.1:NNNN/`; forward that one instead. When it is taken on your machine, `ssh` says `bind: Address already in use`; pick another local number (`-L 9000:127.0.0.1:8790`, then `http://127.0.0.1:9000/`).
 
 ## Using the interfaces
+
+The start page (`http://127.0.0.1:8765/`, or the port `review` prints) shows both interfaces side by side: how many subjects are rated and how many are left, how many functional runs are packed, and a link into each. Every page links back to it ("start"). In a blind run, or with a second rater, the EPI movies and the review screen open once the rater has nothing left to rate; until then the start page says so and shows no numbers of the functional data.
 
 ### Rating surfaces
 

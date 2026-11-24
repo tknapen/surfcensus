@@ -126,13 +126,17 @@ def test_the_examples_cover_every_route_shape() -> None:
         "EpiStreamOut",
         "SubjectsOut",
         "SubjectPageOut",
+        "HomeOut",
     }
 
 
 def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
     # docs/dev/contract.md, section 7.5: the table of routes
     assert {(route.method, route.path): route for route in ROUTES} == {
+        # the start page, which leads to both interfaces, and the rating screen
         ("GET", "/"): Route("GET", "/"),
+        ("GET", "/rate"): Route("GET", "/rate"),
+        ("GET", "/api/home"): Route("GET", "/api/home", schemas.HomeOut),
         ("GET", "/review"): Route("GET", "/review", unblinded=True),
         ("GET", "/static/{path}"): Route("GET", "/static/{path}"),
         ("GET", "/media/{subject_uid}/{path}"): Route("GET", "/media/{subject_uid}/{path}"),
@@ -171,7 +175,7 @@ def test_the_routes_are_those_of_the_docs_with_their_shapes() -> None:
             "GET", "/api/subjects/{key}", SubjectPageOut, unblinded=True
         ),
     }
-    assert len(ROUTES) == 24  # no route twice
+    assert len(ROUTES) == 26  # no route twice
     # what is unblinded is the review page and everything under its API, the EPI pages and
     # the subject pages, and nothing a rating page calls
     unblinded = {route.path for route in ROUTES if route.unblinded}

@@ -17,7 +17,10 @@ export const ROUTES = {
   review: ["GET", "/api/review"],
   subject: ["GET", "/api/review/{subject_uid}"],
   exportCsv: ["GET", "/api/export"],
-  ratePage: ["GET", "/"],
+  // the start page, which leads to both interfaces, and what it shows (a HomeOut)
+  homePage: ["GET", "/"],
+  home: ["GET", "/api/home"],
+  ratePage: ["GET", "/rate"],
   reviewPage: ["GET", "/review"],
   // the index of the EPI movies, the one link of the rating page to them (session.epi_url);
   // the EPI pages call their own routes (js/epi/)
@@ -100,6 +103,7 @@ export async function request(name, { params = {}, query = null, body = null } =
 const pause = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export const getSession = () => request("session");
+export const getHome = () => request("home");
 export const getNext = () => request("next");
 export const getBack = () => request("back");
 export const getReview = (query) => request("review", { query });

@@ -128,7 +128,7 @@ def test_from_the_rating_screen_to_a_stream_and_back_with_the_draft_kept(
 ) -> None:
     tab = Tab(browser, server.url, width=width)
     page = tab.page
-    page.goto(server.url)
+    page.goto(server.url + "rate")
     uid = rating_screen(tab)
     page.keyboard.press("2")  # A minor: a draft of the open subject
     page.keyboard.press("n")
@@ -170,7 +170,7 @@ def test_from_the_rating_screen_to_a_stream_and_back_with_the_draft_kept(
     tab.shot(f"stream_{width}")
 
     page.click("#rate-link")
-    page.wait_for_url(server.url)
+    page.wait_for_url(server.url + "rate")
     assert rating_screen(tab) == uid
     assert pressed(tab) == [["A", "1"]]
     assert page.input_value("#note") == "seen before the EPI movies"
@@ -272,7 +272,7 @@ def test_a_closed_epi_page_is_a_page_with_a_way_back(
     try:
         tab = Tab(browser, handle.url, width=1400)
         page = tab.page
-        page.goto(handle.url)
+        page.goto(handle.url + "rate")
         rating_screen(tab)
         assert page.locator("#epi-link").is_hidden()
         tab.problems.clear()

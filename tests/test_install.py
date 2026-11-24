@@ -177,6 +177,7 @@ def test_the_wheel_holds_the_app_and_the_protocol_and_nothing_else_beside_the_co
             "base.html",
             "epi.html",
             "epi_index.html",
+            "home.html",
             "rate.html",
             "review.html",
             "subject.html",
@@ -398,7 +399,7 @@ def test_review_in_the_installed_environment_serves_the_page_and_stores_a_rating
 
     # the test run may sit behind a proxy for the index; the app is on this machine
     with httpx.Client(base_url=url, trust_env=False, timeout=60) as client:
-        page = client.get("/")
+        page = client.get("/rate")
         assert page.status_code == 200 and page.headers["content-type"].startswith("text/html")
         scripts = re.findall(r'src="(/static/[^"?]+)', page.text)
         styles = re.findall(r'href="(/static/[^"?]+\.css)', page.text)

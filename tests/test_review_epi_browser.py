@@ -70,7 +70,7 @@ def test_from_the_rating_screen_to_a_stream_made_by_review_and_back(
     url, _ = reviewing
     tab = Tab(browser, url, width=1400)
     page = tab.page
-    page.goto(url)
+    page.goto(url + "rate")
     uid = rating_screen(tab)
     page.keyboard.press("2")
     page.keyboard.press("n")
@@ -119,7 +119,7 @@ def test_from_the_rating_screen_to_a_stream_made_by_review_and_back(
     assert media and all(p.startswith(f"/epi-media/{first}/") for p in media)
 
     page.click("#rate-link")
-    page.wait_for_url(url)
+    page.wait_for_url(url + "rate")
     assert rating_screen(tab) == uid
     assert pressed(tab) == [["A", "1"]]
     assert page.input_value("#note") == "before the EPI movies"
