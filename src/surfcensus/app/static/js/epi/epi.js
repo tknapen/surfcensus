@@ -33,6 +33,7 @@ import {
   skipNote,
   pointOf,
   RATES,
+  runLabels,
   segmentOfRun,
   signalOf,
   slicesAt,
@@ -190,9 +191,12 @@ function readyFor(g) {
 
 // ---- painting ---------------------------------------------------------------------------------
 
+// The heading over the panels: the name of the stream on screen, and what it is (D36).
 function streamLabel() {
-  const what = { series: '', mean: 'temporal mean: ', sd: 'temporal SD: ' }[state.kind];
-  return state.view === 'raw' ? `${what}raw data, one placement per session` : `${what}preprocessed, as the pipeline wrote it`;
+  const what = { series: '', mean: 'temporal mean of ', sd: 'temporal SD of ' }[state.kind];
+  return state.view === 'raw'
+    ? ['raw', `${what}the raw BIDS series, placed once per session by one rigid registration (one cubic resampling); nothing else done to it`]
+    : ['preprocessed', `${what}the series as the pipeline wrote it`];
 }
 
 function setPending(on, reason) {
@@ -237,7 +241,7 @@ function render(reason = 'other', advanced = 0) {
   enterSegment(k);
   const streams = streamsOf(state.view);
   store.want(streams, state.g, playFor(state.g));
-  views.setStream(state.view, streamLabel());
+  views.setStream(state.view, ...streamLabel());
   const vols = volumesFor(k, streams);
   writeControls();
   if (!vols) {
@@ -378,7 +382,6 @@ function writeControls() {
   $('play-text').textContent = state.playing ? 'pause' : 'play';
   $('rate').value = String(state.rate);
   const tr = run.tr_s ? `, ${(t * run.tr_s).toFixed(1)} s` : '';
-  setText('readout-run', run.name);
   setText(
     'readout-volume',
     state.kind === 'series'
@@ -953,6 +956,13 @@ function tick(now) {
 // ---- keys --------------------------------------------------------------------------------------------
 
 let contourKeyDown = 0;
+let flipKeyDown = 0;
+
+// f: the other stream. Held down for a while, the other stream only while it is held, so that
+// the two can be compared by pressing and letting go; a repeat of the held key does nothing.
+function flip() {
+  setView(state.view === 'raw' ? 'pre' : 'raw');
+}
 
 function onKeyDown(event) {
   if (event.ctrlKey || event.metaKey || event.altKey) return;
@@ -1001,7 +1011,11 @@ function onKeyDown(event) {
     },
     1: () => setView('raw'),
     2: () => setView('pre'),
-    f: () => setView(state.view === 'raw' ? 'pre' : 'raw'),
+    f: () => {
+      if (event.repeat) return;
+      flipKeyDown = performance.now();
+      flip();
+    },
     q: () => setKind('series'),
     w: () => setKind('mean'),
     e: () => setKind('sd'),
@@ -1045,6 +1059,8 @@ function onKeyUp(event) {
     drawOverlay();
   }
   if (event.key === 's') contourKeyDown = 0;
+  if (event.key === 'f' && flipKeyDown && performance.now() - flipKeyDown > 400 && !state.help) flip();
+  if (event.key === 'f') flipKeyDown = 0;
 }
 
 // ---- start -------------------------------------------------------------------------------------------
@@ -1068,13 +1084,14 @@ function buildSegments() {
   box.replaceChildren();
   const total = timeline.total;
   const stops = [];
+  const labels = runLabels(timeline.segments.map((seg) => stream.sessions[seg.session].runs[seg.run].name));
   timeline.segments.forEach((seg, k) => {
     const session = stream.sessions[seg.session];
     const run = session.runs[seg.run];
     const b = document.createElement('button');
     b.type = 'button';
     b.dataset.seg = String(k);
-    b.textContent = run.name;
+    b.textContent = labels[k];
     const left = k === 0 ? '0px' : along(boundaryFraction(seg.first, total));
     const next = timeline.segments[k + 1];
     const right = next ? along(boundaryFraction(next.first, total)) : '100%';
@@ -1106,6 +1123,7 @@ function buildControls() {
   $('notice-reload').addEventListener('click', () => window.location.reload());
   $('notice-close').addEventListener('click', () => showNotice('', ''));
   for (const b of $('views-buttons').children) b.addEventListener('click', () => setView(b.dataset.view));
+  $('flip').addEventListener('click', flip);
   for (const b of $('kinds-buttons').children) b.addEventListener('click', () => setKind(b.dataset.kind));
   $('normalize').addEventListener('click', () => setNormalized(!state.normalized));
   for (const rate of RATES) $('rate').add(new Option(String(rate), String(rate)));
@@ -1259,7 +1277,7 @@ async function start() {
   store.onload = recovered;
   document.title = `EPI movie: ${stream.label}`;
   $('subject').textContent = stream.label;
-  $('reading').textContent = stream.reading;
+  $('reading').title = stream.reading; // the whole statement; the help says it at length
   state.fdLimit = stream.sessions.find((s) => s.fd_threshold_mm)?.fd_threshold_mm || 0.5;
   // the run the address names (#run=<run_uid>, a link of a subject page), else the beginning
   const asked = new URLSearchParams(window.location.hash.slice(1)).get('run');
@@ -1307,7 +1325,7 @@ async function start() {
   });
   buildControls();
   enterSegment(k0);
-  views.setStream(state.view, streamLabel());
+  views.setStream(state.view, ...streamLabel());
   traces.setData(streamData, state.fdLimit);
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('pointerup', (event) => {

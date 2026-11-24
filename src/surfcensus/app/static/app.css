@@ -1081,15 +1081,24 @@ textarea:focus-visible {
   --ns: #ffb300;
   --flag: var(--warn-line);
   --cursor: #ff3df0;
+  /* the two streams, as the tag over the panels and the pressed view button show them: hues
+     that no contour, marker, flag or cursor uses */
+  --stream-raw: #c4b5fd;
+  --stream-pre: #93c5fd;
+  /* the plot area of the traces (traces.js reads these), which the track of the stream lines up
+     with, so that a run boundary on the track runs straight into the traces */
+  --trace-left: 46px;
+  --trace-right: 10px;
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   grid-template-areas:
     "bar"
     "views"
     "timeline"
+    "track"
+    "traces"
     "run"
     "controls"
-    "traces"
     "status"
     "about";
   row-gap: 4px;
@@ -1107,6 +1116,10 @@ textarea:focus-visible {
 
 .epi #timeline {
   grid-area: timeline;
+}
+
+.epi #track-row {
+  grid-area: track;
 }
 
 .epi #run-strip {
@@ -1138,16 +1151,6 @@ textarea:focus-visible {
 
 .epi h1 .what {
   color: var(--muted);
-}
-
-.epi .tagline {
-  color: var(--muted);
-  white-space: nowrap;
-}
-
-.epi .tagline b {
-  color: var(--text);
-  font-weight: 600;
 }
 
 .epi button,
@@ -1193,6 +1196,21 @@ textarea:focus-visible {
   display: flex;
   flex-wrap: wrap;
   gap: 4px;
+}
+
+/* the pressed view button carries the colour of the stream's tag over the panels */
+.epi #views-buttons button[data-view="raw"][aria-pressed="true"] {
+  border-color: var(--stream-raw);
+  box-shadow: inset 0 -3px 0 var(--stream-raw);
+}
+
+.epi #views-buttons button[data-view="pre"][aria-pressed="true"] {
+  border-color: var(--stream-pre);
+  box-shadow: inset 0 -3px 0 var(--stream-pre);
+}
+
+.epi #bar .epi-nav {
+  margin-left: auto;
 }
 
 /* the width of the normalization button does not change with on and off */
@@ -1242,14 +1260,38 @@ textarea:focus-visible {
   min-width: 0;
 }
 
-.epi .epi-group h2 span:first-child {
+/* the tag of the stream on screen: its name on the stream's colour, then what it is (D36) */
+.epi .epi-group h2 .tag {
   flex: 0 0 auto;
-  max-width: 100%;
+  padding: 0 6px;
+  border-radius: 3px;
+  color: #11151a;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  line-height: 18px;
+  margin-top: 1px;
+}
+
+.epi .epi-group[data-group="raw"] h2 .tag {
+  background: var(--stream-raw);
+}
+
+.epi .epi-group[data-group="pre"] h2 .tag {
+  background: var(--stream-pre);
+}
+
+.epi .epi-group h2 .what-stream {
+  flex: 0 1 auto;
+  color: var(--text);
+  font-weight: 500;
+  line-height: 20px;
 }
 
 .epi .epi-group .badge {
   font-weight: 700;
   flex: 0 1 auto;
+  line-height: 20px;
 }
 
 .epi .epi-group.marker-fd {
@@ -1372,11 +1414,13 @@ textarea:focus-visible {
   text-overflow: ellipsis;
 }
 
+/* the track of the stream: the thumb's centre runs from the left to the right end of the plot
+   area of the traces under it (5 px, half the thumb, outside each end) */
 .epi #track {
   position: relative;
-  flex: 1 1 300px;
   min-width: 0;
   height: 34px;
+  margin: 0 calc(var(--trace-right) - 5px) 0 calc(var(--trace-left) - 5px);
 }
 
 .epi #segments {
@@ -1454,9 +1498,11 @@ textarea:focus-visible {
 }
 
 .epi #readout {
-  flex: 1 1 100%;
+  flex: 1 1 24em;
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
+  min-width: 0;
   margin: 0;
   height: 18px;
   line-height: 18px;
@@ -1467,7 +1513,6 @@ textarea:focus-visible {
 
 /* slots of fixed size: a text that changes length at a run boundary, or at play and pause,
    moves nothing beside it (D38); it is cut with an ellipsis, the whole text in its tooltip */
-.epi #readout-run,
 .epi #readout-volume,
 .epi .epi-run-line > *:not(#run-more) {
   min-width: 0;
@@ -1476,12 +1521,9 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
-.epi #readout-run {
-  flex: 0 0 min(16em, 50%);
-}
-
 .epi #readout-volume {
   flex: 1 1 0;
+  text-align: right;
   color: var(--muted);
 }
 
@@ -1693,7 +1735,7 @@ textarea:focus-visible {
 .epi #traces {
   display: block;
   width: 100%;
-  height: 104px;
+  height: 88px;
   touch-action: none;
   cursor: col-resize;
 }
@@ -1717,8 +1759,8 @@ body.no-traces .epi #traces {
 }
 
 .epi #about p {
-  margin: 0 0 2px;
-  max-width: 150ch;
+  margin: 0;
+  max-width: 160ch;
 }
 
 .epi #about #reading {
@@ -1778,9 +1820,8 @@ body.no-traces .epi #traces {
   border-top: 1px solid var(--line);
 }
 
-/* the EPI page of a run directory: links to the index and to the rating screen, and the word
-   that packs are still being made, in the section under everything else, so that the views
-   keep the place they have on the page of step 1; nothing of it depends on the run on screen */
+/* the EPI page of a run directory: links to the other pages, at the end of the bar; and the word
+   that packs are still being made, under everything else */
 .epi .epi-nav {
   display: flex;
   flex-wrap: wrap;
@@ -1791,9 +1832,10 @@ body.no-traces .epi #traces {
   color: var(--warn-line);
 }
 
-/* hidden, its place kept, while no pack of the participant waits */
+/* not shown while no pack of the participant waits; it lies under everything else, so that
+   nothing above it moves when it comes or goes */
 .epi .epi-packing[data-waiting="false"] {
-  visibility: hidden;
+  display: none;
 }
 
 /* --- the index of the EPI movies of a run (epi_index.html) ---------------------------------- */

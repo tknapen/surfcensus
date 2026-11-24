@@ -607,6 +607,30 @@ export function boundaryFraction(b, total) {
 // The colours of the contours: those of the surface interface.
 export const SURFACE_COLOURS = { white: '#FF3B30', pial: '#FFD400' };
 
+// Short labels of the runs on the timeline: of the BIDS entities of the run names (sub- left
+// out already), those with the same value in every run are dropped, since they tell no run from
+// another, so that what differs is not cut off by an ellipsis. ses and task give their value
+// alone, the others their key and value ('retest · linebisection', 'run 2'). A name without a
+// varying entity keeps its whole name. The whole name is in each segment's tooltip.
+export function runLabels(names) {
+  const parsed = names.map((name) =>
+    name.split('_').map((part) => {
+      const i = part.indexOf('-');
+      return i > 0 ? [part.slice(0, i), part.slice(i + 1)] : [part, ''];
+    }),
+  );
+  const valueOf = (entities, key) => {
+    const hit = entities.find(([k]) => k === key);
+    return hit ? hit[1] : null;
+  };
+  const keys = [...new Set(parsed.flat().map(([k]) => k))];
+  const varying = new Set(keys.filter((key) => new Set(parsed.map((e) => valueOf(e, key))).size > 1));
+  return parsed.map((entities, n) => {
+    const parts = entities.filter(([k]) => varying.has(k)).map(([k, v]) => (k === 'ses' || k === 'task' || !v ? v || k : `${k} ${v}`));
+    return parts.length ? parts.join(' · ') : names[n];
+  });
+}
+
 // ---- contours ---------------------------------------------------------------------------------
 
 // The contour file of one plane (func.contours), inflated: lines of points in voxel

@@ -4,35 +4,40 @@
 <div class="epi">
   <header id="bar">
     <h1><span class="what">EPI movie</span> <strong id="subject"></strong></h1>
-    <span class="tagline">quality control of the <b>raw data</b> and of the <b>preprocessing</b></span>
-    <div id="views-buttons" class="buttons" role="group" aria-label="streams shown">
+    <div id="views-buttons" class="buttons" role="group" aria-label="stream shown">
       <button type="button" data-view="raw"><kbd>1</kbd> raw</button>
       <button type="button" data-view="pre"><kbd>2</kbd> preprocessed</button>
     </div>
+    <button type="button" id="flip" title="the other stream at the same volume and slices; held down, only while held"><kbd>f</kbd> flip</button>
     <div id="kinds-buttons" class="buttons" role="group" aria-label="moving picture or still">
       <button type="button" data-kind="series"><kbd>q</kbd> series</button>
       <button type="button" data-kind="mean"><kbd>w</kbd> mean</button>
       <button type="button" data-kind="sd"><kbd>e</kbd> SD</button>
     </div>
     <button type="button" id="normalize" aria-pressed="false"><kbd>n</kbd> normalization <span id="normalize-text">off</span></button>
+    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages">{% if rate_url %}<a id="home-link" href="/">{{ nav.home }}</a> <a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a> {% endif %}{% if subjects_url is defined %}<a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a> <a id="subject-back" href="{{ subjects_url }}" hidden>this subject</a> {% endif %}<a id="index-link" href="{{ index_url }}">{{ nav.epi }}</a></nav>{% endif %}
     <button type="button" id="help-button"><kbd>?</kbd> help</button>
   </header>
 
   <main id="views" data-api="{{ api }}" data-poll="{{ poll_s }}"{% if poll_idle_s is defined and poll_idle_s %} data-poll-waiting="{{ poll_waiting_s }}" data-poll-idle="{{ poll_idle_s }}" data-waiting="{{ 'true' if waiting else 'false' }}" data-index-api="{{ index_api }}" data-participant="{{ participant_uid }}"{% endif %}></main>
 
-  <section id="timeline" aria-label="the stream of every run, session after session">
+  <section id="timeline" aria-label="playing the stream">
     <button type="button" id="play"><kbd>Space</kbd> <span id="play-text">play</span></button>
     <label class="epi-rate">rate <select id="rate" aria-label="volumes per second"></select>/s</label>
     <span id="rate-note" class="epi-rate-note" aria-live="off"></span>
     <span class="epi-random" role="group" aria-label="the order of play"><label><input type="checkbox" id="random"> random order <kbd>x</kbd></label>
       <select id="random-scope" aria-label="what the random order permutes"><option value="stream">whole stream</option><option value="run">run by run</option></select>
       <span id="random-note" aria-live="off"></span></span>
+    <p id="readout" aria-live="off"><span id="readout-volume"></span></p>
+  </section>
+
+  <section id="track-row" aria-label="the stream of every run, session after session, over the traces">
     <div id="track">
       <div id="segments" role="group" aria-label="the runs of the stream; each jumps to its first volume"></div>
       <input id="time" type="range" min="0" max="0" step="1" value="0" aria-label="volume of the stream">
     </div>
-    <p id="readout" aria-live="off"><b id="readout-run"></b> <span id="readout-volume"></span></p>
   </section>
+  <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
 
   <section id="run-strip" aria-label="the run on screen">
     <p class="line epi-run-line"><b id="run-name"></b> <span id="run-where"></span> <span id="badges"></span>
@@ -60,14 +65,14 @@
       <p id="legend"><span id="legend-text"></span></p>
     </div>
   </section>
-  <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
   <p id="status" role="status"></p>
   <section id="about" aria-label="what the two streams are">
-    {% if index_url %}<nav id="epi-nav" class="epi-nav" aria-label="other pages"><a id="index-link" href="{{ index_url }}">{{ nav.epi }}</a>{% if rate_url %} <a id="rate-link" href="{{ rate_url }}">{{ nav.rate }}</a> <a id="home-link" href="/">{{ nav.home }}</a>{% endif %}{% if subjects_url is defined %} <a id="subjects-link" href="{{ subjects_url }}">{{ nav.subjects }}</a> <a id="subject-back" href="{{ subjects_url }}" hidden>this subject</a>{% endif %}{% if poll_idle_s is defined and poll_idle_s %} <span id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">packs of this participant are still being made: the stream shows what is packed, and the page says when there is more</span>{% endif %}</nav>{% endif %}
-    <p id="reading"></p>
-    <p id="rate-limit">Above 60 volumes per second, faster than most displays refresh, not every volume is put on
-      screen (beside the rate it says which share is), and an artefact in a single volume can be missed. At 60 or
-      slower, and stepping with the arrow keys, every volume is shown.</p>
+    {% if poll_idle_s is defined and poll_idle_s %}<p id="packing" class="epi-packing" data-waiting="{{ 'true' if waiting else 'false' }}">Packs of this participant are still being made: the stream shows what is packed, and the page says when there is more.</p>{% endif %}
+    <p id="reading">Quality control of the <b>raw data</b> and of the <b>preprocessing</b>: what the pipeline
+      changed is seen by flipping between the two streams (<kbd>f</kbd>), and how each fits the white and pial
+      contours.</p>
+    <p id="rate-limit">Above 60 volumes per second not every volume is put on screen, and an artefact in a single
+      volume can be missed; at 60 or slower, and stepping with the arrow keys, every volume is shown.</p>
   </section>
 
   <div id="notice" hidden role="alertdialog" aria-labelledby="notice-text">
@@ -78,6 +83,30 @@
   <div id="help" hidden role="dialog" aria-modal="true" aria-labelledby="help-title">
     <div class="sheet">
       <h2 id="help-title">What this page shows</h2>
+      <table>
+        <tr><th>Key</th><th>Action</th></tr>
+        <tr><td><kbd>Space</kbd></td><td>play, pause</td></tr>
+        <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous, next volume of the stream (pauses)</td></tr>
+        <tr><td><kbd>Shift</kbd> + <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>10 volumes</td></tr>
+        <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first, last volume of the stream</td></tr>
+        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>slower, faster (1 to 300 volumes per second; above 60, not every volume is shown)</td></tr>
+        <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd></td><td>next, previous slice of the active plane; with <kbd>Shift</kbd>, 5 slices</td></tr>
+        <tr><td><kbd>p</kbd></td><td>next plane becomes the active one; the mouse wheel over a panel scrubs its slices</td></tr>
+        <tr><td>click, drag</td><td>in a panel: the other two planes go to that point; in the traces: go to that volume</td></tr>
+        <tr><td><kbd>1</kbd> <kbd>2</kbd></td><td>raw, preprocessed</td></tr>
+        <tr><td><kbd>f</kbd></td><td>flip between raw and preprocessed, at the same volume and slices (held down: the other stream while held)</td></tr>
+        <tr><td><kbd>q</kbd> <kbd>w</kbd> <kbd>e</kbd></td><td>the moving series, the temporal mean, the temporal SD of the run (stills)</td></tr>
+        <tr><td><kbd>n</kbd></td><td>intensity normalization on, off</td></tr>
+        <tr><td><kbd>r</kbd>, <kbd>Shift</kbd> + <kbd>r</kbd></td><td>jump to the next, previous run of the stream</td></tr>
+        <tr><td><kbd>s</kbd></td><td>surfaces (the white and pial contours) on, off (held down: off while held)</td></tr>
+        <tr><td><kbd>x</kbd></td><td>random order of play on, off (the order of acquisition when off)</td></tr>
+        <tr><td><kbd>Shift</kbd> + <kbd>x</kbd></td><td>the next seed of the random order</td></tr>
+        <tr><td><kbd>c</kbd></td><td>crosshair on, off</td></tr>
+        <tr><td><kbd>t</kbd></td><td>traces and markers on, off</td></tr>
+        <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
+      </table>
+      <p>Surfaces: the white and pial surfaces as contours, white surface red, pial surface yellow, both hemispheres,
+        cut at the centre of the slice, on both streams and on the stills.</p>
       <p>Every functional run of a subject, session after session, as one continuous moving picture in the anatomy. The
         page serves two kinds of quality control at once: of the <b>raw data</b>, and of the <b>preprocessing</b>. Two
         streams of every run lie on the same slices, with the white and pial surfaces of FreeSurfer as contours:</p>
@@ -96,7 +125,7 @@
       </ul>
       <p><b>The difference</b> between the two streams, and the raw stream's misfit to the contours, are what the page
         exists to show. The panels show one stream at a time; <kbd>f</kbd> flips to the other at the same volume and
-        slices, so what the pipeline changed is seen in place. The strip under the timeline says what the pipeline did to the run on screen, each statement
+        slices, so what the pipeline changed is seen in place. The strip under the traces says what the pipeline did to the run on screen, each statement
         with where it was read; <b>details</b> gives the whole text.</p>
       <p><b>One stream.</b> The runs follow each other without a stop: playing runs on from the last volume of a run to
         the first of the next, and from the last run of a session to the first of the next session (sessions put in order by: <span id="help-order"></span>). At a boundary
@@ -139,30 +168,6 @@
         the random order: those between two pictures are not shown, none twice in a loop. In a random order the
         pieces of the stream that the coming volumes need are loaded first; when the stream is larger than the memory
         held, playing waits for them often.</p>
-      <table>
-        <tr><th>Key</th><th>Action</th></tr>
-        <tr><td><kbd>Space</kbd></td><td>play, pause</td></tr>
-        <tr><td><kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>previous, next volume of the stream (pauses)</td></tr>
-        <tr><td><kbd>Shift</kbd> + <kbd>&larr;</kbd> <kbd>&rarr;</kbd></td><td>10 volumes</td></tr>
-        <tr><td><kbd>Home</kbd> <kbd>End</kbd></td><td>first, last volume of the stream</td></tr>
-        <tr><td><kbd>[</kbd> <kbd>]</kbd></td><td>slower, faster (1 to 300 volumes per second; above 60, not every volume is shown)</td></tr>
-        <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd></td><td>next, previous slice of the active plane; with <kbd>Shift</kbd>, 5 slices</td></tr>
-        <tr><td><kbd>p</kbd></td><td>next plane becomes the active one; the mouse wheel over a panel scrubs its slices</td></tr>
-        <tr><td>click, drag</td><td>in a panel: the other two planes go to that point; in the traces: go to that volume</td></tr>
-        <tr><td><kbd>1</kbd> <kbd>2</kbd></td><td>raw, preprocessed</td></tr>
-        <tr><td><kbd>f</kbd></td><td>flip between raw and preprocessed, at the same volume and slices</td></tr>
-        <tr><td><kbd>q</kbd> <kbd>w</kbd> <kbd>e</kbd></td><td>the moving series, the temporal mean, the temporal SD of the run (stills)</td></tr>
-        <tr><td><kbd>n</kbd></td><td>intensity normalization on, off</td></tr>
-        <tr><td><kbd>r</kbd>, <kbd>Shift</kbd> + <kbd>r</kbd></td><td>jump to the next, previous run of the stream</td></tr>
-        <tr><td><kbd>s</kbd></td><td>surfaces (the white and pial contours) on, off (held down: off while held)</td></tr>
-        <tr><td><kbd>x</kbd></td><td>random order of play on, off (the order of acquisition when off)</td></tr>
-        <tr><td><kbd>Shift</kbd> + <kbd>x</kbd></td><td>the next seed of the random order</td></tr>
-        <tr><td><kbd>c</kbd></td><td>crosshair on, off</td></tr>
-        <tr><td><kbd>t</kbd></td><td>traces and markers on, off</td></tr>
-        <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
-      </table>
-      <p>Surfaces: the white and pial surfaces as contours, white surface red, pial surface yellow, both hemispheres,
-        cut at the centre of the slice, on both streams and on the stills.</p>
       <p><button type="button" id="help-close">close</button></p>
     </div>
   </div>

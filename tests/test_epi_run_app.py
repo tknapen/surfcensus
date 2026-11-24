@@ -380,7 +380,7 @@ def test_the_page_of_a_participant_plays_its_stream_from_the_run(
     assert f'data-index-api="/api/epi" data-participant="{FULL}"' in page
     assert '<a id="index-link" href="/epi">EPI movies</a>' in page
     assert '<a id="rate-link" href="/rate">rating screen</a>' in page
-    assert '<span id="packing" class="epi-packing" data-waiting="false">' in page
+    assert '<p id="packing" class="epi-packing" data-waiting="false">' in page
     body = ok(client.get(f"/api/epi/{FULL}"), shapes.EpiStreamOut)
     # the answer of step 1's server on the same directory, with only the media URLs changed
     alone = Packs(epi_run.run_dir / EPI_DIR / FULL).shape().model_dump(mode="json")
@@ -399,7 +399,7 @@ def test_a_half_packed_participant_shows_what_is_packed_and_asks_again(
     assert len(epi_run.sessions[HALF]) == 2 and len(epi_run.shown[HALF]) == 1
     page = ok(client.get(f"/epi/{HALF}", headers=PAGE)).text
     assert 'data-poll="5"' in page and 'data-waiting="true"' in page
-    assert '<span id="packing" class="epi-packing" data-waiting="true">' in page
+    assert '<p id="packing" class="epi-packing" data-waiting="true">' in page
     # the second session is packed behind the app: the next answer holds it
     second = epi_run.sessions[HALF][1]
     source = epi_run.run_dir / EPI_DIR / FULL / epi_run.sessions[FULL][1]

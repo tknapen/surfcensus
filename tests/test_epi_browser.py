@@ -461,7 +461,7 @@ def test_what_the_page_says_follows_the_run_on_screen(page: Page, packed: Packed
         page.set({"g": seg["first"]})
         texts = page.js("window.__epi.texts()")
         said[k] = texts
-        assert seg["run"].name in texts["runNote"] and seg["run"].name in texts["readout"]
+        assert seg["run"].name in texts["runNote"] and seg["run"].name not in texts["readout"]
         assert seg["run"].name in texts["corrections"]
         flagged = seg["run"].frame is not None and seg["run"].frame.flagged
         assert (f"{seg['run'].name} is flagged" in texts["warning"]) is flagged
@@ -518,8 +518,22 @@ def test_f_flips_between_the_streams_at_the_same_volume_and_place_and_nothing_mo
         want = expected(segs, 30, shown["slices"], view, False)
         for plane in range(3):
             assert np.array_equal(canvas(page, view, plane), want[plane]), (view, plane)
-        heading = page.js("document.querySelector('#views .epi-group h2').textContent")
-        assert ("raw data" if view == "raw" else "preprocessed") in heading
+        tag = page.js("document.querySelector('#views .epi-group h2 .tag').textContent")
+        assert tag == ("raw" if view == "raw" else "preprocessed")
+    # held down: the other stream while held, then back; the repeats of the held key do nothing
+    page.page.keyboard.down("f")
+    page.page.wait_for_function("() => window.__epi.shown.view === 'pre'")
+    for _ in range(5):
+        page.page.keyboard.down("f")  # a repeat of the key that is held
+    page.page.wait_for_timeout(500)
+    assert page.js("window.__epi.state.view") == "pre"
+    page.page.keyboard.up("f")
+    page.page.wait_for_function("() => window.__epi.shown.view === 'raw'")
+    # the button flips as the key does
+    page.page.click("#flip")
+    page.page.wait_for_function("() => window.__epi.shown.view === 'pre'")
+    page.page.click("#flip")
+    page.page.wait_for_function("() => window.__epi.shown.view === 'raw'")
     for key in ("3", "4"):
         page.page.keyboard.press(key)
     assert page.js("window.__epi.state.view") == "raw"
@@ -591,7 +605,7 @@ def test_screenshots_for_a_reader(
 
 # --- the layout (review of the page, findings 1, 3 and 10) ----------------------------------
 
-BLOCKS = ("bar", "timeline", "run-strip", "controls", "traces", "status", "about")
+BLOCKS = ("bar", "timeline", "track-row", "run-strip", "controls", "traces", "status", "about")
 
 
 def rects(page: Page) -> dict[str, list[list[float]]]:
@@ -606,7 +620,7 @@ def rects(page: Page) -> dict[str, list[list[float]]]:
     )
 
 
-HELD = ("bar", "run-strip", "timeline", "controls")
+HELD = ("bar", "run-strip", "timeline", "track-row", "controls")
 """The parts of the page whose every element with an id keeps its box (finding F7 of the
 review of step 2): not a list of elements, so that one added later is measured too."""
 
@@ -780,20 +794,22 @@ def test_the_cursor_and_the_boundaries_are_marked_apart_on_the_slider_and_in_the
     # the segments are the runs, each a jump to its first volume, the session start marked
     buttons = page.js(
         "Array.from(document.querySelectorAll('#segments button')).map((b) => [b.textContent,"
-        " b.classList.contains('session-start'), b.getBoundingClientRect().width])"
+        " b.classList.contains('session-start'), b.getBoundingClientRect().width, b.title])"
     )
-    assert [b[0] for b in buttons] == [s["run"].name for s in segs]
+    # labelled by what tells the runs apart, the whole name in the tooltip
+    assert all(s["run"].name in b[3] for s, b in zip(segs, buttons, strict=True))
+    assert all(b[0] and len(b[0]) <= len(s["run"].name) for s, b in zip(segs, buttons, strict=True))
     assert [b[1] for b in buttons] == [k == 5 for k in range(len(segs))]
-    assert all(w > 10 for *_, w in buttons)
+    assert all(b[2] > 10 for b in buttons)
     # hiding the traces leaves the slider and its marks as they are
-    before = rects(page)["blocks"][BLOCKS.index("timeline")]
+    before = rects(page)["blocks"][BLOCKS.index("track-row")]
     page.page.keyboard.press("t")
     page.page.wait_for_function("() => window.__epi.state.traces === false")
     assert page.js("document.getElementById('time').style.getPropertyValue('--ticks')") == ticks
     assert page.js("document.getElementById('segments').children.length") == len(segs)
     page.page.keyboard.press("t")
     page.page.wait_for_function("() => window.__epi.state.traces === true")
-    assert rects(page)["blocks"][BLOCKS.index("timeline")][2:] == before[2:]
+    assert rects(page)["blocks"][BLOCKS.index("track-row")][2:] == before[2:]
     # in the traces: the cursor in a colour of its own, unlike a run or a session boundary
     page.set({"g": 50})
     shot = Image.open(io.BytesIO(page.page.locator("#traces").screenshot())).convert("RGB")

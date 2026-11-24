@@ -857,3 +857,38 @@ def test_the_chunks_are_wanted_in_the_order_the_coming_volumes_need_them(
             or chunk_of[order[(p + 1) % len(order)]] == chunk_of[order[p]]
         )
         assert [k.split("|")[0] for k in case["d"]] == [str(c) for c in want[: len(case["d"])]]
+
+
+def test_the_runs_on_the_timeline_are_labelled_by_what_tells_them_apart(js_copy: Path) -> None:
+    """The labels of the segments leave out the entities that every run shares, so that the
+    ellipsis of a narrow segment does not cut off what differs (design review, 2026-11-24)."""
+    cases = [
+        ["task-flanker_run-1", "task-flanker_run-2"],
+        [
+            "ses-retest_task-covertverbgeneration",
+            "ses-retest_task-linebisection",
+            "ses-test_task-covertverbgeneration",
+        ],
+        ["ses-1_task-rest_dir-AP_run-1", "ses-1_task-rest_dir-PA_run-1"],
+        ["task-rest"],
+        ["task-rest", "task-rest_run-2"],
+    ]
+    out = run_js(js_copy, "output(input.map((names) => L.runLabels(names)));\n", cases)
+    assert out == [
+        ["run 1", "run 2"],
+        ["retest · covertverbgeneration", "retest · linebisection", "test · covertverbgeneration"],
+        ["dir AP", "dir PA"],
+        ["task-rest"],
+        ["task-rest", "run 2"],
+    ]
+
+
+def test_the_track_and_the_traces_share_the_plot_area() -> None:
+    """The track of the stream is lined up with the plot area of the traces under it: the two
+    values of traces.js are those app.css gives the track."""
+    traces = (EPI_JS / "traces.js").read_text(encoding="utf-8")
+    css = (EPI_JS.parent.parent / "app.css").read_text(encoding="utf-8")
+    for js_name, css_name in (("LEFT", "--trace-left"), ("RIGHT", "--trace-right")):
+        js_value = re.search(rf"^const {js_name} = (\d+);$", traces, re.M)
+        css_value = re.search(rf"{css_name}: (\d+)px;", css)
+        assert js_value and css_value and js_value.group(1) == css_value.group(1), js_name

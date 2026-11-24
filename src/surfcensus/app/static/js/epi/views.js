@@ -37,7 +37,7 @@ export class Views {
     this.sizes = sizesMm;
     this.handlers = handlers;
     this.grid = null;
-    this.group = null; // { element, heading, badge, row, panels: [{ box, gray, over, letters, ctx, image }] }
+    this.group = null; // { element, tag, heading, badge, row, panels: [{ box, gray, over, letters, ctx, image }] }
     this.scale = 2;
     this.markerState = ['', ''];
     this.crosshair = crosshairColour();
@@ -51,26 +51,35 @@ export class Views {
     if (this.group) this.fitGroup(this.group);
   }
 
-  // The stream on screen ('raw' or 'pre') and the heading over its panels. A flip changes the
-  // heading and the pictures, not the panels: nothing moves (D38).
-  setStream(key, label) {
+  // The stream on screen ('raw' or 'pre') and the heading over its panels: a tag with the
+  // stream's name on its colour, and what the stream is. A flip changes the heading and the
+  // pictures, not the panels: nothing moves (D38).
+  setStream(key, name, text) {
     if (!this.group) {
       this.group = this.makeGroup();
       this.layout();
       this.marker(...this.markerState);
     }
-    this.group.element.dataset.group = key;
-    if (this.group.heading.textContent !== label) this.group.heading.textContent = label;
+    const { element, tag, heading } = this.group;
+    element.dataset.group = key;
+    if (tag.textContent !== name) tag.textContent = name;
+    if (heading.textContent !== text) {
+      heading.textContent = text;
+      heading.title = text;
+    }
   }
 
   makeGroup() {
     const element = document.createElement('section');
     element.className = 'epi-group';
     const head = document.createElement('h2');
+    const tag = document.createElement('span');
+    tag.className = 'tag';
     const heading = document.createElement('span');
+    heading.className = 'what-stream';
     const badge = document.createElement('span');
     badge.className = 'badge';
-    head.append(heading, badge);
+    head.append(tag, heading, badge);
     const row = document.createElement('div');
     row.className = 'epi-panels';
     element.append(head, row);
@@ -117,7 +126,7 @@ export class Views {
       return { box, gray, over, letters, ctx: gray.getContext('2d'), image: null };
     });
     this.root.append(element);
-    const group = { element, heading, badge, panels, row };
+    const group = { element, tag, heading, badge, panels, row };
     this.fitGroup(group);
     return group;
   }

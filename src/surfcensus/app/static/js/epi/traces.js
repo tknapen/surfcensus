@@ -5,6 +5,8 @@
 // traces has (magenta, with a head at the top and the bottom). A click or a drag sets the volume.
 import { aboveLimit, clamp } from './logic.js';
 
+// the plot area of the traces; app.css has the same two values (--trace-left, --trace-right),
+// to which the track of the stream is lined up
 const LEFT = 46;
 const RIGHT = 10;
 export const COLOURS = {
