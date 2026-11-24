@@ -2375,6 +2375,36 @@ def test_the_subject_page_says_the_corrections_once_for_a_session_and_the_differ
 
 
 @needs_node
+def test_a_run_says_recorded_once_and_its_corrections_column_only_when_needed(
+    js_copy: Path,
+) -> None:
+    """The design review of 2026-11-24: "(recorded)" was said in every state cell, and a
+    column of corrections read "as for every run of the session (above)" in every row."""
+    out = run_js(
+        js_copy,
+        """
+        import { STATE_HEADING, stateText, ownCorrectionsShown } from "./js/subjects.js";
+        output({
+          heading: STATE_HEADING,
+          packed: stateText({ state: "packed", reason: null }),
+          failed: stateText({ state: "failed", reason: "pack failure" }),
+          waiting: stateText({ state: "pending", reason: null }),
+          none: ownCorrectionsShown([[], []]),
+          some: ownCorrectionsShown([[], ["distortion correction, FLB"]]),
+        });
+        """,
+    )
+    assert out == {
+        "heading": "state (recorded)",
+        "packed": "packed",
+        "failed": "pack failed: pack failure",
+        "waiting": "waiting for its pack",
+        "none": False,
+        "some": True,
+    }
+
+
+@needs_node
 def test_the_list_of_subjects_puts_each_count_under_its_heading(js_copy: Path) -> None:
     """A broken copy with the columns waiting and failed swapped passed every test (review of
     step 3, F4): the headings of the table and the fields drawn under them are read together."""

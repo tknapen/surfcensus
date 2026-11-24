@@ -32,13 +32,19 @@ function draw(index) {
   for (const p of index.participants) {
     const row = document.createElement('tr');
     row.dataset.participant = p.participant_uid;
-    cell(row, p.label || p.participant_uid);
+    if (p.n_flagged) row.className = 'flagged-row';
+    // the participant is the link to its stream, as the last column is
+    const name = cell(row, '');
+    const named = document.createElement('a');
+    named.href = p.url;
+    named.textContent = p.label || p.participant_uid;
+    name.append(named);
     cell(row, sessionsText(p));
     cell(row, String(p.n_runs));
     cell(row, String(p.n_packed));
     cell(row, String(p.n_pending));
     cell(row, String(p.n_failed));
-    cell(row, String(p.n_flagged));
+    cell(row, String(p.n_flagged), p.n_flagged ? 'flagged' : '');
     const td = cell(row, '');
     const link = document.createElement('a');
     link.href = p.url;

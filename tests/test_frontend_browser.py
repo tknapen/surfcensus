@@ -337,6 +337,51 @@ def test_the_page_shows_three_square_panels_side_by_side(
     page.close()
 
 
+LAYOUT_JS = """() => {
+  const box = (s) => document.querySelector(s).getBoundingClientRect();
+  const levels = [...document.querySelectorAll('.criterion .levels')]
+    .map((e) => e.getBoundingClientRect());
+  const legend = document.querySelector('.legend');
+  return {
+    label: box('.criterion[data-criterion="A"] .criterion-label').left,
+    levels: levels.map((r) => Math.round(r.left)),
+    caption: box('.panel figcaption').bottom,
+    transport: box('.transport').top,
+    legendCut: legend.scrollWidth > legend.clientWidth + 1,
+    scrollWidth: document.documentElement.scrollWidth,
+  };
+}"""
+
+
+def test_the_buttons_of_a_row_follow_its_label_and_the_slider_its_pictures(
+    browser: Any, server: MockHandle
+) -> None:
+    """The design review of 2026-11-24: the level buttons lay 760 px from their labels at
+    1400 px, the slider 146 px below the pictures, and the key legend was cut."""
+    page = browser.new_page(viewport=WIDE)
+    rater = Rater(page, server).open().paused()
+    before = page.evaluate(LAYOUT_JS)
+    # the label column is at most 24em (14 px type) and the gap between the columns 24 px
+    assert all(left - before["label"] <= 24 * 14 + 24 + 2 for left in before["levels"])
+    assert len(set(before["levels"])) == 1
+    assert before["transport"] - before["caption"] <= 12
+    assert not before["legendCut"] and before["scrollWidth"] <= WIDE["width"]
+    # a refused Enter puts words into the labels; the buttons stay where they were
+    rater.press("Enter")
+    page.wait_for_selector("#refusal:not([hidden])")
+    after = page.evaluate(LAYOUT_JS)
+    assert after["levels"] == before["levels"]
+    assert after["transport"] == before["transport"]
+    # the selected levels carry white text (4.5:1 or more on their fills)
+    rater.press("1", "5", "9")
+    colours = page.eval_on_selector_all(
+        ".level[aria-pressed='true']", "all => all.map((e) => getComputedStyle(e).color)"
+    )
+    assert colours == ["rgb(255, 255, 255)"] * 3
+    assert rater.console == [] and rater.failed == []
+    page.close()
+
+
 def test_the_page_asks_its_own_server_and_nothing_else(rater: Rater, state: MockState) -> None:
     rater.open().ready()
     rater.press("?")
@@ -1573,6 +1618,25 @@ def test_when_nothing_is_left_the_page_says_so_and_backspace_still_goes_back(
         rater.page.is_visible("#review-link")
         and rater.page.get_attribute("#review-link", "href") == "/review"
     )
+    # where to go next, under the message: the links of the progress line that are shown, and
+    # no other (the EPI movies are not offered by this server, so they are not offered here)
+    rater.page.wait_for_selector("#message .message-actions a")
+    actions = rater.page.eval_on_selector_all(
+        "#message .message-actions a",
+        "all => all.map((a) => [a.dataset.for, a.getAttribute('href'), a.textContent])",
+    )
+    footer = rater.page.eval_on_selector_all(
+        "#progress .links a:not([hidden])", "all => all.map((a) => a.id)"
+    )
+    assert [a[0] for a in actions] == ["review-link", "home-link"]
+    assert set(footer) == {"review-link", "home-link"}
+    assert [a[1] for a in actions] == ["/review", "/"]
+    # back and help still work and are not dimmed; the rows are
+    opacity = rater.page.evaluate(
+        "() => ['#back', '#help-toggle', '#criteria', '#skip'].map("
+        "(s) => getComputedStyle(document.querySelector(s)).opacity)"
+    )
+    assert opacity == ["1", "1", "0.35", "0.35"]
     assert rater.page.is_disabled("#submit") and rater.pressed() == {}
     # the keys of a subject do nothing when there is none
     rater.press(" ", "3", "Enter", "u")
@@ -1580,6 +1644,7 @@ def test_when_nothing_is_left_the_page_says_so_and_backspace_still_goes_back(
     rater.press("Backspace")
     rater.ready(0)
     assert rater.page_state == "rating" and rater.pressed() == {"A": 0, "B": 0, "C": 0}
+    assert rater.page.query_selector("#message .message-actions") is None
     rater.press("2", "Enter")
     rater.page.wait_for_selector("#rate[data-state='done']")
     assert [rating.values["A"] for rating in state.ratings] == [0, 1]
@@ -1738,7 +1803,18 @@ def test_the_review_page_lists_the_subjects_and_sorts_and_filters(
     rater.page.press("#filter", "Enter")
     rater.page.wait_for_function("document.querySelectorAll('#subjects tbody tr').length === 1")
     assert "filter=final_A%3A2" in state.paths("/api/review?")[-1]
-    assert rater.page.inner_text("#review-count") == "1 subjects"
+    assert rater.page.inner_text("#review-count") == "1 subject"
+    # one subject at its label: the dot on the line of the label, not beside it; the first
+    # column stays in view when the table is scrolled sideways (design review of 2026-11-24)
+    dot = rater.page.eval_on_selector("#scatter .scatter-dot", "d => Number(d.getAttribute('cy'))")
+    lines = rater.page.eval_on_selector_all(
+        "#scatter .scatter-grid", "all => all.map((l) => Number(l.getAttribute('y1')))"
+    )
+    assert any(abs(dot - y) < 1e-6 for y in lines)
+    position = rater.page.eval_on_selector(
+        "#subjects tbody td:first-child", "c => getComputedStyle(c).position"
+    )
+    assert position == "sticky"
     assert rater.page.get_attribute("#export-link", "href") == "/api/export"
     assert rater.console == []
 

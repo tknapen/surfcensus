@@ -6,11 +6,17 @@
   --surface: #191e25;
   --raised: #242b35;
   --line: #36404d;
+  /* the boundary of a control (button, select, input): 3.49:1 against --bg and 3.14:1 against
+     --surface, the 3:1 that WCAG 1.4.11 asks of a component; --line stays for rules and frames */
+  --control-line: #606c7c;
+  /* the fill of a pressed control, on every page */
+  --pressed: #1d3a5c;
   --text: #dfe4ea;
   --muted: #8f9aa7;
   --accent: #4ea1ff;
   --low: #2e7d5b;
-  --mid: #a8741a;
+  /* darker than at first, so that white text on it is 5.75:1 (#a8741a gave 4.06) */
+  --mid: #8a5d12;
   --high: #b83a31;
   --mark-a: #ff5ae0;
   --mark-b: #5bff8f;
@@ -23,6 +29,8 @@
   --warn-line: #ffb15c;
   --gap: 8px;
   --pad: 10px;
+  /* the title of every page but the rating screen and the EPI page */
+  --fs-h1: 20px;
 }
 
 * {
@@ -73,7 +81,7 @@ button {
 .reason,
 .sort {
   padding: 3px 8px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-line);
   border-radius: 5px;
   background: var(--raised);
   cursor: pointer;
@@ -101,7 +109,14 @@ textarea:focus-visible {
 
 .control[aria-pressed="true"] {
   border-color: var(--accent);
-  background: #1d3a5c;
+  background: var(--pressed);
+}
+
+/* a link that looks like a button (the start page, the message of the rating screen) */
+a.control {
+  display: inline-block;
+  color: var(--text);
+  text-decoration: none;
 }
 
 .primary:not(:disabled) {
@@ -109,9 +124,10 @@ textarea:focus-visible {
   background: #1f5fa8;
 }
 
-/* A submit that would be refused: it can be pressed, and then says what is missing. */
+/* A submit that would be refused: it can be pressed, and then says what is missing. It keeps
+   the accent border, so that the primary action is found before it is complete. */
 .primary[aria-disabled="true"]:not(:disabled) {
-  border-color: var(--line);
+  border-color: var(--accent);
   background: var(--raised);
   color: var(--muted);
 }
@@ -144,9 +160,16 @@ textarea:focus-visible {
 }
 
 .rate[data-state="rendering"] .rating,
-.rate[data-state="done"] .rating,
 .rate[data-state="loading"] .rating,
 .rate[data-state="error"] .rating {
+  opacity: 0.35;
+}
+
+/* nothing is left to rate: the rows and the buttons that do nothing now are dimmed; back and
+   help still work, and look it */
+.rate[data-state="done"] .criteria,
+.rate[data-state="done"] .hint-row,
+.rate[data-state="done"] .actions > :not(#back):not(#help-toggle) {
   opacity: 0.35;
 }
 
@@ -160,6 +183,10 @@ textarea:focus-visible {
   justify-content: center;
   gap: var(--gap);
   min-height: min(calc((100vw - 2 * var(--pad) - 2 * var(--gap)) / 3 + 18px), 60vh);
+  /* never taller than three panels of a third of the width need: when the width decides their
+     size, the box ends at their captions, and the slider stays under the pictures; the room
+     left goes below the slider */
+  max-height: calc((100vw - 2 * var(--pad) - 2 * var(--gap)) / 3 + 18px);
 }
 
 .panel {
@@ -419,10 +446,14 @@ textarea:focus-visible {
   background: var(--surface);
 }
 
+/* The buttons of a row follow its label, not the far edge of the window: the label column is
+   at most 24em (room for the longest label and the words a refused Enter puts in it, so that the
+   buttons do not move then), less in a narrow window, where the label is cut. */
 .criteria {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto auto;
-  gap: 4px 12px;
+  grid-template-columns: minmax(0, 24em) max-content max-content;
+  justify-content: start;
+  gap: 4px 24px;
   align-items: center;
 }
 
@@ -444,6 +475,11 @@ textarea:focus-visible {
 .levels {
   display: flex;
   gap: 4px;
+}
+
+/* white on the three fills: 5.0, 5.75 and 5.69:1 */
+.level[aria-pressed="true"] {
+  color: #fff;
 }
 
 .level[aria-pressed="true"][data-rank="low"] {
@@ -473,7 +509,7 @@ textarea:focus-visible {
 
 .class-key[aria-pressed="true"] {
   border-color: var(--text);
-  background: #3a4553;
+  background: var(--pressed);
 }
 
 .class-key[data-class="A"] kbd,
@@ -519,9 +555,20 @@ textarea:focus-visible {
   font-weight: 600;
 }
 
-/* takes the room the buttons leave and no more: it is cut short before a button wraps */
+/* the line under the buttons: what the page says of the rating on the left, the keys of the
+   marks on the right, where every key the legend names is shown (beside the buttons it was cut) */
+.hint-row {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+
+.hint-row .hint {
+  flex: 1 1 auto;
+}
+
 .legend {
-  flex: 100 1 0;
+  flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
   color: var(--muted);
@@ -549,7 +596,7 @@ textarea:focus-visible {
   flex: 1 1 auto;
   min-height: 2.9em;
   padding: 4px 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-line);
   border-radius: 5px;
   background: #0c0f13;
   color: var(--text);
@@ -678,6 +725,16 @@ textarea:focus-visible {
   text-align: center;
 }
 
+/* where to go once nothing is left to rate: the links of the progress line that are shown */
+.message-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin-top: 12px;
+  font-size: 14px;
+}
+
 /* --- dialogs: the unratable reasons, the help screen ---------------------------------- */
 
 .overlay {
@@ -776,7 +833,7 @@ textarea:focus-visible {
   width: 26px;
   height: 26px;
   padding: 0;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-line);
   border-radius: 5px;
   background: var(--raised);
   font-size: 17px;
@@ -823,7 +880,7 @@ textarea:focus-visible {
 
 .reason[aria-selected="true"] {
   border-color: var(--accent);
-  background: #1d3a5c;
+  background: var(--pressed);
 }
 
 .help-table {
@@ -889,7 +946,7 @@ textarea:focus-visible {
 
 .review-head h1 {
   margin: 0;
-  font-size: 18px;
+  font-size: var(--fs-h1);
 }
 
 .filter-form {
@@ -902,7 +959,7 @@ textarea:focus-visible {
   flex: 1 1 auto;
   min-width: 0;
   padding: 3px 6px;
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-line);
   border-radius: 5px;
   background: #0c0f13;
   color: var(--text);
@@ -998,7 +1055,30 @@ textarea:focus-visible {
 }
 
 .subjects tr[aria-selected="true"] td {
-  background: #1d3a5c;
+  background: var(--pressed);
+}
+
+/* the review table: its first column stays in view while the table is scrolled sideways */
+#subjects td:first-child,
+#subjects th:first-child {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: var(--bg);
+  box-shadow: inset -1px 0 0 var(--line);
+}
+
+#subjects th:first-child {
+  z-index: 2;
+  background: var(--raised);
+}
+
+#subjects tr:hover td:first-child {
+  background: #1d232c;
+}
+
+#subjects tr[aria-selected="true"] td:first-child {
+  background: var(--pressed);
 }
 
 .sort {
@@ -1830,6 +1910,16 @@ body.no-traces .epi #traces {
   color: var(--muted);
 }
 
+.epi-index .subjects .flagged {
+  color: var(--warn-line);
+}
+
+/* a row with a flagged run (a statement about the raw data): an amber edge at its start, on
+   the index, the list of subjects and the runs of a subject page */
+.subjects tr.flagged-row td:first-child {
+  box-shadow: inset 3px 0 0 var(--warn-line);
+}
+
 #index-packing {
   color: var(--warn-line);
 }
@@ -1964,13 +2054,20 @@ body.no-traces .epi #traces {
   padding-left: 1.1em;
 }
 
-.anchor-badge {
+.anchor-badge,
+.flag-badge {
   margin-left: 6px;
   padding: 0 5px;
   border: 1px solid var(--accent);
   border-radius: 4px;
   color: var(--accent);
   font-size: 11px;
+  white-space: nowrap;
+}
+
+.flag-badge {
+  border-color: var(--warn-line);
+  color: var(--warn-line);
 }
 
 @media (max-width: 760px) {
@@ -2023,7 +2120,7 @@ body.no-traces .epi #traces {
 
 .home-head h1 {
   margin: 0 0 6px;
-  font-size: 22px;
+  font-size: var(--fs-h1);
 }
 
 .home-head .tagline {
@@ -2086,18 +2183,8 @@ body.no-traces .epi #traces {
   margin: auto 0 0;
 }
 
-.home-button {
-  display: inline-block;
-  padding: 6px 14px;
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  background: var(--raised);
-  color: var(--text);
-  text-decoration: none;
-}
-
-.home-button:hover,
-.home-button:focus-visible {
-  background: var(--accent);
-  color: #0c0f13;
+/* the button of a card: the shared .control.primary, a little larger on a page that is mostly
+   empty */
+.home-actions .control {
+  padding: 5px 12px;
 }

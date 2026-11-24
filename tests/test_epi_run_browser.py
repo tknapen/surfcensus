@@ -155,6 +155,16 @@ def test_from_the_rating_screen_to_a_stream_and_back_with_the_draft_kept(
     assert LABELS[FULL] in text and LABELS[HALF] in text and "ses-1" in text
     assert page.is_visible("#index-packing")  # HALF waits for its second session
     assert "still being made" in page.inner_text("#index-packing")
+    # the participant in the first column is the link to its stream, as the last column is; a
+    # participant with a flagged run has an amber edge (design review of 2026-11-24)
+    cells = page.eval_on_selector_all(
+        "#participants tbody tr",
+        "rows => rows.map(r => [r.cells[0].querySelector('a').getAttribute('href'),"
+        " r.cells[r.cells.length - 1].querySelector('a').getAttribute('href'),"
+        " r.classList.contains('flagged-row'), Number(r.cells[6].textContent)])",
+    )
+    for first, last, edge, n_flagged in cells:
+        assert first == last and edge == (n_flagged > 0)
     no_horizontal_scroll(tab)
     tab.shot(f"index_{width}")
 
