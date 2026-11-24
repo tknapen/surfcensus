@@ -114,7 +114,7 @@ The start page (`http://127.0.0.1:8765/`, or the port `review` prints) shows bot
 
 ### Watching EPI movies
 
-- `/epi` lists the participants. A participant's page plays every run of every session in one stream, in acquisition order, raw beside preprocessed or one at a time or their difference, with the surfaces as contours.
+- `/epi` lists the participants. A participant's page plays every run of every session in one stream, in acquisition order, raw or preprocessed, with the surfaces as contours; `f` flips from one to the other at the same volume and slices.
 - Space plays and pauses, the arrow keys step one volume, `[` and `]` change the rate (up to 300 volumes per second; above 60 the page says that not every volume is painted), `n` switches the intensity normalization per run on and off, `x` plays the volumes in a seeded random order, `s` toggles the surfaces, and `?` lists every key.
 - Above the views, a flagged run (one that lies more than 10 mm from the session's registration) and a raw affine that could not be checked are said as statements about the raw data. Under them, the corrections the pipeline applied to the run on screen are named with the file they were read from.
 - "functional runs of this subject" on the rating screen and `/subjects` lead to a page per subject: its sessions, their registration, and every run with its state, volumes, displacement and corrections, each linked into the EPI movie at that run.

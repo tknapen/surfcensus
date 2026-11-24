@@ -1,5 +1,5 @@
 // The EPI page: one continuous stream of a subject's functional runs (decision D38), raw and
-// preprocessed on the same slices with the white and pial contours. State, keys, the playback
+// preprocessed on the same slices with the white and pial contours, one at a time (f flips). State, keys, the playback
 // loop and what is written on the page. Ported from stage 1's player (main.js).
 //
 // The stream is every packed run of every session, in order, as one timeline of volumes. At a
@@ -15,11 +15,8 @@ import {
   clamp,
   CONTOUR_UNIT,
   decodeContours,
-  DIFF_SCALES,
-  diffLut,
   extractSlice,
   formatBytes,
-  groupsOf,
   HOLD_MS,
   intensityTables,
   KINDS,
@@ -66,7 +63,6 @@ const state = {
   crosshair: true,
   traces: true,
   normalized: false,
-  diffScale: 32,
   fdLimit: 0.5,
   active: 0,
   help: false,
@@ -81,13 +77,11 @@ let store;
 let views;
 let traces;
 let tables;
-let lut = diffLut(state.diffScale);
 let shown = null; // what the panels hold now
 let pending = false;
 let pendingReason = 'other';
 let nextDue = 0;
 let seek = null;
-let lastFlip = 'pre';
 let stalled = false;
 const frameTimes = []; // the animation frames of the last second or so, for the frame rate
 let note = null; // what is said beside the rate (logic.skipNote), and when it was said
@@ -170,7 +164,7 @@ function gridOf(k) {
 }
 
 function stateKey(s) {
-  return [s.kind === 'series' ? s.g : `${segOf(s.g)}:${s.kind}`, s.view, s.slices.join(','), s.diffScale, s.normalized].join('|');
+  return [s.kind === 'series' ? s.g : `${segOf(s.g)}:${s.kind}`, s.view, s.slices.join(','), s.normalized].join('|');
 }
 
 // The contours of a grid belong to its session: two sessions on one grid may have the
@@ -196,13 +190,9 @@ function readyFor(g) {
 
 // ---- painting ---------------------------------------------------------------------------------
 
-function groupLabels() {
+function streamLabel() {
   const what = { series: '', mean: 'temporal mean: ', sd: 'temporal SD: ' }[state.kind];
-  return {
-    raw: `${what}raw data, one placement per session`,
-    pre: `${what}preprocessed, as the pipeline wrote it`,
-    diff: `${what}raw minus preprocessed`,
-  };
+  return state.view === 'raw' ? `${what}raw data, one placement per session` : `${what}preprocessed, as the pipeline wrote it`;
 }
 
 function setPending(on, reason) {
@@ -234,7 +224,7 @@ function enterSegment(k) {
     views.setGrid(grid);
     for (let plane = 0; plane < 3; plane++) {
       const [w, h] = planeSize(grid.shape, plane);
-      sliceBuffers[plane] = [new Uint8Array(w * h), new Uint8Array(w * h)];
+      sliceBuffers[plane] = new Uint8Array(w * h);
     }
     writeSliceControls();
   }
@@ -247,7 +237,7 @@ function render(reason = 'other', advanced = 0) {
   enterSegment(k);
   const streams = streamsOf(state.view);
   store.want(streams, state.g, playFor(state.g));
-  views.setGroups(groupsOf(state.view), groupLabels());
+  views.setStream(state.view, streamLabel());
   const vols = volumesFor(k, streams);
   writeControls();
   if (!vols) {
@@ -269,20 +259,12 @@ function render(reason = 'other', advanced = 0) {
   const shape = grid.shape;
   const table = state.kind === 'sd' ? tables[k].sd : tables[k].value;
   let nz = 0;
-  for (const group of groupsOf(state.view)) {
-    for (let plane = 0; plane < 3; plane++) {
-      const index = state.slices[SPEC[plane].axis];
-      const [a, b] = sliceBuffers[plane];
-      if (group === 'diff') {
-        extractSlice(vols.raw, shape, plane, index, a, table);
-        extractSlice(vols.pre, shape, plane, index, b, table);
-        views.paintDiff(group, plane, a, b, lut);
-      } else {
-        extractSlice(vols[group], shape, plane, index, a, table);
-        views.paintGray(group, plane, a);
-      }
-      if (plane === 0) for (let i = 0; i < a.length; i++) if (a[i]) nz += 1;
-    }
+  for (let plane = 0; plane < 3; plane++) {
+    const index = state.slices[SPEC[plane].axis];
+    const slice = sliceBuffers[plane];
+    extractSlice(vols[state.view], shape, plane, index, slice, table);
+    views.paintGray(plane, slice);
+    if (plane === 0) for (let i = 0; i < slice.length; i++) if (slice[i]) nz += 1;
   }
   drawOverlay();
   const now = performance.now();
@@ -418,7 +400,6 @@ function writeControls() {
   writeRandomNote();
   $('crosshair').checked = state.crosshair;
   $('traces-on').checked = state.traces;
-  $('diff-scale').value = String(state.diffScale);
   document.body.classList.toggle('no-traces', !state.traces);
 }
 
@@ -559,42 +540,20 @@ function setDetails(open) {
   $('run-more').setAttribute('aria-expanded', String(open));
 }
 
-// What the gray levels on screen stand for, and the scale of the difference, under the
-// setting of intensity normalization.
+// What the gray levels on screen stand for under the setting of intensity normalization.
 function legendText() {
   const k = segOf(state.g);
   const run = runOf(k);
   const sd = state.kind === 'sd';
   const what = sd ? 'temporal SD' : 'signal';
   const top = sd ? tables[k].topSd : tables[k].top;
-  const scope = state.normalized
+  return state.normalized
     ? `Intensity normalization on: each run under its own window; in ${run.name} gray 0 to 255 is ${what} 0 to ${top.toFixed(0)}.`
     : `Intensity normalization off: one window for the stream; gray 0 to 255 is ${what} 0 to ${top.toFixed(0)} in every run.`;
-  if (state.view !== 'diff') return scope;
-  // what the colours of the difference mean comes first: it is what this view shows
-  return (
-    `Raw minus preprocessed, of the gray levels on screen: blue raw lower, red raw higher, saturating at ${state.diffScale} gray levels ` +
-    `(${((state.diffScale * top) / 255).toFixed(0)} units of ${what}); surfaces green (white) and magenta (pial). ${scope}`
-  );
 }
 
 function writeLegend() {
   if (!tables || segOnScreen < 0) return;
-  const bar = $('legend-bar');
-  if (state.view === 'diff') {
-    const ctx = bar.getContext('2d');
-    const image = ctx.createImageData(255, 10);
-    for (let x = 0; x < 255; x++) {
-      const d = Math.round(((x - 127) / 127) * state.diffScale);
-      for (let y = 0; y < 10; y++) {
-        const o = 4 * (y * 255 + x);
-        image.data.set(lut.subarray(3 * (d + 255), 3 * (d + 255) + 3), o);
-        image.data[o + 3] = 255;
-      }
-    }
-    ctx.putImageData(image, 0, 0);
-  }
-  bar.hidden = state.view !== 'diff';
   $('legend-text').textContent = legendText();
   $('legend').title = $('legend-text').textContent;
   $('legend').dataset.normalized = String(state.normalized);
@@ -807,12 +766,12 @@ function jumpToSegment(k) {
   setTime(segment(wrap(k, timeline.segments.length)).first, 'seek');
 }
 
+// The stream on screen. A flip keeps the panels, the slices and the volume: only the pictures
+// and the heading change, so the two streams can be compared at one place and time.
 function setView(view) {
-  if (view === 'raw' || view === 'pre') lastFlip = view === 'raw' ? 'pre' : 'raw';
+  if (!VIEWS.includes(view) || view === state.view) return;
   state.view = view;
-  writeLegend();
   writeCorrections();
-  views.layout();
   render('other');
 }
 
@@ -920,13 +879,6 @@ function writeRandomNote() {
       (waits ? '. The stream is larger than the memory held, so playing waits while pieces of it are loaded' : '');
   }
   setText('random-note', text, title);
-}
-
-function setDiffScale(scale) {
-  state.diffScale = scale;
-  lut = diffLut(scale);
-  writeLegend();
-  render('other');
 }
 
 // The help is a modal dialog: the focus goes into it, Tab goes round its buttons, and on
@@ -1049,9 +1001,7 @@ function onKeyDown(event) {
     },
     1: () => setView('raw'),
     2: () => setView('pre'),
-    3: () => setView('side'),
-    4: () => setView('diff'),
-    f: () => setView(state.view === 'raw' ? 'pre' : state.view === 'pre' ? 'raw' : lastFlip === 'raw' ? 'pre' : 'raw'),
+    f: () => setView(state.view === 'raw' ? 'pre' : 'raw'),
     q: () => setKind('series'),
     w: () => setKind('mean'),
     e: () => setKind('sd'),
@@ -1159,13 +1109,8 @@ function buildControls() {
   for (const b of $('kinds-buttons').children) b.addEventListener('click', () => setKind(b.dataset.kind));
   $('normalize').addEventListener('click', () => setNormalized(!state.normalized));
   for (const rate of RATES) $('rate').add(new Option(String(rate), String(rate)));
-  for (const scale of DIFF_SCALES) $('diff-scale').add(new Option(String(scale), String(scale)));
   $('rate').addEventListener('change', (event) => {
     setRate(Number(event.target.value));
-    event.target.blur();
-  });
-  $('diff-scale').addEventListener('change', (event) => {
-    setDiffScale(Number(event.target.value));
     event.target.blur();
   });
   $('play').addEventListener('click', () => setPlaying(!state.playing));
@@ -1362,7 +1307,7 @@ async function start() {
   });
   buildControls();
   enterSegment(k0);
-  views.setGroups(groupsOf(state.view), groupLabels());
+  views.setStream(state.view, streamLabel());
   traces.setData(streamData, state.fdLimit);
   document.addEventListener('keydown', onKeyDown);
   document.addEventListener('pointerup', (event) => {
@@ -1399,7 +1344,7 @@ window.__epi = {
   },
   tables: () => tables.map((t) => ({ value: Array.from(t.value), sd: Array.from(t.sd), top: t.top, topSd: t.topSd })),
   stats: () => ({ ...store.stats(), pageRequests: page.requests, pageFetchedBytes: page.fetchedBytes }),
-  // Change the state (g, slices, view, kind, rate, playing, diffScale, contours, crosshair,
+  // Change the state (g, slices, view, kind, rate, playing, contours, crosshair,
   // normalized, random, scope, seed) and resolve when the panels hold what was asked for.
   set(change) {
     if ('view' in change && VIEWS.includes(change.view)) setView(change.view);
@@ -1425,7 +1370,6 @@ window.__epi = {
       const [plane, index] = change.step;
       setSlice(plane, index);
     }
-    if ('diffScale' in change) setDiffScale(change.diffScale);
     if ('rate' in change) setRate(change.rate);
     if ('random' in change || 'scope' in change || 'seed' in change) {
       setRandom('random' in change ? change.random : state.random, change.scope || state.scope, change.seed || state.seed);

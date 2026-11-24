@@ -96,7 +96,7 @@ def test_random_play_paints_the_order_in_force_every_volume_once_per_loop(
     page: Page, packed: PackedStream, scope: str, rate: int
 ) -> None:
     segs = segments(packed)
-    page.set({"view": "side", "normalized": False})
+    page.set({"view": "raw", "normalized": False})
     got = random_on(page, scope)
     assert got != list(range(TOTAL))
     if scope == "run":
@@ -125,7 +125,7 @@ def test_random_play_paints_the_order_in_force_every_volume_once_per_loop(
 
 @pytest.mark.parametrize("scope", ["stream", "run"])
 def test_at_300_the_painted_volumes_are_a_subsequence_of_the_order(page: Page, scope: str) -> None:
-    page.set({"view": "side"})
+    page.set({"view": "pre"})
     got = random_on(page, scope, seed=3)
     place = {g: p for p, g in enumerate(got)}
     log = play_for(page, got[-1], 300, 3.0)
@@ -150,7 +150,7 @@ def test_the_canvas_holds_the_decoded_volume_painted_in_a_random_order(
     segs = segments(packed)
     random_on(page, "stream", seed=7)
     checked = set()
-    for view in ("raw", "pre", "diff"):
+    for view in ("raw", "pre"):
         page.set({"view": view})
         for _ in range(4):
             page.set({"rate": 30, "playing": True})
@@ -256,7 +256,7 @@ def test_nothing_moves_when_the_order_is_switched_or_while_it_plays(
 ) -> None:
     opened = Page(browser, server.url, *size)
     try:
-        for view in ("raw", "side"):
+        for view in ("raw", "pre"):
             opened.set({"view": view, "g": 40})
             held0 = held_rects(opened)
             opened.page.keyboard.press("x")
@@ -306,7 +306,7 @@ def test_the_surface_control_is_named_and_visible_and_acts_in_every_view(
         assert opened.js("document.scrollingElement.scrollWidth") <= size[0]
         drawn = "window.__epi.pixels(arg, 1, 'over').drawn"
         opened.set({"crosshair": False, "g": 10, "slices": [8, 9, 7]})
-        for view, group in (("raw", "raw"), ("pre", "pre"), ("side", "pre"), ("diff", "diff")):
+        for view, group in (("raw", "raw"), ("pre", "pre")):
             for kind in ("series", "mean", "sd"):
                 opened.set({"view": view, "kind": kind})
                 assert opened.js(drawn, group) > 0, (view, kind)
@@ -316,13 +316,9 @@ def test_the_surface_control_is_named_and_visible_and_acts_in_every_view(
                 assert opened.js(drawn, group) == 0, (view, kind)
                 opened.page.keyboard.press("s")
                 opened.page.wait_for_function("() => window.__epi.state.contours === true")
-        # the help and the legend say the same word
+        # the help says the same word
         help_text = opened.js("document.getElementById('help').textContent")
         assert "surfaces (the white and pial contours) on, off" in " ".join(help_text.split())
-        opened.set({"view": "diff", "kind": "series"})
-        assert "surfaces green (white) and magenta (pial)" in opened.js(
-            "window.__epi.texts().legend"
-        )
     finally:
         opened.clean()
 

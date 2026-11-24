@@ -45,6 +45,14 @@ What follows from it:
 
 Where the sections below speak of a run selector, of a window per run or of playback of a run, read them with this section.
 
+## One stream at a time (Tomas, 2026-11-24)
+
+> "Lets also simplify the epi viewer. No need for side by side views or a difference visualization, so we can take those out"
+
+Decision D52. The views "side by side" (key `3`) and "difference" (key `4`) are gone from the page, and with them the difference scale, the colours of the difference and its legend bar, and the green and magenta contours drawn on a dark outline for that view. The panels show one stream at a time, raw (`1`) or preprocessed (`2`), in one set of three panels. `f` flips to the other stream at the volume and the slices on screen: the panels, the boxes of every block and the scale in px per mm stay (D38), only the pictures and the heading over them change, so the comparison that D36 is about is made in place, by flipping. The stream that is not on screen is loaded behind the one that is, as far as the memory limit allows (`logic.desiredChunks`, unchanged), so that a flip finds it in memory. What the page says of the two streams (`func.model.READING`) now says that their difference is seen by flipping; the help no longer describes a difference view. Nothing of the packs changes: they hold both streams as before, and `rules.difference` of `session.json` stays as a rule of the format.
+
+Where the sections below speak of a side-by-side view, a difference view, its scale or its contour colours, they describe what was built before this change.
+
 ## Step 1 as built (2026-11-14)
 
 `surfcensus epi-session PATH --subject LABEL [--session LABEL]... [--raw DIR] --out DIR [--epi-runs GLOB]... [--serve] [--port N] [--no-browser]` packs the functional sessions of one subject of a local folder and, with `--serve`, plays them in the browser. No run directory, no catalog, view only. The choices are decision D39; where this section and the sections below disagree, this section holds, because it describes what exists.

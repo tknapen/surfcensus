@@ -39,9 +39,6 @@ sync_api = pytest.importorskip("playwright.sync_api")
 pytestmark = pytest.mark.browser
 
 N_VOLUMES = 24
-ZERO = (24, 24, 24)
-POS = ((214, 48, 39), (255, 224, 144))
-NEG = ((33, 102, 172), (166, 226, 255))
 
 
 @pytest.fixture(scope="module")
@@ -150,44 +147,22 @@ def panel_rows(volume: np.ndarray, plane: int, index: int) -> np.ndarray:
     return rows[:, ::-1] if plane > 0 else rows
 
 
-def diff_colour(d: int, scale: int) -> tuple[int, int, int]:
-    a = min(abs(d), scale)
-    if a == 0:
-        return ZERO
-    mid, end = POS if d > 0 else NEG
-    c0, c1, num = (ZERO, mid, 2 * a) if 2 * a <= scale else (mid, end, 2 * a - scale)
-    return tuple(c0[k] + ((c1[k] - c0[k]) * num * 2 + scale) // (2 * scale) for k in range(3))  # type: ignore[return-value]
-
-
 def expected(
     segs: list[dict[str, Any]],
     g: int,
     slices: list[int],
     view: str,
     normalized: bool,
-    scale: int = 32,
 ) -> list[np.ndarray]:
-    """Per plane, the RGB the canvas of the first group of ``view`` holds."""
+    """Per plane, the RGB the canvas of the stream ``view`` holds."""
     seg = segment_of(segs, g)
     lut = table(segs, seg, normalized)
     t = g - seg["first"]
-    raw = lut[decode_volume(seg["dir"], seg["pack"], "raw", t)]
-    pre = lut[decode_volume(seg["dir"], seg["pack"], "pre", t)]
+    volume = lut[decode_volume(seg["dir"], seg["pack"], view, t)]
     out = []
     for plane in range(3):
-        if view == "diff":
-            a = panel_rows(raw, plane, slices[plane]).astype(int)
-            b = panel_rows(pre, plane, slices[plane]).astype(int)
-            colours = np.array(
-                [
-                    [diff_colour(int(x - y), scale) for x, y in zip(ra, rb, strict=True)]
-                    for ra, rb in zip(a, b, strict=True)
-                ]
-            )
-            out.append(colours.astype(np.uint8))
-        else:
-            gray = panel_rows(raw if view == "raw" else pre, plane, slices[plane])
-            out.append(np.repeat(gray[..., None], 3, axis=2))
+        gray = panel_rows(volume, plane, slices[plane])
+        out.append(np.repeat(gray[..., None], 3, axis=2))
     return out
 
 
@@ -221,7 +196,7 @@ def test_the_canvas_holds_the_decoded_values_through_the_table_of_the_setting(
     page.set({"normalized": normalized})
     rng = np.random.default_rng(11)
     cases = [0, 23, 24, 30, 95, 96, 110, 119, 120, 191] + [int(x) for x in rng.integers(0, 192, 6)]
-    for view in ("raw", "pre", "diff"):
+    for view in ("raw", "pre"):
         page.set({"view": view})
         for g in cases:
             shown = page.set({"g": g})
@@ -325,7 +300,7 @@ def test_playing_paints_every_volume_once_in_order_through_every_boundary(
 ) -> None:
     segs = segments(packed)
     total = sum(s["n"] for s in segs)
-    page.set({"view": "side", "normalized": False})
+    page.set({"view": "raw", "normalized": False})
     stalls = page.js("window.__epi.page.stalls")
     log = play(page, start, rate, count)
     gs = [e["g"] for e in log]
@@ -341,7 +316,7 @@ def test_playing_paints_every_volume_once_in_order_through_every_boundary(
     assert gaps.max() < 3 * 1000 / rate, gaps.max()
     assert page.js("window.__epi.page.stalls") == stalls
     # nothing but the pictures: the view, the slices at the place, the layout stay
-    assert {e["view"] for e in log} == {"side"}
+    assert {e["view"] for e in log} == {"raw"}
     boxes = {tuple(page.js("window.__epi.boxRect('raw', arg)", p).values()) for p in range(3)}
     assert len(boxes) == 3
 
@@ -369,7 +344,7 @@ def test_above_the_refresh_rate_the_stream_keeps_the_rate_and_says_what_it_leave
     without anything moving."""
     segs = segments(packed)
     total = sum(s["n"] for s in segs)
-    page.set({"view": "side", "normalized": False, "g": 0})
+    page.set({"view": "raw", "normalized": False, "g": 0})
     held0 = held_rects(page)
     assert page.js("document.getElementById('rate-note').textContent") == ""
     stalls = page.js("window.__epi.page.stalls + window.__epi.page.holds")
@@ -521,8 +496,36 @@ def test_the_normalization_key_and_what_the_legend_says(page: Page) -> None:
     page.page.wait_for_function("() => window.__epi.state.normalized === true")
     assert "normalization on" in page.js("window.__epi.texts().legend")
     assert page.js("document.getElementById('normalize').getAttribute('aria-pressed')") == "true"
-    page.set({"view": "diff"})
-    assert "units of signal" in page.js("window.__epi.texts().legend")
+
+
+def test_f_flips_between_the_streams_at_the_same_volume_and_place_and_nothing_moves(
+    page: Page, packed: PackedStream
+) -> None:
+    """D52: the panels show one stream at a time; f flips to the other at the volume and the
+    slices on screen, the panels and every block stay where they are, and the canvas then holds
+    the other stream. The keys of the views that were taken out do nothing."""
+    segs = segments(packed)
+    shown = page.set({"view": "raw", "g": 30, "normalized": False})
+    r0 = rects(page)
+    held0 = held_rects(page)
+    for view in ("pre", "raw"):
+        page.page.keyboard.press("f")
+        page.page.wait_for_function(f"() => window.__epi.shown.view === '{view}'")
+        flipped = page.js("window.__epi.ready()")
+        assert (flipped["g"], flipped["slices"]) == (shown["g"], shown["slices"])
+        assert rects(page) == r0
+        assert moved(held0, held_rects(page)) == {}
+        want = expected(segs, 30, shown["slices"], view, False)
+        for plane in range(3):
+            assert np.array_equal(canvas(page, view, plane), want[plane]), (view, plane)
+        heading = page.js("document.querySelector('#views .epi-group h2').textContent")
+        assert ("raw data" if view == "raw" else "preprocessed") in heading
+    for key in ("3", "4"):
+        page.page.keyboard.press(key)
+    assert page.js("window.__epi.state.view") == "raw"
+    assert page.js("document.querySelectorAll('#views-buttons button').length") == 2
+    assert page.js("document.querySelectorAll('#views .epi-group').length") == 1
+    assert page.js("document.getElementById('diff-scale') === null")
 
 
 @pytest.mark.parametrize("width", [1400, 400])
@@ -534,8 +537,8 @@ def test_the_page_fits_the_window(browser: Any, server: Any, width: int) -> None
             for plane in range(3):
                 box = opened.js("window.__epi.boxRect(arg[0], arg[1])", [group, plane])
                 assert box["w"] > 50 and box["x"] >= 0 and box["x"] + box["w"] <= width + 0.5
-        opened.page.keyboard.press("3")
-        opened.page.wait_for_function("() => window.__epi.shown.view === 'side'")
+        opened.page.keyboard.press("f")
+        opened.page.wait_for_function("() => window.__epi.shown.view === 'pre'")
         assert opened.js("document.scrollingElement.scrollWidth") <= width
     finally:
         opened.clean()
@@ -575,9 +578,9 @@ def test_screenshots_for_a_reader(
         ("start", {"g": 0}),
         ("boundary", {"g": 24}),
         ("grid_change", {"g": 96}),
-        ("normalized_off", {"g": 30, "view": "side", "normalized": False}),
-        ("normalized_on", {"g": 30, "view": "side", "normalized": True}),
-        ("difference", {"g": 30, "view": "diff"}),
+        ("normalized_off", {"g": 30, "view": "raw", "normalized": False}),
+        ("normalized_on", {"g": 30, "view": "raw", "normalized": True}),
+        ("preprocessed", {"g": 30, "view": "pre"}),
         ("flagged", {"g": 75, "view": "raw"}),
         ("session_two", {"g": 140}),
     ):
@@ -631,7 +634,7 @@ def moved(r0: dict[str, list[float]], r1: dict[str, list[float]]) -> dict[str, l
 
 
 @pytest.mark.parametrize("size", [(1400, 900), (1920, 1080), (400, 800)])
-@pytest.mark.parametrize("view", ["raw", "side", "diff"])
+@pytest.mark.parametrize("view", ["raw", "pre"])
 def test_nothing_moves_at_any_boundary_of_the_stream(
     browser: Any, server: Any, packed: PackedStream, size: tuple[int, int], view: str
 ) -> None:
@@ -712,7 +715,7 @@ def test_the_page_does_not_overflow_the_window(
     opened = Page(browser, server.url, *size)
     try:
         assert opened.js("window.__epi.state.traces") is True
-        for view in ("raw", "pre", "side", "diff"):
+        for view in ("raw", "pre"):
             for g in (0, 75, 100, 150):  # an anchor, the flagged run, grid C, session B
                 opened.set({"view": view, "g": g})
                 height = opened.js("document.scrollingElement.scrollHeight")
@@ -737,7 +740,7 @@ def test_the_pictures_come_first_and_take_most_of_the_window(browser: Any, serve
     largest share of the window the controls leave."""
     opened = Page(browser, server.url, 1400, 900)
     try:
-        for view, least in (("raw", 0.3), ("side", 0.2), ("diff", 0.3)):
+        for view, least in (("raw", 0.3), ("pre", 0.3)):
             opened.set({"view": view, "g": 75})
             top = opened.js("document.getElementById('views').getBoundingClientRect().top")
             bar = opened.js("document.getElementById('bar').getBoundingClientRect().bottom")
@@ -749,9 +752,8 @@ def test_the_pictures_come_first_and_take_most_of_the_window(browser: Any, serve
             assert share >= least, (view, share)
             # the views take what the rest leaves: the page fills the window, it does not
             # leave a stretch empty under it (height-limited views)
-            if view != "side":
-                height = opened.js("document.querySelector('.epi').getBoundingClientRect().height")
-                assert height >= 900 - 30, (view, height)
+            height = opened.js("document.querySelector('.epi').getBoundingClientRect().height")
+            assert height >= 900 - 30, (view, height)
     finally:
         opened.clean()
     narrow = Page(browser, server.url, 400, 900)

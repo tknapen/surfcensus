@@ -99,7 +99,7 @@ def test_from_the_rating_screen_to_a_stream_made_by_review_and_back(
     assert len(segments) == 7 and len({s["session"] for s in segments}) == 2
     boundary = next(s["first"] for s in segments if s["session"] == 1)
     start, count = boundary - 3, 6
-    page.evaluate("(c) => window.__epi.set(c)", {"g": start, "rate": 30, "view": "side"})
+    page.evaluate("(c) => window.__epi.set(c)", {"g": start, "rate": 30, "view": "raw"})
     page.evaluate("window.__epi.page.log.length = 0")
     page.evaluate("(c) => window.__epi.set(c)", {"playing": True})
     page.wait_for_function(

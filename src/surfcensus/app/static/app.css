@@ -1211,11 +1211,6 @@ textarea:focus-visible {
   min-width: 0;
 }
 
-.epi #views[data-groups="column"] {
-  flex-direction: column;
-  align-items: center;
-}
-
 /* waiting for a volume: the picture stays, its frame says so */
 .epi #views.stale .epi-panel {
   outline-color: var(--warn-line);
@@ -1691,19 +1686,8 @@ textarea:focus-visible {
   -webkit-line-clamp: 2;
 }
 
-.epi #legend-bar {
-  flex: 0 0 auto;
-}
-
 .epi #legend[data-normalized="true"] #legend-text {
   color: var(--text);
-}
-
-.epi #legend-bar {
-  vertical-align: middle;
-  width: 160px;
-  height: 10px;
-  border: 1px solid var(--line);
 }
 
 .epi #traces {

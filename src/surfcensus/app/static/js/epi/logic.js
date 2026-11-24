@@ -1,6 +1,6 @@
 // The logic of the EPI page that needs no page: slices of a volume, the timeline of the
 // subject's one stream, the slices of another grid at the same place in the anatomy, the
-// common intensity scale, the difference colours, the layout, the playback clock, which
+// common intensity scale, the layout, the playback clock, which
 // chunks to hold, and the contour file. Imported by the page, by the worker, and by the tests
 // under Node (tests/test_epi_frontend.py). Ported from stage 1's player (logic.js).
 
@@ -18,7 +18,8 @@ export const SPEC = [
 
 export const STREAMS = ['raw', 'pre'];
 export const STILLS = ['ref', 'mean', 'sd'];
-export const VIEWS = ['raw', 'pre', 'side', 'diff'];
+// what the panels show: one stream at a time; f flips between the two (decision D52)
+export const VIEWS = ['raw', 'pre'];
 export const KINDS = ['series', 'mean', 'sd'];
 export const RATES = [1, 2, 5, 12, 24, 30, 60, 120, 200, 300];
 // At this rate and below, playing paints every volume once, in order, whatever the machine:
@@ -28,15 +29,12 @@ export const RATES = [1, 2, 5, 12, 24, 30, 60, 120, 200, 300];
 export const PAINT_EVERY_MAX = 60;
 // The rate counts as above the frame rate the page achieves when it exceeds it by this factor.
 export const SKIP_MARGIN = 1.1;
-export const DIFF_SCALES = [8, 16, 32, 64, 128];
 export const HOLD_MS = 500; // a marker stays on the frame at least this long
 
+// The streams a view needs now. The other stream is loaded behind it, as far as the memory
+// limit allows (desiredChunks), so that a flip finds it in memory.
 export function streamsOf(view) {
-  return view === 'raw' ? ['raw'] : view === 'pre' ? ['pre'] : ['raw', 'pre'];
-}
-
-export function groupsOf(view) {
-  return view === 'side' ? ['raw', 'pre'] : [view];
+  return [view];
 }
 
 export function wrap(t, n) {
@@ -256,56 +254,6 @@ export function grayToRgba(slice, rgba) {
     rgba[o] = g;
     rgba[o + 1] = g;
     rgba[o + 2] = g;
-    rgba[o + 3] = 255;
-  }
-}
-
-// The colours of a signed difference d = raw - pre in gray levels, -255 to 255, at the scale S
-// (gray levels at which the colour saturates); stage 1's rule, unchanged.
-export const DIFF_STOPS = {
-  zero: [24, 24, 24],
-  pos: [
-    [214, 48, 39],
-    [255, 224, 144],
-  ],
-  neg: [
-    [33, 102, 172],
-    [166, 226, 255],
-  ],
-};
-
-export function diffColour(d, scale) {
-  const a = Math.min(Math.abs(d), scale);
-  if (a === 0) return DIFF_STOPS.zero.slice();
-  const [mid, end] = d > 0 ? DIFF_STOPS.pos : DIFF_STOPS.neg;
-  let c0;
-  let c1;
-  let num;
-  if (2 * a <= scale) {
-    c0 = DIFF_STOPS.zero;
-    c1 = mid;
-    num = 2 * a;
-  } else {
-    c0 = mid;
-    c1 = end;
-    num = 2 * a - scale;
-  }
-  return [0, 1, 2].map((k) => c0[k] + Math.floor(((c1[k] - c0[k]) * num * 2 + scale) / (2 * scale)));
-}
-
-// lut[3 * (d + 255) + channel]
-export function diffLut(scale) {
-  const lut = new Uint8Array(511 * 3);
-  for (let d = -255; d <= 255; d++) lut.set(diffColour(d, scale), 3 * (d + 255));
-  return lut;
-}
-
-export function diffToRgba(a, b, lut, rgba) {
-  for (let i = 0, o = 0; i < a.length; i++, o += 4) {
-    const k = 3 * (a[i] - b[i] + 255);
-    rgba[o] = lut[k];
-    rgba[o + 1] = lut[k + 1];
-    rgba[o + 2] = lut[k + 2];
     rgba[o + 3] = 255;
   }
 }
@@ -616,24 +564,19 @@ export function streamPanelSizesMm(grids) {
   return out;
 }
 
-// How to lay out nGroups groups of three panels in a box of availW x availH px (stage 1).
-// padX, padY: px left and right, above and below each panel outside its picture (the margin
-// that holds the edge letters).
-export function fitLayout(sizes, nGroups, availW, availH, gap = 8, head = 22, frame = 4, padX = 0, padY = 0) {
+// How to lay out the three panels of the stream on screen in a box of availW x availH px: in a
+// row or in a column, whichever gives the larger scale in px per mm. padX, padY: px left and
+// right, above and below each panel outside its picture (the margin that holds the edge
+// letters); head: the height of the heading over the panels; frame: the border around them.
+export function fitLayout(sizes, availW, availH, gap = 8, head = 22, frame = 4, padX = 0, padY = 0) {
   let best = null;
   for (const panels of ['row', 'column']) {
     const gw = panels === 'row' ? sizes.reduce((a, s) => a + s[0], 0) : Math.max(...sizes.map((s) => s[0]));
     const gh = panels === 'row' ? Math.max(...sizes.map((s) => s[1])) : sizes.reduce((a, s) => a + s[1], 0);
-    const gapsW = (panels === 'row' ? 2 * gap + 6 * padX : 2 * padX) + frame;
-    const gapsH = (panels === 'row' ? 2 * padY : 2 * gap + 6 * padY) + head + frame;
-    for (const groups of nGroups > 1 ? ['row', 'column'] : ['row']) {
-      const nw = groups === 'row' ? nGroups : 1;
-      const nh = groups === 'row' ? 1 : nGroups;
-      const w = availW - nw * gapsW - (nw - 1) * 2 * gap;
-      const h = availH - nh * gapsH - (nh - 1) * gap;
-      const scale = Math.min(w / (nw * gw), h / (nh * gh));
-      if (!best || scale > best.scale) best = { scale, panels, groups };
-    }
+    const w = availW - (panels === 'row' ? 2 * gap + 6 * padX : 2 * padX) - frame;
+    const h = availH - (panels === 'row' ? 2 * padY : 2 * gap + 6 * padY) - head - frame;
+    const scale = Math.min(w / gw, h / gh);
+    if (!best || scale > best.scale) best = { scale, panels };
   }
   best.scale = clamp(best.scale, 0.1, 16);
   return best;
@@ -661,10 +604,8 @@ export function boundaryFraction(b, total) {
   return total > 1 ? clamp((b - 0.5) / (total - 1), 0, 1) : 0;
 }
 
-// The colours of the contours: in the series views those of the surface interface; in the
-// difference view, whose colours run to red and yellow, another pair, drawn on a dark outline.
+// The colours of the contours: those of the surface interface.
 export const SURFACE_COLOURS = { white: '#FF3B30', pial: '#FFD400' };
-export const DIFF_SURFACE_COLOURS = { white: '#3DFF5A', pial: '#FF4DFF', outline: '#000000' };
 
 // ---- contours ---------------------------------------------------------------------------------
 

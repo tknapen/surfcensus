@@ -193,7 +193,7 @@ def test_the_stream_of_a_run_plays_through_its_boundaries_under_the_runs_urls(
     session_start = next(s["first"] for s in timeline["segments"] if s["session"] == 1)
     start = session_start - 4
     count = 8
-    page.evaluate("(c) => window.__epi.set(c)", {"g": start, "rate": 30, "view": "side"})
+    page.evaluate("(c) => window.__epi.set(c)", {"g": start, "rate": 30, "view": "raw"})
     page.evaluate("window.__epi.page.log.length = 0")
     page.evaluate("(c) => window.__epi.set(c)", {"playing": True})
     page.wait_for_function(
@@ -336,7 +336,7 @@ def test_a_run_packed_later_into_the_session_on_screen_is_noticed_and_plays_on(
         for seg in before["segments"]
         if seg["session"] == len(epi_run.shown[participant]) - 1
     )
-    page.evaluate("(c) => window.__epi.set(c)", {"g": first, "rate": 12, "view": "side"})
+    page.evaluate("(c) => window.__epi.set(c)", {"g": first, "rate": 12, "view": "raw"})
     boxes = page.evaluate(PLACES)
     page.evaluate("window.__epi.page.log.length = 0")
     page.evaluate("(c) => window.__epi.set(c)", {"playing": True})

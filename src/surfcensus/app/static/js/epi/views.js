@@ -1,13 +1,11 @@
-// The panels: per group (a stream, or the difference) three planes, each a box of a fixed
-// size for the whole stream that holds a canvas with one pixel per voxel of the grid on screen
+// The panels: the stream on screen (raw or preprocessed; f flips, decision D52) in three
+// planes, each a box of a fixed size for the whole stream that holds a canvas with one pixel per voxel of the grid on screen
 // and a second canvas over it for the contours and the crosshair. A grid with a smaller field
 // of view sits in the middle of its box; the scale in px per mm is that of the whole stream,
 // so at a boundary nothing moves but the pictures. The orientation letters lie in a margin of
 // the box above and below the canvas (PAD_Y px; the letters of the left and right edges at the
 // two ends of the upper margin), so that they cover no voxel.
 import {
-  DIFF_SURFACE_COLOURS,
-  diffToRgba,
   fitLayout,
   grayToRgba,
   panelSizesMm,
@@ -22,11 +20,8 @@ export const PAD_X = 1;
 export const PAD_Y = 13;
 const EDGES = ['left', 'right', 'top', 'bottom'];
 
-// per surface of a contour file (lh, rh white; lh, rh pial): the colour in a group's panels
-function surfaceColours(group) {
-  const c = group === 'diff' ? DIFF_SURFACE_COLOURS : SURFACE_COLOURS;
-  return [c.white, c.white, c.pial, c.pial];
-}
+// per surface of a contour file (lh, rh white; lh, rh pial): its colour
+const COLOURS = [SURFACE_COLOURS.white, SURFACE_COLOURS.white, SURFACE_COLOURS.pial, SURFACE_COLOURS.pial];
 
 function crosshairColour() {
   const css = getComputedStyle(document.documentElement);
@@ -42,7 +37,7 @@ export class Views {
     this.sizes = sizesMm;
     this.handlers = handlers;
     this.grid = null;
-    this.groups = new Map(); // key -> { element, heading, badge, panels: [{ box, gray, over, ctx, image }] }
+    this.group = null; // { element, heading, badge, row, panels: [{ box, gray, over, letters, ctx, image }] }
     this.scale = 2;
     this.markerState = ['', ''];
     this.crosshair = crosshairColour();
@@ -53,26 +48,24 @@ export class Views {
     if (this.grid && this.grid.grid_key === grid.grid_key) return;
     this.grid = grid;
     this.overlayKey = null;
-    for (const group of this.groups.values()) this.fitGroup(group);
+    if (this.group) this.fitGroup(this.group);
   }
 
-  // keys: the groups to show ('raw', 'pre', 'diff'); labels: key -> heading text
-  setGroups(keys, labels) {
-    const same = keys.length === this.groups.size && keys.every((k) => this.groups.has(k));
-    if (!same) {
-      this.root.replaceChildren();
-      this.groups.clear();
-      for (const key of keys) this.groups.set(key, this.makeGroup(key));
+  // The stream on screen ('raw' or 'pre') and the heading over its panels. A flip changes the
+  // heading and the pictures, not the panels: nothing moves (D38).
+  setStream(key, label) {
+    if (!this.group) {
+      this.group = this.makeGroup();
       this.layout();
-      this.marker(...this.markerState); // the new groups carry the marker that is up
+      this.marker(...this.markerState);
     }
-    for (const key of keys) this.groups.get(key).heading.textContent = labels[key];
+    this.group.element.dataset.group = key;
+    if (this.group.heading.textContent !== label) this.group.heading.textContent = label;
   }
 
-  makeGroup(key) {
+  makeGroup() {
     const element = document.createElement('section');
     element.className = 'epi-group';
-    element.dataset.group = key;
     const head = document.createElement('h2');
     const heading = document.createElement('span');
     const badge = document.createElement('span');
@@ -171,28 +164,20 @@ export class Views {
   // Sizes every box for the space the views have. Returns the scale in px per mm.
   layout() {
     this.overlayKey = null; // resizing a canvas clears it
-    const n = this.groups.size || 1;
     const availW = this.root.clientWidth;
     const availH = Math.max(this.handlers.availableHeight(), 200);
-    const fit = fitLayout(this.sizes, n, availW, availH, 8, 22, 4, PAD_X, PAD_Y);
+    const fit = fitLayout(this.sizes, availW, availH, 8, 22, 4, PAD_X, PAD_Y);
     this.scale = fit.scale;
-    this.root.dataset.groups = fit.groups;
-    for (const group of this.groups.values()) {
-      group.row.dataset.panels = fit.panels;
-      this.fitGroup(group);
+    if (this.group) {
+      this.group.row.dataset.panels = fit.panels;
+      this.fitGroup(this.group);
     }
     return fit.scale;
   }
 
-  paintGray(key, plane, slice) {
-    const panel = this.groups.get(key).panels[plane];
+  paintGray(plane, slice) {
+    const panel = this.group.panels[plane];
     grayToRgba(slice, panel.image.data);
-    panel.ctx.putImageData(panel.image, 0, 0);
-  }
-
-  paintDiff(key, plane, a, b, lut) {
-    const panel = this.groups.get(key).panels[plane];
-    diffToRgba(a, b, lut, panel.image.data);
     panel.ctx.putImageData(panel.image, 0, 0);
   }
 
@@ -201,79 +186,64 @@ export class Views {
   // only when the slices, the grid, the switches, the layout or the loaded contours change.
   overlay(slices, contours, showContours, showCrosshair, active, contourKey = '') {
     const shape = this.grid.shape;
-    const groups = [...this.groups.keys()].join('+');
-    const key = [this.grid.grid_key, contourKey, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active, groups].join('|');
+    const key = [this.grid.grid_key, contourKey, slices.join(','), contours.map((c) => (c ? 1 : 0)).join(''), showContours, showCrosshair, active].join('|');
     if (key === this.overlayKey) return;
     this.overlayKey = key;
     const dpr = window.devicePixelRatio || 1;
-    for (const [groupKey, group] of this.groups.entries()) {
-      const colours = surfaceColours(groupKey);
-      const outlined = groupKey === 'diff';
-      group.panels.forEach((panel, plane) => {
-        const spec = SPEC[plane];
-        const [w, h] = planeSize(shape, plane);
-        const ctx = panel.over.getContext('2d');
-        const sx = panel.over.width / w;
-        const sy = panel.over.height / h;
-        ctx.clearRect(0, 0, panel.over.width, panel.over.height);
-        const c = contours[plane];
-        if (showContours && c) {
-          ctx.lineJoin = 'round';
-          const slice = slices[spec.axis];
-          const path = (surface) => {
-            const cell = slice * c.nSurfaces + surface;
-            ctx.beginPath();
-            for (let n = c.lineStart[cell]; n < c.lineStart[cell + 1]; n++) {
-              for (let p = c.pointStart[n]; p < c.pointStart[n + 1]; p++) {
-                const [x, y] = voxelToPanel(plane, shape, c.xy[2 * p], c.xy[2 * p + 1]);
-                if (p === c.pointStart[n]) ctx.moveTo(x * sx, y * sy);
-                else ctx.lineTo(x * sx, y * sy);
-              }
-            }
-          };
-          if (outlined) {
-            // a dark outline under every line first, so that no line lies on a colour of the
-            // difference without an edge
-            ctx.strokeStyle = DIFF_SURFACE_COLOURS.outline;
-            ctx.lineWidth = 3.5 * dpr;
-            for (let surface = 0; surface < c.nSurfaces; surface++) {
-              path(surface);
-              ctx.stroke();
-            }
-          }
-          ctx.lineWidth = (outlined ? 1.5 : 1.25) * dpr;
-          for (let surface = 0; surface < c.nSurfaces; surface++) {
-            ctx.strokeStyle = colours[surface % colours.length];
-            path(surface);
-            ctx.stroke();
-          }
-        }
-        if (showCrosshair) {
-          const [x, y] = voxelToPanel(plane, shape, slices[spec.h], slices[spec.v]);
-          ctx.strokeStyle = this.crosshair.colour;
-          ctx.globalAlpha = this.crosshair.alpha;
-          ctx.lineWidth = dpr;
+    this.group.panels.forEach((panel, plane) => {
+      const spec = SPEC[plane];
+      const [w, h] = planeSize(shape, plane);
+      const ctx = panel.over.getContext('2d');
+      const sx = panel.over.width / w;
+      const sy = panel.over.height / h;
+      ctx.clearRect(0, 0, panel.over.width, panel.over.height);
+      const c = contours[plane];
+      if (showContours && c) {
+        ctx.lineJoin = 'round';
+        const slice = slices[spec.axis];
+        const path = (surface) => {
+          const cell = slice * c.nSurfaces + surface;
           ctx.beginPath();
-          ctx.moveTo(Math.round(x * sx) + 0.5, 0);
-          ctx.lineTo(Math.round(x * sx) + 0.5, panel.over.height);
-          ctx.moveTo(0, Math.round(y * sy) + 0.5);
-          ctx.lineTo(panel.over.width, Math.round(y * sy) + 0.5);
+          for (let n = c.lineStart[cell]; n < c.lineStart[cell + 1]; n++) {
+            for (let p = c.pointStart[n]; p < c.pointStart[n + 1]; p++) {
+              const [x, y] = voxelToPanel(plane, shape, c.xy[2 * p], c.xy[2 * p + 1]);
+              if (p === c.pointStart[n]) ctx.moveTo(x * sx, y * sy);
+              else ctx.lineTo(x * sx, y * sy);
+            }
+          }
+        };
+        ctx.lineWidth = 1.25 * dpr;
+        for (let surface = 0; surface < c.nSurfaces; surface++) {
+          ctx.strokeStyle = COLOURS[surface % COLOURS.length];
+          path(surface);
           ctx.stroke();
-          ctx.globalAlpha = 1;
         }
-        panel.box.classList.toggle('active', plane === active);
-      });
-    }
+      }
+      if (showCrosshair) {
+        const [x, y] = voxelToPanel(plane, shape, slices[spec.h], slices[spec.v]);
+        ctx.strokeStyle = this.crosshair.colour;
+        ctx.globalAlpha = this.crosshair.alpha;
+        ctx.lineWidth = dpr;
+        ctx.beginPath();
+        ctx.moveTo(Math.round(x * sx) + 0.5, 0);
+        ctx.lineTo(Math.round(x * sx) + 0.5, panel.over.height);
+        ctx.moveTo(0, Math.round(y * sy) + 0.5);
+        ctx.lineTo(panel.over.width, Math.round(y * sy) + 0.5);
+        ctx.stroke();
+        ctx.globalAlpha = 1;
+      }
+      panel.box.classList.toggle('active', plane === active);
+    });
   }
 
-  // The marker on the frame: text in the heading of every group and a coloured frame.
+  // The marker on the frame: text in the heading and a coloured frame.
   marker(kind, text) {
     this.markerState = [kind, text];
-    for (const group of this.groups.values()) {
-      group.element.classList.toggle('marker-fd', kind === 'fd');
-      group.element.classList.toggle('marker-ns', kind === 'ns');
-      group.badge.textContent = text;
-    }
+    const group = this.group;
+    if (!group) return;
+    group.element.classList.toggle('marker-fd', kind === 'fd');
+    group.element.classList.toggle('marker-ns', kind === 'ns');
+    group.badge.textContent = text;
   }
 
   stale(on) {

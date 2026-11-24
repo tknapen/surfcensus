@@ -8,8 +8,6 @@
     <div id="views-buttons" class="buttons" role="group" aria-label="streams shown">
       <button type="button" data-view="raw"><kbd>1</kbd> raw</button>
       <button type="button" data-view="pre"><kbd>2</kbd> preprocessed</button>
-      <button type="button" data-view="side"><kbd>3</kbd> side by side</button>
-      <button type="button" data-view="diff"><kbd>4</kbd> difference</button>
     </div>
     <div id="kinds-buttons" class="buttons" role="group" aria-label="moving picture or still">
       <button type="button" data-kind="series"><kbd>q</kbd> series</button>
@@ -58,9 +56,8 @@
       <label title="the white and pial surfaces of FreeSurfer, drawn as contours on every view"><input type="checkbox" id="contours" checked> surfaces <kbd>s</kbd></label>
       <label><input type="checkbox" id="crosshair" checked> crosshair <kbd>c</kbd></label>
       <label><input type="checkbox" id="traces-on" checked> traces <kbd>t</kbd></label>
-      <label>difference scale <select id="diff-scale" aria-label="difference scale, gray levels"></select></label>
       <label>FD threshold, mm <input type="number" id="fd-limit" min="0" step="0.1" value="0.5"></label>
-      <p id="legend"><canvas id="legend-bar" width="255" height="10" hidden></canvas> <span id="legend-text"></span></p>
+      <p id="legend"><span id="legend-text"></span></p>
     </div>
   </section>
   <canvas id="traces" aria-label="framewise displacement and standardised DVARS of the stream, with run and session boundaries"></canvas>
@@ -91,14 +88,15 @@
         <li><b>raw</b>: the raw BIDS series, resampled once (cubic interpolation) onto the grid of the preprocessed
           series by the session's one rigid placement (the stored registration of the session's anchor run), and
           nothing else. No motion, slice-timing or distortion correction, and no other processing. That one resampling
-          smooths single-volume detail slightly, and it enters the difference. The raw stream shows head motion within
+          smooths single-volume detail slightly, which shows when the two streams are compared. The raw stream shows head motion within
           a run, artefacts confined to single volumes, distortion and dropout as acquired, and how far the head moved
           between runs.</li>
         <li><b>preprocessed</b>: the series as the pipeline wrote it, voxel for voxel on its own grid. It shows what
           remains after the pipeline's corrections, and how the corrected series fits the contours.</li>
       </ul>
       <p><b>The difference</b> between the two streams, and the raw stream's misfit to the contours, are what the page
-        exists to show. The strip under the timeline says what the pipeline did to the run on screen, each statement
+        exists to show. The panels show one stream at a time; <kbd>f</kbd> flips to the other at the same volume and
+        slices, so what the pipeline changed is seen in place. The strip under the timeline says what the pipeline did to the run on screen, each statement
         with where it was read; <b>details</b> gives the whole text.</p>
       <p><b>One stream.</b> The runs follow each other without a stop: playing runs on from the last volume of a run to
         the first of the next, and from the last run of a session to the first of the next session (sessions put in order by: <span id="help-order"></span>). At a boundary
@@ -113,8 +111,7 @@
         of the page.</p>
       <p><b>Intensity normalization</b> (<kbd>n</kbd>), off by default. Off: one linear window for the whole stream,
         so that a run that is brighter or darker than another is seen as it is. On: each run under its own window.
-        The legend under the controls says which is on and what the gray levels stand for. The difference is taken of
-        the gray levels on screen, and its scale is given in gray levels and in units of signal under either setting.
+        The legend under the controls says which is on and what the gray levels stand for.
         <span id="help-window"></span></p>
       <p><b>Exact values.</b> Every voxel on screen is one block of a stored 8-bit value (through the table of the common
         window when normalization is off), no smoothing. The orientation letters lie in a margin outside the
@@ -152,8 +149,8 @@
         <tr><td><kbd>&uarr;</kbd> <kbd>&darr;</kbd></td><td>next, previous slice of the active plane; with <kbd>Shift</kbd>, 5 slices</td></tr>
         <tr><td><kbd>p</kbd></td><td>next plane becomes the active one; the mouse wheel over a panel scrubs its slices</td></tr>
         <tr><td>click, drag</td><td>in a panel: the other two planes go to that point; in the traces: go to that volume</td></tr>
-        <tr><td><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd></td><td>raw, preprocessed, side by side, difference</td></tr>
-        <tr><td><kbd>f</kbd></td><td>flip between raw and preprocessed</td></tr>
+        <tr><td><kbd>1</kbd> <kbd>2</kbd></td><td>raw, preprocessed</td></tr>
+        <tr><td><kbd>f</kbd></td><td>flip between raw and preprocessed, at the same volume and slices</td></tr>
         <tr><td><kbd>q</kbd> <kbd>w</kbd> <kbd>e</kbd></td><td>the moving series, the temporal mean, the temporal SD of the run (stills)</td></tr>
         <tr><td><kbd>n</kbd></td><td>intensity normalization on, off</td></tr>
         <tr><td><kbd>r</kbd>, <kbd>Shift</kbd> + <kbd>r</kbd></td><td>jump to the next, previous run of the stream</td></tr>
@@ -165,8 +162,7 @@
         <tr><td><kbd>?</kbd> <kbd>Esc</kbd></td><td>this help; close it</td></tr>
       </table>
       <p>Surfaces: the white and pial surfaces as contours, white surface red, pial surface yellow, both hemispheres,
-        cut at the centre of the slice, in every view and on the stills. In the difference view, whose colours run to
-        red and yellow, they are green (white surface) and magenta (pial), each on a dark outline.</p>
+        cut at the centre of the slice, on both streams and on the stills.</p>
       <p><button type="button" id="help-close">close</button></p>
     </div>
   </div>
