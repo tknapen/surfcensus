@@ -1239,7 +1239,7 @@ a.control {
   font: inherit;
   color: var(--text);
   background: var(--raised);
-  border: 1px solid var(--line);
+  border: 1px solid var(--control-line);
   border-radius: 4px;
   padding: 2px 7px;
 }
@@ -1255,7 +1255,7 @@ a.control {
 
 .epi button[aria-pressed="true"] {
   border-color: var(--accent);
-  background: #14343c;
+  background: var(--pressed);
 }
 
 .epi button:focus-visible,
@@ -1538,7 +1538,7 @@ a.control {
 
 .epi #segments button[aria-pressed="true"] {
   color: var(--text);
-  background: #14343c;
+  background: var(--pressed);
 }
 
 .epi #time {
