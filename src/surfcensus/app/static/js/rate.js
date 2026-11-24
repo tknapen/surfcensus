@@ -339,18 +339,43 @@ class RatePage {
       this.leave();
       this.setState("done");
       byId("review-link").hidden = false;
-      // the EPI movies open for a rater who has nothing left to rate (asked again: the
-      // session said whether they were open when the page was loaded)
-      api.getSession().then((session) => this.showEpiLink(session)).catch(() => {});
       this.say(
         `Nothing is left to rate: ${next.progress.done_total} done. ` +
           "Backspace goes back to the last subject.",
       );
+      this.showDoneActions();
+      // the EPI movies open for a rater who has nothing left to rate (asked again: the
+      // session said whether they were open when the page was loaded)
+      api
+        .getSession()
+        .then((session) => {
+          this.showEpiLink(session);
+          this.showDoneActions();
+        })
+        .catch(() => {});
       return;
     }
     this.say("");
     this.open(next.assignment);
     this.viewer.prefetch(next.prefetch);
+  }
+
+  // Where to go once nothing is left to rate: under the message, the links of the progress
+  // line that are shown now (review, EPI movies, start), as buttons. The page decides nothing
+  // here: a link the progress line hides (a closed page, D6) is not offered either.
+  showDoneActions() {
+    if (this.page.dataset.state !== "done") return;
+    for (const old of this.message.querySelectorAll(".message-actions")) old.remove();
+    const actions = html("span", "message-actions");
+    for (const id of ["review-link", "epi-link", "home-link"]) {
+      const source = byId(id);
+      if (source.hidden) continue;
+      const target = html("a", "control", source.textContent);
+      target.href = source.getAttribute("href");
+      target.dataset.for = id;
+      actions.append(target);
+    }
+    if (actions.childElementCount) this.message.append(actions);
   }
 
   // One link to the EPI movies of the run, which names no subject; shown only when the

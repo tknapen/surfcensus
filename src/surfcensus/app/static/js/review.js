@@ -157,7 +157,7 @@ class ReviewPage {
     this.openFromHash();
     const first = review.total ? this.offset + 1 : 0;
     const last = this.offset + review.rows.length;
-    byId("review-count").textContent = `${review.total} subjects`;
+    byId("review-count").textContent = `${review.total} ${review.total === 1 ? "subject" : "subjects"}`;
     byId("page-label").textContent = `${first} to ${last} of ${review.total}`;
     byId("page-previous").disabled = this.offset === 0;
     byId("page-next").disabled = last >= review.total;
@@ -262,8 +262,10 @@ class ReviewPage {
     const xs = rows.map((row) => row.composite);
     const low = xs.length ? Math.min(...xs) : 0;
     const high = xs.length ? Math.max(...xs) : 1;
-    const span = high - low || 1;
-    const x = (value) => left + ((value - low) / span) * (width - left - right);
+    const span = high - low;
+    // every composite equal (one subject, say): the dots in the middle, the value once
+    const x = (value) =>
+      span ? left + ((value - low) / span) * (width - left - right) : (left + width - right) / 2;
     const y = (position) => height - bottom - (position + 0.5) * band;
     const parts = [];
     const label = (at, baseline, anchor, text) =>
@@ -281,14 +283,25 @@ class ReviewPage {
       );
     });
     parts.push(
-      label(left, height - 18, "start", cellText(low)),
-      label(width - right, height - 18, "end", cellText(high)),
+      ...(span
+        ? [
+            label(left, height - 18, "start", cellText(low)),
+            label(width - right, height - 18, "end", cellText(high)),
+          ]
+        : [label((left + width - right) / 2, height - 18, "middle", xs.length ? cellText(low) : "")]),
       label((left + width - right) / 2, height - 4, "middle", "composite score"),
     );
+    const perLevel = new Map();
+    for (const row of rows) {
+      const level = finalLevel(row);
+      perLevel.set(level, (perLevel.get(level) || 0) + 1);
+    }
     rows.forEach((row, position) => {
       const level = levels.indexOf(finalLevel(row));
-      // a fixed spread within the band, so dots of one label do not hide each other
-      const spread = (((position * 7919) % 17) / 16 - 0.5) * band * 0.6;
+      // a fixed spread within the band, so dots of one label do not hide each other; a label
+      // with one dot keeps it on its line
+      const alone = perLevel.get(finalLevel(row)) === 1;
+      const spread = alone ? 0 : (((position * 7919) % 17) / 16 - 0.5) * band * 0.6;
       const dot = svg("circle", {
         class: row.subject_uid === this.selected ? "scatter-dot scatter-chosen" : "scatter-dot",
         cx: x(row.composite),
@@ -303,7 +316,8 @@ class ReviewPage {
     figure.replaceChildren(...parts);
     byId("scatter-caption").textContent = rows.length
       ? "Composite score against the final label (the worse of A and B) of the " +
-        `${rows.length} subjects of this page that have a score. A dot opens its subject.`
+        `${rows.length === 1 ? "subject" : `${rows.length} subjects`} of this page that ` +
+        `${rows.length === 1 ? "has" : "have"} a score. A dot opens its subject.`
       : "No subject of this page has a composite score.";
   }
 

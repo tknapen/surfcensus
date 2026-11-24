@@ -181,6 +181,25 @@ def test_from_the_rating_screen_to_a_run_of_the_subject_and_back_with_the_draft_
     )
     assert [r for r, _ in runs] == list(epi_run.runs[session])
     assert {s for _, s in runs} == {"packed"}
+    # the design review of 2026-11-24: the run name is the link into the EPI page at the run,
+    # "(recorded)" is said once, in the heading of the states, a flagged run has a badge and an
+    # amber edge, and the column of the corrections is left out when no run has its own
+    info = page.evaluate(f"fetch('/api/subjects/{uid}').then((r) => r.json())")
+    for run in info["sessions"][0]["runs"]:
+        row = f".subject-session[data-session='{session}'] tr[data-run='{run['run_uid']}']"
+        assert page.inner_text(f"{row} .run-name") == (run["name"] or run["run_uid"])
+        if run["epi_url"]:
+            assert (page.get_attribute(f"{row} a.run-link", "href") or "").startswith(
+                run["epi_url"]
+            )
+        flagged = bool(run["frame"] and run["frame"]["flagged"])
+        assert page.locator(f"{row} .flag-badge").count() == int(flagged)
+        assert ("flagged-row" in (page.get_attribute(row, "class") or "")) == flagged
+    headings = page.eval_on_selector_all(
+        f".subject-session[data-session='{session}'] thead th", "h => h.map((e) => e.textContent)"
+    )
+    assert "state (recorded)" in headings and "preprocessing applied" not in headings
+    assert "open the EPI page at this run" not in text and "packed (recorded)" not in text
     assert page.locator("#review-link").get_attribute("href") == f"/review#subject={uid}"
     no_horizontal_scroll(tab)
     tab.shot("subject")

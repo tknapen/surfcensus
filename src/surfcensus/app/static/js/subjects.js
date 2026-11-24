@@ -139,15 +139,18 @@ export function frameText(funcFrame, limit) {
   return text;
 }
 
-// The state of a run as the page says it: what the catalog records.
+// The state of a run as the page says it: what the catalog records, which the heading of the
+// column says once (STATE_HEADING).
+export const STATE_HEADING = "state (recorded)";
+
 export function stateText(funcRun) {
   switch (funcRun.state) {
     case "packed":
-      return "packed (recorded)";
+      return "packed";
     case "pending":
       return "waiting for its pack";
     case "failed":
-      return `pack failed (recorded)${funcRun.reason ? `: ${funcRun.reason}` : ""}`;
+      return `pack failed${funcRun.reason ? `: ${funcRun.reason}` : ""}`;
     case "not selected":
       return "not selected (--epi-runs)";
     default:
@@ -186,7 +189,7 @@ export const LIST_COLUMNS = [
 function drawList(listing) {
   const body = byId("subject-rows").tBodies[0];
   const lines = listing.subjects.map((subjectRow) => {
-    const line = html("tr");
+    const line = html("tr", subjectRow.n_flagged ? "flagged-row" : "");
     line.dataset.key = subjectRow.key;
     line.dataset.kind = subjectRow.kind;
     cell(line, link(subjectRow.url, subjectRow.label || subjectRow.key));
@@ -315,10 +318,19 @@ export function runLink(epiUrl, key) {
   return `${epiUrl}&subject=${encodeURIComponent(key)}`;
 }
 
+// Whether a run of the session has corrections of its own beside those said for the session:
+// the column of them is left out when none has.
+export function ownCorrectionsShown(own) {
+  return own.some((lines) => lines.length > 0);
+}
+
 function runTable(funcSession, key, own) {
   const table = html("table", "subjects runs");
   const head = html("tr");
-  for (const name of ["#", "run", "state", "volumes", "TR", "displacement under the session's registration", "raw affine", "preprocessing applied"]) {
+  const columns = ["#", "run", STATE_HEADING, "volumes", "TR", "displacement under the session's registration", "raw affine"];
+  const ownShown = ownCorrectionsShown(own);
+  if (ownShown) columns.push("preprocessing applied");
+  for (const name of columns) {
     const th = html("th", "", name);
     th.scope = "col";
     head.append(th);
@@ -326,15 +338,24 @@ function runTable(funcSession, key, own) {
   table.createTHead().append(head);
   const body = table.createTBody();
   funcSession.runs.forEach((funcRun, at) => {
-    const line = html("tr");
+    const flagged = Boolean(funcRun.frame && funcRun.frame.flagged);
+    const line = html("tr", flagged ? "flagged-row" : "");
     line.dataset.run = funcRun.run_uid;
     line.dataset.state = funcRun.state;
     cell(line, funcRun.acquisition_order === null ? "" : String(funcRun.acquisition_order + 1));
-    const name = cell(line, html("span", "run-name", funcRun.name || funcRun.run_uid), "run-cell");
+    // the name of a run in the stream is the link into the EPI page at that run
+    const runName = funcRun.name || funcRun.run_uid;
+    const name = cell(
+      line,
+      funcRun.epi_url
+        ? link(runLink(funcRun.epi_url, key), runName, "run-name run-link")
+        : html("span", "run-name", runName),
+      "run-cell",
+    );
+    if (funcRun.epi_url) name.firstChild.title = "open the EPI page at this run";
     if (funcRun.anchor) name.append(html("span", "anchor-badge", "anchor"));
-    if (funcRun.epi_url) {
-      name.append(html("br"), link(runLink(funcRun.epi_url, key), "open the EPI page at this run", "run-link"));
-    } else if (funcRun.state === "packed") {
+    if (flagged) name.append(html("span", "flag-badge", "flagged"));
+    if (!funcRun.epi_url && funcRun.state === "packed") {
       name.append(html("br"), html("span", "hint", "not in the stream yet"));
     }
     const state = cell(line, stateText(funcRun), `wrap state-${funcRun.state.replace(/ /g, "-")}`);
@@ -343,12 +364,14 @@ function runTable(funcSession, key, own) {
     cell(line, funcRun.tr_s === null ? "" : `${funcRun.tr_s} s`);
     cell(line, frameText(funcRun.frame, funcSession.frame_limit_mm), funcRun.frame && funcRun.frame.flagged ? "flagged wrap" : "wrap");
     cell(line, funcRun.raw_affine ? AFFINE_TEXT[funcRun.raw_affine] || funcRun.raw_affine : "", funcRun.raw_affine === "header, unchecked" ? "flagged wrap" : "wrap");
-    const list = html("ul", "corrections");
-    for (const text of own[at]) {
-      list.append(html("li", text.startsWith("affine registration, not rigid") ? "flagged" : "", text));
+    if (ownShown) {
+      const list = html("ul", "corrections");
+      for (const text of own[at]) {
+        list.append(html("li", text.startsWith("affine registration, not rigid") ? "flagged" : "", text));
+      }
+      if (!own[at].length) list.append(html("li", "hint", "as for every run of the session (above)"));
+      cell(line, list, "wrap corrections-cell");
     }
-    if (!own[at].length) list.append(html("li", "hint", "as for every run of the session (above)"));
-    cell(line, list, "wrap corrections-cell");
     body.append(line);
   });
   const wrap = html("div", "table-wrap runs-wrap");

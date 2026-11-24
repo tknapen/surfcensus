@@ -11,7 +11,6 @@
       <button type="button" id="unratable" class="control" aria-pressed="false"><kbd>u</kbd> unratable<span id="unratable-reason"></span></button>
       <button type="button" id="other" class="control" aria-pressed="false"><kbd>o</kbd> other problem</button>
       <button type="button" id="note-toggle" class="control" aria-pressed="false"><kbd>n</kbd> note</button>
-      <span class="legend">click: mark · <kbd>Delete</kbd> remove · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · hold <kbd>h</kbd> marks off · hold <kbd>s</kbd> contours off</span>
       <span class="spacer"></span>
       <button type="button" id="back" class="control"><kbd>Backspace</kbd> back</button>
       <button type="button" id="skip" class="control" disabled><kbd>k</kbd> skip</button>
@@ -23,7 +22,10 @@
       <textarea id="note" rows="2" maxlength="10000" placeholder="Note" aria-label="Note"></textarea>
       <span class="note-hint"><kbd>Esc</kbd> back to the keys</span>
     </div>
-    <p id="hint" class="hint" role="status"></p>
+    <div class="hint-row">
+      <p id="hint" class="hint" role="status"></p>
+      <span class="legend">click: mark · <kbd>Delete</kbd> remove · <kbd>Ctrl</kbd>+<kbd>Z</kbd> undo · hold <kbd>h</kbd> marks off · hold <kbd>s</kbd> contours off</span>
+    </div>
   </section>
 
   <footer id="progress" class="progress">
